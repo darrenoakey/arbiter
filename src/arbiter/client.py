@@ -155,10 +155,10 @@ class ArbiterClient:
                          image=image_b64, audio=audio_b64, **kwargs)
         return result["result"]["data_bytes"]
 
-    def video_generate(self, images_b64: list[str], audio_b64: str, **kwargs) -> bytes:
-        """Generate video. Returns MP4 bytes."""
-        result = self.run("video-generate", timeout=600,
-                         images=images_b64, audio=audio_b64, **kwargs)
+    def video_generate(self, segments: list[dict], audio_b64: str, **kwargs) -> bytes:
+        """Generate video from segments + audio. Returns MP4 bytes."""
+        result = self.run("video-generate", timeout=1800,
+                         segments=segments, audio_b64=audio_b64, **kwargs)
         return result["result"]["data_bytes"]
 
     # --- System ---

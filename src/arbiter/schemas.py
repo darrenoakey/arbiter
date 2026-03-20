@@ -176,13 +176,21 @@ class TalkingHeadParams(BaseModel):
     seed: Optional[int] = None
 
 
+class VideoSegmentParams(BaseModel):
+    description: str = ""
+    start_time: float = 0.0
+    end_time: float = 0.0
+    start_image_b64: str = ""
+    end_image_b64: str = ""
+
+
 class VideoGenerateParams(BaseModel):
-    images: list[str]  # list of base64
-    audio: str  # base64
-    transcript: Optional[str] = None
+    segments: list[VideoSegmentParams]
+    audio_b64: str  # base64-encoded audio file
     resolution: str = "large"
     fps: int = 24
     seed: int = 42
+    chunk_frames: int = 121
 
 
 # Maps job type to its parameter validation schema

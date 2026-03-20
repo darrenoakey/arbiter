@@ -177,7 +177,7 @@ class LTX2Adapter(GroupAdapter):
             )
 
         try:
-            from video_fast import FastPipeline
+            from video_fast_gpu import FastPipeline
 
             self._pipeline = FastPipeline()
             log.info("LTX-2 FastPipeline config objects created (no heavy weights yet)")
