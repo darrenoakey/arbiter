@@ -16,6 +16,7 @@ class JobType(str, Enum):
     CAPTION = "caption"
     QUERY = "query"
     DETECT = "detect"
+    POINT = "point"
     TRANSCRIBE = "transcribe"
     TTS_CUSTOM = "tts-custom"
     TTS_CLONE = "tts-clone"
@@ -33,6 +34,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "caption": "moondream",
     "query": "moondream",
     "detect": "moondream",
+    "point": "moondream",
     "transcribe": "whisper-large",
     "tts-custom": "tts-custom",
     "tts-clone": "tts-clone",
@@ -144,6 +146,11 @@ class DetectParams(BaseModel):
     object: str
 
 
+class PointParams(BaseModel):
+    image: str  # base64
+    object: str
+
+
 class TranscribeParams(BaseModel):
     audio: str  # base64
     language: Optional[str] = "en"
@@ -207,6 +214,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "caption": CaptionParams,
     "query": QueryParams,
     "detect": DetectParams,
+    "point": PointParams,
     "transcribe": TranscribeParams,
     "tts-custom": TTSCustomParams,
     "tts-clone": TTSCloneParams,

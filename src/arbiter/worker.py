@@ -62,10 +62,12 @@ class WorkerPool:
             if slot is None:
                 raise RuntimeError(f"No slot for model {job.model_id}")
 
+            # Inject job_type into params so adapters can dispatch
+            infer_params = {**job.payload, "_job_type": job.job_type}
             result = await loop.run_in_executor(
                 self._executor,
                 slot.adapter.infer,
-                job.payload,
+                infer_params,
                 job_dir,
                 thread_cancel,
             )

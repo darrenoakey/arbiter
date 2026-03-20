@@ -58,7 +58,9 @@ class MoondreamAdapter(ModelAdapter):
         self._check_cancel(cancel_flag)
 
         image = self._decode_image(params)
-        task = params.get("task", "caption")
+        # Determine task from _job_type (injected by worker) or explicit "task" param
+        job_type = params.get("_job_type", "")
+        task = params.get("task") or job_type or "caption"
 
         self._check_cancel(cancel_flag)
 
