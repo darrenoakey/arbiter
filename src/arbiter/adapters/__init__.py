@@ -1,0 +1,10 @@
+"""Model adapters — auto-import to trigger registration."""
+from . import birefnet  # noqa: F401
+from . import flux  # noqa: F401
+from . import moondream  # noqa: F401
+from . import whisper_large  # noqa: F401
+from . import tts_custom  # noqa: F401
+from . import tts_clone  # noqa: F401
+from . import tts_design  # noqa: F401
+from . import sonic  # noqa: F401
+from . import ltx2  # noqa: F401
