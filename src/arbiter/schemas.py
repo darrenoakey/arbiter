@@ -22,6 +22,7 @@ class JobType(str, Enum):
     TTS_DESIGN = "tts-design"
     TALKING_HEAD = "talking-head"
     VIDEO_GENERATE = "video-generate"
+    AESTHETIC_SCORE = "aesthetic-score"
 
 
 # Maps job type to model_id
@@ -38,6 +39,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "tts-design": "tts-design",
     "talking-head": "sonic",
     "video-generate": "ltx2",
+    "aesthetic-score": "aesthetic-scorer",
 }
 
 
@@ -193,6 +195,10 @@ class VideoGenerateParams(BaseModel):
     chunk_frames: int = 121
 
 
+class AestheticScoreParams(BaseModel):
+    image: str  # base64
+
+
 # Maps job type to its parameter validation schema
 JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "image-generate": ImageGenerateParams,
@@ -207,4 +213,5 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "tts-design": TTSDesignParams,
     "talking-head": TalkingHeadParams,
     "video-generate": VideoGenerateParams,
+    "aesthetic-score": AestheticScoreParams,
 }

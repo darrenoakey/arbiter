@@ -206,5 +206,6 @@ def _get_test_params(model_name: str) -> dict:
         "tts-design": {"text": "Hello world, this is a calibration test.", "voice_description": "A clear neutral voice."},
         "sonic": {"image": img, "audio": audio},
         "ltx2": {"images": [img], "audio": audio, "resolution": "small"},
+        "aesthetic-scorer": {"image": img},
     }
     return defaults.get(model_name, {})
