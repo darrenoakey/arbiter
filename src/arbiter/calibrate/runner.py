@@ -190,18 +190,21 @@ def _timed_infer(adapter, params, output_dir, cancel_flag):
 
 
 def _get_test_params(model_name: str) -> dict:
-    """Get realistic test parameters for a model. Uses small inputs."""
-    # These are minimal test inputs — calibration needs real data
-    # For production calibration, use actual test assets from assets/
+    """Get realistic test parameters for a model."""
+    from .inputs import get_test_image_b64, get_test_audio_b64
+
+    img = get_test_image_b64()
+    audio = get_test_audio_b64()
+
     defaults = {
         "flux-schnell": {"prompt": "A red fox in a forest", "width": 512, "height": 512, "steps": 4, "seed": 42},
-        "birefnet": {"image": ""},  # Will need a real base64 image
-        "moondream": {"image": "", "task": "caption", "length": "short"},
-        "whisper-large": {"audio": "", "language": "en"},
+        "birefnet": {"image": img},
+        "moondream": {"image": img, "task": "caption", "length": "short"},
+        "whisper-large": {"audio": audio, "language": "en"},
         "tts-custom": {"text": "Hello world, this is a calibration test.", "speaker": "Aiden", "language": "English"},
-        "tts-clone": {"text": "Hello world, this is a calibration test.", "ref_audio": "", "language": "English"},
+        "tts-clone": {"text": "Hello world, this is a calibration test.", "ref_audio": audio, "language": "English"},
         "tts-design": {"text": "Hello world, this is a calibration test.", "voice_description": "A clear neutral voice."},
-        "sonic": {"image": "", "audio": ""},
-        "ltx2": {"images": [""], "audio": "", "resolution": "small"},
+        "sonic": {"image": img, "audio": audio},
+        "ltx2": {"images": [img], "audio": audio, "resolution": "small"},
     }
     return defaults.get(model_name, {})

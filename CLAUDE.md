@@ -138,3 +138,71 @@ JSONL at `output/logs/arbiter-YYYY-MM-DD.jsonl`. Events: job lifecycle, model lo
 - **Async job API**: Submit → poll → get result. Server crashes are transparent to clients.
 - **LRU eviction**: Models idle past keep_alive_seconds get evicted. When memory is needed, oldest idle model goes first.
 - **Group adapters**: Sonic (8 sub-models) and LTX-2 (phased pipeline) load/unload atomically.
+
+## Calibration Results (Grace Blackwell GB10, 128GB VRAM)
+
+| Model | VRAM (GB) | Load Time | Inference Time | Max Concurrent |
+|-------|-----------|-----------|----------------|----------------|
+| birefnet | 0.83 | 5.4s | 1.0s | 2 |
+| flux-schnell | 31.42 | 248s | 12s | 1 |
+| moondream (v3) | 17.28 | 142s | 103s | 1 |
+| whisper-large | 5.88 | 11.3s | 1.8s | 1 |
+| tts-custom | 3.89 | 43s | 4s | 1 |
+| tts-clone | 3.91 | 44s | ~4s | 1 |
+| tts-design | ~3.9 | ~43s | ~5s | 1 |
+| sonic (group) | 4.84 | 11s | ~45s | 1 |
+| ltx2 (group) | ~55 | ~30s | ~120s | 1 |
+
+Note: FLUX at 31GB was a surprise (estimated 12GB). Moondream3 at 17GB is 4x moondream2.
+Sonic at 5GB is much lighter than the 15GB estimate.
+
+## Known Issues & Compatibility
+
+### transformers version
+- **Must use transformers 4.57.3** — qwen-tts pins this exact version
+- moondream3, FLUX, BiRefNet all work fine on 4.57.3
+- transformers 5.x breaks qwen-tts import (`check_model_inputs` removed)
+
+### Model-specific notes
+- **Moondream3** (`moondream/moondream3-preview`): Upgraded from moondream2. Uses `dtype=` not `torch_dtype=` (deprecated). First inference triggers FlexAttention JIT compilation (~extra 30s). Consider torch.compile for production speed.
+- **Whisper large-v3**: NOT thread-safe for concurrent calls. Errors at concurrency >= 2.
+- **TTS output format**: `generate_custom_voice()` returns numpy arrays, not torch tensors. Adapter handles both via hasattr check.
+- **TTS-clone**: Requires `ref_text` parameter alongside `ref_audio` for voice cloning.
+- **Sonic**: Requires a real face in the input image — fails with "cannot access local variable 'bbox_s'" if no face detected.
+- **LTX-2**: `load()` is instant (~2ms) — only creates config objects. Heavy model loading happens inside `infer()` per-phase. Memory manager should budget 55GB for the full job duration.
+- **FLUX.1-schnell**: Needs `sentencepiece` package for tokenizer.
+- **BiRefNet**: Needs `kornia` package.
+
+## Key Dependencies
+
+Core: fastapi, uvicorn, pydantic, httpx
+ML: torch 2.10+cu130, transformers==4.57.3, diffusers, openai-whisper, qwen-tts
+Model-specific: kornia (birefnet), sentencepiece (flux), omegaconf opencv-python-headless (sonic)
+Packages: ltx-core, ltx-pipelines (installed from /home/darren/src/ltx2-spark/packages/)
+
+## Model Weight Locations
+
+Weights owned by Arbiter (in local/models/):
+- `local/models/ltx2/` — LTX-2 checkpoints (moved from /home/darren/models/ltx2/)
+- `local/models/sonic/` — Sonic checkpoints (moved from talking-head/Sonic/checkpoints/)
+- Symlinks exist at the old locations pointing back here
+
+HuggingFace cache (loaded by repo ID, shared ~/.cache/huggingface/):
+- FLUX.1-schnell, BiRefNet, Moondream3, Qwen3-TTS variants
+
+Whisper cache: ~/.cache/whisper/large-v3.pt
+
+Note: tts-design (Qwen3-TTS-12Hz-1.7B-VoiceDesign) is NOT downloaded yet.
+
+## Running as a Daemon
+
+Arbiter runs under `auto` (process manager):
+
+```bash
+# It's already registered:
+auto ps                    # Check status
+auto start arbiter         # Start
+auto stop arbiter          # Stop
+auto restart arbiter       # Restart
+auto log arbiter           # View logs
+```

@@ -48,8 +48,15 @@ class TTSDesignAdapter(ModelAdapter):
 
         self._check_cancel(cancel_flag)
 
+        import numpy as np
+        wav = wavs[0]
+        if hasattr(wav, "cpu"):
+            wav = wav.cpu().numpy()
+        elif not isinstance(wav, np.ndarray):
+            wav = np.array(wav)
+
         out_path = output_dir / "result.wav"
-        sf.write(str(out_path), wavs[0].cpu().numpy(), sr)
+        sf.write(str(out_path), wav, sr)
 
         return {"format": "wav", "sample_rate": sr}
 

@@ -1,4 +1,4 @@
-"""Moondream 2 vision-language adapter."""
+"""Moondream 3 vision-language adapter."""
 from __future__ import annotations
 
 import base64
@@ -13,7 +13,7 @@ from arbiter.adapters.registry import register
 
 log = logging.getLogger(__name__)
 
-MODEL_HF_ID = "vikhyatk/moondream2"
+MODEL_HF_ID = "moondream/moondream3-preview"
 
 
 @register
@@ -35,10 +35,10 @@ class MoondreamAdapter(ModelAdapter):
             device_map={"": device},
         )
         self._device = device
-        log.info("Moondream2 ready.")
+        log.info("Moondream3 ready.")
 
     def unload(self) -> None:
-        log.info("Unloading Moondream2.")
+        log.info("Unloading Moondream3.")
         del self._model
         self._model = None
         self._cleanup_gpu()

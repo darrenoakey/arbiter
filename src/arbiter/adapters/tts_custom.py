@@ -36,6 +36,7 @@ class TTSCustomAdapter(ModelAdapter):
         self._cleanup_gpu()
 
     def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+        import numpy as np
         import soundfile as sf
         self._check_cancel(cancel_flag)
 
@@ -50,8 +51,14 @@ class TTSCustomAdapter(ModelAdapter):
 
         self._check_cancel(cancel_flag)
 
+        wav = wavs[0]
+        if hasattr(wav, "cpu"):
+            wav = wav.cpu().numpy()
+        elif not isinstance(wav, np.ndarray):
+            wav = np.array(wav)
+
         out_path = output_dir / "result.wav"
-        sf.write(str(out_path), wavs[0].cpu().numpy(), sr)
+        sf.write(str(out_path), wav, sr)
 
         return {"format": "wav", "sample_rate": sr}
 
