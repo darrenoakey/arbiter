@@ -192,6 +192,15 @@ class JobStore:
             ).fetchone()
         return row["cnt"] if row else 0
 
+    def count_active(self, model_id: str) -> int:
+        """Count scheduled + running jobs for a model (all in-flight work)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) as cnt FROM jobs WHERE model_id = ? AND state IN ('scheduled', 'running')",
+                (model_id,),
+            ).fetchone()
+        return row["cnt"] if row else 0
+
     def recover_from_crash(self) -> int:
         """Reset scheduled/running jobs to queued. Call on startup. Returns count recovered."""
         with self._lock:

@@ -38,8 +38,13 @@ class WorkerPool:
         self._logger = event_logger
         self._on_job_done = on_job_done  # callback for scheduler cleanup
 
-    async def run_job(self, job: Job, cancel_flag: asyncio.Event):
-        """Run a job's inference in the thread pool. Handles completion/failure."""
+    async def run_job(self, job: Job, cancel_flag: asyncio.Event, instance_id: Optional[str] = None):
+        """Run a job's inference in the thread pool. Handles completion/failure.
+
+        instance_id: specific instance slot to use (for multi-instance models).
+                     Falls back to job.model_id for single-instance models.
+        """
+        resolved_id = instance_id or job.model_id
         job_dir = self._output_dir / "jobs" / job.id
         job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -58,9 +63,9 @@ class WorkerPool:
         start_time = time.time()
 
         try:
-            slot = self._memory.get_slot(job.model_id)
+            slot = self._memory.get_slot(resolved_id)
             if slot is None:
-                raise RuntimeError(f"No slot for model {job.model_id}")
+                raise RuntimeError(f"No slot for instance {resolved_id}")
 
             # Inject job_type into params so adapters can dispatch
             infer_params = {**job.payload, "_job_type": job.job_type}
@@ -119,8 +124,8 @@ class WorkerPool:
 
         finally:
             bridge_task.cancel()
-            # Release model
-            self._memory.release(job.model_id)
+            # Release the specific instance slot
+            self._memory.release(resolved_id)
             # Rescore since model may now have capacity
             if self._on_job_done:
                 self._on_job_done(job)

@@ -89,3 +89,51 @@ class TestSJFScoring:
         sched, _, _ = scheduler_deps
         p = sched.compute_priority("nonexistent")
         assert p == float("inf")
+
+
+class TestMultiInstanceCapacity:
+    """Test that _get_full_models accounts for max_instances."""
+
+    def test_single_instance_full(self, scheduler_deps):
+        sched, store, memory = scheduler_deps
+        # model-b: max_concurrent=1, max_instances=1 -> capacity=1
+        # Simulate 1 running job
+        job = store.create_job("model-b", "t", {})
+        store.update_state(job.id, "running")
+        full = sched._get_full_models()
+        assert "model-b" in full
+
+    def test_multi_instance_not_full(self):
+        """With max_instances=3, model isn't full until 3 jobs running."""
+        from arbiter.config import ArbiterConfig
+        from arbiter.store import JobStore
+        from unittest.mock import MagicMock
+
+        config = ArbiterConfig(models={
+            "mdl": {
+                "memory_gb": 4.0,
+                "max_concurrent": 1,
+                "max_instances": 3,
+                "avg_inference_ms": 1000,
+                "load_ms": 2000,
+            },
+        })
+        store = JobStore(":memory:")
+        memory = MagicMock()
+        memory.is_loaded = MagicMock(return_value=True)
+        sched = Scheduler(config=config, store=store, memory=memory, worker_pool=MagicMock())
+
+        # 1 running job -> not full (capacity=3)
+        j1 = store.create_job("mdl", "t", {})
+        store.update_state(j1.id, "running")
+        assert "mdl" not in sched._get_full_models()
+
+        # 2 running jobs -> not full
+        j2 = store.create_job("mdl", "t", {})
+        store.update_state(j2.id, "running")
+        assert "mdl" not in sched._get_full_models()
+
+        # 3 running jobs -> full
+        j3 = store.create_job("mdl", "t", {})
+        store.update_state(j3.id, "running")
+        assert "mdl" in sched._get_full_models()

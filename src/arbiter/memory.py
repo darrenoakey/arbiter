@@ -2,6 +2,11 @@
 
 Tracks model load states, manages VRAM budget, handles LRU eviction,
 and supports pipeline overlap (loading one model while running another).
+
+Supports multi-instance models: a single model_id (e.g. "moondream") can
+have N independent adapter instances, each with its own VRAM slot.  Instances
+are loaded on-demand — a new instance is only loaded when all existing loaded
+instances are busy.
 """
 from __future__ import annotations
 
@@ -31,9 +36,11 @@ class ModelState(str, Enum):
 @dataclass
 class ModelSlot:
     model_id: str
+    instance_id: str
     adapter: ModelAdapter
     memory_gb: float
     keep_alive_s: float
+    max_concurrent: int = 1
     state: ModelState = ModelState.UNLOADED
     active_count: int = 0
     last_active: float = 0.0
@@ -53,11 +60,12 @@ class MemoryManager:
         mm = MemoryManager(budget_gb=100, executor=pool, event_logger=logger)
         mm.register("flux", adapter, memory_gb=12, keep_alive_s=300)
 
-        await mm.ensure_loaded("flux")  # loads if needed, increments active_count
+        instance_id = mm.pick_instance("flux", max_concurrent=1)
+        await mm.ensure_loaded(instance_id)
         try:
-            # ... run inference ...
+            # ... run inference using mm.get_slot(instance_id) ...
         finally:
-            mm.release("flux")  # decrements active_count, starts keep-alive timer
+            mm.release(instance_id)
     """
 
     def __init__(
@@ -70,7 +78,8 @@ class MemoryManager:
         self._used_gb = 0.0
         self._executor = executor
         self._event_logger = event_logger
-        self._slots: dict[str, ModelSlot] = {}
+        self._slots: dict[str, ModelSlot] = {}  # keyed by instance_id
+        self._model_instances: dict[str, list[str]] = {}  # model_id -> [instance_ids]
         self._global_lock = asyncio.Lock()
         self._keepalive_task: Optional[asyncio.Task] = None
 
@@ -92,27 +101,107 @@ class MemoryManager:
         adapter: ModelAdapter,
         memory_gb: float,
         keep_alive_s: float = 300,
+        max_concurrent: int = 1,
+        instance_id: Optional[str] = None,
     ):
-        """Register a model slot. Must be called before ensure_loaded."""
-        self._slots[model_id] = ModelSlot(
+        """Register a model slot. Must be called before ensure_loaded.
+
+        For multi-instance models, call once per instance with a unique
+        instance_id (e.g. "moondream#0", "moondream#1").  For single-instance
+        models, instance_id defaults to model_id.
+        """
+        iid = instance_id or model_id
+        self._slots[iid] = ModelSlot(
             model_id=model_id,
+            instance_id=iid,
             adapter=adapter,
             memory_gb=memory_gb,
             keep_alive_s=keep_alive_s,
+            max_concurrent=max_concurrent,
         )
+        if model_id not in self._model_instances:
+            self._model_instances[model_id] = []
+        if iid not in self._model_instances[model_id]:
+            self._model_instances[model_id].append(iid)
 
-    def get_slot(self, model_id: str) -> Optional[ModelSlot]:
-        return self._slots.get(model_id)
+    def get_slot(self, instance_id: str) -> Optional[ModelSlot]:
+        return self._slots.get(instance_id)
+
+    def get_model_instances(self, model_id: str) -> list[str]:
+        """Return all instance_ids for a model."""
+        return list(self._model_instances.get(model_id, []))
 
     def is_loaded(self, model_id: str) -> bool:
+        """True if ANY instance of this model is loaded."""
+        for iid in self._model_instances.get(model_id, []):
+            slot = self._slots.get(iid)
+            if slot is not None and slot.state == ModelState.LOADED:
+                return True
+        # Fallback: direct slot lookup (backward compat for tests)
         slot = self._slots.get(model_id)
-        return slot is not None and slot.state in (ModelState.LOADED,)
+        return slot is not None and slot.state == ModelState.LOADED
+
+    def pick_instance(self, model_id: str, max_concurrent: int = 1) -> Optional[str]:
+        """Pick the best instance for a new job.
+
+        Preference order:
+        1. Loaded instance with spare capacity (least busy first)
+        2. Loading instance (job will wait for it via load_event)
+        3. Unloaded instance (cold start — only when all others are busy)
+        4. None if no instances registered
+
+        This ordering ensures we don't start loading N instances simultaneously.
+        A new instance only starts loading when existing loaded+loading instances
+        are all at capacity.
+        """
+        instances = self._model_instances.get(model_id, [])
+        if not instances:
+            # Fallback: if model_id is itself a slot key (single-instance)
+            if model_id in self._slots:
+                return model_id
+            return None
+
+        # Categorize instances
+        loaded = []
+        loading = []
+        unloaded = []
+        for iid in instances:
+            slot = self._slots[iid]
+            if slot.state == ModelState.LOADED:
+                if slot.active_count < max_concurrent:
+                    loaded.append((iid, slot))
+            elif slot.state == ModelState.LOADING:
+                loading.append(iid)
+            elif slot.state == ModelState.UNLOADED:
+                unloaded.append(iid)
+
+        # 1. Prefer loaded instances with capacity
+        if loaded:
+            loaded.sort(key=lambda x: x[1].active_count)
+            return loaded[0][0]
+
+        # 2. If an instance is already loading, wait for it rather than
+        #    starting another cold load
+        if loading:
+            return loading[0]
+
+        # 3. No loaded or loading instances available — cold start one
+        if unloaded:
+            return unloaded[0]
+
+        # All errored — return first to retry
+        return instances[0]
+
+    def total_capacity(self, model_id: str, max_concurrent: int = 1) -> int:
+        """Total job capacity across all instances of a model."""
+        instances = self._model_instances.get(model_id, [])
+        return len(instances) * max_concurrent
 
     def get_all_slots(self) -> dict[str, ModelSlot]:
         return dict(self._slots)
 
-    async def ensure_loaded(self, model_id: str) -> None:
-        """Ensure model is loaded and increment active_count.
+    async def ensure_loaded(self, instance_id: str) -> None:
+        """Ensure instance is loaded and increment active_count.
 
         If already loaded: immediate.
         If loading: wait for load to complete.
@@ -120,9 +209,9 @@ class MemoryManager:
 
         Raises EvictionImpossible if can't free enough VRAM.
         """
-        slot = self._slots.get(model_id)
+        slot = self._slots.get(instance_id)
         if slot is None:
-            raise KeyError(f"Model not registered: {model_id}")
+            raise KeyError(f"Model not registered: {instance_id}")
 
         async with slot._lock:
             if slot.state == ModelState.LOADED:
@@ -145,7 +234,7 @@ class MemoryManager:
                     slot.active_count += 1
                     return
                 elif slot.state == ModelState.ERROR:
-                    raise RuntimeError(f"Model {model_id} failed to load")
+                    raise RuntimeError(f"Model {instance_id} failed to load")
 
         # Need to load — acquire global lock for budget arithmetic
         async with self._global_lock:
@@ -164,7 +253,12 @@ class MemoryManager:
             slot.state = ModelState.LOADING
             self._used_gb += needed
 
-        self._log("model.load_start", model_id=model_id, memory_gb=slot.memory_gb)
+        self._log(
+            "model.load_start",
+            model_id=slot.model_id,
+            instance_id=instance_id,
+            memory_gb=slot.memory_gb,
+        )
 
         # Load in thread pool (blocking I/O)
         loop = asyncio.get_event_loop()
@@ -176,7 +270,12 @@ class MemoryManager:
             async with slot._lock:
                 slot.state = ModelState.ERROR
                 slot.load_event.set()
-            self._log("model.load_error", model_id=model_id, error=str(e))
+            self._log(
+                "model.load_error",
+                model_id=slot.model_id,
+                instance_id=instance_id,
+                error=str(e),
+            )
             raise
 
         async with slot._lock:
@@ -184,11 +283,16 @@ class MemoryManager:
             slot.active_count += 1
             slot.load_event.set()
 
-        self._log("model.load_done", model_id=model_id, memory_gb=slot.memory_gb)
+        self._log(
+            "model.load_done",
+            model_id=slot.model_id,
+            instance_id=instance_id,
+            memory_gb=slot.memory_gb,
+        )
 
-    def release(self, model_id: str):
+    def release(self, instance_id: str):
         """Decrement active_count and record last_active time. Thread-safe (sync)."""
-        slot = self._slots.get(model_id)
+        slot = self._slots.get(instance_id)
         if slot is None:
             return
         slot.active_count = max(0, slot.active_count - 1)
@@ -205,7 +309,7 @@ class MemoryManager:
         if deficit <= 0:
             return
 
-        # Collect evictable models: loaded, no active inferences
+        # Collect evictable slots: loaded, no active inferences
         evictable = [
             s for s in self._slots.values()
             if s.state == ModelState.LOADED and s.active_count == 0
@@ -227,19 +331,28 @@ class MemoryManager:
                 f"({len(evictable)} idle models)"
             )
 
-        # Evict selected models
+        # Evict selected slots
         loop = asyncio.get_event_loop()
         for slot in to_evict:
             slot.state = ModelState.EVICTING
-            self._log("model.evict_start", model_id=slot.model_id, memory_gb=slot.memory_gb)
+            self._log(
+                "model.evict_start",
+                model_id=slot.model_id,
+                instance_id=slot.instance_id,
+                memory_gb=slot.memory_gb,
+            )
             try:
                 await loop.run_in_executor(self._executor, slot.adapter.unload)
             except Exception as e:
-                logger.error("Failed to unload %s: %s", slot.model_id, e)
+                logger.error("Failed to unload %s: %s", slot.instance_id, e)
             self._used_gb -= slot.memory_gb
             slot.state = ModelState.UNLOADED
             slot.active_count = 0
-            self._log("model.evict_done", model_id=slot.model_id)
+            self._log(
+                "model.evict_done",
+                model_id=slot.model_id,
+                instance_id=slot.instance_id,
+            )
 
     async def run_keepalive_loop(self, interval: float = 10.0):
         """Background task: evict models idle past their keep_alive_s."""
@@ -267,16 +380,21 @@ class MemoryManager:
                         self._log(
                             "model.evict_start",
                             model_id=slot.model_id,
+                            instance_id=slot.instance_id,
                             reason="keepalive_expired",
                             memory_gb=slot.memory_gb,
                         )
                         try:
                             await loop.run_in_executor(self._executor, slot.adapter.unload)
                         except Exception as e:
-                            logger.error("Keepalive unload failed for %s: %s", slot.model_id, e)
+                            logger.error("Keepalive unload failed for %s: %s", slot.instance_id, e)
                         self._used_gb -= slot.memory_gb
                         slot.state = ModelState.UNLOADED
-                        self._log("model.evict_done", model_id=slot.model_id)
+                        self._log(
+                            "model.evict_done",
+                            model_id=slot.model_id,
+                            instance_id=slot.instance_id,
+                        )
 
     def start_keepalive(self):
         """Start the keepalive background task."""
@@ -289,19 +407,57 @@ class MemoryManager:
             self._keepalive_task = None
 
     def snapshot(self) -> dict:
-        """Return current state for logging/API."""
-        models = []
+        """Return current state for logging/API.
+
+        Multi-instance models are grouped: each model appears once with
+        aggregated stats and a per-instance breakdown.
+        """
+        # Group slots by model_id
+        model_groups: dict[str, list[ModelSlot]] = {}
         for slot in self._slots.values():
+            model_groups.setdefault(slot.model_id, []).append(slot)
+
+        models = []
+        for model_id, slots in model_groups.items():
+            total_active = sum(s.active_count for s in slots)
+            loaded_count = sum(1 for s in slots if s.state == ModelState.LOADED)
+            total_memory = sum(s.memory_gb for s in slots if s.state != ModelState.UNLOADED)
+
+            # Idle time: min idle across loaded idle instances
             idle_s = None
-            if slot.state == ModelState.LOADED and slot.active_count == 0 and slot.last_active > 0:
-                idle_s = round(time.monotonic() - slot.last_active, 1)
-            models.append({
-                "id": slot.model_id,
-                "state": slot.state.value if slot.active_count == 0 else "active",
-                "memory_gb": slot.memory_gb,
-                "active_jobs": slot.active_count,
+            for s in slots:
+                if s.state == ModelState.LOADED and s.active_count == 0 and s.last_active > 0:
+                    s_idle = round(time.monotonic() - s.last_active, 1)
+                    idle_s = s_idle if idle_s is None else min(idle_s, s_idle)
+
+            entry = {
+                "id": model_id,
+                "state": "active" if total_active > 0 else (
+                    "loaded" if loaded_count > 0 else slots[0].state.value
+                ),
+                "memory_gb": round(total_memory, 2) if total_memory else slots[0].memory_gb,
+                "active_jobs": total_active,
                 "idle_seconds": idle_s,
-            })
+            }
+
+            # Add instance breakdown for multi-instance models
+            if len(slots) > 1:
+                entry["instances"] = []
+                for s in slots:
+                    s_idle = None
+                    if s.state == ModelState.LOADED and s.active_count == 0 and s.last_active > 0:
+                        s_idle = round(time.monotonic() - s.last_active, 1)
+                    entry["instances"].append({
+                        "instance_id": s.instance_id,
+                        "state": s.state.value if s.active_count == 0 else "active",
+                        "active_jobs": s.active_count,
+                        "idle_seconds": s_idle,
+                    })
+                entry["loaded_instances"] = loaded_count
+                entry["total_instances"] = len(slots)
+
+            models.append(entry)
+
         # Read actual GPU memory from CUDA (not just bookkeeping)
         vram_actual_gb = self._used_gb  # fallback to bookkeeping
         try:

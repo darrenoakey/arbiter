@@ -47,28 +47,39 @@ _start_time: float = 0
 
 
 def _setup_adapters(config: ArbiterConfig, memory: MemoryManager):
-    """Register all configured models with the memory manager using stub adapters.
+    """Register all configured models with the memory manager.
 
-    Real adapters will be imported when available. For now, register with
-    the adapter registry to discover what's available.
+    For models with max_instances > 1, creates separate adapter instances
+    for each slot (e.g. moondream#0, moondream#1).  Each instance gets its
+    own copy of model weights in VRAM.
     """
     from .adapters import registry
 
     for model_id, model_cfg in config.models.items():
         try:
             adapter_cls = registry.get_adapter_class(model_id)
-            adapter = adapter_cls()
         except KeyError:
-            # No adapter registered yet — use a placeholder that will fail on load
             logger.warning("No adapter registered for model: %s (will fail on load)", model_id)
             continue
 
-        memory.register(
-            model_id=model_id,
-            adapter=adapter,
-            memory_gb=model_cfg.memory_gb,
-            keep_alive_s=model_cfg.keep_alive_seconds,
-        )
+        n = model_cfg.max_instances
+        for i in range(n):
+            adapter = adapter_cls()
+            instance_id = f"{model_id}#{i}" if n > 1 else None
+            memory.register(
+                model_id=model_id,
+                adapter=adapter,
+                memory_gb=model_cfg.memory_gb,
+                keep_alive_s=model_cfg.keep_alive_seconds,
+                max_concurrent=model_cfg.max_concurrent,
+                instance_id=instance_id,
+            )
+
+        if n > 1:
+            logger.info(
+                "Registered %d instances for %s (%.1fGB each, %.1fGB total max)",
+                n, model_id, model_cfg.memory_gb, n * model_cfg.memory_gb,
+            )
 
 
 @asynccontextmanager

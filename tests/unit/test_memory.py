@@ -146,7 +146,7 @@ class TestMemoryManager:
 
         snap = mm.snapshot()
         assert snap["vram_budget_gb"] == 24
-        assert snap["vram_used_gb"] == 4.0
+        assert snap["vram_configured_gb"] == 4.0
         assert len(snap["models"]) == 1
         assert snap["models"][0]["id"] == "test-model"
         assert snap["models"][0]["active_jobs"] == 1
@@ -163,3 +163,123 @@ class TestMemoryManager:
         assert mm.free_gb == 24.0
         await mm.ensure_loaded("m")
         assert mm.free_gb == 14.0
+
+
+class TestMultiInstance:
+    """Tests for multi-instance model support."""
+
+    @pytest.mark.asyncio
+    async def test_register_multiple_instances(self, mm):
+        for i in range(3):
+            mm.register("mdl", make_adapter(), memory_gb=4.0, instance_id=f"mdl#{i}")
+        assert mm.get_model_instances("mdl") == ["mdl#0", "mdl#1", "mdl#2"]
+
+    @pytest.mark.asyncio
+    async def test_pick_instance_prefers_loaded(self, mm):
+        for i in range(3):
+            mm.register("mdl", make_adapter(), memory_gb=4.0, instance_id=f"mdl#{i}")
+
+        # Load instance #1
+        await mm.ensure_loaded("mdl#1")
+        mm.release("mdl#1")
+
+        # pick_instance should prefer the loaded one
+        picked = mm.pick_instance("mdl", max_concurrent=1)
+        assert picked == "mdl#1"
+
+    @pytest.mark.asyncio
+    async def test_pick_instance_skips_busy(self, mm):
+        for i in range(3):
+            mm.register("mdl", make_adapter(), memory_gb=4.0, instance_id=f"mdl#{i}")
+
+        # Load and keep active on instance #0
+        await mm.ensure_loaded("mdl#0")
+        # active_count is now 1, max_concurrent=1 -> full
+
+        # Should pick an unloaded instance
+        picked = mm.pick_instance("mdl", max_concurrent=1)
+        assert picked == "mdl#1"  # first unloaded
+
+    @pytest.mark.asyncio
+    async def test_pick_instance_least_busy(self, mm):
+        for i in range(3):
+            mm.register("mdl", make_adapter(), memory_gb=4.0, max_concurrent=2, instance_id=f"mdl#{i}")
+
+        # Load both #0 and #1
+        await mm.ensure_loaded("mdl#0")
+        await mm.ensure_loaded("mdl#1")
+        # #0 has active_count=1, #1 has active_count=1
+        # Add another to #0
+        await mm.ensure_loaded("mdl#0")
+        # #0 has active_count=2, #1 has active_count=1
+
+        picked = mm.pick_instance("mdl", max_concurrent=2)
+        assert picked == "mdl#1"  # least busy
+
+    @pytest.mark.asyncio
+    async def test_multi_instance_independent_load_unload(self, mm):
+        for i in range(2):
+            mm.register("mdl", make_adapter(), memory_gb=4.0, instance_id=f"mdl#{i}")
+
+        await mm.ensure_loaded("mdl#0")
+        await mm.ensure_loaded("mdl#1")
+        assert mm.used_gb == 8.0
+
+        mm.release("mdl#0")
+        mm.release("mdl#1")
+
+        # Each instance is independent
+        assert mm.get_slot("mdl#0").state == ModelState.LOADED
+        assert mm.get_slot("mdl#1").state == ModelState.LOADED
+
+    @pytest.mark.asyncio
+    async def test_is_loaded_any_instance(self, mm):
+        for i in range(2):
+            mm.register("mdl", make_adapter(), memory_gb=4.0, instance_id=f"mdl#{i}")
+
+        assert not mm.is_loaded("mdl")
+        await mm.ensure_loaded("mdl#0")
+        assert mm.is_loaded("mdl")
+
+    @pytest.mark.asyncio
+    async def test_multi_instance_eviction(self, mm):
+        """Idle instances can be evicted independently."""
+        for i in range(2):
+            mm.register("mdl", make_adapter(), memory_gb=10.0, instance_id=f"mdl#{i}")
+        mm.register("other", make_adapter(), memory_gb=10.0)
+
+        # Load both instances
+        await mm.ensure_loaded("mdl#0")
+        mm.release("mdl#0")
+        await asyncio.sleep(0.01)
+        await mm.ensure_loaded("mdl#1")
+        mm.release("mdl#1")
+
+        # Budget=24, used=20. Loading "other" (10GB) needs eviction.
+        # mdl#0 is oldest idle -> evicted first
+        await mm.ensure_loaded("other")
+        assert mm.get_slot("mdl#0").state == ModelState.UNLOADED
+        assert mm.get_slot("mdl#1").state == ModelState.LOADED
+
+    @pytest.mark.asyncio
+    async def test_multi_instance_snapshot(self, mm):
+        for i in range(2):
+            mm.register("mdl", make_adapter(), memory_gb=4.0, instance_id=f"mdl#{i}")
+
+        await mm.ensure_loaded("mdl#0")
+        snap = mm.snapshot()
+
+        # Should be grouped as one model entry
+        assert len(snap["models"]) == 1
+        entry = snap["models"][0]
+        assert entry["id"] == "mdl"
+        assert entry["total_instances"] == 2
+        assert entry["loaded_instances"] == 1
+        assert entry["active_jobs"] == 1
+        assert len(entry["instances"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_total_capacity(self, mm):
+        for i in range(3):
+            mm.register("mdl", make_adapter(), memory_gb=4.0, instance_id=f"mdl#{i}")
+        assert mm.total_capacity("mdl", max_concurrent=2) == 6

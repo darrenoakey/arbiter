@@ -16,6 +16,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 class ModelConfig(BaseModel):
     memory_gb: float
     max_concurrent: int = 1
+    max_instances: int = 1
     keep_alive_seconds: int = 300
     avg_inference_ms: float = 5000
     load_ms: float = 10000
