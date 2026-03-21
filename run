@@ -13,7 +13,19 @@ shift || true
 
 case "$CMD" in
     server)
+        # Use Go server if binary exists, otherwise fall back to Python
+        if [ -f "$SCRIPT_DIR/arbiter-go" ]; then
+            exec "$SCRIPT_DIR/arbiter-go" "$@"
+        else
+            exec python -m arbiter.server "$@"
+        fi
+        ;;
+    server-python)
         exec python -m arbiter.server "$@"
+        ;;
+    build)
+        export PATH="$PATH:/usr/local/go/bin"
+        exec go build -o "$SCRIPT_DIR/arbiter-go" ./cmd/arbiter/
         ;;
     test)
         exec python -m pytest tests/ "$@"

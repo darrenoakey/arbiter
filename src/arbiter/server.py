@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -43,7 +44,15 @@ _scheduler: Scheduler = None
 _worker: WorkerPool = None
 _event_logger: EventLogger = None
 _executor: ThreadPoolExecutor = None
+_io_executor: ThreadPoolExecutor = None  # dedicated pool for API handlers (never blocked by inference)
+_ps_cache: dict = None  # cached /v1/ps snapshot, updated by background task
 _start_time: float = 0
+
+
+async def _run_io(fn, *args):
+    """Run a blocking function in the IO executor so it never blocks the event loop."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_io_executor, functools.partial(fn, *args))
 
 
 def _setup_adapters(config: ArbiterConfig, memory: MemoryManager):
@@ -84,7 +93,7 @@ def _setup_adapters(config: ArbiterConfig, memory: MemoryManager):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _config, _store, _memory, _scheduler, _worker, _event_logger, _executor, _start_time
+    global _config, _store, _memory, _scheduler, _worker, _event_logger, _executor, _io_executor, _start_time
 
     _start_time = time.time()
     _config = load_config(_PROJECT_ROOT)
@@ -105,8 +114,9 @@ async def lifespan(app: FastAPI):
     if recovered:
         logger.info("Recovered %d jobs from crash", recovered)
 
-    # Thread pool
+    # Thread pools: inference pool for GPU work, IO pool for API handlers
     _executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="arbiter")
+    _io_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="arbiter-io")
 
     # Memory manager
     _memory = MemoryManager(
@@ -146,14 +156,25 @@ async def lifespan(app: FastAPI):
     _event_logger.log("server.start", vram_budget_gb=_config.vram_budget_gb, recovered_jobs=recovered)
     logger.info("Arbiter started on %s:%d (VRAM budget: %.0fGB)", _config.host, _config.port, _config.vram_budget_gb)
 
-    # Memory snapshot task
-    async def _snapshot_loop():
+    # Background snapshot: updates _ps_cache every second in the IO pool
+    # so /v1/ps always returns instantly without blocking
+    async def _ps_update_loop():
+        global _ps_cache
+        log_counter = 0
         while True:
-            await asyncio.sleep(60)
-            snap = _memory.snapshot()
-            _event_logger.log("memory.snapshot", **snap)
+            try:
+                snap = await _run_io(_build_ps_snapshot)
+                _ps_cache = snap
+                # Log to event log every 60 iterations (~60s)
+                log_counter += 1
+                if log_counter >= 60:
+                    _event_logger.log("memory.snapshot", **snap)
+                    log_counter = 0
+            except Exception as e:
+                logger.debug("PS snapshot update failed: %s", e)
+            await asyncio.sleep(1.0)
 
-    snapshot_task = asyncio.create_task(_snapshot_loop())
+    snapshot_task = asyncio.create_task(_ps_update_loop())
 
     yield
 
@@ -165,6 +186,7 @@ async def lifespan(app: FastAPI):
     _event_logger.close()
     _store.close()
     _executor.shutdown(wait=False)
+    _io_executor.shutdown(wait=False)
 
 
 app = FastAPI(title="Arbiter", version="0.1.0", lifespan=lifespan)
@@ -189,11 +211,9 @@ async def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
             raise HTTPException(400, f"Invalid params: {e}")
 
     priority = _scheduler.compute_priority(model_id)
-    job = _store.create_job(
-        model_id=model_id,
-        job_type=job_type,
-        payload=req.params,
-        priority=priority,
+    job = await _run_io(
+        _store.create_job,
+        model_id, job_type, req.params, priority,
     )
 
     model_cfg = _config.models[model_id]
@@ -211,7 +231,7 @@ async def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
 
 @app.get("/v1/jobs/{job_id}")
 async def get_job(job_id: str) -> JobStatusResponse:
-    job = _store.get_job(job_id)
+    job = await _run_io(_store.get_job, job_id)
     if not job:
         raise HTTPException(404, f"Job not found: {job_id}")
 
@@ -239,7 +259,7 @@ async def get_job(job_id: str) -> JobStatusResponse:
 
 @app.delete("/v1/jobs/{job_id}")
 async def cancel_job(job_id: str):
-    job = _store.get_job(job_id)
+    job = await _run_io(_store.get_job, job_id)
     if not job:
         raise HTTPException(404, f"Job not found: {job_id}")
 
@@ -255,7 +275,7 @@ async def cancel_job(job_id: str):
 
 @app.get("/v1/jobs")
 async def list_jobs(state: str | None = None, model: str | None = None, limit: int = 100):
-    jobs = _store.list_jobs(state=state, model_id=model, limit=limit)
+    jobs = await _run_io(_store.list_jobs, state, model, limit)
     return [
         {
             "job_id": j.id,
@@ -270,18 +290,23 @@ async def list_jobs(state: str | None = None, model: str | None = None, limit: i
     ]
 
 
-@app.get("/v1/ps")
-async def system_status() -> dict:
+def _build_ps_snapshot() -> dict:
+    """Build the full /v1/ps response. Called from IO thread pool."""
     snap = _memory.snapshot()
     counts = _store.count_by_state()
-
-    # Add queued counts per model
     for model_info in snap["models"]:
         queued = _store.count_by_state(model_id=model_info["id"])
         model_info["queued_jobs"] = queued.get("queued", 0)
-
     snap["queue"] = counts
     return snap
+
+
+@app.get("/v1/ps")
+async def system_status() -> dict:
+    if _ps_cache is not None:
+        return _ps_cache
+    # Fallback before first background update
+    return await _run_io(_build_ps_snapshot)
 
 
 @app.get("/v1/health")
