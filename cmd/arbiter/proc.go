@@ -100,10 +100,7 @@ func (inst *Instance) Spawn() error {
 
 	cmd := exec.Command(inst.pythonBin, "-m", "arbiter.worker_main", inst.ModelID)
 	cmd.Dir = inst.projectRoot
-	cmd.Env = append(os.Environ(),
-		"PYTHONUNBUFFERED=1",
-		fmt.Sprintf("ARBITER_MAX_CONCURRENT=%d", inst.MaxConcurrent),
-	)
+	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1")
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
