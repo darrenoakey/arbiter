@@ -100,7 +100,10 @@ func (inst *Instance) Spawn() error {
 
 	cmd := exec.Command(inst.pythonBin, "-m", "arbiter.worker_main", inst.ModelID)
 	cmd.Dir = inst.projectRoot
-	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1")
+	cmd.Env = append(os.Environ(),
+		"PYTHONUNBUFFERED=1",
+		fmt.Sprintf("ARBITER_MAX_CONCURRENT=%d", inst.MaxConcurrent),
+	)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -140,10 +143,8 @@ func (inst *Instance) Spawn() error {
 		}
 	}()
 
-	// For concurrent mode: background reader that dispatches responses
-	if inst.MaxConcurrent > 1 {
-		go inst.readLoop()
-	}
+	// Background reader dispatches responses by req_id
+	go inst.readLoop()
 
 	slog.Info("adapter subprocess started", "instance", inst.InstanceID, "pid", cmd.Process.Pid)
 	return nil
@@ -154,7 +155,10 @@ func (inst *Instance) Spawn() error {
 func (inst *Instance) readLoop() {
 	defer close(inst.readerDone)
 	for inst.stdout.Scan() {
-		line := inst.stdout.Bytes()
+		// Copy the line — scanner.Bytes() is reused on next Scan()
+		line := make([]byte, len(inst.stdout.Bytes()))
+		copy(line, inst.stdout.Bytes())
+
 		var resp WorkerResponse
 		if err := json.Unmarshal(line, &resp); err != nil {
 			slog.Warn("non-JSON from adapter", "instance", inst.InstanceID, "line", string(line))
@@ -172,13 +176,15 @@ func (inst *Instance) readLoop() {
 		inst.pendingMu.Unlock()
 		if ok {
 			ch <- line
+		} else {
+			slog.Warn("no pending request for response", "instance", inst.InstanceID, "req_id", resp.ReqID)
 		}
 	}
+	slog.Warn("readLoop exited", "instance", inst.InstanceID)
 }
 
 // sendAndReceive sends a command and waits for the response.
-// For single-concurrent instances, reads directly from stdout.
-// For multi-concurrent instances, uses the pending channel system.
+// Uses the background readLoop to dispatch responses by req_id.
 func (inst *Instance) sendAndReceive(cmd map[string]any) (*WorkerResponse, error) {
 	data, _ := json.Marshal(cmd)
 	data = append(data, '\n')
@@ -191,46 +197,27 @@ func (inst *Instance) sendAndReceive(cmd map[string]any) (*WorkerResponse, error
 	stdin := inst.stdin
 	inst.mu.Unlock()
 
-	if inst.MaxConcurrent > 1 {
-		// Concurrent mode: register pending channel, send, wait
-		reqID, _ := cmd["req_id"].(string)
-		if reqID == "" {
-			reqID = "_default"
-		}
-		ch := make(chan json.RawMessage, 1)
-		inst.pendingMu.Lock()
-		inst.pending[reqID] = ch
-		inst.pendingMu.Unlock()
-
-		if _, err := stdin.Write(data); err != nil {
-			return nil, fmt.Errorf("write to subprocess: %w", err)
-		}
-
-		raw := <-ch
-		var resp WorkerResponse
-		json.Unmarshal(raw, &resp)
-		return &resp, nil
+	// Register pending channel for this request
+	reqID, _ := cmd["req_id"].(string)
+	if reqID == "" {
+		reqID = "_default"
 	}
-
-	// Single-concurrent mode: direct stdin/stdout
-	inst.mu.Lock()
-	scanner := inst.stdout
-	inst.mu.Unlock()
+	ch := make(chan json.RawMessage, 1)
+	inst.pendingMu.Lock()
+	inst.pending[reqID] = ch
+	inst.pendingMu.Unlock()
 
 	if _, err := stdin.Write(data); err != nil {
+		inst.pendingMu.Lock()
+		delete(inst.pending, reqID)
+		inst.pendingMu.Unlock()
 		return nil, fmt.Errorf("write to subprocess: %w", err)
 	}
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		var resp WorkerResponse
-		if err := json.Unmarshal(line, &resp); err != nil {
-			slog.Warn("non-JSON from adapter", "instance", inst.InstanceID, "line", string(line))
-			continue
-		}
-		return &resp, nil
-	}
-	return nil, fmt.Errorf("subprocess stdout closed")
+	raw := <-ch
+	var resp WorkerResponse
+	json.Unmarshal(raw, &resp)
+	return &resp, nil
 }
 
 // Load sends the load command and waits for completion.
@@ -275,18 +262,27 @@ func (inst *Instance) Infer(jobID, jobType string, params json.RawMessage, outpu
 		inst.mu.Unlock()
 	}()
 
-	cmd := map[string]any{
+	return inst.sendAndReceive(map[string]any{
 		"cmd":        "infer",
+		"req_id":     jobID,
 		"params":     json.RawMessage(params),
 		"output_dir": outputDir,
 		"job_id":     jobID,
 		"job_type":   jobType,
-	}
-	if inst.MaxConcurrent > 1 {
-		cmd["req_id"] = jobID
-	}
+	})
+}
 
-	return inst.sendAndReceive(cmd)
+// InferRaw sends an inference command without managing activeJobs.
+// Used when the caller (scheduler) manages the reservation itself.
+func (inst *Instance) InferRaw(jobID, jobType string, params json.RawMessage, outputDir string) (*WorkerResponse, error) {
+	return inst.sendAndReceive(map[string]any{
+		"cmd":        "infer",
+		"req_id":     jobID,
+		"params":     json.RawMessage(params),
+		"output_dir": outputDir,
+		"job_id":     jobID,
+		"job_type":   jobType,
+	})
 }
 
 // Cancel sends SIGUSR1 to the subprocess to set the cancel flag.
@@ -405,15 +401,15 @@ func (m *InstanceManager) PickInstance(modelID string) *Instance {
 		return bestLoaded
 	}
 
-	// 2. Loading (job will wait for load to complete)
+	// 2. Loading with capacity (job will wait for load to complete)
 	for _, id := range ids {
 		inst := m.instances[id]
-		if inst.State() == "loading" {
+		if inst.State() == "loading" && inst.HasCapacity() {
 			return inst
 		}
 	}
 
-	// 3. Unloaded or stopped (needs cold start)
+	// 3. Unloaded or stopped with capacity (needs cold start)
 	for _, id := range ids {
 		inst := m.instances[id]
 		s := inst.State()

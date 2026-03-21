@@ -111,6 +111,7 @@ def _run_single(adapter, cancel_flag: threading.Event):
             params = msg.get("params", {})
             output_dir = Path(msg.get("output_dir", "/tmp"))
             job_type = msg.get("job_type", "")
+            req_id = msg.get("req_id", "")
 
             # Inject _job_type so adapters can dispatch
             if isinstance(params, dict):
@@ -122,14 +123,14 @@ def _run_single(adapter, cancel_flag: threading.Event):
             try:
                 result = adapter.infer(params, output_dir, cancel_flag)
                 if cancel_flag.is_set():
-                    respond({"status": "cancelled"})
+                    respond({"status": "cancelled", "req_id": req_id})
                 else:
-                    respond({"status": "ok", "result": result})
+                    respond({"status": "ok", "req_id": req_id, "result": result})
             except CancelledException:
-                respond({"status": "cancelled"})
+                respond({"status": "cancelled", "req_id": req_id})
             except Exception as e:
                 log.exception("Infer failed")
-                respond({"status": "error", "error": f"{type(e).__name__}: {e}"})
+                respond({"status": "error", "req_id": req_id, "error": f"{type(e).__name__}: {e}"})
 
         elif cmd == "unload":
             try:

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -120,24 +121,19 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 	return nil
 }
 
-// dispatchJob picks an instance, loads it, and runs inference.
-func (s *Scheduler) dispatchJob(job *Job) {
-	modelCfg, ok := s.config.Models[job.ModelID]
-	if !ok {
-		s.store.UpdateState(job.ID, "failed", WithError("model not configured"), WithFinishedAt(nowTS()))
-		return
-	}
-	_ = modelCfg
+// dispatchJobToInstance loads the instance and runs inference.
+// activeJobs is already incremented by the caller to reserve the slot.
+// This function owns the reservation and releases it when done.
+func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance) {
+	defer func() {
+		atomic.AddInt32(&inst.activeJobs, -1)
+		inst.mu.Lock()
+		inst.lastActive = time.Now()
+		inst.mu.Unlock()
+		s.rescoreModel(job.ModelID)
+	}()
 
 	s.logger.Log("job.scheduled", map[string]any{"job_id": job.ID, "model_id": job.ModelID})
-
-	// Pick best instance
-	inst := s.mgr.PickInstance(job.ModelID)
-	if inst == nil {
-		slog.Debug("no instance available, requeueing", "model", job.ModelID, "job", job.ID)
-		s.store.UpdateState(job.ID, "queued")
-		return
-	}
 
 	// Ensure loaded
 	if err := s.ensureLoaded(inst); err != nil {
@@ -155,12 +151,12 @@ func (s *Scheduler) dispatchJob(job *Job) {
 		"instance_id": inst.InstanceID,
 	})
 
-	// Run inference (blocking)
+	// Run inference (blocking) — we use InferRaw which skips activeJobs management
 	jobDir := filepath.Join(s.outputDir, "jobs", job.ID)
 	os.MkdirAll(jobDir, 0o755)
 
 	start := time.Now()
-	resp, err := inst.Infer(job.ID, job.JobType, job.Payload, jobDir)
+	resp, err := inst.InferRaw(job.ID, job.JobType, job.Payload, jobDir)
 	elapsed := time.Since(start).Seconds()
 
 	if err != nil {
@@ -196,7 +192,6 @@ func (s *Scheduler) dispatchJob(job *Job) {
 		})
 	}
 
-	s.rescoreModel(job.ModelID)
 	s.Wake() // check for more work
 }
 
@@ -255,12 +250,20 @@ func (s *Scheduler) Run(ctx context.Context) {
 		// Mark scheduled so it won't be re-picked
 		s.store.UpdateState(job.ID, "scheduled")
 
-		// Dispatch blocks until inference completes — but runs in a goroutine
-		// so the scheduler can continue picking more jobs
-		go func(j *Job) {
-			s.dispatchJob(j)
-			s.Wake() // signal scheduler to check for more work
-		}(job)
+		// Pick instance NOW (synchronous) so concurrent goroutines
+		// don't race to pick the same instance
+		inst := s.mgr.PickInstance(job.ModelID)
+		if inst == nil {
+			s.store.UpdateState(job.ID, "queued")
+			continue
+		}
+		// Reserve the slot immediately so PickInstance won't return it again
+		atomic.AddInt32(&inst.activeJobs, 1)
+
+		go func(j *Job, inst *Instance) {
+			s.dispatchJobToInstance(j, inst)
+			s.Wake()
+		}(job, inst)
 
 		// Preload next instance in background
 		s.tryPreload()

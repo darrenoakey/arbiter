@@ -86,14 +86,7 @@ class AestheticScorerAdapter(ModelAdapter):
 
         self._check_cancel(cancel_flag)
 
-        # Decode input image from base64
-        image_b64 = params.get("image", "")
-        if image_b64.startswith("data:"):
-            _, image_b64 = image_b64.split(",", 1)
-        try:
-            image = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
-        except Exception as e:
-            raise InferenceError(f"Failed to decode image: {e}")
+        image = self._resolve_image(params)
 
         self._check_cancel(cancel_flag)
 
