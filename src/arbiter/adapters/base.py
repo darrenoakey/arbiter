@@ -1,13 +1,18 @@
 """Abstract base classes for model adapters."""
 from __future__ import annotations
 
+import base64
 import gc
+import io
+import logging
 import threading
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
+
+_base_log = logging.getLogger(__name__)
 
 
 class ModelState(str, Enum):
@@ -82,6 +87,45 @@ class ModelAdapter(ABC):
         """Helper: raise CancelledException if flag is set."""
         if cancel_flag.is_set():
             raise CancelledException(f"Job cancelled for model {self.model_id}")
+
+    @staticmethod
+    def _resolve_media(params: dict, key: str = "image", file_key: str | None = None) -> bytes:
+        """Resolve media bytes from either a file path or base64 data.
+
+        Checks for a file path first (key + "_file" or explicit file_key),
+        then falls back to base64 decoding of the standard key.
+        This is the single place all adapters should get their media from.
+        """
+        if file_key is None:
+            file_key = f"{key}_file"
+        file_path = params.get(file_key)
+        if file_path:
+            p = Path(file_path)
+            if p.is_file():
+                _base_log.debug("Reading %s from file: %s", key, p)
+                return p.read_bytes()
+            _base_log.warning("%s file not found, falling back to base64: %s", key, p)
+        # Fall back to base64
+        b64_data = params.get(key) or params.get(f"{key}_url", "")
+        if not b64_data:
+            from arbiter.adapters.base import InferenceError
+            raise InferenceError(f"No {key} or {file_key} provided")
+        if b64_data.startswith("data:"):
+            _, b64_data = b64_data.split(",", 1)
+        return base64.b64decode(b64_data)
+
+    @staticmethod
+    def _resolve_image(params: dict) -> "Image.Image":
+        """Convenience: resolve image media and return a PIL Image."""
+        from PIL import Image
+        from arbiter.adapters.base import ModelAdapter, InferenceError
+        try:
+            raw = ModelAdapter._resolve_media(params, "image")
+            return Image.open(io.BytesIO(raw)).convert("RGB")
+        except Exception as e:
+            if isinstance(e, InferenceError):
+                raise
+            raise InferenceError(f"Failed to decode image: {e}")
 
     @staticmethod
     def _cleanup_gpu():

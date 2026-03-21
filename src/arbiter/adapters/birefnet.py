@@ -50,11 +50,12 @@ class BiRefNetAdapter(ModelAdapter):
         self._check_cancel(cancel_flag)
 
         # Decode input image from base64
-        image_b64 = params.get("image") or params.get("image_url", "")
-        if image_b64.startswith("data:"):
-            _, image_b64 = image_b64.split(",", 1)
+        from arbiter.adapters.base import InferenceError as _IE
         try:
-            original = Image.open(io.BytesIO(base64.b64decode(image_b64)))
+            raw = self._resolve_media(params, "image")
+            original = Image.open(io.BytesIO(raw))
+        except _IE:
+            raise
         except Exception as e:
             raise InferenceError(f"Failed to decode image: {e}")
 

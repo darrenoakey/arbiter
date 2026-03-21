@@ -49,7 +49,7 @@ class TTSCloneAdapter(ModelAdapter):
         tmp_file = None
         try:
             tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            tmp_file.write(base64.b64decode(ref_audio_b64))
+            tmp_file.write(self._resolve_media(params, "ref_audio"))
             tmp_file.close()
 
             voice_clone_prompt = self._model.create_voice_clone_prompt(

@@ -131,15 +131,19 @@ class SonicAdapter(GroupAdapter):
         try:
             try:
                 with open(tmp_image, "wb") as f:
-                    f.write(base64.b64decode(image_b64))
+                    f.write(self._resolve_media(params, "image"))
+            except InferenceError:
+                raise
             except Exception as exc:
-                raise InferenceError(f"Failed to decode image from base64: {exc}") from exc
+                raise InferenceError(f"Failed to decode image: {exc}") from exc
 
             try:
                 with open(tmp_audio, "wb") as f:
-                    f.write(base64.b64decode(audio_b64))
+                    f.write(self._resolve_media(params, "audio"))
+            except InferenceError:
+                raise
             except Exception as exc:
-                raise InferenceError(f"Failed to decode audio from base64: {exc}") from exc
+                raise InferenceError(f"Failed to decode audio: {exc}") from exc
 
             self._check_cancel(cancel_flag)
 

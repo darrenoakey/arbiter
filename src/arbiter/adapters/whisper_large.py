@@ -44,7 +44,7 @@ class WhisperLargeAdapter(ModelAdapter):
         language = params.get("language", None)
 
         try:
-            audio_bytes = base64.b64decode(audio_b64)
+            audio_bytes = self._resolve_media(params, "audio")
         except Exception as e:
             raise InferenceError(f"Failed to decode audio: {e}")
 

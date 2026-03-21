@@ -302,9 +302,19 @@ class MemoryManager:
                 "active_jobs": slot.active_count,
                 "idle_seconds": idle_s,
             })
+        # Read actual GPU memory from CUDA (not just bookkeeping)
+        vram_actual_gb = self._used_gb  # fallback to bookkeeping
+        try:
+            import torch
+            if torch.cuda.is_available():
+                vram_actual_gb = torch.cuda.memory_allocated() / (1024**3)
+        except Exception:
+            pass
+
         return {
             "vram_budget_gb": self._budget_gb,
-            "vram_used_gb": round(self._used_gb, 2),
+            "vram_used_gb": round(vram_actual_gb, 2),
+            "vram_configured_gb": round(self._used_gb, 2),
             "models": models,
         }
 

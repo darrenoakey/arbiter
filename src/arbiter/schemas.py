@@ -118,7 +118,8 @@ class ImageGenerateParams(BaseModel):
 
 class ImageEditParams(BaseModel):
     prompt: str
-    image: str  # base64
+    image: Optional[str] = None  # base64
+    image_file: Optional[str] = None
     width: int = 1024
     height: int = 1024
     steps: int = 4
@@ -128,31 +129,37 @@ class ImageEditParams(BaseModel):
 
 
 class BackgroundRemoveParams(BaseModel):
-    image: str  # base64
+    image: Optional[str] = None
+    image_file: Optional[str] = None
 
 
 class CaptionParams(BaseModel):
-    image: str  # base64
+    image: Optional[str] = None  # base64
+    image_file: Optional[str] = None  # local path on spark
     length: str = "normal"
 
 
 class QueryParams(BaseModel):
-    image: str  # base64
+    image: Optional[str] = None
+    image_file: Optional[str] = None
     question: str
 
 
 class DetectParams(BaseModel):
-    image: str  # base64
+    image: Optional[str] = None
+    image_file: Optional[str] = None
     object: str
 
 
 class PointParams(BaseModel):
-    image: str  # base64
+    image: Optional[str] = None
+    image_file: Optional[str] = None
     object: str
 
 
 class TranscribeParams(BaseModel):
-    audio: str  # base64
+    audio: Optional[str] = None  # base64
+    audio_file: Optional[str] = None
     language: Optional[str] = "en"
 
 
@@ -165,7 +172,8 @@ class TTSCustomParams(BaseModel):
 
 class TTSCloneParams(BaseModel):
     text: str
-    ref_audio: str  # base64
+    ref_audio: Optional[str] = None  # base64
+    ref_audio_file: Optional[str] = None
     ref_text: Optional[str] = None
     language: str = "English"
     temperature: float = 0.9
@@ -179,8 +187,10 @@ class TTSDesignParams(BaseModel):
 
 
 class TalkingHeadParams(BaseModel):
-    image: str  # base64
-    audio: str  # base64
+    image: Optional[str] = None
+    image_file: Optional[str] = None
+    audio: Optional[str] = None
+    audio_file: Optional[str] = None
     dynamic_scale: float = 1.0
     seed: Optional[int] = None
 
@@ -203,7 +213,8 @@ class VideoGenerateParams(BaseModel):
 
 
 class AestheticScoreParams(BaseModel):
-    image: str  # base64
+    image: Optional[str] = None
+    image_file: Optional[str] = None
 
 
 # Maps job type to its parameter validation schema

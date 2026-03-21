@@ -44,15 +44,7 @@ class MoondreamAdapter(ModelAdapter):
         self._cleanup_gpu()
 
     def _decode_image(self, params: dict):
-        from PIL import Image
-
-        image_b64 = params.get("image") or params.get("image_url", "")
-        if image_b64.startswith("data:"):
-            _, image_b64 = image_b64.split(",", 1)
-        try:
-            return Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
-        except Exception as e:
-            raise InferenceError(f"Failed to decode image: {e}")
+        return self._resolve_image(params)
 
     def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
         self._check_cancel(cancel_flag)
