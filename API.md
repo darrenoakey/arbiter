@@ -641,6 +641,35 @@ Running jobs are not affected. Combine with `max_instances: 0` to fully drain a 
 
 ---
 
+### DELETE /v1/models/{model_id}/running -- Kill Running Jobs
+
+Cancel all queued AND running jobs for a model. Sends SIGUSR1 to all active instances to abort in-progress inference.
+
+**Request**
+
+```
+DELETE /v1/models/moondream/running
+```
+
+**Response (200)**
+
+```json
+{
+  "model_id": "moondream",
+  "cancelled_queued": 5,
+  "cancelled_running": 3
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `cancelled_queued` | int | Queued/scheduled jobs cancelled in the store |
+| `cancelled_running` | int | Running jobs signalled to abort |
+
+Running jobs receive a cancel signal and will transition to `cancelled` state shortly after. This is a hard stop — use `DELETE /v1/models/{model_id}/queue` if you only want to clear the queue without killing running work.
+
+---
+
 ### POST /v1/reserve -- Reserve VRAM Budget
 
 Reserve VRAM budget space to prevent the scheduler from using it for model loads. Useful for adapter testing or manual GPU work.
