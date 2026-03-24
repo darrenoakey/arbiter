@@ -40,7 +40,9 @@ var JobTypeToModel = map[string]string{
 	"tts-custom":        "tts-custom",
 	"tts-clone":         "tts-clone",
 	"tts-design":        "tts-design",
-	"talking-head":      "sonic",
+	"talking-head":            "sonic",
+	"talking-head-sadtalker":  "sadtalker",
+	"lipsync":                "latentsync",
 	"video-generate":    "ltx2",
 	"aesthetic-score":   "aesthetic-scorer",
 }
@@ -95,4 +97,52 @@ func LoadConfig(projectRoot string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+
+// SaveModelConfigField updates a single field in a model's config and persists to config.json.
+// Reads the current config file, updates the field, and writes to local/config.json.
+func SaveModelConfigField(projectRoot, modelID, field string, value any) error {
+	cfgPath := filepath.Join(projectRoot, "local", "config.json")
+	defaultPath := filepath.Join(projectRoot, "local", "config.default.json")
+
+	// Read current config file
+	var data map[string]any
+	path := cfgPath
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		path = defaultPath
+		raw, err = os.ReadFile(path)
+		if err != nil {
+			data = make(map[string]any)
+			raw = nil
+		}
+	}
+	if raw != nil {
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return fmt.Errorf("parse config: %w", err)
+		}
+	}
+
+	// Update the field
+	models, ok := data["models"].(map[string]any)
+	if !ok {
+		models = make(map[string]any)
+		data["models"] = models
+	}
+	model, ok := models[modelID].(map[string]any)
+	if !ok {
+		model = make(map[string]any)
+		models[modelID] = model
+	}
+	model[field] = value
+
+	// Write to config.json
+	os.MkdirAll(filepath.Join(projectRoot, "local"), 0o755)
+	out, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	out = append(out, '\n')
+	return os.WriteFile(cfgPath, out, 0o644)
 }

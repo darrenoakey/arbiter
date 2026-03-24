@@ -126,10 +126,7 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 // This function owns the reservation and releases it when done.
 func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance) {
 	defer func() {
-		atomic.AddInt32(&inst.activeJobs, -1)
-		inst.mu.Lock()
-		inst.lastActive = time.Now()
-		inst.mu.Unlock()
+		s.mgr.ReleaseAndCheck(inst)
 		s.rescoreModel(job.ModelID)
 	}()
 

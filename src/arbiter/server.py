@@ -13,8 +13,9 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-from .config import ArbiterConfig, load_config
+from .config import ArbiterConfig, load_config, save_model_config_field
 from .log import EventLogger
 from .memory import MemoryManager
 from .scheduler import Scheduler
@@ -192,6 +193,14 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Arbiter", version="0.1.0", lifespan=lifespan)
 
 
+# --- Request schemas for management endpoints ---
+
+class ModelUpdateRequest(BaseModel):
+    max_instances: int
+
+
+# --- Job endpoints ---
+
 @app.post("/v1/jobs", status_code=202)
 async def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
     job_type = req.type.value
@@ -290,13 +299,111 @@ async def list_jobs(state: str | None = None, model: str | None = None, limit: i
     ]
 
 
+# --- Model management endpoints ---
+
+@app.patch("/v1/models/{model_id}")
+async def update_model(model_id: str, req: ModelUpdateRequest):
+    """Update model configuration at runtime.
+
+    Currently supports changing max_instances:
+    - Scaling up adds new unloaded instances (loaded on demand).
+    - Scaling down evicts idle instances immediately; active instances
+      finish their current jobs then auto-evict.
+    - Setting to 0 disables dispatch (queue waits until scaled back up).
+    - Changes are persisted to config.json.
+    """
+    if model_id not in _config.models:
+        raise HTTPException(404, f"Model not configured: {model_id}")
+
+    if req.max_instances < 0:
+        raise HTTPException(400, "max_instances must be >= 0")
+
+    model_cfg = _config.models[model_id]
+    old_max = model_cfg.max_instances
+    new_max = req.max_instances
+
+    if new_max == old_max:
+        return {
+            "model_id": model_id,
+            "max_instances": new_max,
+            "previous_max_instances": old_max,
+            "added": 0,
+            "removed": 0,
+            "condemned": 0,
+        }
+
+    # Get adapter class for creating new instances (only needed for scale-up)
+    from .adapters import registry
+    try:
+        adapter_cls = registry.get_adapter_class(model_id)
+    except KeyError:
+        raise HTTPException(500, f"No adapter registered for model: {model_id}")
+
+    # Update in-memory config FIRST so scheduler sees new capacity immediately
+    model_cfg.max_instances = new_max
+
+    # Scale instances in memory manager
+    scale_result = await _memory.scale_model(
+        model_id=model_id,
+        new_count=new_max,
+        adapter_cls=adapter_cls,
+        memory_gb=model_cfg.memory_gb,
+        keep_alive_s=model_cfg.keep_alive_seconds,
+        max_concurrent=model_cfg.max_concurrent,
+    )
+
+    # Persist to config file
+    await _run_io(save_model_config_field, model_id, "max_instances", new_max, _PROJECT_ROOT)
+
+    # Rescore priorities
+    _scheduler.rescore_model(model_id)
+
+    _event_logger.log(
+        "model.scaled",
+        model_id=model_id,
+        old_max_instances=old_max,
+        new_max_instances=new_max,
+        **scale_result,
+    )
+
+    return {
+        "model_id": model_id,
+        "max_instances": new_max,
+        "previous_max_instances": old_max,
+        **scale_result,
+    }
+
+
+@app.delete("/v1/models/{model_id}/queue")
+async def clear_model_queue(model_id: str):
+    """Cancel all queued jobs for a specific model."""
+    if model_id not in _config.models:
+        raise HTTPException(404, f"Model not configured: {model_id}")
+
+    cancelled = await _run_io(_store.cancel_queued_for_model, model_id)
+
+    _event_logger.log("queue.cleared", model_id=model_id, cancelled=cancelled)
+
+    return {
+        "model_id": model_id,
+        "cancelled": cancelled,
+    }
+
+
+# --- System status endpoints ---
+
 def _build_ps_snapshot() -> dict:
     """Build the full /v1/ps response. Called from IO thread pool."""
     snap = _memory.snapshot()
     counts = _store.count_by_state()
     for model_info in snap["models"]:
-        queued = _store.count_by_state(model_id=model_info["id"])
+        mid = model_info["id"]
+        queued = _store.count_by_state(model_id=mid)
         model_info["queued_jobs"] = queued.get("queued", 0)
+        # Add configured max_instances so API consumers see target vs actual
+        model_cfg = _config.models.get(mid)
+        if model_cfg:
+            model_info["max_instances"] = model_cfg.max_instances
     snap["queue"] = counts
     return snap
 

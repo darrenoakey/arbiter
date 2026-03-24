@@ -22,6 +22,8 @@ class JobType(str, Enum):
     TTS_CLONE = "tts-clone"
     TTS_DESIGN = "tts-design"
     TALKING_HEAD = "talking-head"
+    TALKING_HEAD_SADTALKER = "talking-head-sadtalker"
+    LIPSYNC = "lipsync"
     VIDEO_GENERATE = "video-generate"
     AESTHETIC_SCORE = "aesthetic-score"
 
@@ -40,6 +42,8 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "tts-clone": "tts-clone",
     "tts-design": "tts-design",
     "talking-head": "sonic",
+    "talking-head-sadtalker": "sadtalker",
+    "lipsync": "latentsync",
     "video-generate": "ltx2",
     "aesthetic-score": "aesthetic-scorer",
 }
@@ -195,6 +199,28 @@ class TalkingHeadParams(BaseModel):
     seed: Optional[int] = None
 
 
+class TalkingHeadSadTalkerParams(BaseModel):
+    image: Optional[str] = None
+    image_file: Optional[str] = None
+    audio: Optional[str] = None
+    audio_file: Optional[str] = None
+    size: int = 256
+    facerender: str = "pirender"
+    expression_scale: float = 1.0
+    preprocess: str = "crop"
+    enhancer: str = ""
+    still: bool = False
+
+
+class LipsyncParams(BaseModel):
+    video: Optional[str] = None
+    video_file: Optional[str] = None
+    audio: Optional[str] = None
+    audio_file: Optional[str] = None
+    inference_steps: int = 20
+    guidance_scale: float = 1.5
+
+
 class VideoSegmentParams(BaseModel):
     description: str = ""
     start_time: float = 0.0
@@ -231,6 +257,8 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "tts-clone": TTSCloneParams,
     "tts-design": TTSDesignParams,
     "talking-head": TalkingHeadParams,
+    "talking-head-sadtalker": TalkingHeadSadTalkerParams,
+    "lipsync": LipsyncParams,
     "video-generate": VideoGenerateParams,
     "aesthetic-score": AestheticScoreParams,
 }

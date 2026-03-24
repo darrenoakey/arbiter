@@ -325,6 +325,22 @@ func (s *Store) RecoverFromCrash() (int, error) {
 	return int(n), nil
 }
 
+
+func (s *Store) CancelQueuedForModel(modelID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := nowTS()
+	res, err := s.db.Exec(
+		"UPDATE jobs SET state = 'cancelled', finished_at = ? WHERE model_id = ? AND state = 'queued'",
+		now, modelID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 func (s *Store) Close() {
 	s.db.Close()
 }

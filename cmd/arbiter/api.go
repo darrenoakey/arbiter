@@ -4,38 +4,42 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type API struct {
-	config    *Config
-	store     *Store
-	mgr       *InstanceManager
-	scheduler *Scheduler
-	logger    *EventLogger
-	outputDir string
-	startTime time.Time
+	config      *Config
+	store       *Store
+	mgr         *InstanceManager
+	scheduler   *Scheduler
+	logger      *EventLogger
+	outputDir   string
+	projectRoot string
+	startTime   time.Time
 
 	// Cached /v1/ps response — updated every second by background goroutine
 	psCache atomic.Value // json.RawMessage
 }
 
-func NewAPI(cfg *Config, store *Store, mgr *InstanceManager, sched *Scheduler, logger *EventLogger, outputDir string) *API {
+func NewAPI(cfg *Config, store *Store, mgr *InstanceManager, sched *Scheduler, logger *EventLogger, outputDir, projectRoot string) *API {
 	a := &API{
-		config:    cfg,
-		store:     store,
-		mgr:       mgr,
-		scheduler: sched,
-		logger:    logger,
-		outputDir: outputDir,
-		startTime: time.Now(),
+		config:      cfg,
+		store:       store,
+		mgr:         mgr,
+		scheduler:   sched,
+		logger:      logger,
+		outputDir:   outputDir,
+		projectRoot: projectRoot,
+		startTime:   time.Now(),
 	}
 	return a
 }
@@ -47,6 +51,15 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/jobs/{id}", a.cancelJob)
 	mux.HandleFunc("GET /v1/jobs", a.listJobs)
 	mux.HandleFunc("GET /v1/ps", a.systemStatus)
+	mux.HandleFunc("POST /v1/refs", a.uploadRef)
+	mux.HandleFunc("GET /v1/refs", a.listRefs)
+	mux.HandleFunc("GET /v1/refs/{id}", a.getRef)
+	mux.HandleFunc("DELETE /v1/refs/{id}", a.deleteRef)
+	mux.HandleFunc("POST /v1/reserve", a.createReservation)
+	mux.HandleFunc("GET /v1/reserve", a.listReservations)
+	mux.HandleFunc("DELETE /v1/reserve/{id}", a.releaseReservation)
+	mux.HandleFunc("PATCH /v1/models/{model_id}", a.updateModel)
+	mux.HandleFunc("DELETE /v1/models/{model_id}/queue", a.clearModelQueue)
 	mux.HandleFunc("GET /v1/health", a.health)
 	return withLogging(mux)
 }
@@ -68,6 +81,9 @@ func (a *API) RunPSCache(done <-chan struct{}) {
 func (a *API) updatePSCache() {
 	snap := a.mgr.Snapshot()
 
+	// Add GPU utilization
+	snap["gpu_utilization_pct"] = GetGPUUtilization()
+
 	// Add queue counts
 	counts, _ := a.store.CountByState("")
 	snap["queue"] = counts
@@ -77,6 +93,9 @@ func (a *API) updatePSCache() {
 			if id, ok := m["id"].(string); ok {
 				modelCounts, _ := a.store.CountByState(id)
 				m["queued_jobs"] = modelCounts["queued"]
+				if cfg, ok := a.config.Models[id]; ok {
+					m["max_instances"] = cfg.MaxInstances
+				}
 			}
 		}
 	}
@@ -170,8 +189,12 @@ func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
 		if job.State == "completed" && result != nil {
 			if fmt, ok := result["format"].(string); ok && fmt != "" {
 				resultFile := filepath.Join(a.outputDir, "jobs", job.ID, "result."+fmt)
-				if data, err := os.ReadFile(resultFile); err == nil {
-					result["data"] = base64.StdEncoding.EncodeToString(data)
+				result["result_path"] = resultFile
+				skipData := r.URL.Query().Get("no_data") == "1"
+				if !skipData {
+					if data, err := os.ReadFile(resultFile); err == nil {
+						result["data"] = base64.StdEncoding.EncodeToString(data)
+					}
 				}
 			}
 		}
@@ -265,6 +288,269 @@ func (a *API) systemStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{})
+}
+
+func (a *API) refsDir() string {
+	return filepath.Join(a.outputDir, "refs")
+}
+
+func (a *API) uploadRef(w http.ResponseWriter, r *http.Request) {
+	// Accept multipart (file field) or raw body (with ?filename= query param)
+	var data []byte
+	var filename string
+
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
+		if err := r.ParseMultipartForm(100 << 20); err != nil { // 100MB
+			writeError(w, 400, fmt.Sprintf("parse multipart: %s", err))
+			return
+		}
+		f, header, err := r.FormFile("file")
+		if err != nil {
+			writeError(w, 400, fmt.Sprintf("missing file field: %s", err))
+			return
+		}
+		defer f.Close()
+		filename = header.Filename
+		data, err = io.ReadAll(f)
+		if err != nil {
+			writeError(w, 500, fmt.Sprintf("read file: %s", err))
+			return
+		}
+	} else {
+		var err error
+		data, err = io.ReadAll(io.LimitReader(r.Body, 100<<20))
+		if err != nil {
+			writeError(w, 400, fmt.Sprintf("read body: %s", err))
+			return
+		}
+		filename = r.URL.Query().Get("filename")
+		if filename == "" {
+			writeError(w, 400, "raw upload requires ?filename= query param")
+			return
+		}
+	}
+
+	if len(data) == 0 {
+		writeError(w, 400, "empty file")
+		return
+	}
+
+	ext := filepath.Ext(filename)
+	refID := genID() + ext
+	dst := filepath.Join(a.refsDir(), refID)
+	if err := os.WriteFile(dst, data, 0o644); err != nil {
+		writeError(w, 500, fmt.Sprintf("write ref: %s", err))
+		return
+	}
+
+	slog.Info("ref uploaded", "ref_id", refID, "size", len(data), "filename", filename)
+	writeJSON(w, 201, map[string]any{
+		"ref_id":     refID,
+		"size_bytes": len(data),
+		"filename":   filename,
+	})
+}
+
+func (a *API) getRef(w http.ResponseWriter, r *http.Request) {
+	refID := r.PathValue("id")
+	path := filepath.Join(a.refsDir(), refID)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		writeError(w, 404, "ref not found")
+		return
+	}
+	http.ServeFile(w, r, path)
+}
+
+func (a *API) deleteRef(w http.ResponseWriter, r *http.Request) {
+	refID := r.PathValue("id")
+	path := filepath.Join(a.refsDir(), refID)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		writeError(w, 404, "ref not found")
+		return
+	}
+	os.Remove(path)
+	slog.Info("ref deleted", "ref_id", refID)
+	writeJSON(w, 200, map[string]any{"ref_id": refID, "status": "deleted"})
+}
+
+func (a *API) listRefs(w http.ResponseWriter, r *http.Request) {
+	entries, err := os.ReadDir(a.refsDir())
+	if err != nil {
+		writeJSON(w, 200, []any{})
+		return
+	}
+	var refs []map[string]any
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		refs = append(refs, map[string]any{
+			"ref_id":     e.Name(),
+			"size_bytes": info.Size(),
+			"created_at": info.ModTime().Unix(),
+		})
+	}
+	if refs == nil {
+		refs = []map[string]any{}
+	}
+	writeJSON(w, 200, refs)
+}
+
+func (a *API) createReservation(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		MemoryGB float64 `json:"memory_gb"`
+		Label    string  `json:"label"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if req.MemoryGB <= 0 {
+		writeError(w, 400, "memory_gb must be > 0")
+		return
+	}
+
+	// Build keepalive map from config for smart eviction
+	keepAliveSecs := make(map[string]int)
+	for id, cfg := range a.config.Models {
+		keepAliveSecs[id] = cfg.KeepAliveSec
+	}
+
+	id, err := a.mgr.CreateReservation(req.MemoryGB, req.Label, keepAliveSecs)
+	if err != nil {
+		writeError(w, 409, err.Error())
+		return
+	}
+
+	a.logger.Log("reservation.create", map[string]any{
+		"id":        id,
+		"memory_gb": req.MemoryGB,
+		"label":     req.Label,
+	})
+
+	writeJSON(w, 201, map[string]any{
+		"reservation_id": id,
+		"memory_gb":      req.MemoryGB,
+		"label":          req.Label,
+	})
+}
+
+func (a *API) releaseReservation(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !a.mgr.ReleaseReservation(id) {
+		writeError(w, 404, fmt.Sprintf("reservation not found: %s", id))
+		return
+	}
+
+	a.logger.Log("reservation.release", map[string]any{"id": id})
+	writeJSON(w, 200, map[string]any{"reservation_id": id, "released": true})
+}
+
+func (a *API) listReservations(w http.ResponseWriter, r *http.Request) {
+	reservations := a.mgr.ListReservations()
+	out := make([]map[string]any, 0, len(reservations))
+	for _, r := range reservations {
+		out = append(out, map[string]any{
+			"id":         r.ID,
+			"memory_gb":  r.MemoryGB,
+			"label":      r.Label,
+			"created_at": r.CreatedAt.Unix(),
+		})
+	}
+	writeJSON(w, 200, out)
+}
+
+func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
+	modelID := r.PathValue("model_id")
+
+	cfg, ok := a.config.Models[modelID]
+	if !ok {
+		writeError(w, 404, fmt.Sprintf("model not configured: %s", modelID))
+		return
+	}
+
+	var req struct {
+		MaxInstances int `json:"max_instances"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if req.MaxInstances < 0 {
+		writeError(w, 400, "max_instances must be >= 0")
+		return
+	}
+
+	oldMax := cfg.MaxInstances
+	newMax := req.MaxInstances
+
+	if newMax == oldMax {
+		writeJSON(w, 200, map[string]any{
+			"model_id":               modelID,
+			"max_instances":          newMax,
+			"previous_max_instances": oldMax,
+			"added": 0, "removed": 0, "condemned": 0,
+		})
+		return
+	}
+
+	// Update in-memory config FIRST so scheduler sees new capacity immediately
+	cfg.MaxInstances = newMax
+	a.config.Models[modelID] = cfg
+
+	// Scale instances
+	result := a.mgr.ScaleModel(modelID, newMax, cfg)
+
+	// Persist to config file
+	if err := SaveModelConfigField(a.projectRoot, modelID, "max_instances", newMax); err != nil {
+		slog.Error("failed to persist config", "error", err)
+		// Non-fatal: in-memory change is already applied
+	}
+
+	// Rescore
+	a.scheduler.rescoreModel(modelID)
+
+	a.logger.Log("model.scaled", map[string]any{
+		"model_id":          modelID,
+		"old_max_instances": oldMax,
+		"new_max_instances": newMax,
+		"added":             result["added"],
+		"removed":           result["removed"],
+		"condemned":         result["condemned"],
+	})
+
+	result["model_id"] = modelID
+	result["max_instances"] = newMax
+	result["previous_max_instances"] = oldMax
+	writeJSON(w, 200, result)
+}
+
+func (a *API) clearModelQueue(w http.ResponseWriter, r *http.Request) {
+	modelID := r.PathValue("model_id")
+	if _, ok := a.config.Models[modelID]; !ok {
+		writeError(w, 404, fmt.Sprintf("model not configured: %s", modelID))
+		return
+	}
+
+	cancelled, err := a.store.CancelQueuedForModel(modelID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+
+	a.logger.Log("queue.cleared", map[string]any{
+		"model_id":  modelID,
+		"cancelled": cancelled,
+	})
+
+	writeJSON(w, 200, map[string]any{
+		"model_id":  modelID,
+		"cancelled": cancelled,
+	})
 }
 
 func (a *API) health(w http.ResponseWriter, r *http.Request) {

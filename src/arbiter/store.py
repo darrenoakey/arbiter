@@ -222,6 +222,28 @@ class JobStore:
             self._conn.commit()
             return cursor.rowcount > 0
 
+    def cancel_queued_for_model(self, model_id: str) -> int:
+        """Cancel all queued jobs for a model. Returns count cancelled."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE jobs SET state = 'cancelled', finished_at = ? "
+                "WHERE model_id = ? AND state = 'queued'",
+                (time.time(), model_id),
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
+    def cancel_all_queued(self) -> int:
+        """Cancel all queued jobs across all models. Returns count cancelled."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE jobs SET state = 'cancelled', finished_at = ? "
+                "WHERE state = 'queued'",
+                (time.time(),),
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
     def close(self):
         """Close the database connection."""
         with self._lock:

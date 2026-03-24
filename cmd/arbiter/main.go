@@ -34,6 +34,7 @@ func main() {
 	outputDir := filepath.Join(projectRoot, "output")
 	os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755)
 	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+	os.MkdirAll(filepath.Join(outputDir, "refs"), 0o755)
 
 	// Event logger
 	eventLog := NewEventLogger(filepath.Join(outputDir, "logs"))
@@ -60,14 +61,14 @@ func main() {
 	}
 
 	// Instance manager
-	mgr := NewInstanceManager(cfg.VRAMBudgetGB)
+	mgr := NewInstanceManager(cfg.VRAMBudgetGB, pythonBin, projectRoot)
 	setupInstances(cfg, mgr, pythonBin, projectRoot)
 
 	// Scheduler
 	sched := NewScheduler(cfg, store, mgr, eventLog, outputDir)
 
 	// API
-	api := NewAPI(cfg, store, mgr, sched, eventLog, outputDir)
+	api := NewAPI(cfg, store, mgr, sched, eventLog, outputDir, projectRoot)
 
 	// Context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())

@@ -58,3 +58,43 @@ def load_config(project_root: Path | None = None) -> ArbiterConfig:
         data["host"] = env_host
 
     return ArbiterConfig(**data)
+
+
+def save_model_config_field(
+    model_id: str,
+    field: str,
+    value,
+    project_root: Path | None = None,
+):
+    """Update a single field in a model's config and persist to config.json.
+
+    Reads the current config file (config.json or config.default.json),
+    updates the specific field, and writes to config.json.
+    Does not persist env var overrides — only the targeted field is changed.
+    """
+    root = project_root or _PROJECT_ROOT
+    config_path = root / "local" / "config.json"
+    default_path = root / "local" / "config.default.json"
+
+    # Load current file config
+    if config_path.exists():
+        with open(config_path) as f:
+            data = json.load(f)
+    elif default_path.exists():
+        with open(default_path) as f:
+            data = json.load(f)
+    else:
+        data = {}
+
+    # Update the field
+    if "models" not in data:
+        data["models"] = {}
+    if model_id not in data["models"]:
+        data["models"][model_id] = {}
+    data["models"][model_id][field] = value
+
+    # Write to config.json
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(config_path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")

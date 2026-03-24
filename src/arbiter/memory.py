@@ -82,6 +82,7 @@ class MemoryManager:
         self._model_instances: dict[str, list[str]] = {}  # model_id -> [instance_ids]
         self._global_lock = asyncio.Lock()
         self._keepalive_task: Optional[asyncio.Task] = None
+        self._condemned: set[str] = set()  # instance_ids pending removal after current jobs finish
 
     @property
     def budget_gb(self) -> float:
@@ -291,13 +292,200 @@ class MemoryManager:
         )
 
     def release(self, instance_id: str):
-        """Decrement active_count and record last_active time. Thread-safe (sync)."""
+        """Decrement active_count and record last_active time. Thread-safe (sync).
+
+        If the instance is condemned (marked for removal during scale-down) and
+        now idle, schedules async eviction and slot removal.
+        """
         slot = self._slots.get(instance_id)
         if slot is None:
             return
         slot.active_count = max(0, slot.active_count - 1)
         if slot.active_count == 0:
             slot.last_active = time.monotonic()
+            if instance_id in self._condemned:
+                self._condemned.discard(instance_id)
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self._evict_and_remove(instance_id))
+                except RuntimeError:
+                    pass  # No event loop — keepalive will catch it
+
+    async def _evict_and_remove(self, instance_id: str):
+        """Evict a condemned instance and remove its slot entirely."""
+        async with self._global_lock:
+            slot = self._slots.get(instance_id)
+            if slot is None:
+                return
+            if slot.active_count > 0:
+                # Got busy again somehow — re-condemn
+                self._condemned.add(instance_id)
+                return
+            if slot.state == ModelState.LOADED:
+                slot.state = ModelState.EVICTING
+                self._log(
+                    "model.evict_start",
+                    model_id=slot.model_id,
+                    instance_id=instance_id,
+                    reason="condemned",
+                    memory_gb=slot.memory_gb,
+                )
+                loop = asyncio.get_event_loop()
+                try:
+                    await loop.run_in_executor(self._executor, slot.adapter.unload)
+                except Exception as e:
+                    logger.error("Failed to unload condemned %s: %s", instance_id, e)
+                self._used_gb -= slot.memory_gb
+                self._log(
+                    "model.evict_done",
+                    model_id=slot.model_id,
+                    instance_id=instance_id,
+                )
+            elif slot.state in (ModelState.LOADING, ModelState.EVICTING):
+                # Still loading or already evicting — re-condemn and let it finish
+                self._condemned.add(instance_id)
+                return
+            # Remove slot entirely
+            model_id = slot.model_id
+            del self._slots[instance_id]
+            # Also clean from _model_instances if somehow still there
+            if model_id in self._model_instances and instance_id in self._model_instances[model_id]:
+                self._model_instances[model_id].remove(instance_id)
+            self._log(
+                "instance.removed",
+                model_id=model_id,
+                instance_id=instance_id,
+            )
+
+    async def scale_model(
+        self,
+        model_id: str,
+        new_count: int,
+        adapter_cls,
+        memory_gb: float,
+        keep_alive_s: float,
+        max_concurrent: int,
+    ) -> dict:
+        """Scale the number of instances for a model.
+
+        Scaling up: creates new unloaded instances (loaded on demand by scheduler).
+        Scaling down: evicts idle excess immediately, condemns active excess
+        (they auto-evict when their current jobs finish).
+
+        Returns dict with results: added, removed, condemned.
+        """
+        current_ids = list(self._model_instances.get(model_id, []))
+        current_count = len(current_ids)
+
+        result = {"added": 0, "removed": 0, "condemned": 0}
+
+        if new_count == current_count:
+            return result
+
+        if new_count > current_count:
+            # Scale up: add new instances
+            next_idx = self._next_instance_index(model_id)
+            for i in range(new_count - current_count):
+                idx = next_idx + i
+                instance_id = f"{model_id}#{idx}"
+                adapter = adapter_cls()
+                self.register(
+                    model_id=model_id,
+                    adapter=adapter,
+                    memory_gb=memory_gb,
+                    keep_alive_s=keep_alive_s,
+                    max_concurrent=max_concurrent,
+                    instance_id=instance_id,
+                )
+                result["added"] += 1
+                self._log(
+                    "instance.added",
+                    model_id=model_id,
+                    instance_id=instance_id,
+                )
+            return result
+
+        # Scale down: remove from the end of the list
+        to_remove = current_ids[new_count:]
+
+        async with self._global_lock:
+            for iid in to_remove:
+                slot = self._slots.get(iid)
+                if slot is None:
+                    continue
+
+                # Remove from active instance list (prevents new job dispatch)
+                if model_id in self._model_instances and iid in self._model_instances[model_id]:
+                    self._model_instances[model_id].remove(iid)
+
+                if slot.state == ModelState.UNLOADED:
+                    # Not loaded — just remove the slot
+                    del self._slots[iid]
+                    result["removed"] += 1
+                    self._log("instance.removed", model_id=model_id, instance_id=iid)
+                elif slot.state == ModelState.LOADED and slot.active_count == 0:
+                    # Loaded but idle — evict and remove immediately
+                    slot.state = ModelState.EVICTING
+                    self._log(
+                        "model.evict_start",
+                        model_id=model_id,
+                        instance_id=iid,
+                        reason="scale_down",
+                        memory_gb=slot.memory_gb,
+                    )
+                    loop = asyncio.get_event_loop()
+                    try:
+                        await loop.run_in_executor(self._executor, slot.adapter.unload)
+                    except Exception as e:
+                        logger.error("Failed to unload %s during scale-down: %s", iid, e)
+                    self._used_gb -= slot.memory_gb
+                    del self._slots[iid]
+                    result["removed"] += 1
+                    self._log("instance.removed", model_id=model_id, instance_id=iid)
+                elif slot.state == ModelState.ERROR:
+                    # Errored — just remove
+                    del self._slots[iid]
+                    result["removed"] += 1
+                    self._log("instance.removed", model_id=model_id, instance_id=iid)
+                else:
+                    # Active (running jobs) or loading — condemn
+                    # Will be auto-evicted and removed when current jobs finish
+                    self._condemned.add(iid)
+                    result["condemned"] += 1
+                    self._log(
+                        "instance.condemned",
+                        model_id=model_id,
+                        instance_id=iid,
+                        active_count=slot.active_count,
+                        state=slot.state.value,
+                    )
+
+        return result
+
+    def _next_instance_index(self, model_id: str) -> int:
+        """Find the next available instance index for a model.
+
+        Checks active instances, condemned slots still in _slots, and all
+        known instance_ids to avoid collisions.
+        """
+        max_idx = -1
+        # Check all known instance IDs (active list + any slots still alive)
+        all_ids: set[str] = set(self._model_instances.get(model_id, []))
+        for iid, slot in self._slots.items():
+            if slot.model_id == model_id:
+                all_ids.add(iid)
+
+        for iid in all_ids:
+            if "#" in iid:
+                try:
+                    idx = int(iid.rsplit("#", 1)[1])
+                    max_idx = max(max_idx, idx)
+                except ValueError:
+                    pass
+            else:
+                # Bare model_id counts as occupying index 0
+                max_idx = max(max_idx, 0)
+        return max_idx + 1
 
     async def _evict_for(self, needed_gb: float):
         """Evict idle models (LRU) to free at least needed_gb.
@@ -430,6 +618,10 @@ class MemoryManager:
                     s_idle = round(time.monotonic() - s.last_active, 1)
                     idle_s = s_idle if idle_s is None else min(idle_s, s_idle)
 
+            # Count active (non-condemned) instances
+            active_instance_ids = set(self._model_instances.get(model_id, []))
+            condemned_count = sum(1 for s in slots if s.instance_id in self._condemned)
+
             entry = {
                 "id": model_id,
                 "state": "active" if total_active > 0 else (
@@ -440,21 +632,26 @@ class MemoryManager:
                 "idle_seconds": idle_s,
             }
 
-            # Add instance breakdown for multi-instance models
-            if len(slots) > 1:
+            # Add instance breakdown for multi-instance models or when condemned instances exist
+            if len(slots) > 1 or condemned_count > 0:
                 entry["instances"] = []
                 for s in slots:
                     s_idle = None
                     if s.state == ModelState.LOADED and s.active_count == 0 and s.last_active > 0:
                         s_idle = round(time.monotonic() - s.last_active, 1)
-                    entry["instances"].append({
+                    inst_info = {
                         "instance_id": s.instance_id,
                         "state": s.state.value if s.active_count == 0 else "active",
                         "active_jobs": s.active_count,
                         "idle_seconds": s_idle,
-                    })
+                    }
+                    if s.instance_id in self._condemned:
+                        inst_info["condemned"] = True
+                    entry["instances"].append(inst_info)
                 entry["loaded_instances"] = loaded_count
-                entry["total_instances"] = len(slots)
+                entry["total_instances"] = len(active_instance_ids)
+                if condemned_count > 0:
+                    entry["condemned_instances"] = condemned_count
 
             models.append(entry)
 
