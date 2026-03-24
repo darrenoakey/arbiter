@@ -2,9 +2,13 @@
 
 # Arbiter
 
-Arbiter is your personal AI studio — a single server that runs a whole collection of AI models on your machine, so you can generate images, clone voices, transcribe audio, create talking-head videos, and more, all from one place.
+Arbiter is a GPU inference job server built to maximize utilization of high-memory unified-architecture machines like the **NVIDIA DGX Spark** and **ASUS ROG Flow Z13 with GB10**. It runs a whole collection of AI models on a single machine — image generation, voice cloning, transcription, talking-head videos, and more — with automatic VRAM management, model loading/eviction, and priority scheduling.
 
-Instead of juggling a dozen separate AI tools, you ask Arbiter to do things, and it figures out which model to use, when to load it, and how to get the job done — even if that means waiting while a previous task finishes. Think of it as a smart queue for your GPU.
+Instead of running one model at a time and wasting 80% of your GPU memory, Arbiter keeps multiple models hot, queues work intelligently (shortest-job-first), and loads/evicts models automatically as demand shifts. It's a smart job queue that treats your GPU like a shared resource.
+
+> **[Full API Reference](API.md)** — detailed endpoint docs, request/response schemas, job type params
+>
+> **[spark-view](https://github.com/darrenoakey/spark-view)** — web GUI for monitoring and managing Arbiter
 
 ---
 
@@ -252,14 +256,54 @@ requests.delete(f"{ARBITER}/v1/jobs/{job_id}")
 
 ---
 
-## Need to cancel everything?
+## Polling many jobs at once
 
-You can list all queued jobs and cancel them in bulk:
+If you've submitted a batch of jobs, poll them all in one request instead of hitting the server 100 times:
 
 ```python
-jobs = requests.get(f"{ARBITER}/v1/jobs?state=queued").json()
-for job in jobs:
-    requests.delete(f"{ARBITER}/v1/jobs/{job['job_id']}")
+job_ids = [j["job_id"] for j in submitted_jobs]
+resp = requests.post(f"{ARBITER}/v1/jobs/status", json={"job_ids": job_ids})
+for status in resp.json()["jobs"]:
+    if status and status["status"] == "completed":
+        # Fetch full result with file data
+        full = requests.get(f"{ARBITER}/v1/jobs/{status['job_id']}").json()
+```
+
+Up to 1000 IDs per request. Results come back in the same order you sent them.
+
+---
+
+## Scaling models at runtime
+
+You can change how many parallel instances a model runs without restarting:
+
+```python
+# Scale moondream to 8 instances
+requests.patch(f"{ARBITER}/v1/models/moondream", json={"max_instances": 8})
+
+# Temporarily disable a model (queue waits, nothing dispatched)
+requests.patch(f"{ARBITER}/v1/models/flux-schnell", json={"max_instances": 0})
+
+# Clear all queued jobs for a model
+requests.delete(f"{ARBITER}/v1/models/moondream/queue")
+```
+
+When scaling down, running jobs finish gracefully — only idle instances are removed immediately.
+
+---
+
+## Need to cancel everything?
+
+Clear the queue for a specific model in one call:
+
+```python
+requests.delete(f"{ARBITER}/v1/models/moondream/queue")  # cancels all queued moondream jobs
+```
+
+Or cancel individual jobs:
+
+```python
+requests.delete(f"{ARBITER}/v1/jobs/{job_id}")
 ```
 
 ---
