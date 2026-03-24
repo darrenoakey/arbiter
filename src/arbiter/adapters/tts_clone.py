@@ -22,13 +22,12 @@ class TTSCloneAdapter(ModelAdapter):
     def load(self, device: str = "cuda") -> None:
         import torch
         from qwen_tts import Qwen3TTSModel
-        kwargs = {"device_map": f"{device}:0" if device == "cuda" else device, "dtype": torch.bfloat16}
-        try:
-            kwargs["attn_implementation"] = "flash_attention_2"
-            self._model = Qwen3TTSModel.from_pretrained(self._HF_MODEL, **kwargs)
-        except Exception:
-            kwargs.pop("attn_implementation", None)
-            self._model = Qwen3TTSModel.from_pretrained(self._HF_MODEL, **kwargs)
+        kwargs = {
+            "device_map": f"{device}:0" if device == "cuda" else device,
+            "dtype": torch.bfloat16,
+            "attn_implementation": "sdpa",
+        }
+        self._model = Qwen3TTSModel.from_pretrained(self._HF_MODEL, **kwargs)
 
     def unload(self) -> None:
         del self._model
@@ -40,10 +39,10 @@ class TTSCloneAdapter(ModelAdapter):
         self._check_cancel(cancel_flag)
 
         text = params["text"]
-        ref_audio_b64 = params["ref_audio"]
+        # ref_audio resolved via _resolve_media (supports both base64 and file path)
         ref_text = params.get("ref_text")
         language = params.get("language", "English")
-        temperature = params.get("temperature", 0.9)
+        temperature = params.get("temperature", 0.7)
 
         # Write reference audio to a temp file for the model API
         tmp_file = None
@@ -55,6 +54,7 @@ class TTSCloneAdapter(ModelAdapter):
             voice_clone_prompt = self._model.create_voice_clone_prompt(
                 ref_audio=tmp_file.name,
                 ref_text=ref_text,
+                x_vector_only_mode=True,
             )
 
             self._check_cancel(cancel_flag)
@@ -64,6 +64,9 @@ class TTSCloneAdapter(ModelAdapter):
                 language=language,
                 voice_clone_prompt=voice_clone_prompt,
                 temperature=temperature,
+                max_new_tokens=2048,
+                repetition_penalty=1.1,
+                top_p=0.9,
             )
         finally:
             if tmp_file is not None:
@@ -77,6 +80,13 @@ class TTSCloneAdapter(ModelAdapter):
             wav = wav.cpu().numpy()
         elif not isinstance(wav, np.ndarray):
             wav = np.array(wav)
+
+        # Validate output duration
+        expected_max_s = max(5, len(text.split()) * 1.5)
+        actual_s = len(wav) / sr
+        if actual_s > expected_max_s:
+            import sys
+            print(f"WARNING: TTS output {actual_s:.1f}s exceeds expected max {expected_max_s:.1f}s for {len(text.split())} words", file=sys.stderr)
 
         out_path = output_dir / "result.wav"
         sf.write(str(out_path), wav, sr)

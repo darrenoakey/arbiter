@@ -41,3 +41,25 @@ func GetPerProcessVRAM() map[int]int64 {
 	}
 	return result
 }
+
+// GetGPUUtilization returns GPU compute utilization as a percentage (0-100).
+func GetGPUUtilization() int {
+	out, err := exec.Command(
+		"nvidia-smi",
+		"--query-gpu=utilization.gpu",
+		"--format=csv,noheader,nounits",
+	).Output()
+	if err != nil {
+		return -1
+	}
+	line := strings.TrimSpace(string(out))
+	// Multi-GPU: take first line
+	if idx := strings.IndexByte(line, '\n'); idx >= 0 {
+		line = line[:idx]
+	}
+	pct, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil {
+		return -1
+	}
+	return pct
+}

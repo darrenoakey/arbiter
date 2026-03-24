@@ -7,7 +7,7 @@ Complete API reference for client developers integrating with the Arbiter GPU mo
 ## Table of Contents
 
 1. [Overview](#1-overview)
-2. [Endpoints Reference](#2-endpoints-reference)
+2. [Endpoints Reference](#2-endpoints-reference) — Jobs, Reference Files, System Status, Health
 3. [Job Types Reference](#3-job-types-reference)
 4. [Client Workflow](#4-client-workflow)
 5. [Model Memory & Scheduling](#5-model-memory--scheduling)
@@ -26,7 +26,10 @@ http://localhost:8400
 ### Core Concepts
 
 - **Async job model**: All work is asynchronous. Submit a job, receive a `job_id`, then poll for the result. There is no synchronous inference endpoint.
-- **Base64 encoding**: All binary data (images, audio, video) is transferred as base64-encoded strings in JSON request and response bodies.
+- **Three ways to pass binary data**:
+  1. **Base64 inline**: Encode binary as base64 and pass directly in the JSON params (e.g., `"image": "<base64>"`).
+  2. **File path**: Pass a local filesystem path in a `_file` param (e.g., `"image_file": "/path/to/file.png"`).
+  3. **Reference file**: Upload a file once via `POST /v1/refs`, then reference it in any job with a `ref:` prefix (e.g., `"image_file": "ref:a1b2c3.png"`). The file persists until explicitly deleted. Ideal for files reused across many jobs.
 - **No authentication**: Arbiter is designed for internal/local use and does not require API keys or tokens.
 - **Persistent queue**: Jobs are stored in SQLite and survive server restarts. If Arbiter crashes, in-flight jobs are automatically re-queued on the next startup.
 
@@ -308,6 +311,7 @@ GET /v1/ps
 {
   "vram_budget_gb": 100.0,
   "vram_used_gb": 37.0,
+  "gpu_utilization_pct": 86,
   "models": [
     {
       "id": "flux-schnell",
@@ -346,10 +350,11 @@ GET /v1/ps
 
 | Field            | Type  | Description                                        |
 |------------------|-------|----------------------------------------------------|
-| `vram_budget_gb` | float | Total VRAM budget configured for the server        |
-| `vram_used_gb`   | float | VRAM currently used by loaded models               |
-| `models`         | array | Status of each registered model                    |
-| `queue`          | object| Job counts by state across all models              |
+| `vram_budget_gb`      | float | Total VRAM budget configured for the server             |
+| `vram_used_gb`        | float | VRAM currently used by loaded models                    |
+| `gpu_utilization_pct` | int   | GPU compute utilization percentage (0-100, -1 if unavailable) |
+| `models`              | array | Status of each registered model                         |
+| `queue`               | object| Job counts by state across all models                   |
 
 Each model object:
 
@@ -361,6 +366,133 @@ Each model object:
 | `active_jobs`  | int         | Jobs currently running on this model          |
 | `queued_jobs`  | int         | Jobs waiting in queue for this model          |
 | `idle_seconds` | float/null  | Seconds since last inference (null if active or unloaded) |
+
+---
+
+### POST /v1/refs -- Upload a Reference File
+
+Upload a file once for reuse across multiple jobs. Reference files persist until explicitly deleted.
+
+**Request (multipart)**
+
+```
+POST /v1/refs
+Content-Type: multipart/form-data
+```
+
+Attach the file as the `file` field.
+
+**Request (raw body)**
+
+```
+POST /v1/refs?filename=voice.wav
+Content-Type: application/octet-stream
+
+<raw file bytes>
+```
+
+**Response (201 Created)**
+
+```json
+{
+  "ref_id": "a1b2c3d4e5f6.wav",
+  "size_bytes": 128000,
+  "filename": "voice.wav"
+}
+```
+
+The `ref_id` includes the file extension from the original filename. Use it in jobs with the `ref:` prefix:
+
+```json
+{
+  "type": "tts-clone",
+  "params": {
+    "text": "Hello world",
+    "ref_text": "Reference transcript",
+    "ref_audio_file": "ref:a1b2c3d4e5f6.wav"
+  }
+}
+```
+
+This works with any `_file` parameter on any job type (e.g., `image_file`, `audio_file`, `ref_audio_file`).
+
+**Error Responses**
+
+| Status | Condition                          | Body Example                                  |
+|--------|------------------------------------|-----------------------------------------------|
+| 400    | Missing file or empty body         | `{"detail": "empty file"}`                    |
+| 400    | Raw upload without `?filename=`    | `{"detail": "raw upload requires ?filename= query param"}` |
+
+**curl Examples**
+
+```bash
+# Upload via multipart
+curl -X POST http://localhost:8400/v1/refs -F file=@voice_sample.wav
+
+# Upload via raw body
+curl -X POST "http://localhost:8400/v1/refs?filename=voice.wav" \
+  --data-binary @voice_sample.wav
+```
+
+---
+
+### GET /v1/refs -- List Reference Files
+
+List all uploaded reference files.
+
+**Response (200)**
+
+```json
+[
+  {
+    "ref_id": "a1b2c3d4e5f6.wav",
+    "size_bytes": 128000,
+    "created_at": 1711000000
+  },
+  {
+    "ref_id": "f0e1d2c3b4a5.png",
+    "size_bytes": 2048000,
+    "created_at": 1711000050
+  }
+]
+```
+
+---
+
+### GET /v1/refs/{id} -- Download a Reference File
+
+Download a reference file by its `ref_id`.
+
+**Response (200)**
+
+Returns the raw file bytes with the appropriate `Content-Type` header.
+
+**Error Responses**
+
+| Status | Condition      | Body Example                    |
+|--------|----------------|---------------------------------|
+| 404    | Ref not found  | `{"detail": "ref not found"}`   |
+
+---
+
+### DELETE /v1/refs/{id} -- Delete a Reference File
+
+Permanently delete a reference file. Jobs already using this ref will fail if the file is needed again.
+
+**Response (200)**
+
+```json
+{
+  "ref_id": "a1b2c3d4e5f6.wav",
+  "status": "deleted"
+}
+```
+
+**Error Responses**
+
+| Status | Condition      | Body Example                    |
+|--------|----------------|---------------------------------|
+| 404    | Ref not found  | `{"detail": "ref not found"}`   |
 
 ---
 
@@ -850,7 +982,8 @@ Generate speech using a cloned voice from a reference audio sample.
 | Parameter     | Type   | Required | Default     | Description                                                  |
 |---------------|--------|----------|-------------|--------------------------------------------------------------|
 | `text`        | string | Yes      | --          | Text to speak                                                |
-| `ref_audio`   | string | Yes      | --          | Base64-encoded reference audio of the voice to clone         |
+| `ref_audio`   | string | Yes*     | --          | Base64-encoded reference audio of the voice to clone         |
+| `ref_audio_file` | string | Yes* | --          | Alternative: file path or `ref:` reference (e.g., `"ref:abc123.wav"`) |
 | `ref_text`    | string | No       | null        | Transcript of the reference audio (improves cloning quality) |
 | `language`    | string | No       | `"English"` | Output language                                              |
 | `temperature` | float  | No       | 0.9         | Sampling temperature                                         |
@@ -874,9 +1007,12 @@ Generate speech using a cloned voice from a reference audio sample.
 | Inference      | ~4 s      |
 | Cold start     | ~47 s     |
 
-**curl Example**
+*Provide either `ref_audio` (base64) or `ref_audio_file` (path or ref), not both.
+
+**curl Examples**
 
 ```bash
+# Option 1: Base64 inline
 REF_AUDIO_B64=$(base64 -w0 reference_voice.wav)
 
 curl -s -X POST http://localhost:8400/v1/jobs \
@@ -891,6 +1027,23 @@ curl -s -X POST http://localhost:8400/v1/jobs \
       \"temperature\": 0.9
     }
   }"
+
+# Option 2: Reference file (upload once, reuse forever)
+curl -s -X POST http://localhost:8400/v1/refs -F file=@reference_voice.wav
+# => {"ref_id": "a1b2c3d4e5f6.wav", ...}
+
+curl -s -X POST http://localhost:8400/v1/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "tts-clone",
+    "params": {
+      "text": "This sentence will be spoken in the cloned voice.",
+      "ref_audio_file": "ref:a1b2c3d4e5f6.wav",
+      "ref_text": "This is the transcript of the reference audio clip.",
+      "language": "English",
+      "temperature": 0.9
+    }
+  }'
 
 # Poll and decode
 curl -s http://localhost:8400/v1/jobs/{job_id} | jq -r '.result.data' | base64 -d > cloned_speech.wav
@@ -1183,6 +1336,34 @@ while true; do
   esac
 done
 ```
+
+### Using Reference Files
+
+For files reused across many jobs (e.g., a voice sample for TTS cloning), upload once and reference by ID:
+
+```python
+# Upload once
+resp = requests.post(f"{ARBITER}/v1/refs", files={"file": open("voice.wav", "rb")})
+ref_id = resp.json()["ref_id"]  # e.g., "a1b2c3d4e5f6.wav"
+
+# Reuse in any number of jobs — no re-upload, no base64 encoding
+for text in texts:
+    run_job("tts-clone", {
+        "text": text,
+        "ref_audio_file": f"ref:{ref_id}",
+        "ref_text": "Reference transcript",
+    })
+
+# Clean up when done
+requests.delete(f"{ARBITER}/v1/refs/{ref_id}")
+```
+
+Every job type that accepts binary data supports `_file` params. For example:
+- `image_file` for image-edit, background-remove, caption, query, detect, talking-head
+- `audio_file` for transcribe, talking-head
+- `ref_audio_file` for tts-clone
+
+All `_file` params accept either an absolute filesystem path or a `ref:` reference.
 
 ### Decoding Base64 Results
 

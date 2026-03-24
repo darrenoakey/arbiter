@@ -6,6 +6,8 @@ from . import whisper_large  # noqa: F401
 from . import tts_custom  # noqa: F401
 from . import tts_clone  # noqa: F401
 from . import tts_design  # noqa: F401
+from . import latentsync  # noqa: F401
+from . import sadtalker  # noqa: F401
 from . import sonic  # noqa: F401
 from . import ltx2  # noqa: F401
 from . import aesthetic_scorer  # noqa: F401
