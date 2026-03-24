@@ -61,6 +61,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/reserve/{id}", a.releaseReservation)
 	mux.HandleFunc("PATCH /v1/models/{model_id}", a.updateModel)
 	mux.HandleFunc("DELETE /v1/models/{model_id}/queue", a.clearModelQueue)
+	mux.HandleFunc("DELETE /v1/models/{model_id}/running", a.killModelRunning)
 	mux.HandleFunc("GET /v1/health", a.health)
 	return withLogging(mux)
 }
@@ -611,6 +612,39 @@ func (a *API) clearModelQueue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"model_id":  modelID,
 		"cancelled": cancelled,
+	})
+}
+
+func (a *API) killModelRunning(w http.ResponseWriter, r *http.Request) {
+	modelID := r.PathValue("model_id")
+	if _, ok := a.config.Models[modelID]; !ok {
+		writeError(w, 404, fmt.Sprintf("model not configured: %s", modelID))
+		return
+	}
+
+	// Cancel queued/scheduled jobs in the store
+	cancelledQueued, _ := a.store.CancelQueuedForModel(modelID)
+
+	// Send cancel signal to all instances (kills running inference)
+	instances := a.mgr.GetModelInstances(modelID)
+	cancelledRunning := 0
+	for _, inst := range instances {
+		if inst.ActiveJobs() > 0 {
+			inst.Cancel()
+			cancelledRunning += inst.ActiveJobs()
+		}
+	}
+
+	a.logger.Log("model.killed", map[string]any{
+		"model_id":          modelID,
+		"cancelled_queued":  cancelledQueued,
+		"cancelled_running": cancelledRunning,
+	})
+
+	writeJSON(w, 200, map[string]any{
+		"model_id":          modelID,
+		"cancelled_queued":  cancelledQueued,
+		"cancelled_running": cancelledRunning,
 	})
 }
 
