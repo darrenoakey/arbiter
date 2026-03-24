@@ -130,6 +130,36 @@ Key per-model fields:
 
 JSONL at `output/logs/arbiter-YYYY-MM-DD.jsonl`. Events: job lifecycle, model load/evict, memory snapshots.
 
+## Reference Files
+
+Arbiter supports "reference files" — binary files uploaded once and reused across multiple jobs without re-uploading.
+
+### API
+
+- `POST /v1/refs` — Upload a file (multipart `file` field or raw body with `?filename=`). Returns `{"ref_id": "abc123.wav"}`.
+- `GET /v1/refs` — List all reference files.
+- `GET /v1/refs/{id}` — Download a reference file.
+- `DELETE /v1/refs/{id}` — Delete a reference file.
+
+Files are stored in `output/refs/`.
+
+### Usage in Jobs
+
+Pass a `ref:` prefix in any `_file` parameter. This works with every adapter via `_resolve_media()`:
+
+```json
+{
+  "type": "tts-clone",
+  "params": {
+    "text": "Hello",
+    "ref_text": "Reference transcript",
+    "ref_audio_file": "ref:abc123.wav"
+  }
+}
+```
+
+The `ref:` prefix is resolved in `_resolve_media()` in `src/arbiter/adapters/base.py`. No adapter-specific changes are needed.
+
 ## Key Design Decisions
 
 - **Single process, ThreadPoolExecutor**: PyTorch releases GIL during CUDA ops. Threads share GPU memory efficiently.

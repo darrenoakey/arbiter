@@ -102,7 +102,7 @@ class SonicAdapter(GroupAdapter):
             audio:          base64-encoded WAV audio
             dynamic_scale:  (optional) motion intensity, default 1.0
             seed:           (optional) RNG seed
-            min_resolution: (optional) minimum resolution, default 512
+            min_resolution: (optional) minimum resolution, default 256
         """
         if self._sonic is None:
             raise InferenceError("Sonic model is not loaded")
@@ -113,10 +113,10 @@ class SonicAdapter(GroupAdapter):
         image_b64 = params.get("image", "")
         audio_b64 = params.get("audio", "")
 
-        if not image_b64:
-            raise InferenceError("Missing required parameter: image")
-        if not audio_b64:
-            raise InferenceError("Missing required parameter: audio")
+        if not image_b64 and not params.get("image_file"):
+            raise InferenceError("Missing required parameter: image or image_file")
+        if not audio_b64 and not params.get("audio_file"):
+            raise InferenceError("Missing required parameter: audio or audio_file")
 
         # Strip data-URI prefix if present
         if image_b64.startswith("data:"):
@@ -177,7 +177,7 @@ class SonicAdapter(GroupAdapter):
                 audio_path=tmp_audio,
                 output_path=output_path,
                 min_resolution=min_resolution,
-                inference_steps=25,
+                inference_steps=int(params.get("inference_steps", 25)),
                 dynamic_scale=dynamic_scale,
                 seed=seed,
             )
@@ -224,12 +224,16 @@ class SonicAdapter(GroupAdapter):
 
         Heuristic: ~2500 ms per second of audio.
         """
+        audio_file = params.get("audio_file", "")
         audio_b64 = params.get("audio", "")
-        if audio_b64.startswith("data:"):
-            _, audio_b64 = audio_b64.split(",", 1)
 
         try:
-            audio_bytes = base64.b64decode(audio_b64)
+            if audio_file and Path(audio_file).is_file():
+                audio_bytes = Path(audio_file).read_bytes()
+            else:
+                if audio_b64.startswith("data:"):
+                    _, audio_b64 = audio_b64.split(",", 1)
+                audio_bytes = base64.b64decode(audio_b64)
             duration = self._wav_duration(audio_bytes)
         except Exception:
             # Fallback: assume 5 seconds of audio

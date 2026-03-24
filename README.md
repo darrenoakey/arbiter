@@ -63,7 +63,20 @@ curl http://localhost:8400/v1/jobs/{job_id}
 # Cancel a job
 curl -X DELETE http://localhost:8400/v1/jobs/{job_id}
 
-# System status
+# Upload a reference file (upload once, reuse in many jobs)
+curl -X POST http://localhost:8400/v1/refs -F file=@voice.wav
+# => {"ref_id": "a1b2c3d4e5f6.wav"}
+
+# Use reference file in a job (no re-upload needed)
+curl -X POST http://localhost:8400/v1/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"type": "tts-clone", "params": {"text": "Hello", "ref_audio_file": "ref:a1b2c3d4e5f6.wav"}}'
+
+# List / delete reference files
+curl http://localhost:8400/v1/refs
+curl -X DELETE http://localhost:8400/v1/refs/a1b2c3d4e5f6.wav
+
+# System status (includes GPU utilization %)
 curl http://localhost:8400/v1/ps
 
 # Health check
@@ -122,4 +135,4 @@ Client -> FastAPI Server -> Scheduler (SJF) -> Memory Manager -> Worker Pool -> 
 - `src/arbiter/calibrate/` — Calibration tool
 - `tests/` — Test suite
 - `local/` — Config and calibration results (gitignored)
-- `output/` — Logs, job results, SQLite DB (gitignored)
+- `output/` — Logs, job results, reference files, SQLite DB (gitignored)

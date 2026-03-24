@@ -99,6 +99,8 @@ class ModelAdapter(ABC):
         if file_key is None:
             file_key = f"{key}_file"
         file_path = params.get(file_key)
+        if file_path and file_path.startswith("ref:"):
+            file_path = str(Path("output/refs") / file_path[4:])
         if file_path:
             p = Path(file_path)
             if p.is_file():

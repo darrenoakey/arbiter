@@ -33,6 +33,9 @@ case "$CMD" in
     test-all)
         exec python -m pytest tests/ -m "not calibration" "$@"
         ;;
+    adapter-test)
+        exec python -m arbiter.adapter_test "$@"
+        ;;
     calibrate)
         exec python -m arbiter.calibrate "$@"
         ;;
@@ -61,6 +64,7 @@ Commands:
   server              Start the Arbiter API server
   test                Run fast tests (unit + integration, no calibration)
   test-all            Run all tests except calibration
+  adapter-test <model> Test an adapter lifecycle (load/infer/verify/unload)
   calibrate <model>   Run calibration for a model (or --all for all models)
   ps                  Show loaded models and VRAM usage
   jobs                List job queue
