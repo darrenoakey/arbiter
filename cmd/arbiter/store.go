@@ -344,3 +344,59 @@ func (s *Store) CancelQueuedForModel(modelID string) (int, error) {
 func (s *Store) Close() {
 	s.db.Close()
 }
+
+// GetJobs fetches multiple jobs by ID in a single query.
+// Returns a map of jobID -> Job. Missing IDs are omitted.
+func (s *Store) GetJobs(ids []string) (map[string]*Job, error) {
+	if len(ids) == 0 {
+		return map[string]*Job{}, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	placeholders := ""
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		if i > 0 {
+			placeholders += ","
+		}
+		placeholders += "?"
+		args[i] = id
+	}
+
+	query := "SELECT * FROM jobs WHERE id IN (" + placeholders + ")"
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]*Job, len(ids))
+	for rows.Next() {
+		var j Job
+		var payload, res, errStr sql.NullString
+		var startedAt, finishedAt sql.NullFloat64
+		if err := rows.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
+			&payload, &res, &errStr, &j.CreatedAt, &startedAt, &finishedAt); err != nil {
+			return nil, err
+		}
+		if payload.Valid {
+			j.Payload = json.RawMessage(payload.String)
+		}
+		if res.Valid {
+			rm := json.RawMessage(res.String)
+			j.Result = &rm
+		}
+		if errStr.Valid {
+			j.Error = errStr.String
+		}
+		if startedAt.Valid {
+			j.StartedAt = &startedAt.Float64
+		}
+		if finishedAt.Valid {
+			j.FinishedAt = &finishedAt.Float64
+		}
+		result[j.ID] = &j
+	}
+	return result, nil
+}

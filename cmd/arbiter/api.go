@@ -49,6 +49,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs", a.submitJob)
 	mux.HandleFunc("GET /v1/jobs/{id}", a.getJob)
 	mux.HandleFunc("DELETE /v1/jobs/{id}", a.cancelJob)
+	mux.HandleFunc("POST /v1/jobs/status", a.bulkStatus)
 	mux.HandleFunc("GET /v1/jobs", a.listJobs)
 	mux.HandleFunc("GET /v1/ps", a.systemStatus)
 	mux.HandleFunc("POST /v1/refs", a.uploadRef)
@@ -235,6 +236,66 @@ func (a *API) cancelJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"job_id": jobID, "status": "cancelling"})
 }
 
+
+func (a *API) bulkStatus(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		JobIDs []string `json:"job_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if len(req.JobIDs) == 0 {
+		writeJSON(w, 200, map[string]any{"jobs": []any{}})
+		return
+	}
+	if len(req.JobIDs) > 1000 {
+		writeError(w, 400, "max 1000 job IDs per request")
+		return
+	}
+
+	jobs, err := a.store.GetJobs(req.JobIDs)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+
+	// Return in request order, null for missing
+	out := make([]any, len(req.JobIDs))
+	for i, id := range req.JobIDs {
+		j, ok := jobs[id]
+		if !ok {
+			out[i] = nil
+			continue
+		}
+		entry := map[string]any{
+			"job_id":     j.ID,
+			"status":     j.State,
+			"model":      j.ModelID,
+			"type":       j.JobType,
+			"created_at": j.CreatedAt,
+		}
+		if j.StartedAt != nil {
+			entry["started_at"] = *j.StartedAt
+		}
+		if j.FinishedAt != nil {
+			entry["finished_at"] = *j.FinishedAt
+		}
+		if j.Error != "" {
+			entry["error"] = j.Error
+		}
+		if j.State == "completed" && j.Result != nil {
+			var result map[string]any
+			json.Unmarshal(*j.Result, &result)
+			// Include result metadata but NOT file data (use GET /v1/jobs/{id} for that)
+			delete(result, "data")
+			entry["result"] = result
+		}
+		out[i] = entry
+	}
+
+	writeJSON(w, 200, map[string]any{"jobs": out})
+}
 func (a *API) listJobs(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 	model := r.URL.Query().Get("model")
