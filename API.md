@@ -7,7 +7,7 @@ Complete API reference for client developers integrating with the Arbiter GPU mo
 ## Table of Contents
 
 1. [Overview](#1-overview)
-2. [Endpoints Reference](#2-endpoints-reference) — Jobs, Reference Files, System Status, Health
+2. [Endpoints Reference](#2-endpoints-reference) — Jobs, Bulk Status, Reference Files, Model Management, Reservations, System Status, Health
 3. [Job Types Reference](#3-job-types-reference)
 4. [Client Workflow](#4-client-workflow)
 5. [Model Memory & Scheduling](#5-model-memory--scheduling)
@@ -519,6 +519,158 @@ GET /v1/health
 |------------------|--------|--------------------------------------|
 | `status`         | string | Always `"ok"` if server is running   |
 | `uptime_seconds` | float  | Seconds since server started         |
+
+---
+
+### POST /v1/jobs/status -- Bulk Poll Job Status
+
+Poll up to 1000 jobs in a single request. Returns statuses in request order with `null` for unknown IDs. Result metadata is included but file data is not (use `GET /v1/jobs/{id}` to fetch file data for individual completed jobs).
+
+**Request**
+
+```
+POST /v1/jobs/status
+Content-Type: application/json
+
+{"job_ids": ["abc123", "def456", "unknown789"]}
+```
+
+**Response (200)**
+
+```json
+{
+  "jobs": [
+    {
+      "job_id": "abc123",
+      "status": "completed",
+      "model": "moondream",
+      "type": "caption",
+      "created_at": 1774045000.0,
+      "started_at": 1774045001.0,
+      "finished_at": 1774045003.0,
+      "result": {"caption": "A dog sitting on grass", "format": "json"}
+    },
+    {
+      "job_id": "def456",
+      "status": "running",
+      "model": "flux-schnell",
+      "type": "image-generate",
+      "created_at": 1774045100.0,
+      "started_at": 1774045110.0
+    },
+    null
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `jobs` | array | One entry per requested ID, in request order. `null` if ID not found. |
+
+Each non-null entry has the same fields as `GET /v1/jobs/{id}` except `result.data` is omitted (no inline file bytes).
+
+---
+
+### PATCH /v1/models/{model_id} -- Update Model Configuration
+
+Change `max_instances` at runtime. Persists to `local/config.json`.
+
+**Request**
+
+```
+PATCH /v1/models/moondream
+Content-Type: application/json
+
+{"max_instances": 8}
+```
+
+**Response (200)**
+
+```json
+{
+  "model_id": "moondream",
+  "max_instances": 8,
+  "previous_max_instances": 4,
+  "added": 4,
+  "removed": 0,
+  "condemned": 0
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `model_id` | string | The model that was updated |
+| `max_instances` | int | New instance count |
+| `previous_max_instances` | int | Previous instance count |
+| `added` | int | New instances created (unloaded, loaded on demand) |
+| `removed` | int | Instances removed immediately (were idle or unloaded) |
+| `condemned` | int | Instances with running jobs that will auto-remove when done |
+
+**Scaling behavior:**
+
+- **Scale up**: New instances start stopped and load on demand when the scheduler needs them.
+- **Scale down**: Idle instances are evicted and removed immediately. Instances with active jobs are "condemned" — they finish their work, then auto-evict. No jobs are killed.
+- **`max_instances: 0`**: Disables all dispatch for the model. Queued jobs wait until you scale back up. Useful for temporarily prioritizing other models.
+
+---
+
+### DELETE /v1/models/{model_id}/queue -- Clear Queued Jobs
+
+Cancel all queued (not running) jobs for a model.
+
+**Request**
+
+```
+DELETE /v1/models/moondream/queue
+```
+
+**Response (200)**
+
+```json
+{
+  "model_id": "moondream",
+  "cancelled": 15
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `cancelled` | int | Number of queued jobs cancelled |
+
+Running jobs are not affected. Combine with `max_instances: 0` to fully drain a model.
+
+---
+
+### POST /v1/reserve -- Reserve VRAM Budget
+
+Reserve VRAM budget space to prevent the scheduler from using it for model loads. Useful for adapter testing or manual GPU work.
+
+**Request**
+
+```
+POST /v1/reserve
+Content-Type: application/json
+
+{"memory_gb": 64, "label": "adapter testing"}
+```
+
+**Response (201)**
+
+```json
+{
+  "reservation_id": "abc123",
+  "memory_gb": 64.0,
+  "label": "adapter testing"
+}
+```
+
+### GET /v1/reserve -- List Active Reservations
+
+Returns all active VRAM reservations.
+
+### DELETE /v1/reserve/{id} -- Release a Reservation
+
+Releases a previously created VRAM reservation.
 
 ---
 
