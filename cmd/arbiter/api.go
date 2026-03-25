@@ -90,34 +90,17 @@ func (a *API) updatePSCache() {
 	counts, _ := a.store.CountByState("")
 	snap["queue"] = counts
 
-	models, _ := snap["models"].([]map[string]any)
-	seen := make(map[string]bool)
-	for _, m := range models {
-		if id, ok := m["id"].(string); ok {
-			seen[id] = true
-			modelCounts, _ := a.store.CountByState(id)
-			m["queued_jobs"] = modelCounts["queued"]
-			if cfg, ok := a.config.Models[id]; ok {
-				m["max_instances"] = *cfg.MaxInstances
+	if models, ok := snap["models"].([]map[string]any); ok {
+		for _, m := range models {
+			if id, ok := m["id"].(string); ok {
+				modelCounts, _ := a.store.CountByState(id)
+				m["queued_jobs"] = modelCounts["queued"]
+				if cfg, ok := a.config.Models[id]; ok {
+					m["max_instances"] = *cfg.MaxInstances
+				}
 			}
 		}
 	}
-	for id, cfg := range a.config.Models {
-		if seen[id] {
-			continue
-		}
-		modelCounts, _ := a.store.CountByState(id)
-		models = append(models, map[string]any{
-			"id":            id,
-			"state":         "disabled",
-			"memory_gb":     cfg.MemoryGB,
-			"active_jobs":   0,
-			"queued_jobs":   modelCounts["queued"],
-			"max_instances": *cfg.MaxInstances,
-			"idle_seconds":  nil,
-		})
-	}
-	snap["models"] = models
 
 	data, _ := json.Marshal(snap)
 	a.psCache.Store(data)

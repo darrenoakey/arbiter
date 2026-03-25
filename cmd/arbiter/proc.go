@@ -400,6 +400,15 @@ func (m *InstanceManager) Register(inst *Instance) {
 	m.byModel[inst.ModelID] = append(m.byModel[inst.ModelID], inst.InstanceID)
 }
 
+// EnsureModel ensures a model key exists in byModel, even with 0 instances.
+func (m *InstanceManager) EnsureModel(modelID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.byModel[modelID]; !ok {
+		m.byModel[modelID] = []string{}
+	}
+}
+
 func (m *InstanceManager) Get(instanceID string) *Instance {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1004,7 +1013,7 @@ func (m *InstanceManager) Snapshot() map[string]any {
 			stateStr = "active"
 		} else if loadedCount > 0 {
 			stateStr = "loaded"
-		} else if g.instances[0].State() == "loading" {
+		} else if len(g.instances) > 0 && g.instances[0].State() == "loading" {
 			stateStr = "loading"
 		}
 
@@ -1015,7 +1024,7 @@ func (m *InstanceManager) Snapshot() map[string]any {
 			"active_jobs": totalActive,
 		}
 
-		if totalMem == 0 {
+		if totalMem == 0 && len(g.instances) > 0 {
 			entry["memory_gb"] = g.instances[0].memoryGB
 		}
 
