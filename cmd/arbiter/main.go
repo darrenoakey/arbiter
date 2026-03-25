@@ -61,7 +61,11 @@ func main() {
 	}
 
 	// Instance manager
-	mgr := NewInstanceManager(cfg.VRAMBudgetGB, pythonBin, projectRoot)
+	hardLimit := cfg.VRAMHardLimitGB
+	if hardLimit == 0 {
+		hardLimit = cfg.VRAMBudgetGB // backward compat: no burst
+	}
+	mgr := NewInstanceManager(cfg.VRAMBudgetGB, hardLimit, pythonBin, projectRoot)
 	setupInstances(cfg, mgr, pythonBin, projectRoot)
 
 	// Scheduler

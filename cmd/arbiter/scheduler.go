@@ -74,7 +74,8 @@ func (s *Scheduler) getFullModels() map[string]bool {
 	return full
 }
 
-// ensureLoaded makes sure an instance is loaded, evicting other models if needed.
+// ensureLoaded makes sure an instance is loaded, using two-tier VRAM budget.
+// Strategy: try soft limit first, then evict idle, then burst (condemn active).
 func (s *Scheduler) ensureLoaded(inst *Instance) error {
 	state := inst.State()
 	if state == "loaded" {
@@ -83,17 +84,28 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 
 	// Need to load — check VRAM budget
 	if state == "stopped" || state == "unloaded" || state == "error" {
-		if !s.mgr.ReserveMemory(inst.memoryGB) {
-			// Try to evict
-			deficit := inst.memoryGB - s.mgr.FreeGB()
-			if err := s.mgr.EvictForGB(deficit); err != nil {
-				return fmt.Errorf("can't load %s: %w", inst.InstanceID, err)
+		needed := inst.memoryGB
+
+		// Step 1: Try normal reserve (fits under soft limit)
+		if !s.mgr.ReserveMemory(needed) {
+			// Step 2: Evict idle models
+			deficit := needed - s.mgr.FreeGB()
+			if deficit > 0 {
+				s.mgr.EvictForGB(deficit) // best effort
 			}
-			if !s.mgr.ReserveMemory(inst.memoryGB) {
-				return fmt.Errorf("can't reserve memory for %s after eviction", inst.InstanceID)
+
+			// Step 3: Try reserve again
+			if !s.mgr.ReserveMemory(needed) {
+				// Step 4: Try burst mode (condemn active instances, use hard limit)
+				if err := s.mgr.CondemnAndBurstReserve(needed); err != nil {
+					return fmt.Errorf("can't load %s: %w", inst.InstanceID, err)
+				}
+				// Burst reserve succeeded — memory is reserved under hard limit
+				goto doLoad
 			}
 		}
 
+	doLoad:
 		s.logger.Log("model.load_start", map[string]any{
 			"model_id":    inst.ModelID,
 			"instance_id": inst.InstanceID,
@@ -210,7 +222,7 @@ func (s *Scheduler) tryPreload() {
 		return
 	}
 
-	if s.mgr.FreeGB() >= inst.memoryGB {
+	if s.mgr.FreeGB() >= inst.memoryGB { // only preload if fits under soft limit
 		slog.Debug("preloading", "instance", inst.InstanceID)
 		go func() {
 			if err := s.ensureLoaded(inst); err != nil {

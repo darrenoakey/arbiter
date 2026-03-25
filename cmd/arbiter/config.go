@@ -21,7 +21,8 @@ type ModelConfig struct {
 }
 
 type Config struct {
-	VRAMBudgetGB float64                `json:"vram_budget_gb"`
+	VRAMBudgetGB     float64        `json:"vram_budget_gb"`
+	VRAMHardLimitGB  float64        `json:"vram_hard_limit_gb"`
 	Host         string                 `json:"host"`
 	Port         int                    `json:"port"`
 	Models       map[string]ModelConfig `json:"models"`

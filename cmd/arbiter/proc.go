@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"sync"
+	"sort"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -363,27 +364,32 @@ type Reservation struct {
 
 // InstanceManager manages all adapter instances for all models.
 type InstanceManager struct {
-	mu           sync.RWMutex
-	instances    map[string]*Instance  // instanceID -> Instance
-	byModel      map[string][]string   // modelID -> []instanceID
-	condemned    map[string]bool       // instance IDs pending removal after current jobs finish
-	budgetGB     float64
-	usedGB       float64
-	reservations map[string]*Reservation
-	reservedGB   float64
-	pythonBin    string
-	projectRoot  string
+	mu              sync.RWMutex
+	instances       map[string]*Instance  // instanceID -> Instance
+	byModel         map[string][]string   // modelID -> []instanceID
+	condemned       map[string]bool       // instance IDs pending removal (scale-down, permanent)
+	softCondemned   map[string]bool       // instance IDs condemned for VRAM pressure (repriveable)
+	softCondemnedGB float64               // total VRAM of soft-condemned instances
+	softBudgetGB    float64               // soft VRAM limit (logical target)
+	hardBudgetGB    float64               // hard VRAM limit (physical max during burst)
+	usedGB          float64
+	reservations    map[string]*Reservation
+	reservedGB      float64
+	pythonBin       string
+	projectRoot     string
 }
 
-func NewInstanceManager(budgetGB float64, pythonBin, projectRoot string) *InstanceManager {
+func NewInstanceManager(softBudgetGB, hardBudgetGB float64, pythonBin, projectRoot string) *InstanceManager {
 	return &InstanceManager{
-		instances:    make(map[string]*Instance),
-		byModel:      make(map[string][]string),
-		condemned:    make(map[string]bool),
-		budgetGB:     budgetGB,
-		reservations: make(map[string]*Reservation),
-		pythonBin:    pythonBin,
-		projectRoot:  projectRoot,
+		instances:     make(map[string]*Instance),
+		byModel:       make(map[string][]string),
+		condemned:     make(map[string]bool),
+		softCondemned: make(map[string]bool),
+		softBudgetGB:  softBudgetGB,
+		hardBudgetGB:  hardBudgetGB,
+		reservations:  make(map[string]*Reservation),
+		pythonBin:     pythonBin,
+		projectRoot:   projectRoot,
 	}
 }
 
@@ -467,17 +473,31 @@ func (m *InstanceManager) IsLoaded(modelID string) bool {
 	return false
 }
 
+// FreeGB returns logical free VRAM (soft budget minus logical usage).
 func (m *InstanceManager) FreeGB() float64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.budgetGB - m.usedGB - m.reservedGB
+	logicalUsed := m.usedGB - m.softCondemnedGB
+	return m.softBudgetGB - logicalUsed - m.reservedGB
 }
 
-// ReserveMemory adds to used VRAM. Returns false if would exceed budget (respects reservations).
+// HardFreeGB returns physical free VRAM (hard limit minus physical usage).
+func (m *InstanceManager) HardFreeGB() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.hardBudgetGB - m.usedGB - m.reservedGB
+}
+
+// ReserveMemory reserves VRAM if it fits under the soft budget (logical).
+// Also checks that physical usage stays under the hard limit.
 func (m *InstanceManager) ReserveMemory(gb float64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.usedGB+gb > m.budgetGB-m.reservedGB {
+	logicalUsed := m.usedGB - m.softCondemnedGB
+	if logicalUsed+gb > m.softBudgetGB-m.reservedGB {
+		return false
+	}
+	if m.usedGB+gb > m.hardBudgetGB-m.reservedGB {
 		return false
 	}
 	m.usedGB += gb
@@ -486,10 +506,162 @@ func (m *InstanceManager) ReserveMemory(gb float64) bool {
 
 func (m *InstanceManager) ReleaseMemory(gb float64) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.usedGB -= gb
 	if m.usedGB < 0 {
 		m.usedGB = 0
+	}
+	m.mu.Unlock()
+	m.TryReprieve()
+}
+
+// CondemnAndBurstReserve condemns active instances to free logical VRAM,
+// then reserves physical VRAM under the hard limit.
+// Used when the soft limit would be exceeded but we can temporarily burst.
+//
+// Condemned instances continue running their current jobs. When they finish,
+// they are evicted automatically. If the pressure is relieved before then
+// (e.g., the model that caused the burst is unloaded), they are reprieved.
+func (m *InstanceManager) CondemnAndBurstReserve(needed float64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Check hard limit (physical)
+	if m.usedGB+needed > m.hardBudgetGB-m.reservedGB {
+		return fmt.Errorf("need %.1fGB but only %.1fGB physical VRAM available (hard limit %.0fGB)",
+			needed, m.hardBudgetGB-m.usedGB-m.reservedGB, m.hardBudgetGB)
+	}
+
+	// Special case: model itself exceeds soft limit (e.g., 85GB model with 80GB soft)
+	// Just allow it — "suffer mode"
+	if needed > m.softBudgetGB-m.reservedGB {
+		slog.Warn("model exceeds soft VRAM budget, allowing under hard limit",
+			"needed_gb", needed, "soft_budget_gb", m.softBudgetGB, "hard_budget_gb", m.hardBudgetGB)
+		m.usedGB += needed
+		return nil
+	}
+
+	// How much logical space do we need to free?
+	logicalUsed := m.usedGB - m.softCondemnedGB
+	logicalFree := m.softBudgetGB - logicalUsed - m.reservedGB
+	logicalDeficit := needed - logicalFree
+	if logicalDeficit <= 0 {
+		m.usedGB += needed
+		return nil
+	}
+
+	// Find instances to condemn
+	// Priority: models with most active instances (most redundant), then fewest active jobs
+	type candidate struct {
+		instanceID    string
+		modelID       string
+		memoryGB      float64
+		activeJobs    int
+		instanceCount int
+	}
+
+	modelInstCount := make(map[string]int)
+	for _, ids := range m.byModel {
+		for _, id := range ids {
+			inst := m.instances[id]
+			if inst != nil && (inst.State() == "loaded" || inst.State() == "loading") {
+				modelInstCount[inst.ModelID]++
+			}
+		}
+	}
+
+	var candidates []candidate
+	for _, inst := range m.instances {
+		if inst.State() != "loaded" || inst.ActiveJobs() == 0 {
+			continue // only condemn active loaded instances
+		}
+		if m.condemned[inst.InstanceID] || m.softCondemned[inst.InstanceID] {
+			continue // no double counting!
+		}
+		candidates = append(candidates, candidate{
+			instanceID:    inst.InstanceID,
+			modelID:       inst.ModelID,
+			memoryGB:      inst.memoryGB,
+			activeJobs:    inst.ActiveJobs(),
+			instanceCount: modelInstCount[inst.ModelID],
+		})
+	}
+
+	// Sort: most instances first (most redundant), then fewest active jobs
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].instanceCount != candidates[j].instanceCount {
+			return candidates[i].instanceCount > candidates[j].instanceCount
+		}
+		return candidates[i].activeJobs < candidates[j].activeJobs
+	})
+
+	var toCondemn []candidate
+	condemned := 0.0
+	for _, c := range candidates {
+		if condemned >= logicalDeficit {
+			break
+		}
+		toCondemn = append(toCondemn, c)
+		condemned += c.memoryGB
+	}
+
+	if condemned < logicalDeficit {
+		return fmt.Errorf("need %.1fGB logical but can only condemn %.1fGB (%d candidates)",
+			logicalDeficit, condemned, len(candidates))
+	}
+
+	// Commit the condemns
+	for _, c := range toCondemn {
+		m.softCondemned[c.instanceID] = true
+		m.softCondemnedGB += c.memoryGB
+		// Remove from dispatch list
+		ids := m.byModel[c.modelID]
+		for j, id := range ids {
+			if id == c.instanceID {
+				m.byModel[c.modelID] = append(ids[:j], ids[j+1:]...)
+				break
+			}
+		}
+		slog.Info("soft-condemned instance for burst load",
+			"instance", c.instanceID, "memory_gb", c.memoryGB,
+			"model_instances", c.instanceCount, "active_jobs", c.activeJobs)
+	}
+
+	m.usedGB += needed
+	return nil
+}
+
+// TryReprieve un-condemns soft-condemned instances when VRAM pressure is relieved.
+// Called automatically after any memory-freeing event.
+func (m *InstanceManager) TryReprieve() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(m.softCondemned) == 0 {
+		return
+	}
+
+	for instanceID := range m.softCondemned {
+		inst := m.instances[instanceID]
+		if inst == nil {
+			delete(m.softCondemned, instanceID)
+			continue
+		}
+
+		// Would un-condemning this push logical usage over soft limit?
+		newLogicalUsed := (m.usedGB - m.softCondemnedGB) + inst.memoryGB
+		if newLogicalUsed > m.softBudgetGB-m.reservedGB {
+			continue
+		}
+
+		// Reprieve: remove from soft-condemned, add back to dispatch list
+		delete(m.softCondemned, instanceID)
+		m.softCondemnedGB -= inst.memoryGB
+		if m.softCondemnedGB < 0 {
+			m.softCondemnedGB = 0
+		}
+		m.byModel[inst.ModelID] = append(m.byModel[inst.ModelID], instanceID)
+		slog.Info("reprieved soft-condemned instance",
+			"instance", instanceID, "memory_gb", inst.memoryGB)
 	}
 }
 
@@ -607,7 +779,8 @@ func (m *InstanceManager) EvictForGB(needed float64) error {
 //  3. Regular LRU among remaining idle instances
 func (m *InstanceManager) CreateReservation(memoryGB float64, label string, keepAliveSecs map[string]int) (string, error) {
 	m.mu.Lock()
-	available := m.budgetGB - m.usedGB - m.reservedGB
+	logicalUsed := m.usedGB - m.softCondemnedGB
+	available := m.softBudgetGB - logicalUsed - m.reservedGB
 	m.mu.Unlock()
 
 	if memoryGB > available {
@@ -621,7 +794,8 @@ func (m *InstanceManager) CreateReservation(memoryGB float64, label string, keep
 	defer m.mu.Unlock()
 
 	// Re-check after eviction
-	available = m.budgetGB - m.usedGB - m.reservedGB
+	logicalUsed = m.usedGB - m.softCondemnedGB
+	available = m.softBudgetGB - logicalUsed - m.reservedGB
 	if memoryGB > available {
 		return "", fmt.Errorf("need %.1fGB but only %.1fGB available after eviction", memoryGB, available)
 	}
@@ -873,6 +1047,9 @@ func (m *InstanceManager) Snapshot() map[string]any {
 			if m.condemned[inst.InstanceID] {
 				ie["condemned"] = true
 			}
+			if m.softCondemned[inst.InstanceID] {
+				ie["soft_condemned"] = true
+			}
 			inst.mu.Lock()
 			if inst.cmd != nil && inst.cmd.Process != nil {
 				pid := inst.cmd.Process.Pid
@@ -946,14 +1123,20 @@ func (m *InstanceManager) Snapshot() map[string]any {
 		})
 	}
 
-	return map[string]any{
-		"vram_budget_gb":     m.budgetGB,
-		"vram_used_gb":       totalActualVRAM,
-		"vram_configured_gb": m.usedGB,
-		"vram_reserved_gb":   m.reservedGB,
-		"models":             models,
-		"reservations":       reservations,
+	snap := map[string]any{
+		"vram_budget_gb":      m.softBudgetGB,
+		"vram_hard_limit_gb":  m.hardBudgetGB,
+		"vram_used_gb":        totalActualVRAM,
+		"vram_configured_gb":  m.usedGB,
+		"vram_logical_gb":     m.usedGB - m.softCondemnedGB,
+		"vram_reserved_gb":    m.reservedGB,
+		"models":              models,
+		"reservations":        reservations,
 	}
+	if m.softCondemnedGB > 0 {
+		snap["vram_condemned_gb"] = m.softCondemnedGB
+	}
+	return snap
 }
 
 // ScaleModel changes the number of instances for a model at runtime.
@@ -1049,9 +1232,9 @@ func (m *InstanceManager) ScaleModel(modelID string, newCount int, cfg ModelConf
 	return result
 }
 
-// ReleaseAndCheck decrements activeJobs and checks if the instance is condemned.
-// If condemned and now idle, evicts and removes it in a background goroutine.
-// Returns true if the instance was condemned and cleanup was triggered.
+// ReleaseAndCheck decrements activeJobs and checks if the instance is condemned
+// (either hard-condemned from scale-down or soft-condemned for VRAM pressure).
+// If condemned and now idle, evicts in a background goroutine.
 func (m *InstanceManager) ReleaseAndCheck(inst *Instance) bool {
 	atomic.AddInt32(&inst.activeJobs, -1)
 	inst.mu.Lock()
@@ -1060,44 +1243,59 @@ func (m *InstanceManager) ReleaseAndCheck(inst *Instance) bool {
 
 	m.mu.Lock()
 	isCondemned := m.condemned[inst.InstanceID]
+	isSoftCondemned := m.softCondemned[inst.InstanceID]
 	m.mu.Unlock()
 
-	if isCondemned && inst.ActiveJobs() == 0 {
-		go m.evictCondemned(inst)
+	if (isCondemned || isSoftCondemned) && inst.ActiveJobs() == 0 {
+		go m.evictCondemnedOrSoft(inst, isSoftCondemned)
 		return true
 	}
 	return false
 }
 
-func (m *InstanceManager) evictCondemned(inst *Instance) {
-	// Double-check under lock
+func (m *InstanceManager) evictCondemnedOrSoft(inst *Instance, wasSoft bool) {
 	m.mu.Lock()
-	if !m.condemned[inst.InstanceID] || inst.ActiveJobs() > 0 {
-		m.mu.Unlock()
-		return
+	if wasSoft {
+		if !m.softCondemned[inst.InstanceID] || inst.ActiveJobs() > 0 {
+			m.mu.Unlock()
+			return
+		}
+		delete(m.softCondemned, inst.InstanceID)
+		m.softCondemnedGB -= inst.memoryGB
+		if m.softCondemnedGB < 0 {
+			m.softCondemnedGB = 0
+		}
+	} else {
+		if !m.condemned[inst.InstanceID] || inst.ActiveJobs() > 0 {
+			m.mu.Unlock()
+			return
+		}
+		delete(m.condemned, inst.InstanceID)
 	}
-	delete(m.condemned, inst.InstanceID)
 	m.mu.Unlock()
 
-	slog.Info("evicting condemned instance", "instance", inst.InstanceID)
+	slog.Info("evicting condemned instance", "instance", inst.InstanceID, "soft", wasSoft)
 	if inst.State() == "loaded" {
 		if err := inst.Unload(); err != nil {
 			slog.Error("condemned unload failed", "instance", inst.InstanceID, "error", err)
 		}
-		m.mu.Lock()
-		m.usedGB -= inst.memoryGB
-		if m.usedGB < 0 {
-			m.usedGB = 0
-		}
-		m.mu.Unlock()
+		m.ReleaseMemory(inst.memoryGB) // also calls TryReprieve
 	}
-	inst.Kill()
 
-	m.mu.Lock()
-	delete(m.instances, inst.InstanceID)
-	m.mu.Unlock()
-
-	slog.Info("condemned instance removed", "instance", inst.InstanceID)
+	if wasSoft {
+		// Soft condemned: put back as available (unloaded) instance
+		m.mu.Lock()
+		m.byModel[inst.ModelID] = append(m.byModel[inst.ModelID], inst.InstanceID)
+		m.mu.Unlock()
+		slog.Info("soft-condemned instance returned to pool", "instance", inst.InstanceID)
+	} else {
+		// Hard condemned (scale-down): remove entirely
+		inst.Kill()
+		m.mu.Lock()
+		delete(m.instances, inst.InstanceID)
+		m.mu.Unlock()
+		slog.Info("condemned instance removed", "instance", inst.InstanceID)
+	}
 }
 
 func (m *InstanceManager) nextInstanceIndex(modelID string) int {
