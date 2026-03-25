@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"log/slog"
 	"os"
@@ -16,7 +17,9 @@ type Scheduler struct {
 	mgr      *InstanceManager
 	logger   *EventLogger
 	outputDir string
-	wake     chan struct{}
+	wake          chan struct{}
+	cooldownMu    sync.Mutex
+	cooldownUntil map[string]time.Time // model -> skip until this time
 }
 
 func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *EventLogger, outputDir string) *Scheduler {
@@ -26,7 +29,8 @@ func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *Event
 		mgr:       mgr,
 		logger:    logger,
 		outputDir: outputDir,
-		wake:      make(chan struct{}, 1),
+		wake:          make(chan struct{}, 1),
+		cooldownUntil: make(map[string]time.Time),
 	}
 }
 
@@ -64,6 +68,16 @@ func (s *Scheduler) rescoreAll() {
 // getFullModels returns model IDs that are at total capacity.
 func (s *Scheduler) getFullModels() map[string]bool {
 	full := make(map[string]bool)
+	now := time.Now()
+	s.cooldownMu.Lock()
+	for modelID, until := range s.cooldownUntil {
+		if now.Before(until) {
+			full[modelID] = true
+		} else {
+			delete(s.cooldownUntil, modelID)
+		}
+	}
+	s.cooldownMu.Unlock()
 	for modelID, cfg := range s.config.Models {
 		active, _ := s.store.CountActive(modelID)
 		capacity := *cfg.MaxInstances * cfg.MaxConcurrent
@@ -148,6 +162,10 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance) {
 	if err := s.ensureLoaded(inst); err != nil {
 		slog.Warn("can't load instance, requeueing", "instance", inst.InstanceID, "error", err)
 		s.store.UpdateState(job.ID, "queued")
+		// Cooldown: mark model as temporarily full to prevent scheduler spin
+		s.cooldownMu.Lock()
+		s.cooldownUntil[job.ModelID] = time.Now().Add(5 * time.Second)
+		s.cooldownMu.Unlock()
 		return
 	}
 

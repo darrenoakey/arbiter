@@ -529,6 +529,12 @@ func (m *InstanceManager) ReleaseMemory(gb float64) {
 	if m.usedGB < 0 {
 		m.usedGB = 0
 	}
+	// Ensure softCondemnedGB never exceeds usedGB (can happen if
+	// a soft-condemned instance is evicted via keepalive/EvictForGB
+	// instead of through evictCondemnedOrSoft)
+	if m.softCondemnedGB > m.usedGB {
+		m.softCondemnedGB = m.usedGB
+	}
 	m.mu.Unlock()
 	m.TryReprieve()
 }
@@ -776,6 +782,14 @@ func (m *InstanceManager) EvictForGB(needed float64) error {
 			continue
 		}
 		m.ReleaseMemory(c.inst.memoryGB)
+		// Clean up soft-condemned tracking if this instance was condemned
+		m.mu.Lock()
+		if m.softCondemned[c.inst.InstanceID] {
+			delete(m.softCondemned, c.inst.InstanceID)
+			m.softCondemnedGB -= c.inst.memoryGB
+			if m.softCondemnedGB < 0 { m.softCondemnedGB = 0 }
+		}
+		m.mu.Unlock()
 		freed += c.inst.memoryGB
 		// Update loadedCount for remaining candidates of the same model
 		for i := range ordered {
