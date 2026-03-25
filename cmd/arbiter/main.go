@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -67,6 +68,15 @@ func main() {
 	}
 	mgr := NewInstanceManager(cfg.VRAMBudgetGB, hardLimit, pythonBin, projectRoot)
 	setupInstances(cfg, mgr, pythonBin, projectRoot)
+
+	// Register job type mappings for LLM models (restored from config)
+	for modelID := range cfg.Models {
+		if strings.HasPrefix(modelID, "llm:") {
+			name := strings.TrimPrefix(modelID, "llm:")
+			JobTypeToModel["chat-completion:"+name] = modelID
+			slog.Info("registered LLM job type", "type", "chat-completion:"+name, "model", modelID)
+		}
+	}
 
 	// Scheduler
 	sched := NewScheduler(cfg, store, mgr, eventLog, outputDir)
