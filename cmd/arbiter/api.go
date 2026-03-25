@@ -96,7 +96,7 @@ func (a *API) updatePSCache() {
 				modelCounts, _ := a.store.CountByState(id)
 				m["queued_jobs"] = modelCounts["queued"]
 				if cfg, ok := a.config.Models[id]; ok {
-					m["max_instances"] = cfg.MaxInstances
+					m["max_instances"] = *cfg.MaxInstances
 				}
 			}
 		}
@@ -547,7 +547,7 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	oldMax := cfg.MaxInstances
+	oldMax := *cfg.MaxInstances
 	newMax := req.MaxInstances
 
 	if newMax == oldMax {
@@ -561,7 +561,7 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update in-memory config FIRST so scheduler sees new capacity immediately
-	cfg.MaxInstances = newMax
+	cfg.MaxInstances = &newMax
 	a.config.Models[modelID] = cfg
 
 	// Scale instances

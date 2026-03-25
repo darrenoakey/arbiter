@@ -11,7 +11,7 @@ import (
 type ModelConfig struct {
 	MemoryGB       float64 `json:"memory_gb"`
 	MaxConcurrent  int     `json:"max_concurrent"`
-	MaxInstances   int     `json:"max_instances"`
+	MaxInstances   *int    `json:"max_instances"`
 	KeepAliveSec   int     `json:"keep_alive_seconds"`
 	AvgInferenceMs float64 `json:"avg_inference_ms"`
 	LoadMs         float64 `json:"load_ms"`
@@ -73,8 +73,9 @@ func LoadConfig(projectRoot string) (*Config, error) {
 		if m.MaxConcurrent < 1 {
 			m.MaxConcurrent = 1
 		}
-		if m.MaxInstances < 1 {
-			m.MaxInstances = 1
+		if m.MaxInstances == nil {
+			one := 1
+			m.MaxInstances = &one
 		}
 		if m.KeepAliveSec == 0 {
 			m.KeepAliveSec = 300

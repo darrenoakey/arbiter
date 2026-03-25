@@ -128,7 +128,7 @@ func main() {
 // setupInstances creates Instance objects for all configured models.
 func setupInstances(cfg *Config, mgr *InstanceManager, pythonBin, projectRoot string) {
 	for modelID, modelCfg := range cfg.Models {
-		n := modelCfg.MaxInstances
+		n := *modelCfg.MaxInstances
 		for i := 0; i < n; i++ {
 			instanceID := modelID
 			if n > 1 {

@@ -66,7 +66,7 @@ func (s *Scheduler) getFullModels() map[string]bool {
 	full := make(map[string]bool)
 	for modelID, cfg := range s.config.Models {
 		active, _ := s.store.CountActive(modelID)
-		capacity := cfg.MaxInstances * cfg.MaxConcurrent
+		capacity := *cfg.MaxInstances * cfg.MaxConcurrent
 		if active >= capacity {
 			full[modelID] = true
 		}
