@@ -102,6 +102,7 @@ func (a *API) updatePSCache() {
 				m["queued_jobs"] = modelCounts["queued"]
 				if cfg, ok := a.config.Models[id]; ok {
 					m["max_instances"] = *cfg.MaxInstances
+				m["max_concurrent"] = cfg.MaxConcurrent
 				}
 			}
 		}
@@ -541,58 +542,76 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		MaxInstances int `json:"max_instances"`
+		MaxInstances *int `json:"max_instances"`
+		MaxConcurrent *int `json:"max_concurrent"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	if req.MaxInstances < 0 {
+	if req.MaxInstances != nil && *req.MaxInstances < 0 {
 		writeError(w, 400, "max_instances must be >= 0")
 		return
 	}
-
-	oldMax := *cfg.MaxInstances
-	newMax := req.MaxInstances
-
-	if newMax == oldMax {
-		writeJSON(w, 200, map[string]any{
-			"model_id":               modelID,
-			"max_instances":          newMax,
-			"previous_max_instances": oldMax,
-			"added": 0, "removed": 0, "condemned": 0,
-		})
+	if req.MaxConcurrent != nil && *req.MaxConcurrent < 1 {
+		writeError(w, 400, "max_concurrent must be >= 1")
 		return
 	}
 
-	// Update in-memory config FIRST so scheduler sees new capacity immediately
-	cfg.MaxInstances = &newMax
-	a.config.Models[modelID] = cfg
+	result := map[string]any{"model_id": modelID}
+	changed := false
 
-	// Scale instances
-	result := a.mgr.ScaleModel(modelID, newMax, cfg)
-
-	// Persist to config file
-	if err := SaveModelConfigField(a.projectRoot, modelID, "max_instances", newMax); err != nil {
-		slog.Error("failed to persist config", "error", err)
-		// Non-fatal: in-memory change is already applied
+	// Handle max_concurrent change
+	if req.MaxConcurrent != nil {
+		oldConc := cfg.MaxConcurrent
+		newConc := *req.MaxConcurrent
+		if newConc != oldConc {
+			cfg.MaxConcurrent = newConc
+			a.config.Models[modelID] = cfg
+			// Update all live instances
+			for _, inst := range a.mgr.GetModelInstances(modelID) {
+				inst.MaxConcurrent = newConc
+			}
+			SaveModelConfigField(a.projectRoot, modelID, "max_concurrent", newConc)
+			result["max_concurrent"] = newConc
+			result["previous_max_concurrent"] = oldConc
+			changed = true
+			a.logger.Log("model.concurrency_changed", map[string]any{
+				"model_id": modelID, "old": oldConc, "new": newConc,
+			})
+		}
 	}
 
-	// Rescore
-	a.scheduler.rescoreModel(modelID)
+	// Handle max_instances change
+	if req.MaxInstances != nil {
+		oldMax := *cfg.MaxInstances
+		newMax := *req.MaxInstances
+		if newMax != oldMax {
+			cfg.MaxInstances = req.MaxInstances
+			a.config.Models[modelID] = cfg
+			scaleResult := a.mgr.ScaleModel(modelID, newMax, cfg)
+			SaveModelConfigField(a.projectRoot, modelID, "max_instances", newMax)
+			a.scheduler.rescoreModel(modelID)
+			result["max_instances"] = newMax
+			result["previous_max_instances"] = oldMax
+			result["added"] = scaleResult["added"]
+			result["removed"] = scaleResult["removed"]
+			result["condemned"] = scaleResult["condemned"]
+			changed = true
+			a.logger.Log("model.scaled", map[string]any{
+				"model_id":          modelID,
+				"old_max_instances": oldMax,
+				"new_max_instances": newMax,
+				"added":             scaleResult["added"],
+				"removed":           scaleResult["removed"],
+				"condemned":         scaleResult["condemned"],
+			})
+		}
+	}
 
-	a.logger.Log("model.scaled", map[string]any{
-		"model_id":          modelID,
-		"old_max_instances": oldMax,
-		"new_max_instances": newMax,
-		"added":             result["added"],
-		"removed":           result["removed"],
-		"condemned":         result["condemned"],
-	})
-
-	result["model_id"] = modelID
-	result["max_instances"] = newMax
-	result["previous_max_instances"] = oldMax
+	if !changed {
+		result["message"] = "no changes"
+	}
 	writeJSON(w, 200, result)
 }
 
