@@ -17,7 +17,9 @@ type ModelConfig struct {
 	LoadMs         float64 `json:"load_ms"`
 	AutoDownload   string  `json:"auto_download"`
 	ModelPath      string  `json:"model_path"`
-	Group          bool    `json:"group"`
+	Group          bool              `json:"group"`
+	WorkerCmd      []string          `json:"worker_cmd,omitempty"`
+	AdapterParams  map[string]string `json:"adapter_params,omitempty"`
 }
 
 type Config struct {

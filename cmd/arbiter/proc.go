@@ -42,8 +42,10 @@ type Instance struct {
 	// Background reader goroutine
 	readerDone chan struct{}
 
-	pythonBin  string
+	pythonBin   string
 	projectRoot string
+	workerCmd   []string   // custom worker command (overrides python)
+	workerEnv   []string   // extra env vars for worker
 }
 
 // WorkerResponse is the JSON response from the Python worker.
@@ -100,9 +102,17 @@ func (inst *Instance) Spawn() error {
 	inst.state = "starting"
 	slog.Info("spawning adapter subprocess", "instance", inst.InstanceID, "model", inst.ModelID)
 
-	cmd := exec.Command(inst.pythonBin, "-m", "arbiter.worker_main", inst.ModelID)
+	var cmd *exec.Cmd
+	if len(inst.workerCmd) > 0 {
+		cmd = exec.Command(inst.workerCmd[0], inst.workerCmd[1:]...)
+	} else {
+		cmd = exec.Command(inst.pythonBin, "-m", "arbiter.worker_main", inst.ModelID)
+	}
 	cmd.Dir = inst.projectRoot
 	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1")
+	for _, e := range inst.workerEnv {
+		cmd.Env = append(cmd.Env, e)
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -1176,6 +1186,14 @@ func (m *InstanceManager) ScaleModel(modelID string, newCount int, cfg ModelConf
 				cfg.MemoryGB,
 				m.pythonBin, m.projectRoot,
 			)
+			if len(cfg.WorkerCmd) > 0 {
+				inst.workerCmd = cfg.WorkerCmd
+			}
+			if cfg.AdapterParams != nil {
+				for k, v := range cfg.AdapterParams {
+					inst.workerEnv = append(inst.workerEnv, k+"="+v)
+				}
+			}
 			m.Register(inst)
 			result["added"] = result["added"].(int) + 1
 			slog.Info("instance added", "model", modelID, "instance", instanceID)

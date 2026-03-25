@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,6 +63,10 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("PATCH /v1/models/{model_id}", a.updateModel)
 	mux.HandleFunc("DELETE /v1/models/{model_id}/queue", a.clearModelQueue)
 	mux.HandleFunc("DELETE /v1/models/{model_id}/running", a.killModelRunning)
+	mux.HandleFunc("POST /v1/llm/models", a.registerLLM)
+	mux.HandleFunc("GET /v1/llm/models", a.listLLMs)
+	mux.HandleFunc("DELETE /v1/llm/models/{name}", a.deregisterLLM)
+	mux.HandleFunc("POST /v1/chat/completions", a.chatCompletion)
 	mux.HandleFunc("GET /v1/health", a.health)
 	return withLogging(mux)
 }
@@ -646,6 +651,315 @@ func (a *API) killModelRunning(w http.ResponseWriter, r *http.Request) {
 		"cancelled_queued":  cancelledQueued,
 		"cancelled_running": cancelledRunning,
 	})
+}
+
+// --- LLM Management ---
+
+func llmModelID(name string) string {
+	return "llm:" + name
+}
+
+func llmWorkerBin(projectRoot string) string {
+	// Try built binary first
+	bin := filepath.Join(projectRoot, "llm-worker")
+	if _, err := os.Stat(bin); err == nil {
+		return bin
+	}
+	return "llm-worker" // hope it's in PATH
+}
+
+func estimateMemoryGB(totalParams int64) float64 {
+	// fp16: 2 bytes per param + 20% overhead, rounded up to nearest 5GB
+	gb := float64(totalParams) * 2.0 / (1024 * 1024 * 1024) * 1.2
+	return math.Ceil(gb/5) * 5
+}
+
+func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		HFModel    string  `json:"hf_model"`    // e.g., "unsloth/gpt-oss-20b-GGUF"
+		HFFile     string  `json:"hf_file"`     // e.g., "gpt-oss-20b-Q8_0.gguf"
+		ModelPath  string  `json:"model_path"`  // alternative: local GGUF path
+		Name       string  `json:"name"`        // short name (auto-derived if empty)
+		MemoryGB   float64 `json:"memory_gb"`   // VRAM estimate (auto if 0)
+		CtxSize    int     `json:"ctx_size"`    // context size (default 8192)
+		GPULayers  int     `json:"gpu_layers"`  // -1 = all (default)
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if req.HFModel == "" && req.ModelPath == "" {
+		writeError(w, 400, "hf_model or model_path required")
+		return
+	}
+
+	// Derive name
+	name := req.Name
+	if name == "" {
+		if req.HFModel != "" {
+			parts := strings.Split(req.HFModel, "/")
+			name = parts[len(parts)-1]
+			// Strip -GGUF suffix
+			name = strings.TrimSuffix(name, "-GGUF")
+			name = strings.TrimSuffix(name, "-gguf")
+		} else {
+			// Use filename without extension
+			base := filepath.Base(req.ModelPath)
+			name = strings.TrimSuffix(base, filepath.Ext(base))
+		}
+	}
+
+	modelID := llmModelID(name)
+
+	// Check if already registered
+	if _, ok := a.config.Models[modelID]; ok {
+		writeJSON(w, 200, map[string]any{
+			"model_id": modelID,
+			"name":     name,
+			"status":   "already_registered",
+		})
+		return
+	}
+
+	// Estimate memory if not provided
+	memGB := req.MemoryGB
+	if memGB == 0 {
+		// Default conservative estimate: 45GB for a 20B model
+		memGB = 45
+		slog.Warn("no memory_gb specified for LLM, using default", "model", name, "memory_gb", memGB)
+	}
+
+	// Build adapter params (env vars for the worker)
+	adapterParams := make(map[string]string)
+	if req.HFModel != "" {
+		adapterParams["LLM_HF_REPO"] = req.HFModel
+	}
+	if req.HFFile != "" {
+		adapterParams["LLM_HF_FILE"] = req.HFFile
+	}
+	if req.ModelPath != "" {
+		adapterParams["LLM_MODEL_PATH"] = req.ModelPath
+	}
+	ctx := req.CtxSize
+	if ctx == 0 {
+		ctx = 8192
+	}
+	adapterParams["LLM_CTX_SIZE"] = strconv.Itoa(ctx)
+	gpuLayers := req.GPULayers
+	if gpuLayers == 0 {
+		gpuLayers = -1
+	}
+	adapterParams["LLM_GPU_LAYERS"] = strconv.Itoa(gpuLayers)
+
+	// Register in config
+	one := 1
+	cfg := ModelConfig{
+		MemoryGB:       memGB,
+		MaxConcurrent:  1,
+		MaxInstances:   &one,
+		KeepAliveSec:   3600,
+		AvgInferenceMs: 5000,
+		LoadMs:         120000, // LLMs can take a while to download + load
+		WorkerCmd:      []string{llmWorkerBin(a.projectRoot)},
+		AdapterParams:  adapterParams,
+	}
+	a.config.Models[modelID] = cfg
+
+	// Register job type mapping
+	JobTypeToModel["chat-completion:"+name] = modelID
+
+	// Create instance
+	result := a.mgr.ScaleModel(modelID, 1, cfg)
+
+	// Persist
+	if err := SaveModelConfigField(a.projectRoot, modelID, "memory_gb", memGB); err != nil {
+		slog.Error("failed to persist LLM config", "error", err)
+	}
+	// Save all config fields for the LLM
+	cfgMap := map[string]any{
+		"memory_gb":        memGB,
+		"max_concurrent":   1,
+		"max_instances":    1,
+		"keep_alive_seconds": 3600,
+		"avg_inference_ms": 5000,
+		"load_ms":          120000,
+		"worker_cmd":       cfg.WorkerCmd,
+		"adapter_params":   adapterParams,
+	}
+	// Write full model config
+	data := make(map[string]any)
+	cfgPath := filepath.Join(a.projectRoot, "local", "config.json")
+	if raw, err := os.ReadFile(cfgPath); err == nil {
+		json.Unmarshal(raw, &data)
+	}
+	models, _ := data["models"].(map[string]any)
+	if models == nil {
+		models = make(map[string]any)
+		data["models"] = models
+	}
+	models[modelID] = cfgMap
+	out, _ := json.MarshalIndent(data, "", "  ")
+	os.WriteFile(cfgPath, append(out, '\n'), 0o644)
+
+	a.scheduler.rescoreModel(modelID)
+
+	a.logger.Log("llm.registered", map[string]any{
+		"model_id":  modelID,
+		"name":      name,
+		"hf_model":  req.HFModel,
+		"memory_gb": memGB,
+	})
+
+	writeJSON(w, 201, map[string]any{
+		"model_id":  modelID,
+		"name":      name,
+		"memory_gb": memGB,
+		"status":    "registered",
+		"added":     result["added"],
+	})
+}
+
+func (a *API) listLLMs(w http.ResponseWriter, r *http.Request) {
+	var llms []map[string]any
+	for id, cfg := range a.config.Models {
+		if !strings.HasPrefix(id, "llm:") {
+			continue
+		}
+		name := strings.TrimPrefix(id, "llm:")
+		entry := map[string]any{
+			"model_id":      id,
+			"name":          name,
+			"memory_gb":     cfg.MemoryGB,
+			"max_instances": *cfg.MaxInstances,
+		}
+		if cfg.AdapterParams != nil {
+			if hf, ok := cfg.AdapterParams["LLM_HF_REPO"]; ok {
+				entry["hf_model"] = hf
+			}
+			if hf, ok := cfg.AdapterParams["LLM_HF_FILE"]; ok {
+				entry["hf_file"] = hf
+			}
+		}
+		llms = append(llms, entry)
+	}
+	if llms == nil {
+		llms = []map[string]any{}
+	}
+	writeJSON(w, 200, llms)
+}
+
+func (a *API) deregisterLLM(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	modelID := llmModelID(name)
+
+	if _, ok := a.config.Models[modelID]; !ok {
+		writeError(w, 404, fmt.Sprintf("LLM not registered: %s", name))
+		return
+	}
+
+	// Scale to 0 (kills instances)
+	zero := 0
+	cfg := a.config.Models[modelID]
+	cfg.MaxInstances = &zero
+	a.config.Models[modelID] = cfg
+	a.mgr.ScaleModel(modelID, 0, cfg)
+
+	// Remove from config
+	delete(a.config.Models, modelID)
+	delete(JobTypeToModel, "chat-completion:"+name)
+
+	// Remove from config file
+	cfgPath := filepath.Join(a.projectRoot, "local", "config.json")
+	if raw, err := os.ReadFile(cfgPath); err == nil {
+		var data map[string]any
+		if json.Unmarshal(raw, &data) == nil {
+			if models, ok := data["models"].(map[string]any); ok {
+				delete(models, modelID)
+				out, _ := json.MarshalIndent(data, "", "  ")
+				os.WriteFile(cfgPath, append(out, '\n'), 0o644)
+			}
+		}
+	}
+
+	a.logger.Log("llm.deregistered", map[string]any{"model_id": modelID, "name": name})
+	writeJSON(w, 200, map[string]any{"model_id": modelID, "name": name, "status": "deregistered"})
+}
+
+func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
+	// Parse just the model field first
+	var req struct {
+		Model string `json:"model"`
+	}
+	body, _ := io.ReadAll(r.Body)
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if req.Model == "" {
+		writeError(w, 400, "model field required")
+		return
+	}
+
+	// Find the LLM model
+	modelID := llmModelID(req.Model)
+	if _, ok := a.config.Models[modelID]; !ok {
+		writeError(w, 404, fmt.Sprintf("LLM not registered: %s (register via POST /v1/llm/models)", req.Model))
+		return
+	}
+
+	// Submit as an arbiter job
+	priority := a.scheduler.computePriority(modelID)
+	job, err := a.store.CreateJob(modelID, "chat-completion:"+req.Model, json.RawMessage(body), priority)
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("create job: %s", err))
+		return
+	}
+	a.scheduler.Wake()
+
+	// Wait for completion (synchronous)
+	timeout := time.After(5 * time.Minute)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout:
+			writeError(w, 504, "chat completion timed out")
+			return
+		case <-ticker.C:
+			j, _ := a.store.GetJob(job.ID)
+			if j == nil {
+				continue
+			}
+			switch j.State {
+			case "completed":
+				if j.Result != nil {
+					var result map[string]any
+					json.Unmarshal(*j.Result, &result)
+					// Return the OpenAI response directly
+					if resp, ok := result["response"]; ok {
+						w.Header().Set("Content-Type", "application/json")
+						if raw, ok := resp.(json.RawMessage); ok {
+							w.Write(raw)
+						} else {
+							json.NewEncoder(w).Encode(resp)
+						}
+						return
+					}
+					writeJSON(w, 200, result)
+					return
+				}
+				writeJSON(w, 200, map[string]any{"error": "no result"})
+				return
+			case "failed":
+				writeError(w, 500, j.Error)
+				return
+			case "cancelled":
+				writeError(w, 499, "request cancelled")
+				return
+			}
+		}
+	}
 }
 
 func (a *API) health(w http.ResponseWriter, r *http.Request) {

@@ -141,6 +141,14 @@ func setupInstances(cfg *Config, mgr *InstanceManager, pythonBin, projectRoot st
 				modelCfg.MemoryGB,
 				pythonBin, projectRoot,
 			)
+			if len(modelCfg.WorkerCmd) > 0 {
+				inst.workerCmd = modelCfg.WorkerCmd
+			}
+			if modelCfg.AdapterParams != nil {
+				for k, v := range modelCfg.AdapterParams {
+					inst.workerEnv = append(inst.workerEnv, k+"="+v)
+				}
+			}
 			mgr.Register(inst)
 		}
 		if n > 1 {
