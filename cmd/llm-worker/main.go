@@ -186,6 +186,7 @@ func proxyChat(reqID string, params json.RawMessage) Response {
 		Choices []struct {
 			Message struct {
 				Content string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
 				Role    string `json:"role"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
@@ -204,7 +205,12 @@ func proxyChat(reqID string, params json.RawMessage) Response {
 		"response": json.RawMessage(body), // full OpenAI response
 	}
 	if len(chatResp.Choices) > 0 {
-		result["text"] = chatResp.Choices[0].Message.Content
+		text := chatResp.Choices[0].Message.Content
+		if text == "" && chatResp.Choices[0].Message.ReasoningContent != "" {
+			text = chatResp.Choices[0].Message.ReasoningContent
+			result["reasoning"] = true
+		}
+		result["text"] = text
 		result["finish_reason"] = chatResp.Choices[0].FinishReason
 	}
 	result["usage"] = chatResp.Usage

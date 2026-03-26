@@ -123,6 +123,23 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	modelID, ok := JobTypeToModel[req.Type]
+	if !ok && req.Type == "chat-completion" {
+		// Generic chat-completion: resolve model from params
+		var chatParams struct {
+			Model string `json:"model"`
+		}
+		json.Unmarshal(req.Params, &chatParams)
+		if chatParams.Model == "" {
+			writeError(w, 400, "chat-completion requires model in params")
+			return
+		}
+		modelID = llmModelID(chatParams.Model)
+		if _, exists := a.config.Models[modelID]; !exists {
+			writeError(w, 404, fmt.Sprintf("LLM not registered: %s", chatParams.Model))
+			return
+		}
+		ok = true
+	}
 	if !ok {
 		writeError(w, 400, fmt.Sprintf("unknown job type: %s", req.Type))
 		return
@@ -905,7 +922,6 @@ func (a *API) deregisterLLM(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
-	// Parse just the model field first
 	var req struct {
 		Model string `json:"model"`
 	}
@@ -919,16 +935,15 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Find the LLM model
 	modelID := llmModelID(req.Model)
 	if _, ok := a.config.Models[modelID]; !ok {
 		writeError(w, 404, fmt.Sprintf("LLM not registered: %s (register via POST /v1/llm/models)", req.Model))
 		return
 	}
 
-	// Submit as an arbiter job
+	// Thin wrapper: submit as a regular arbiter job and wait synchronously
 	priority := a.scheduler.computePriority(modelID)
-	job, err := a.store.CreateJob(modelID, "chat-completion:"+req.Model, json.RawMessage(body), priority)
+	job, err := a.store.CreateJob(modelID, "chat-completion", json.RawMessage(body), priority)
 	if err != nil {
 		writeError(w, 500, fmt.Sprintf("create job: %s", err))
 		return
