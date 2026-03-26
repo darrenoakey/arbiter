@@ -322,3 +322,7 @@ print(status["error"])
 **The server won't start.** Make sure you're in the right directory and your virtual environment is active. Try `./run health` — if you get a connection error, the server isn't running yet.
 
 **I want to see what's happening.** Logs are saved daily to `output/logs/arbiter-YYYY-MM-DD.jsonl`. Each line is a structured event (job submitted, model loaded, inference completed, etc.) that you can grep or tail as needed.
+
+## License
+
+This project is licensed under [CC BY-NC 4.0](https://darren-static.waft.dev) - free to use and modify, but no commercial use without permission.
