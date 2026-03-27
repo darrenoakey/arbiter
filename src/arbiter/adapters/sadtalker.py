@@ -1,8 +1,7 @@
 """SadTalker talking-head video generation adapter (in-process).
 
-Loads CropAndExtract, Audio2Coeff, and AnimateFromCoeff_PIRender in-process
-and keeps them on GPU. Supports both 256px and 512px via separate checkpoints.
-Inference runs the full pipeline without spawning subprocesses.
+Loads sub-models for both 256px (pirender) and 512px (facevid2vid) and keeps
+them on GPU. Inference runs the full pipeline without spawning subprocesses.
 """
 from __future__ import annotations
 
@@ -24,8 +23,6 @@ log = logging.getLogger(__name__)
 SADTALKER_DIR = Path("/home/darren/src/talking-head/local-sadtalker")
 SADTALKER_CHECKPOINTS = SADTALKER_DIR / "checkpoints"
 
-SUPPORTED_SIZES = [256, 512]
-
 
 def _patch_numpy_compat():
     """Monkey-patch numpy 2.x to restore attributes removed in 2.0."""
@@ -39,11 +36,17 @@ def _patch_numpy_compat():
 
 
 def _add_sadtalker_to_path():
-    """Add SadTalker repo to sys.path and patch numpy compat."""
     _patch_numpy_compat()
     d = str(SADTALKER_DIR)
     if d not in sys.path:
         sys.path.insert(0, d)
+
+
+# Size -> renderer mapping. PIRender only works at 256; facevid2vid for 512.
+SIZE_RENDERER = {
+    256: "pirender",
+    512: "facevid2vid",
+}
 
 
 @register
@@ -51,11 +54,11 @@ class SadTalkerAdapter(ModelAdapter):
     model_id = "sadtalker"
 
     def __init__(self):
-        self._models = {}  # size -> {preprocess, audio2coeff, animate, paths}
+        self._models = {}  # size -> {preprocess, audio2coeff, animate, paths, renderer}
         self._device = None
 
     def load(self, device: str = "cuda") -> None:
-        """Load SadTalker sub-models for all supported sizes."""
+        """Load SadTalker sub-models for all available sizes."""
         log.info("Loading SadTalker sub-models on %s ...", device)
 
         _add_sadtalker_to_path()
@@ -64,10 +67,11 @@ class SadTalkerAdapter(ModelAdapter):
         from src.utils.preprocess import CropAndExtract
         from src.test_audio2coeff import Audio2Coeff
         from src.facerender.pirender_animate import AnimateFromCoeff_PIRender
+        from src.facerender.animate import AnimateFromCoeff as AnimateFromCoeff_FaceVid2Vid
 
         config_dir = str(SADTALKER_DIR / "src" / "config")
 
-        for size in SUPPORTED_SIZES:
+        for size, renderer in SIZE_RENDERER.items():
             ckpt = SADTALKER_CHECKPOINTS / f"SadTalker_V0.0.2_{size}.safetensors"
             if not ckpt.exists():
                 log.warning("Checkpoint missing for %dpx: %s — skipping", size, ckpt)
@@ -78,16 +82,22 @@ class SadTalkerAdapter(ModelAdapter):
                     str(SADTALKER_CHECKPOINTS), config_dir,
                     size=size, old_version=False, preprocess="crop",
                 )
+
+                if renderer == "pirender":
+                    animate = AnimateFromCoeff_PIRender(paths, device)
+                else:
+                    animate = AnimateFromCoeff_FaceVid2Vid(paths, device)
+
                 self._models[size] = {
                     "preprocess": CropAndExtract(paths, device),
                     "audio2coeff": Audio2Coeff(paths, device),
-                    "animate": AnimateFromCoeff_PIRender(paths, device),
+                    "animate": animate,
                     "paths": paths,
+                    "renderer": renderer,
                 }
-                log.info("  %dpx models loaded.", size)
+                log.info("  %dpx (%s) loaded.", size, renderer)
             except Exception as exc:
-                log.error("Failed to load %dpx models: %s", size, exc)
-                # Clean up partial load for this size
+                log.error("Failed to load %dpx: %s", size, exc)
                 self._models.pop(size, None)
 
         if not self._models:
@@ -98,12 +108,11 @@ class SadTalkerAdapter(ModelAdapter):
         log.info("SadTalker ready (%s). Sizes: %s", device, sorted(self._models.keys()))
 
     def unload(self) -> None:
-        """Release all SadTalker sub-models and free GPU memory."""
         log.info("Unloading SadTalker.")
         self._cleanup()
 
     def _cleanup(self):
-        for size, m in list(self._models.items()):
+        for m in self._models.values():
             for key in ("preprocess", "audio2coeff", "animate"):
                 obj = m.get(key)
                 if obj is not None:
@@ -124,21 +133,20 @@ class SadTalkerAdapter(ModelAdapter):
         output_dir: Path,
         cancel_flag: threading.Event,
     ) -> dict:
-        """Generate a talking-head video using loaded SadTalker models.
+        """Generate a talking-head video.
 
         params:
             image / image_file: portrait image
             audio / audio_file: driving audio
-            size: render size (256 or 512, default 256)
+            size: 256 (pirender, fast) or 512 (facevid2vid, higher res). Default 256.
             expression_scale: float (default 1.0)
             preprocess: crop, resize, full (default crop)
         """
         if not self._models:
-            raise InferenceError("SadTalker not loaded (call load first)")
+            raise InferenceError("SadTalker not loaded")
 
         self._check_cancel(cancel_flag)
 
-        # Resolve inputs
         try:
             image_bytes = self._resolve_media(params, "image")
         except Exception as e:
@@ -149,13 +157,31 @@ class SadTalkerAdapter(ModelAdapter):
             raise InferenceError(f"Failed to resolve audio: {e}") from e
 
         size = int(params.get("size", 256))
+
+        # Allow explicit facerender override, otherwise auto-select
+        renderer = params.get("facerender")
+        if renderer and renderer not in ("pirender", "facevid2vid"):
+            raise InferenceError(f"Unknown facerender: {renderer}")
+
+        if not renderer:
+            renderer = SIZE_RENDERER.get(size, "pirender")
+
+        # Find the right model set — match by size
         if size not in self._models:
             available = sorted(self._models.keys())
-            raise InferenceError(
-                f"Size {size} not loaded. Available: {available}"
-            )
+            raise InferenceError(f"Size {size} not loaded. Available: {available}")
 
         models = self._models[size]
+
+        # Warn if renderer doesn't match what was loaded for this size
+        if renderer != models["renderer"]:
+            log.warning(
+                "Requested facerender=%s but %dpx loaded with %s. "
+                "Using loaded renderer.",
+                renderer, size, models["renderer"],
+            )
+            renderer = models["renderer"]
+
         expression_scale = float(params.get("expression_scale", 1.0))
         preprocess = params.get("preprocess", "crop")
         still = params.get("still", False)
@@ -180,7 +206,6 @@ class SadTalkerAdapter(ModelAdapter):
             from src.generate_batch import get_data
             from src.generate_facerender_batch import get_facerender_data
 
-            # Step 1: 3DMM extraction
             log.info("SadTalker: 3DMM extraction (size=%d)", size)
             first_frame_dir = os.path.join(save_dir, "first_frame_dir")
             os.makedirs(first_frame_dir, exist_ok=True)
@@ -194,7 +219,6 @@ class SadTalkerAdapter(ModelAdapter):
 
             self._check_cancel(cancel_flag)
 
-            # Step 2: Audio -> coefficients
             log.info("SadTalker: audio2coeff")
             batch = get_data(
                 first_coeff_path, tmp_audio, self._device,
@@ -206,13 +230,12 @@ class SadTalkerAdapter(ModelAdapter):
 
             self._check_cancel(cancel_flag)
 
-            # Step 3: Coefficients -> video
-            log.info("SadTalker: face rendering (size=%d, batch=%d)", size, batch_size)
+            log.info("SadTalker: rendering %dpx (%s)", size, renderer)
             data = get_facerender_data(
                 coeff_path, crop_pic_path, first_coeff_path, tmp_audio,
                 batch_size, expression_scale=expression_scale,
                 still_mode=still, preprocess=preprocess,
-                size=size, facemodel="pirender",
+                size=size, facemodel=renderer,
             )
             result_path = models["animate"].generate(
                 data, save_dir, tmp_image, crop_info,
@@ -229,7 +252,6 @@ class SadTalkerAdapter(ModelAdapter):
                 else:
                     raise InferenceError("SadTalker produced no output video")
 
-            # Copy to arbiter output dir
             output_dir = Path(output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
             out_path = output_dir / "result.mp4"
