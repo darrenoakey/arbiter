@@ -77,6 +77,12 @@ func main() {
 	// Dedup cache
 	store.InitDedup()
 
+	// Re-populate dedup cache from queued jobs and remove duplicates
+	deduped := store.DedupRecoveredJobs()
+	if deduped > 0 {
+		slog.Info("deduped recovered jobs", "removed", deduped)
+	}
+
 	// Scheduler
 	sched := NewScheduler(cfg, store, mgr, eventLog, outputDir)
 

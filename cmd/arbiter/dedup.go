@@ -237,3 +237,53 @@ func (s *Store) ResolveFollowers(originalJobID string, originalState string, res
 	}
 	return len(followers)
 }
+
+// DedupRecoveredJobs scans all queued jobs after crash recovery,
+// populates the dedup cache, and cancels duplicate jobs on the queue.
+func (s *Store) DedupRecoveredJobs() int {
+	s.mu.Lock()
+	rows, err := s.db.Query(
+		"SELECT id, job_type, payload FROM jobs WHERE state = 'queued' ORDER BY created_at ASC",
+	)
+	s.mu.Unlock()
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+
+	type queuedJob struct {
+		id      string
+		jobType string
+		payload json.RawMessage
+	}
+	var jobs []queuedJob
+	for rows.Next() {
+		var j queuedJob
+		var payload string
+		rows.Scan(&j.id, &j.jobType, &payload)
+		j.payload = json.RawMessage(payload)
+		jobs = append(jobs, j)
+	}
+
+	seen := make(map[string]string) // hash -> first job_id
+	removed := 0
+	now := nowTS()
+
+	for _, j := range jobs {
+		hash := computeJobHash(j.jobType, j.payload)
+		if firstID, exists := seen[hash]; exists {
+			// Duplicate — cancel it
+			s.mu.Lock()
+			s.db.Exec(
+				"UPDATE jobs SET state = 'cancelled', finished_at = ?, error = ? WHERE id = ?",
+				now, "dedup: duplicate of "+firstID, j.id,
+			)
+			s.mu.Unlock()
+			removed++
+		} else {
+			seen[hash] = j.id
+			s.DedupRegister(hash, j.id)
+		}
+	}
+	return removed
+}
