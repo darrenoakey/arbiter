@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -88,38 +89,50 @@ func (s *Scheduler) getFullModels() map[string]bool {
 	return full
 }
 
-// ensureLoaded makes sure an instance is loaded, using two-tier VRAM budget.
-// Strategy: try soft limit first, then evict idle, then burst (condemn active).
+// ensureLoaded makes sure an instance is loaded within the VRAM budget.
+// Strategy: try reserve, evict idle if needed, retry.
 func (s *Scheduler) ensureLoaded(inst *Instance) error {
 	state := inst.State()
 	if state == "loaded" {
 		return nil
 	}
 
-	// Need to load — check VRAM budget
+	if state == "loading" {
+		slog.Info("ensureLoaded: already loading", "instance", inst.InstanceID)
+		return fmt.Errorf("instance %s is already loading", inst.InstanceID)
+	}
+
 	if state == "stopped" || state == "unloaded" || state == "error" {
 		needed := inst.memoryGB
+		freeGB := s.mgr.FreeGB()
 
-		// Step 1: Try normal reserve (fits under soft limit)
+		slog.Info("ensureLoaded: need VRAM", "instance", inst.InstanceID,
+			"needed_gb", needed, "free_gb", freeGB, "state", state)
+
+		if state == "error" {
+			s.mgr.ReleaseMemory(needed)
+		}
+
+		// Try reserve
 		if !s.mgr.ReserveMemory(needed) {
-			// Step 2: Evict idle models
+			// Evict idle models
 			deficit := needed - s.mgr.FreeGB()
 			if deficit > 0 {
-				s.mgr.EvictForGB(deficit) // best effort
+				slog.Info("ensureLoaded: evicting idle models", "instance", inst.InstanceID, "deficit_gb", deficit)
+				s.mgr.EvictForGB(deficit)
 			}
 
-			// Step 3: Try reserve again
+			// Retry
 			if !s.mgr.ReserveMemory(needed) {
-				// Step 4: Try burst mode (condemn active instances, use hard limit)
-				if err := s.mgr.CondemnAndBurstReserve(needed); err != nil {
-					return fmt.Errorf("can't load %s: %w", inst.InstanceID, err)
-				}
-				// Burst reserve succeeded — memory is reserved under hard limit
-				goto doLoad
+				slog.Warn("ensureLoaded: can't reserve VRAM after eviction",
+					"instance", inst.InstanceID, "needed_gb", needed, "free_gb", s.mgr.FreeGB())
+				return fmt.Errorf("can't load %s: need %.1fGB, only %.1fGB free",
+					inst.InstanceID, needed, s.mgr.FreeGB())
 			}
 		}
 
-	doLoad:
+		slog.Info("ensureLoaded: VRAM reserved, loading model",
+			"instance", inst.InstanceID, "memory_gb", needed)
 		s.logger.Log("model.load_start", map[string]any{
 			"model_id":    inst.ModelID,
 			"instance_id": inst.InstanceID,
@@ -128,6 +141,7 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 
 		if err := inst.Load("cuda"); err != nil {
 			s.mgr.ReleaseMemory(inst.memoryGB)
+			slog.Error("ensureLoaded: load failed", "instance", inst.InstanceID, "error", err)
 			s.logger.Log("model.load_error", map[string]any{
 				"model_id":    inst.ModelID,
 				"instance_id": inst.InstanceID,
@@ -136,6 +150,7 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 			return err
 		}
 
+		slog.Info("ensureLoaded: model loaded successfully", "instance", inst.InstanceID)
 		s.logger.Log("model.load_done", map[string]any{
 			"model_id":    inst.ModelID,
 			"instance_id": inst.InstanceID,
@@ -156,11 +171,12 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance) {
 		s.rescoreModel(job.ModelID)
 	}()
 
-	s.logger.Log("job.scheduled", map[string]any{"job_id": job.ID, "model_id": job.ModelID})
+	slog.Info("dispatching job", "job_id", job.ID, "model", job.ModelID, "instance", inst.InstanceID)
+	s.logger.Log("job.scheduled", map[string]any{"job_id": job.ID, "model_id": job.ModelID, "instance_id": inst.InstanceID})
 
 	// Ensure loaded
 	if err := s.ensureLoaded(inst); err != nil {
-		slog.Warn("can't load instance, requeueing", "instance", inst.InstanceID, "error", err)
+		slog.Warn("can't load instance, requeueing", "instance", inst.InstanceID, "job", job.ID, "error", err)
 		s.store.UpdateState(job.ID, "queued")
 		// Cooldown: mark model as temporarily full to prevent scheduler spin
 		s.cooldownMu.Lock()
@@ -219,6 +235,25 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance) {
 		})
 	}
 
+	// Resolve any follower jobs
+	if resp != nil {
+		var finalState string
+		var finalResult *json.RawMessage
+		var finalErr string
+		if resp.Status == "cancelled" {
+			finalState = "cancelled"
+		} else if resp.Status == "error" {
+			finalState = "failed"
+			finalErr = resp.Error
+		} else {
+			finalState = "completed"
+			finalResult = &resp.Result
+		}
+		if n := s.store.ResolveFollowers(job.ID, finalState, finalResult, finalErr, s.outputDir); n > 0 {
+			slog.Info("resolved follower jobs", "original", job.ID, "followers", n, "state", finalState)
+		}
+	}
+
 	s.Wake() // check for more work
 }
 
@@ -240,7 +275,7 @@ func (s *Scheduler) tryPreload() {
 		return
 	}
 
-	if s.mgr.FreeGB() >= inst.memoryGB { // only preload if fits under soft limit
+	if s.mgr.FreeGB() >= inst.memoryGB { // only preload if fits under budget
 		slog.Debug("preloading", "instance", inst.InstanceID)
 		go func() {
 			if err := s.ensureLoaded(inst); err != nil {
@@ -281,9 +316,12 @@ func (s *Scheduler) Run(ctx context.Context) {
 		// don't race to pick the same instance
 		inst := s.mgr.PickInstance(job.ModelID)
 		if inst == nil {
+			slog.Debug("no instance available, requeueing", "job", job.ID, "model", job.ModelID)
 			s.store.UpdateState(job.ID, "queued")
 			continue
 		}
+		slog.Info("picked instance for job", "job", job.ID, "model", job.ModelID,
+			"instance", inst.InstanceID, "state", inst.State(), "active_jobs", inst.ActiveJobs())
 		// Reserve the slot immediately so PickInstance won't return it again
 		atomic.AddInt32(&inst.activeJobs, 1)
 
@@ -312,7 +350,15 @@ func (s *Scheduler) RunKeepalive(ctx context.Context) {
 		now := time.Now()
 		for modelID, cfg := range s.config.Models {
 			for _, inst := range s.mgr.GetModelInstances(modelID) {
-				if inst.State() != "loaded" || inst.ActiveJobs() > 0 {
+				st := inst.State()
+				active := inst.ActiveJobs()
+				if active > 0 {
+					continue // NEVER unload while active
+				}
+				if st == "loading" || st == "unloading" {
+					continue // NEVER touch loading/unloading instances
+				}
+				if st != "loaded" {
 					continue
 				}
 				la := inst.LastActive()
@@ -320,7 +366,9 @@ func (s *Scheduler) RunKeepalive(ctx context.Context) {
 					continue
 				}
 				if now.Sub(la) > time.Duration(cfg.KeepAliveSec)*time.Second {
-					slog.Info("keepalive evicting", "instance", inst.InstanceID)
+					idle := now.Sub(la).Seconds()
+					slog.Info("keepalive evicting", "instance", inst.InstanceID,
+						"idle_seconds", idle, "keep_alive_seconds", cfg.KeepAliveSec)
 					if err := inst.Unload(); err != nil {
 						slog.Error("keepalive unload failed", "instance", inst.InstanceID, "error", err)
 						continue

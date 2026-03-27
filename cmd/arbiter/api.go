@@ -115,6 +115,7 @@ func (a *API) updatePSCache() {
 func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Type   string          `json:"type"`
+		Model  string          `json:"model"`
 		Params json.RawMessage `json:"params"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -122,7 +123,20 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	modelID, ok := JobTypeToModel[req.Type]
+	// If explicit model provided and configured, use it; otherwise fall back to type mapping
+	var modelID string
+	var ok bool
+	if req.Model != "" {
+		if _, exists := a.config.Models[req.Model]; exists {
+			modelID = req.Model
+			ok = true
+		} else {
+			writeError(w, 404, fmt.Sprintf("model not configured: %s", req.Model))
+			return
+		}
+	} else {
+		modelID, ok = JobTypeToModel[req.Type]
+	}
 	if !ok && req.Type == "chat-completion" {
 		// Generic chat-completion: resolve model from params
 		var chatParams struct {
@@ -153,6 +167,62 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		req.Params = json.RawMessage("{}")
 	}
 
+	// --- Dedup check ---
+	var forceNew bool
+	{
+		var f struct{ Force bool `json:"force"` }
+		json.Unmarshal(req.Params, &f)
+		forceNew = f.Force
+	}
+	var dedupHash string
+	if !forceNew {
+		dedupHash = computeJobHash(req.Type, req.Params)
+		hash := dedupHash
+		if origID, err := a.store.DedupLookup(hash, 86400); err == nil && origID != "" {
+			origJob, _ := a.store.GetJob(origID)
+			if origJob != nil {
+				switch origJob.State {
+				case "completed":
+					// Instant cache hit — create pre-completed job
+					newJob, err := a.store.CreateJob(modelID, req.Type, req.Params, 0)
+					if err == nil {
+						origDir := filepath.Join(a.outputDir, "jobs", origID)
+						newDir := filepath.Join(a.outputDir, "jobs", newJob.ID)
+						os.Symlink(origDir, newDir)
+						if origJob.Result != nil {
+							a.store.UpdateState(newJob.ID, "completed", WithResult(*origJob.Result), WithFinishedAt(nowTS()))
+						}
+						a.logger.Log("job.dedup_hit", map[string]any{
+							"job_id": newJob.ID, "original_id": origID, "type": "cached",
+						})
+						writeJSON(w, 202, map[string]any{
+							"job_id": newJob.ID, "status": "completed",
+							"model": modelID, "cached": true,
+							"original_job_id": origID,
+						})
+						return
+					}
+				case "queued", "scheduled", "running":
+					// In-flight — create follower
+					follower, err := a.store.CreateFollowerJob(modelID, req.Type, req.Params, origID)
+					if err == nil {
+						a.logger.Log("job.dedup_hit", map[string]any{
+							"job_id": follower.ID, "original_id": origID, "type": "following",
+						})
+						writeJSON(w, 202, map[string]any{
+							"job_id": follower.ID, "status": "following",
+							"model": modelID,
+							"original_job_id": origID,
+						})
+						return
+					}
+				// failed/cancelled: fall through to create new job
+				}
+			}
+		}
+		// hash saved for dedup registration after job creation
+	}
+
 	priority := a.scheduler.computePriority(modelID)
 	job, err := a.store.CreateJob(modelID, req.Type, req.Params, priority)
 	if err != nil {
@@ -164,6 +234,10 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	estimated := cfg.AvgInferenceMs
 	if !a.mgr.IsLoaded(modelID) {
 		estimated += cfg.LoadMs
+	}
+
+	if dedupHash != "" {
+		a.store.DedupRegister(dedupHash, job.ID)
 	}
 
 	a.logger.Log("job.submitted", map[string]any{

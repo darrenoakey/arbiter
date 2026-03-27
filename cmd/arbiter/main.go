@@ -62,11 +62,7 @@ func main() {
 	}
 
 	// Instance manager
-	hardLimit := cfg.VRAMHardLimitGB
-	if hardLimit == 0 {
-		hardLimit = cfg.VRAMBudgetGB // backward compat: no burst
-	}
-	mgr := NewInstanceManager(cfg.VRAMBudgetGB, hardLimit, pythonBin, projectRoot)
+	mgr := NewInstanceManager(cfg.VRAMBudgetGB, pythonBin, projectRoot)
 	setupInstances(cfg, mgr, pythonBin, projectRoot)
 
 	// Register job type mappings for LLM models (restored from config)
@@ -77,6 +73,9 @@ func main() {
 			slog.Info("registered LLM job type", "type", "chat-completion:"+name, "model", modelID)
 		}
 	}
+
+	// Dedup cache
+	store.InitDedup()
 
 	// Scheduler
 	sched := NewScheduler(cfg, store, mgr, eventLog, outputDir)
@@ -91,6 +90,23 @@ func main() {
 	// Start background goroutines
 	go sched.Run(ctx)
 	go sched.RunKeepalive(ctx)
+
+	// Dedup cache cleanup (hourly)
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				n := store.DedupCleanup(86400)
+				if n > 0 {
+					slog.Info("dedup cache cleanup", "removed", n)
+				}
+			}
+		}
+	}()
 
 	done := make(chan struct{})
 	go func() {
