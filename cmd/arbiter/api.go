@@ -136,6 +136,16 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		modelID, ok = JobTypeToModel[req.Type]
+		// Also check for model inside params (callers may put it there)
+		if ok {
+			var pm struct{ Model string `json:"model"` }
+			json.Unmarshal(req.Params, &pm)
+			if pm.Model != "" {
+				if _, exists := a.config.Models[pm.Model]; exists {
+					modelID = pm.Model
+				}
+			}
+		}
 	}
 	if !ok && req.Type == "chat-completion" {
 		// Generic chat-completion: resolve model from params
