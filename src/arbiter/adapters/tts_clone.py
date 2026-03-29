@@ -1,10 +1,12 @@
 """Qwen3-TTS VoiceClone adapter."""
 from __future__ import annotations
 
-import base64
+import logging
 import tempfile
 import threading
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 from .base import ModelAdapter, LoadError, InferenceError
 from .registry import register
@@ -44,12 +46,23 @@ class TTSCloneAdapter(ModelAdapter):
         language = params.get("language", "English")
         temperature = params.get("temperature", 0.7)
 
-        # Write reference audio to a temp file for the model API
+        # Write reference audio to a temp file, trimmed to max 20s for ICL speed
+        MAX_REF_SECONDS = 20
         tmp_file = None
         try:
             tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             tmp_file.write(self._resolve_media(params, "ref_audio"))
             tmp_file.close()
+
+            # Trim if longer than MAX_REF_SECONDS
+            import soundfile as sf
+            data, sr = sf.read(tmp_file.name)
+            max_samples = MAX_REF_SECONDS * sr
+            if len(data) > max_samples:
+                orig_dur = len(data) / sr
+                data = data[:max_samples]
+                sf.write(tmp_file.name, data, sr)
+                log.info("Trimmed reference audio from %.1fs to %ds", orig_dur, MAX_REF_SECONDS)
 
             voice_clone_prompt = self._model.create_voice_clone_prompt(
                 ref_audio=tmp_file.name,
@@ -59,12 +72,17 @@ class TTSCloneAdapter(ModelAdapter):
 
             self._check_cancel(cancel_flag)
 
+            # Scale max_new_tokens to input text length.
+            # At 12Hz, ~2 tokens per word. Add headroom for pauses.
+            word_count = len(text.split())
+            max_tokens = min(max(word_count * 4, 60), 2048)
+
             wavs, sr = self._model.generate_voice_clone(
                 text=text,
                 language=language,
                 voice_clone_prompt=voice_clone_prompt,
-                temperature=temperature,
-                max_new_tokens=2048,
+                temperature=max(temperature, 0.3),  # floor at 0.3 for voice stability
+                max_new_tokens=max_tokens,
                 repetition_penalty=1.1,
                 top_p=0.9,
             )
