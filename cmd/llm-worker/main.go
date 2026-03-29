@@ -3,6 +3,7 @@
 // Speaks the Arbiter adapter protocol on stdin/stdout:
 //   {"cmd": "load", "device": "cuda"}       → start llama-server
 //   {"cmd": "infer", "req_id": "x", ...}    → proxy chat completion
+//   {"cmd": "get_port"}                      → return llama-server port
 //   {"cmd": "unload"}                        → stop llama-server
 //   {"cmd": "shutdown"}                      → exit
 //
@@ -17,6 +18,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -49,9 +51,11 @@ type Response struct {
 }
 
 var (
-	llamaCmd    *exec.Cmd
-	llamaPort   int
-	cancelFlag  bool
+	llamaCmd      *exec.Cmd
+	llamaPort     int
+	cancelFlag    bool
+	cancelCtx     context.Context
+	cancelFunc    context.CancelFunc
 )
 
 func respond(r Response) {
@@ -161,12 +165,26 @@ func stopLlamaServer() {
 	}
 }
 
+// stripStream removes the "stream" key from JSON params so llama-server
+// returns a single JSON response instead of SSE events.
+func stripStream(params json.RawMessage) json.RawMessage {
+	var m map[string]any
+	if err := json.Unmarshal(params, &m); err != nil {
+		return params
+	}
+	delete(m, "stream")
+	delete(m, "stream_options")
+	out, _ := json.Marshal(m)
+	return out
+}
+
 func proxyChat(reqID string, params json.RawMessage) Response {
 	url := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", llamaPort)
 
-	// params should contain messages, temperature, max_tokens, etc.
-	// Pass through as-is to llama-server's OpenAI-compatible endpoint
-	resp, err := http.Post(url, "application/json", bytes.NewReader(params))
+	// Strip stream from params — arbiter handles streaming separately
+	cleanParams := stripStream(params)
+
+	resp, err := http.Post(url, "application/json", bytes.NewReader(cleanParams))
 	if err != nil {
 		return Response{Status: "error", ReqID: reqID, Error: fmt.Sprintf("proxy error: %s", err)}
 	}
@@ -185,9 +203,9 @@ func proxyChat(reqID string, params json.RawMessage) Response {
 	var chatResp struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
 				ReasoningContent string `json:"reasoning_content"`
-				Role    string `json:"role"`
+				Role             string `json:"role"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -229,6 +247,9 @@ func main() {
 	go func() {
 		for range sigCh {
 			cancelFlag = true
+			if cancelFunc != nil {
+				cancelFunc()
+			}
 			log.Println("Cancel signal received")
 		}
 	}()
@@ -263,6 +284,10 @@ func main() {
 				resp = Response{Status: "cancelled", ReqID: req.ReqID}
 			}
 			respond(resp)
+
+		case "get_port":
+			portResult, _ := json.Marshal(map[string]any{"port": llamaPort})
+			respond(Response{Status: "ok", Result: portResult})
 
 		case "unload":
 			stopLlamaServer()
