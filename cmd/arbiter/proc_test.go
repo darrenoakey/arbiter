@@ -59,3 +59,34 @@ func TestReloadModelReplacesDispatchInstances(t *testing.T) {
 		}
 	}
 }
+
+func TestHardKillModelRecreatesConfiguredSlots(t *testing.T) {
+	mgr := NewInstanceManager(70, "python3", t.TempDir())
+	cfg := ModelConfig{
+		MemoryGB:      4,
+		MaxConcurrent: 1,
+		MaxInstances:  intPtr(2),
+	}
+
+	initial := mgr.ScaleModel("demo", 2, cfg)
+	if initial["added"].(int) != 2 {
+		t.Fatalf("initial scale added = %v, want 2", initial["added"])
+	}
+	before := modelInstanceIDs(mgr, "demo")
+
+	result := mgr.HardKillModel("demo", true, &cfg)
+	after := modelInstanceIDs(mgr, "demo")
+
+	if result["killed"].(int) != 2 {
+		t.Fatalf("hard kill killed = %v, want 2", result["killed"])
+	}
+	if result["recreated"].(int) != 2 {
+		t.Fatalf("hard kill recreated = %v, want 2", result["recreated"])
+	}
+	if len(after) != 2 {
+		t.Fatalf("dispatch instances after hard kill = %d, want 2", len(after))
+	}
+	if len(before) != len(after) {
+		t.Fatalf("instance count changed unexpectedly: before=%d after=%d", len(before), len(after))
+	}
+}

@@ -300,11 +300,18 @@ requests.patch(f"{ARBITER}/v1/models/tts-voxtral", json={
     "reload_workers": True,
 })
 
+# Hard-kill only one model's workers and recreate fresh slots
+requests.delete(f"{ARBITER}/v1/models/tts-voxtral/workers")
+
+# Remove a model completely
+requests.delete(f"{ARBITER}/v1/models/z-image-turbo?force=1")
+
 # Clear all queued jobs for a model
 requests.delete(f"{ARBITER}/v1/models/moondream/queue")
 ```
 
 When scaling down or reloading a single model, running jobs finish gracefully — only idle instances are removed immediately, and other adapters are not restarted.
+When you need a blunt instrument, `DELETE /v1/models/{id}/workers` force-kills just that adapter’s workers and rebuilds clean slots. `DELETE /v1/models/{id}?force=1` removes the adapter entirely.
 
 ---
 

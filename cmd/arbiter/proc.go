@@ -1215,6 +1215,45 @@ func (m *InstanceManager) ReloadModel(modelID string, targetCount int, cfg Model
 	return result
 }
 
+// HardKillModel forcefully terminates all worker processes for one model.
+// If recreate is true, fresh stopped instances are registered afterward using cfg.
+func (m *InstanceManager) HardKillModel(modelID string, recreate bool, cfg *ModelConfig) map[string]any {
+	m.mu.Lock()
+	currentIDs := make([]string, len(m.byModel[modelID]))
+	copy(currentIDs, m.byModel[modelID])
+	m.byModel[modelID] = []string{}
+	m.mu.Unlock()
+
+	result := map[string]any{"killed": 0, "recreated": 0}
+
+	for _, iid := range currentIDs {
+		m.mu.Lock()
+		inst := m.instances[iid]
+		delete(m.instances, iid)
+		delete(m.condemned, iid)
+		m.mu.Unlock()
+		if inst == nil {
+			continue
+		}
+
+		state := inst.State()
+		if state == "loaded" || state == "loading" || state == "unloading" {
+			m.ReleaseMemory(inst.memoryGB)
+		}
+		inst.Kill()
+		result["killed"] = result["killed"].(int) + 1
+		slog.Warn("instance hard killed", "model", modelID, "instance", iid, "state", state)
+	}
+
+	if recreate && cfg != nil && cfg.MaxInstances != nil && *cfg.MaxInstances > 0 {
+		m.EnsureModel(modelID)
+		scaleResult := m.ScaleModel(modelID, *cfg.MaxInstances, *cfg)
+		result["recreated"] = scaleResult["added"]
+	}
+
+	return result
+}
+
 // ReleaseAndCheck decrements activeJobs and checks if the instance is condemned
 // (either hard-condemned from scale-down or soft-condemned for VRAM pressure).
 // If condemned and now idle, evicts in a background goroutine.

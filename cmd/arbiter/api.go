@@ -80,8 +80,10 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/reserve/{id}", a.releaseReservation)
 	mux.HandleFunc("POST /v1/models", a.registerModel)
 	mux.HandleFunc("PATCH /v1/models/{model_id}", a.updateModel)
+	mux.HandleFunc("DELETE /v1/models/{model_id}", a.removeModel)
 	mux.HandleFunc("DELETE /v1/models/{model_id}/queue", a.clearModelQueue)
 	mux.HandleFunc("DELETE /v1/models/{model_id}/running", a.killModelRunning)
+	mux.HandleFunc("DELETE /v1/models/{model_id}/workers", a.hardKillModelWorkers)
 	mux.HandleFunc("POST /v1/llm/models", a.registerLLM)
 	mux.HandleFunc("GET /v1/llm/models", a.listLLMs)
 	mux.HandleFunc("DELETE /v1/llm/models/{name}", a.deregisterLLM)
@@ -880,6 +882,47 @@ func (a *API) clearModelQueue(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *API) hardKillModelWorkers(w http.ResponseWriter, r *http.Request) {
+	modelID := r.PathValue("model_id")
+	cfg, ok := a.config.Models[modelID]
+	if !ok {
+		writeError(w, 404, fmt.Sprintf("model not configured: %s", modelID))
+		return
+	}
+
+	cancelledQueued, err := a.store.CancelQueuedForModel(modelID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	failedActive, err := a.store.FailActiveForModel(modelID, "adapter hard-killed by operator")
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+
+	killResult := a.mgr.HardKillModel(modelID, true, &cfg)
+	a.scheduler.rescoreModel(modelID)
+	a.scheduler.Wake()
+
+	a.logger.Log("model.hard_killed", map[string]any{
+		"model_id":         modelID,
+		"cancelled_queued": cancelledQueued,
+		"failed_active":    failedActive,
+		"killed":           killResult["killed"],
+		"recreated":        killResult["recreated"],
+	})
+
+	writeJSON(w, 200, map[string]any{
+		"model_id":         modelID,
+		"cancelled_queued": cancelledQueued,
+		"failed_active":    failedActive,
+		"killed_workers":   killResult["killed"],
+		"recreated":        killResult["recreated"],
+		"status":           "hard_killed",
+	})
+}
+
 func (a *API) killModelRunning(w http.ResponseWriter, r *http.Request) {
 	modelID := r.PathValue("model_id")
 	if _, ok := a.config.Models[modelID]; !ok {
@@ -910,6 +953,80 @@ func (a *API) killModelRunning(w http.ResponseWriter, r *http.Request) {
 		"model_id":          modelID,
 		"cancelled_queued":  cancelledQueued,
 		"cancelled_running": cancelledRunning,
+	})
+}
+
+func removeJobTypeMappings(modelID string) []string {
+	var removed []string
+	for jobType, mappedModelID := range JobTypeToModel {
+		if mappedModelID == modelID {
+			delete(JobTypeToModel, jobType)
+			removed = append(removed, jobType)
+		}
+	}
+	return removed
+}
+
+func (a *API) removeModel(w http.ResponseWriter, r *http.Request) {
+	modelID := r.PathValue("model_id")
+	cfg, ok := a.config.Models[modelID]
+	if !ok {
+		writeError(w, 404, fmt.Sprintf("model not configured: %s", modelID))
+		return
+	}
+
+	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
+	counts, err := a.store.CountByState(modelID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	activeOrQueued := counts["queued"] + counts["scheduled"] + counts["running"]
+	if activeOrQueued > 0 && !force {
+		writeError(w, 409, "model has queued or active jobs; retry with ?force=1 to remove it")
+		return
+	}
+
+	cancelledQueued := 0
+	failedActive := 0
+	if force {
+		cancelledQueued, err = a.store.CancelQueuedForModel(modelID)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		failedActive, err = a.store.FailActiveForModel(modelID, "adapter removed by operator")
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+	}
+
+	killResult := a.mgr.HardKillModel(modelID, false, &cfg)
+	delete(a.config.Models, modelID)
+	removedJobTypes := removeJobTypeMappings(modelID)
+	if err := DeleteModelConfig(a.projectRoot, modelID); err != nil {
+		writeError(w, 500, fmt.Sprintf("delete model config: %s", err))
+		return
+	}
+
+	a.logger.Log("model.removed", map[string]any{
+		"model_id":          modelID,
+		"force":             force,
+		"removed_job_types": removedJobTypes,
+		"cancelled_queued":  cancelledQueued,
+		"failed_active":     failedActive,
+		"killed":            killResult["killed"],
+	})
+
+	writeJSON(w, 200, map[string]any{
+		"model_id":          modelID,
+		"force":             force,
+		"removed_job_types": removedJobTypes,
+		"cancelled_queued":  cancelledQueued,
+		"failed_active":     failedActive,
+		"killed_workers":    killResult["killed"],
+		"status":            "removed",
 	})
 }
 
@@ -1087,19 +1204,13 @@ func (a *API) deregisterLLM(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	modelID := llmModelID(name)
 
-	if _, ok := a.config.Models[modelID]; !ok {
+	cfg, ok := a.config.Models[modelID]
+	if !ok {
 		writeError(w, 404, fmt.Sprintf("LLM not registered: %s", name))
 		return
 	}
 
-	// Scale to 0 (kills instances)
-	zero := 0
-	cfg := a.config.Models[modelID]
-	cfg.MaxInstances = &zero
-	a.config.Models[modelID] = cfg
-	a.mgr.ScaleModel(modelID, 0, cfg)
-
-	// Remove from config
+	killResult := a.mgr.HardKillModel(modelID, false, &cfg)
 	delete(a.config.Models, modelID)
 	delete(JobTypeToModel, "chat-completion:"+name)
 
@@ -1107,8 +1218,8 @@ func (a *API) deregisterLLM(w http.ResponseWriter, r *http.Request) {
 		slog.Error("failed to delete LLM config", "model_id", modelID, "error", err)
 	}
 
-	a.logger.Log("llm.deregistered", map[string]any{"model_id": modelID, "name": name})
-	writeJSON(w, 200, map[string]any{"model_id": modelID, "name": name, "status": "deregistered"})
+	a.logger.Log("llm.deregistered", map[string]any{"model_id": modelID, "name": name, "killed": killResult["killed"]})
+	writeJSON(w, 200, map[string]any{"model_id": modelID, "name": name, "killed_workers": killResult["killed"], "status": "deregistered"})
 }
 
 func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {

@@ -723,6 +723,64 @@ Running jobs receive a cancel signal and will transition to `cancelled` state sh
 
 ---
 
+### DELETE /v1/models/{model_id}/workers -- Hard Kill One Adapter
+
+Force-kill all worker processes for one model without restarting arbiter. Queued jobs are cancelled, active jobs are marked failed immediately, and arbiter recreates fresh stopped worker slots for that model using its current config.
+
+**Request**
+
+```
+DELETE /v1/models/tts-voxtral/workers
+```
+
+**Response (200)**
+
+```json
+{
+  "model_id": "tts-voxtral",
+  "cancelled_queued": 2,
+  "failed_active": 1,
+  "killed_workers": 1,
+  "recreated": 1,
+  "status": "hard_killed"
+}
+```
+
+Use this when one adapter is wedged and you want a clean per-model reset without touching the rest of arbiter.
+
+---
+
+### DELETE /v1/models/{model_id} -- Remove a Model
+
+Remove a model configuration and its routing entry without restarting arbiter.
+
+- Default behavior: refuses removal if the model still has queued or active jobs.
+- `?force=1`: cancels queued jobs, fails active jobs, hard-kills worker processes, removes config, and removes any job-type mappings that pointed at that model.
+
+**Request**
+
+```
+DELETE /v1/models/z-image-turbo?force=1
+```
+
+**Response (200)**
+
+```json
+{
+  "model_id": "z-image-turbo",
+  "force": true,
+  "removed_job_types": [],
+  "cancelled_queued": 0,
+  "failed_active": 0,
+  "killed_workers": 1,
+  "status": "removed"
+}
+```
+
+If a built-in job type mapped to the removed model, that job type becomes unavailable until another model is mapped to it.
+
+---
+
 ### POST /v1/reserve -- Reserve VRAM Budget
 
 Reserve VRAM budget space to prevent the scheduler from using it for model loads. Useful for adapter testing or manual GPU work.
