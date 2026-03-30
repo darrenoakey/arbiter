@@ -571,9 +571,50 @@ Each non-null entry has the same fields as `GET /v1/jobs/{id}` except `result.da
 
 ---
 
+### POST /v1/models -- Register a Model at Runtime
+
+Add a new model configuration without restarting arbiter. This is useful when the adapter code already exists on disk and you want to start routing work to it immediately via the request `model` field.
+
+**Request**
+
+```
+POST /v1/models
+Content-Type: application/json
+
+{
+  "model_id": "z-image-turbo",
+  "memory_gb": 24,
+  "max_concurrent": 1,
+  "max_instances": 1,
+  "keep_alive_seconds": 1800,
+  "avg_inference_ms": 5000,
+  "load_ms": 45000
+}
+```
+
+**Response (201)**
+
+```json
+{
+  "model_id": "z-image-turbo",
+  "max_instances": 1,
+  "max_concurrent": 1,
+  "added": 1,
+  "status": "registered"
+}
+```
+
+Use the new model immediately by sending it explicitly in job submission:
+
+```json
+{"type": "image-generate", "model": "z-image-turbo", "params": {...}}
+```
+
+---
+
 ### PATCH /v1/models/{model_id} -- Update Model Configuration
 
-Change `max_instances` at runtime. Persists to `local/config.json`.
+Change a model configuration at runtime. Persists to `local/config.json`.
 
 **Request**
 
@@ -582,6 +623,16 @@ PATCH /v1/models/moondream
 Content-Type: application/json
 
 {"max_instances": 8}
+```
+
+You can also roll just that model's workers to pick up new adapter code or env/config without restarting arbiter:
+
+```json
+{
+  "worker_cmd": ["/home/darren/src/arbiter/vllm-worker"],
+  "adapter_params": {"VLLM_MODEL": "mistralai/Voxtral-4B-TTS-2603"},
+  "reload_workers": true
+}
 ```
 
 **Response (200)**
@@ -605,12 +656,14 @@ Content-Type: application/json
 | `added` | int | New instances created (unloaded, loaded on demand) |
 | `removed` | int | Instances removed immediately (were idle or unloaded) |
 | `condemned` | int | Instances with running jobs that will auto-remove when done |
+| `reload_workers` | bool | Whether arbiter replaced only this model's workers to pick up new code/config |
 
 **Scaling behavior:**
 
 - **Scale up**: New instances start stopped and load on demand when the scheduler needs them.
 - **Scale down**: Idle instances are evicted and removed immediately. Instances with active jobs are "condemned" — they finish their work, then auto-evict. No jobs are killed.
 - **`max_instances: 0`**: Disables all dispatch for the model. Queued jobs wait until you scale back up. Useful for temporarily prioritizing other models.
+- **`reload_workers: true`**: Only the targeted model is rotated. Other adapters continue running unchanged.
 
 ---
 

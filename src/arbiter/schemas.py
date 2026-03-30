@@ -26,6 +26,8 @@ class JobType(str, Enum):
     LIPSYNC = "lipsync"
     VIDEO_GENERATE = "video-generate"
     AESTHETIC_SCORE = "aesthetic-score"
+    TTS_VOXTRAL = "tts-voxtral"
+    LORA_TRAIN = "lora-train"
 
 
 # Maps job type to model_id
@@ -46,6 +48,8 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "lipsync": "latentsync",
     "video-generate": "ltx2",
     "aesthetic-score": "aesthetic-scorer",
+    "tts-voxtral": "tts-voxtral",
+    "lora-train": "lora-train",
 }
 
 
@@ -243,6 +247,37 @@ class AestheticScoreParams(BaseModel):
     image_file: Optional[str] = None
 
 
+
+class TTSVoxtralParams(BaseModel):
+    text: str
+    voice: str = "alloy"
+    language: str = "English"
+    temperature: float = 0.7
+    speed: float = 1.0
+
+
+
+class LoraTrainParams(BaseModel):
+    data_dir: str
+    model_name: str
+    run_name: Optional[str] = None
+    lora_rank: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    learning_rate: float = 2e-4
+    batch_size: int = 4
+    grad_accum_steps: int = 4
+    num_epochs: int = 1
+    max_iters: int = 0
+    max_seq_length: int = 2048
+    warmup_ratio: float = 0.03
+    save_steps: int = 500
+    eval_steps: int = 500
+    load_in_4bit: bool = True
+    full_finetune: bool = False
+    chat_template: Optional[str] = None
+
+
 # Maps job type to its parameter validation schema
 JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "image-generate": ImageGenerateParams,
@@ -261,4 +296,6 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "lipsync": LipsyncParams,
     "video-generate": VideoGenerateParams,
     "aesthetic-score": AestheticScoreParams,
+    "tts-voxtral": TTSVoxtralParams,
+    "lora-train": LoraTrainParams,
 }

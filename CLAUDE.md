@@ -125,6 +125,7 @@ Key per-model fields:
 - `load_ms` — Model load time in ms (from calibration)
 - `keep_alive_seconds` — Keep loaded after last use (default 300)
 - `auto_download` — HuggingFace repo ID for auto-download
+- Runtime registration/update goes through the Go control plane: `POST /v1/models` can add a new configured model live, and `PATCH /v1/models/{id}` with `reload_workers=true` replaces only that model's workers so other adapters keep serving.
 
 ## Logs
 

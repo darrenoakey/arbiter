@@ -1,17 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,6 +31,22 @@ type API struct {
 
 	// Cached /v1/ps response — updated every second by background goroutine
 	psCache atomic.Value // json.RawMessage
+}
+
+type modelConfigRequest struct {
+	ModelID        string             `json:"model_id"`
+	MemoryGB       *float64           `json:"memory_gb"`
+	MaxConcurrent  *int               `json:"max_concurrent"`
+	MaxInstances   *int               `json:"max_instances"`
+	KeepAliveSec   *int               `json:"keep_alive_seconds"`
+	AvgInferenceMs *float64           `json:"avg_inference_ms"`
+	LoadMs         *float64           `json:"load_ms"`
+	AutoDownload   *string            `json:"auto_download"`
+	ModelPath      *string            `json:"model_path"`
+	Group          *bool              `json:"group"`
+	WorkerCmd      *[]string          `json:"worker_cmd"`
+	AdapterParams  *map[string]string `json:"adapter_params"`
+	ReloadWorkers  bool               `json:"reload_workers"`
 }
 
 func NewAPI(cfg *Config, store *Store, mgr *InstanceManager, sched *Scheduler, logger *EventLogger, outputDir, projectRoot string) *API {
@@ -60,6 +78,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/reserve", a.createReservation)
 	mux.HandleFunc("GET /v1/reserve", a.listReservations)
 	mux.HandleFunc("DELETE /v1/reserve/{id}", a.releaseReservation)
+	mux.HandleFunc("POST /v1/models", a.registerModel)
 	mux.HandleFunc("PATCH /v1/models/{model_id}", a.updateModel)
 	mux.HandleFunc("DELETE /v1/models/{model_id}/queue", a.clearModelQueue)
 	mux.HandleFunc("DELETE /v1/models/{model_id}/running", a.killModelRunning)
@@ -102,7 +121,7 @@ func (a *API) updatePSCache() {
 				m["queued_jobs"] = modelCounts["queued"]
 				if cfg, ok := a.config.Models[id]; ok {
 					m["max_instances"] = *cfg.MaxInstances
-				m["max_concurrent"] = cfg.MaxConcurrent
+					m["max_concurrent"] = cfg.MaxConcurrent
 				}
 			}
 		}
@@ -138,7 +157,9 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		modelID, ok = JobTypeToModel[req.Type]
 		// Also check for model inside params (callers may put it there)
 		if ok {
-			var pm struct{ Model string `json:"model"` }
+			var pm struct {
+				Model string `json:"model"`
+			}
 			json.Unmarshal(req.Params, &pm)
 			if pm.Model != "" {
 				if _, exists := a.config.Models[pm.Model]; exists {
@@ -180,7 +201,9 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	// --- Dedup check ---
 	var forceNew bool
 	{
-		var f struct{ Force bool `json:"force"` }
+		var f struct {
+			Force bool `json:"force"`
+		}
 		json.Unmarshal(req.Params, &f)
 		forceNew = f.Force
 	}
@@ -221,12 +244,12 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 						})
 						writeJSON(w, 202, map[string]any{
 							"job_id": follower.ID, "status": "following",
-							"model": modelID,
+							"model":           modelID,
 							"original_job_id": origID,
 						})
 						return
 					}
-				// failed/cancelled: fall through to create new job
+					// failed/cancelled: fall through to create new job
 				}
 			}
 		}
@@ -343,7 +366,6 @@ func (a *API) cancelJob(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"job_id": jobID, "status": "cancelling"})
 }
-
 
 func (a *API) bulkStatus(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -633,84 +655,202 @@ func (a *API) listReservations(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
+func validateModelConfigRequest(req modelConfigRequest) error {
+	if req.MemoryGB != nil && *req.MemoryGB <= 0 {
+		return fmt.Errorf("memory_gb must be > 0")
+	}
+	if req.MaxConcurrent != nil && *req.MaxConcurrent < 1 {
+		return fmt.Errorf("max_concurrent must be >= 1")
+	}
+	if req.MaxInstances != nil && *req.MaxInstances < 0 {
+		return fmt.Errorf("max_instances must be >= 0")
+	}
+	if req.KeepAliveSec != nil && *req.KeepAliveSec < 0 {
+		return fmt.Errorf("keep_alive_seconds must be >= 0")
+	}
+	if req.AvgInferenceMs != nil && *req.AvgInferenceMs < 0 {
+		return fmt.Errorf("avg_inference_ms must be >= 0")
+	}
+	if req.LoadMs != nil && *req.LoadMs < 0 {
+		return fmt.Errorf("load_ms must be >= 0")
+	}
+	if req.WorkerCmd != nil && len(*req.WorkerCmd) == 0 {
+		return fmt.Errorf("worker_cmd must not be empty")
+	}
+	return nil
+}
+
+func applyModelConfigRequest(cfg ModelConfig, req modelConfigRequest) ModelConfig {
+	if req.MemoryGB != nil {
+		cfg.MemoryGB = *req.MemoryGB
+	}
+	if req.MaxConcurrent != nil {
+		cfg.MaxConcurrent = *req.MaxConcurrent
+	}
+	if req.MaxInstances != nil {
+		n := *req.MaxInstances
+		cfg.MaxInstances = &n
+	}
+	if req.KeepAliveSec != nil {
+		cfg.KeepAliveSec = *req.KeepAliveSec
+	}
+	if req.AvgInferenceMs != nil {
+		cfg.AvgInferenceMs = *req.AvgInferenceMs
+	}
+	if req.LoadMs != nil {
+		cfg.LoadMs = *req.LoadMs
+	}
+	if req.AutoDownload != nil {
+		cfg.AutoDownload = *req.AutoDownload
+	}
+	if req.ModelPath != nil {
+		cfg.ModelPath = *req.ModelPath
+	}
+	if req.Group != nil {
+		cfg.Group = *req.Group
+	}
+	if req.WorkerCmd != nil {
+		cfg.WorkerCmd = cloneStrings(*req.WorkerCmd)
+	}
+	if req.AdapterParams != nil {
+		cfg.AdapterParams = maps.Clone(*req.AdapterParams)
+	}
+	return cfg
+}
+
+func (a *API) registerModel(w http.ResponseWriter, r *http.Request) {
+	var req modelConfigRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if err := validateModelConfigRequest(req); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	if req.ModelID == "" {
+		writeError(w, 400, "model_id is required")
+		return
+	}
+	if _, exists := a.config.Models[req.ModelID]; exists {
+		writeError(w, 409, fmt.Sprintf("model already configured: %s", req.ModelID))
+		return
+	}
+
+	one := 1
+	cfg := ModelConfig{
+		MaxConcurrent: 1,
+		MaxInstances:  &one,
+		KeepAliveSec:  300,
+	}
+	cfg = applyModelConfigRequest(cfg, req)
+	a.config.Models[req.ModelID] = cfg
+	a.mgr.EnsureModel(req.ModelID)
+
+	scaleResult := a.mgr.ScaleModel(req.ModelID, *cfg.MaxInstances, cfg)
+	a.mgr.ApplyModelConfig(req.ModelID, cfg)
+	if err := SaveModelConfig(a.projectRoot, req.ModelID, cfg); err != nil {
+		writeError(w, 500, fmt.Sprintf("persist model config: %s", err))
+		return
+	}
+
+	a.scheduler.rescoreModel(req.ModelID)
+	a.scheduler.Wake()
+	a.logger.Log("model.registered", map[string]any{
+		"model_id":       req.ModelID,
+		"max_instances":  *cfg.MaxInstances,
+		"max_concurrent": cfg.MaxConcurrent,
+		"worker_cmd":     cfg.WorkerCmd,
+	})
+
+	writeJSON(w, 201, map[string]any{
+		"model_id":       req.ModelID,
+		"max_instances":  *cfg.MaxInstances,
+		"max_concurrent": cfg.MaxConcurrent,
+		"added":          scaleResult["added"],
+		"status":         "registered",
+	})
+}
+
 func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 	modelID := r.PathValue("model_id")
-
-	cfg, ok := a.config.Models[modelID]
+	current, ok := a.config.Models[modelID]
 	if !ok {
 		writeError(w, 404, fmt.Sprintf("model not configured: %s", modelID))
 		return
 	}
 
-	var req struct {
-		MaxInstances *int `json:"max_instances"`
-		MaxConcurrent *int `json:"max_concurrent"`
-	}
+	var req modelConfigRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	if req.MaxInstances != nil && *req.MaxInstances < 0 {
-		writeError(w, 400, "max_instances must be >= 0")
+	if err := validateModelConfigRequest(req); err != nil {
+		writeError(w, 400, err.Error())
 		return
 	}
-	if req.MaxConcurrent != nil && *req.MaxConcurrent < 1 {
-		writeError(w, 400, "max_concurrent must be >= 1")
+	if req.MemoryGB != nil && *req.MemoryGB != current.MemoryGB && !req.ReloadWorkers && a.mgr.IsLoaded(modelID) {
+		writeError(w, 400, "memory_gb changes require reload_workers=true while the model is loaded")
 		return
 	}
 
-	result := map[string]any{"model_id": modelID}
-	changed := false
+	updated := applyModelConfigRequest(current, req)
+	a.config.Models[modelID] = updated
+	a.mgr.ApplyModelConfig(modelID, updated)
 
-	// Handle max_concurrent change
-	if req.MaxConcurrent != nil {
-		oldConc := cfg.MaxConcurrent
-		newConc := *req.MaxConcurrent
-		if newConc != oldConc {
-			cfg.MaxConcurrent = newConc
-			a.config.Models[modelID] = cfg
-			// Update all live instances
-			for _, inst := range a.mgr.GetModelInstances(modelID) {
-				inst.MaxConcurrent = newConc
-			}
-			SaveModelConfigField(a.projectRoot, modelID, "max_concurrent", newConc)
-			result["max_concurrent"] = newConc
-			result["previous_max_concurrent"] = oldConc
-			changed = true
-			a.logger.Log("model.concurrency_changed", map[string]any{
-				"model_id": modelID, "old": oldConc, "new": newConc,
-			})
-		}
+	result := map[string]any{
+		"model_id":                modelID,
+		"max_instances":           *updated.MaxInstances,
+		"max_concurrent":          updated.MaxConcurrent,
+		"reload_workers":          req.ReloadWorkers,
+		"previous_max_instances":  *current.MaxInstances,
+		"previous_max_concurrent": current.MaxConcurrent,
 	}
 
-	// Handle max_instances change
-	if req.MaxInstances != nil {
-		oldMax := *cfg.MaxInstances
-		newMax := *req.MaxInstances
-		if newMax != oldMax {
-			cfg.MaxInstances = req.MaxInstances
-			a.config.Models[modelID] = cfg
-			scaleResult := a.mgr.ScaleModel(modelID, newMax, cfg)
-			SaveModelConfigField(a.projectRoot, modelID, "max_instances", newMax)
-			a.scheduler.rescoreModel(modelID)
-			result["max_instances"] = newMax
-			result["previous_max_instances"] = oldMax
-			result["added"] = scaleResult["added"]
-			result["removed"] = scaleResult["removed"]
-			result["condemned"] = scaleResult["condemned"]
-			changed = true
-			a.logger.Log("model.scaled", map[string]any{
-				"model_id":          modelID,
-				"old_max_instances": oldMax,
-				"new_max_instances": newMax,
-				"added":             scaleResult["added"],
-				"removed":           scaleResult["removed"],
-				"condemned":         scaleResult["condemned"],
-			})
-		}
+	var scaleResult map[string]any
+	if req.ReloadWorkers {
+		scaleResult = a.mgr.ReloadModel(modelID, *updated.MaxInstances, updated)
+		a.logger.Log("model.reloaded", map[string]any{
+			"model_id":  modelID,
+			"added":     scaleResult["added"],
+			"removed":   scaleResult["removed"],
+			"condemned": scaleResult["condemned"],
+		})
+	} else if req.MaxInstances != nil && *req.MaxInstances != *current.MaxInstances {
+		scaleResult = a.mgr.ScaleModel(modelID, *updated.MaxInstances, updated)
+		a.logger.Log("model.scaled", map[string]any{
+			"model_id":          modelID,
+			"old_max_instances": *current.MaxInstances,
+			"new_max_instances": *updated.MaxInstances,
+			"added":             scaleResult["added"],
+			"removed":           scaleResult["removed"],
+			"condemned":         scaleResult["condemned"],
+		})
 	}
 
-	if !changed {
+	if scaleResult != nil {
+		result["added"] = scaleResult["added"]
+		result["removed"] = scaleResult["removed"]
+		result["condemned"] = scaleResult["condemned"]
+	}
+	if err := SaveModelConfig(a.projectRoot, modelID, updated); err != nil {
+		writeError(w, 500, fmt.Sprintf("persist model config: %s", err))
+		return
+	}
+
+	a.scheduler.rescoreModel(modelID)
+	a.scheduler.Wake()
+	if req.MaxConcurrent != nil && *req.MaxConcurrent != current.MaxConcurrent {
+		a.logger.Log("model.concurrency_changed", map[string]any{
+			"model_id": modelID, "old": current.MaxConcurrent, "new": updated.MaxConcurrent,
+		})
+	}
+	if !req.ReloadWorkers && (req.WorkerCmd != nil || req.AdapterParams != nil) {
+		result["message"] = "config updated; existing loaded workers keep running until this model is reloaded"
+	} else if scaleResult == nil && req.MaxConcurrent == nil && req.MemoryGB == nil &&
+		req.KeepAliveSec == nil && req.AvgInferenceMs == nil && req.LoadMs == nil &&
+		req.WorkerCmd == nil && req.AdapterParams == nil && req.AutoDownload == nil &&
+		req.ModelPath == nil && req.Group == nil && req.MaxInstances == nil {
 		result["message"] = "no changes"
 	}
 	writeJSON(w, 200, result)
@@ -796,13 +936,13 @@ func estimateMemoryGB(totalParams int64) float64 {
 
 func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		HFModel    string  `json:"hf_model"`    // e.g., "unsloth/gpt-oss-20b-GGUF"
-		HFFile     string  `json:"hf_file"`     // e.g., "gpt-oss-20b-Q8_0.gguf"
-		ModelPath  string  `json:"model_path"`  // alternative: local GGUF path
-		Name       string  `json:"name"`        // short name (auto-derived if empty)
-		MemoryGB   float64 `json:"memory_gb"`   // VRAM estimate (auto if 0)
-		CtxSize    int     `json:"ctx_size"`    // context size (default 8192)
-		GPULayers  int     `json:"gpu_layers"`  // -1 = all (default)
+		HFModel   string  `json:"hf_model"`   // e.g., "unsloth/gpt-oss-20b-GGUF"
+		HFFile    string  `json:"hf_file"`    // e.g., "gpt-oss-20b-Q8_0.gguf"
+		ModelPath string  `json:"model_path"` // alternative: local GGUF path
+		Name      string  `json:"name"`       // short name (auto-derived if empty)
+		MemoryGB  float64 `json:"memory_gb"`  // VRAM estimate (auto if 0)
+		CtxSize   int     `json:"ctx_size"`   // context size (default 8192)
+		GPULayers int     `json:"gpu_layers"` // -1 = all (default)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
@@ -892,34 +1032,9 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 	result := a.mgr.ScaleModel(modelID, 1, cfg)
 
 	// Persist
-	if err := SaveModelConfigField(a.projectRoot, modelID, "memory_gb", memGB); err != nil {
+	if err := SaveModelConfig(a.projectRoot, modelID, cfg); err != nil {
 		slog.Error("failed to persist LLM config", "error", err)
 	}
-	// Save all config fields for the LLM
-	cfgMap := map[string]any{
-		"memory_gb":        memGB,
-		"max_concurrent":   1,
-		"max_instances":    1,
-		"keep_alive_seconds": 3600,
-		"avg_inference_ms": 5000,
-		"load_ms":          120000,
-		"worker_cmd":       cfg.WorkerCmd,
-		"adapter_params":   adapterParams,
-	}
-	// Write full model config
-	data := make(map[string]any)
-	cfgPath := filepath.Join(a.projectRoot, "local", "config.json")
-	if raw, err := os.ReadFile(cfgPath); err == nil {
-		json.Unmarshal(raw, &data)
-	}
-	models, _ := data["models"].(map[string]any)
-	if models == nil {
-		models = make(map[string]any)
-		data["models"] = models
-	}
-	models[modelID] = cfgMap
-	out, _ := json.MarshalIndent(data, "", "  ")
-	os.WriteFile(cfgPath, append(out, '\n'), 0o644)
 
 	a.scheduler.rescoreModel(modelID)
 
@@ -988,17 +1103,8 @@ func (a *API) deregisterLLM(w http.ResponseWriter, r *http.Request) {
 	delete(a.config.Models, modelID)
 	delete(JobTypeToModel, "chat-completion:"+name)
 
-	// Remove from config file
-	cfgPath := filepath.Join(a.projectRoot, "local", "config.json")
-	if raw, err := os.ReadFile(cfgPath); err == nil {
-		var data map[string]any
-		if json.Unmarshal(raw, &data) == nil {
-			if models, ok := data["models"].(map[string]any); ok {
-				delete(models, modelID)
-				out, _ := json.MarshalIndent(data, "", "  ")
-				os.WriteFile(cfgPath, append(out, '\n'), 0o644)
-			}
-		}
+	if err := DeleteModelConfig(a.projectRoot, modelID); err != nil {
+		slog.Error("failed to delete LLM config", "model_id", modelID, "error", err)
 	}
 
 	a.logger.Log("llm.deregistered", map[string]any{"model_id": modelID, "name": name})
@@ -1007,7 +1113,8 @@ func (a *API) deregisterLLM(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Model string `json:"model"`
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
 	}
 	body, _ := io.ReadAll(r.Body)
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -1025,7 +1132,13 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Thin wrapper: submit as a regular arbiter job and wait synchronously
+	// Streaming: proxy directly to llama-server for SSE support
+	if req.Stream {
+		a.chatCompletionStream(w, r, modelID, body)
+		return
+	}
+
+	// Non-streaming: submit as a regular arbiter job and wait synchronously
 	priority := a.scheduler.computePriority(modelID)
 	job, err := a.store.CreateJob(modelID, "chat-completion", json.RawMessage(body), priority)
 	if err != nil {
@@ -1076,6 +1189,74 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 				writeError(w, 499, "request cancelled")
 				return
 			}
+		}
+	}
+}
+
+// chatCompletionStream handles streaming chat completions by proxying SSE
+// directly from llama-server to the client, bypassing the job system.
+func (a *API) chatCompletionStream(w http.ResponseWriter, r *http.Request, modelID string, body []byte) {
+	// Ensure model is loaded
+	instances := a.scheduler.mgr.GetModelInstances(modelID)
+	if len(instances) == 0 {
+		writeError(w, 500, "no instances for model")
+		return
+	}
+	inst := instances[0]
+
+	if err := a.scheduler.ensureLoaded(inst); err != nil {
+		writeError(w, 503, fmt.Sprintf("model not ready: %s", err))
+		return
+	}
+
+	// Get the llama-server port from the worker
+	port, err := inst.GetPort()
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("get llama-server port: %s", err))
+		return
+	}
+
+	// Proxy the request directly to llama-server
+	llamaURL := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", port)
+	proxyReq, err := http.NewRequestWithContext(r.Context(), "POST", llamaURL, bytes.NewReader(body))
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("create proxy request: %s", err))
+		return
+	}
+	proxyReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		writeError(w, 502, fmt.Sprintf("llama-server error: %s", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy headers from llama-server response
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	// Stream the response body directly to the client
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		io.Copy(w, resp.Body)
+		return
+	}
+
+	buf := make([]byte, 4096)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			w.Write(buf[:n])
+			flusher.Flush()
+		}
+		if err != nil {
+			break
 		}
 	}
 }

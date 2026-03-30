@@ -9,22 +9,21 @@ import (
 )
 
 type ModelConfig struct {
-	MemoryGB       float64 `json:"memory_gb"`
-	MaxConcurrent  int     `json:"max_concurrent"`
-	MaxInstances   *int    `json:"max_instances"`
-	KeepAliveSec   int     `json:"keep_alive_seconds"`
-	AvgInferenceMs float64 `json:"avg_inference_ms"`
-	LoadMs         float64 `json:"load_ms"`
-	AutoDownload   string  `json:"auto_download"`
-	ModelPath      string  `json:"model_path"`
+	MemoryGB       float64           `json:"memory_gb"`
+	MaxConcurrent  int               `json:"max_concurrent"`
+	MaxInstances   *int              `json:"max_instances"`
+	KeepAliveSec   int               `json:"keep_alive_seconds"`
+	AvgInferenceMs float64           `json:"avg_inference_ms"`
+	LoadMs         float64           `json:"load_ms"`
+	AutoDownload   string            `json:"auto_download"`
+	ModelPath      string            `json:"model_path"`
 	Group          bool              `json:"group"`
 	WorkerCmd      []string          `json:"worker_cmd,omitempty"`
 	AdapterParams  map[string]string `json:"adapter_params,omitempty"`
 }
 
 type Config struct {
-	VRAMBudgetGB     float64        `json:"vram_budget_gb"`
-	VRAMHardLimitGB  float64        `json:"vram_hard_limit_gb"`
+	VRAMBudgetGB float64                `json:"vram_budget_gb"`
 	Host         string                 `json:"host"`
 	Port         int                    `json:"port"`
 	Models       map[string]ModelConfig `json:"models"`
@@ -32,22 +31,25 @@ type Config struct {
 
 // JobTypeToModel maps job type strings to model IDs.
 var JobTypeToModel = map[string]string{
-	"image-generate":    "flux-schnell",
-	"image-edit":        "flux-schnell",
-	"background-remove": "birefnet",
-	"caption":           "moondream",
-	"query":             "moondream",
-	"detect":            "moondream",
-	"point":             "moondream",
-	"transcribe":        "whisper-large",
-	"tts-custom":        "tts-custom",
-	"tts-clone":         "tts-clone",
-	"tts-design":        "tts-design",
-	"talking-head":            "sonic",
-	"talking-head-sadtalker":  "sadtalker",
+	"image-generate":         "flux-schnell",
+	"image-edit":             "flux-schnell",
+	"background-remove":      "birefnet",
+	"caption":                "moondream",
+	"query":                  "moondream",
+	"detect":                 "moondream",
+	"point":                  "moondream",
+	"transcribe":             "whisper-large",
+	"tts-custom":             "tts-custom",
+	"tts-clone":              "tts-clone",
+	"tts-design":             "tts-design",
+	"talking-head":           "sonic",
+	"talking-head-sadtalker": "sadtalker",
 	"lipsync":                "latentsync",
-	"video-generate":    "ltx2",
-	"aesthetic-score":   "aesthetic-scorer",
+	"video-generate":         "ltx2",
+	"aesthetic-score":        "aesthetic-scorer",
+	"tts-voxtral":            "tts-voxtral",
+	"lora-train":             "lora-train",
+	"composite":              "composite",
 }
 
 func LoadConfig(projectRoot string) (*Config, error) {
@@ -103,14 +105,10 @@ func LoadConfig(projectRoot string) (*Config, error) {
 	return cfg, nil
 }
 
-
-// SaveModelConfigField updates a single field in a model's config and persists to config.json.
-// Reads the current config file, updates the field, and writes to local/config.json.
-func SaveModelConfigField(projectRoot, modelID, field string, value any) error {
+func loadMutableConfigData(projectRoot string) (map[string]any, error) {
 	cfgPath := filepath.Join(projectRoot, "local", "config.json")
 	defaultPath := filepath.Join(projectRoot, "local", "config.default.json")
 
-	// Read current config file
 	var data map[string]any
 	path := cfgPath
 	raw, err := os.ReadFile(path)
@@ -124,29 +122,47 @@ func SaveModelConfigField(projectRoot, modelID, field string, value any) error {
 	}
 	if raw != nil {
 		if err := json.Unmarshal(raw, &data); err != nil {
-			return fmt.Errorf("parse config: %w", err)
+			return nil, fmt.Errorf("parse config: %w", err)
 		}
 	}
-
-	// Update the field
-	models, ok := data["models"].(map[string]any)
-	if !ok {
-		models = make(map[string]any)
-		data["models"] = models
+	if data == nil {
+		data = make(map[string]any)
 	}
-	model, ok := models[modelID].(map[string]any)
-	if !ok {
-		model = make(map[string]any)
-		models[modelID] = model
-	}
-	model[field] = value
+	return data, nil
+}
 
-	// Write to config.json
+func writeConfigData(projectRoot string, data map[string]any) error {
 	os.MkdirAll(filepath.Join(projectRoot, "local"), 0o755)
 	out, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
 	out = append(out, '\n')
-	return os.WriteFile(cfgPath, out, 0o644)
+	return os.WriteFile(filepath.Join(projectRoot, "local", "config.json"), out, 0o644)
+}
+
+func SaveModelConfig(projectRoot, modelID string, cfg ModelConfig) error {
+	data, err := loadMutableConfigData(projectRoot)
+	if err != nil {
+		return err
+	}
+	models, ok := data["models"].(map[string]any)
+	if !ok {
+		models = make(map[string]any)
+		data["models"] = models
+	}
+	models[modelID] = cfg
+	return writeConfigData(projectRoot, data)
+}
+
+func DeleteModelConfig(projectRoot, modelID string) error {
+	data, err := loadMutableConfigData(projectRoot)
+	if err != nil {
+		return err
+	}
+	models, ok := data["models"].(map[string]any)
+	if ok {
+		delete(models, modelID)
+	}
+	return writeConfigData(projectRoot, data)
 }

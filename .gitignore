@@ -8,3 +8,14 @@ dist/
 build/
 .pytest_cache/
 arbiter-go
+/arbiter
+/arbiter-backup
+/arbiter-bin
+/arbiter-go-backup
+/arbiter-go-new
+/llm-worker
+/vllm-worker
+cmd/arbiter/arbiter
+_unsloth_temporary_saved_buffers/
+unsloth_compiled_cache/
+gfpgan/weights/

@@ -185,7 +185,7 @@ class SadTalkerAdapter(ModelAdapter):
         expression_scale = float(params.get("expression_scale", 1.0))
         preprocess = params.get("preprocess", "crop")
         still = params.get("still", False)
-        batch_size = int(params.get("batch_size", 2))
+        batch_size = 1  # data prep batch; pirender does its own GPU batching
 
         tmp_dir = tempfile.mkdtemp(prefix="sadtalker_")
         save_dir = os.path.join(tmp_dir, strftime("%Y_%m_%d_%H.%M.%S"))
@@ -252,10 +252,36 @@ class SadTalkerAdapter(ModelAdapter):
                 else:
                     raise InferenceError("SadTalker produced no output video")
 
+            # Ensure file is fully flushed to disk
+            import subprocess as _sp
+            _sp.run(["sync"], timeout=10)
+
+            # Verify the output video is valid
+            probe = _sp.run(
+                ["ffprobe", "-v", "error",
+                 "-show_entries", "format=duration",
+                 "-of", "csv=p=0", result_path],
+                capture_output=True, text=True, timeout=30,
+            )
+            out_duration = float(probe.stdout.strip()) if probe.stdout.strip() else 0
+            if out_duration < 1.0:
+                raise InferenceError(
+                    f"SadTalker output too short: {out_duration:.1f}s at {result_path}"
+                )
+            log.info("SadTalker output verified: %.1fs at %s", out_duration, result_path)
+
             output_dir = Path(output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
             out_path = output_dir / "result.mp4"
             shutil.copy2(result_path, str(out_path))
+            
+            # Verify copy matches original
+            orig_size = os.path.getsize(result_path)
+            copy_size = os.path.getsize(str(out_path))
+            if orig_size != copy_size:
+                raise InferenceError(
+                    f"Copy size mismatch: {orig_size} vs {copy_size}"
+                )
 
             width, height = self._probe_video_dimensions(str(out_path))
 

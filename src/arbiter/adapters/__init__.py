@@ -11,3 +11,6 @@ from . import sadtalker  # noqa: F401
 from . import sonic  # noqa: F401
 from . import ltx2  # noqa: F401
 from . import aesthetic_scorer  # noqa: F401
+from . import z_image  # noqa: F401
+from . import lora_train  # noqa: F401
+from . import composite  # noqa: F401

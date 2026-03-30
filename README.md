@@ -275,20 +275,36 @@ Up to 1000 IDs per request. Results come back in the same order you sent them.
 
 ## Scaling models at runtime
 
-You can change how many parallel instances a model runs without restarting:
+You can change how many parallel instances a model runs without restarting, and you can register a new model config or reload just one model's workers without touching the rest of arbiter:
 
 ```python
 # Scale moondream to 8 instances
 requests.patch(f"{ARBITER}/v1/models/moondream", json={"max_instances": 8})
 
+# Register a new adapter config that already exists on disk
+requests.post(f"{ARBITER}/v1/models", json={
+    "model_id": "z-image-turbo",
+    "memory_gb": 24,
+    "max_instances": 1,
+    "avg_inference_ms": 5000,
+    "load_ms": 45000,
+})
+
 # Temporarily disable a model (queue waits, nothing dispatched)
 requests.patch(f"{ARBITER}/v1/models/flux-schnell", json={"max_instances": 0})
+
+# Reload only one model to pick up new worker_cmd / adapter_params / code
+requests.patch(f"{ARBITER}/v1/models/tts-voxtral", json={
+    "worker_cmd": ["/home/darren/src/arbiter/vllm-worker"],
+    "adapter_params": {"VLLM_MODEL": "mistralai/Voxtral-4B-TTS-2603"},
+    "reload_workers": True,
+})
 
 # Clear all queued jobs for a model
 requests.delete(f"{ARBITER}/v1/models/moondream/queue")
 ```
 
-When scaling down, running jobs finish gracefully — only idle instances are removed immediately.
+When scaling down or reloading a single model, running jobs finish gracefully — only idle instances are removed immediately, and other adapters are not restarted.
 
 ---
 
