@@ -49,6 +49,24 @@ type modelConfigRequest struct {
 	ReloadWorkers  bool               `json:"reload_workers"`
 }
 
+type llmRegisterRequest struct {
+	HFModel        string            `json:"hf_model"`
+	HFFile         string            `json:"hf_file"`
+	ModelPath      string            `json:"model_path"`
+	Name           string            `json:"name"`
+	MemoryGB       float64           `json:"memory_gb"`
+	CtxSize        int               `json:"ctx_size"`
+	GPULayers      int               `json:"gpu_layers"`
+	WorkerCmd      []string          `json:"worker_cmd"`
+	AdapterParams  map[string]string `json:"adapter_params"`
+	LlamaServerBin string            `json:"llama_server_bin"`
+	MaxConcurrent  *int              `json:"max_concurrent"`
+	MaxInstances   *int              `json:"max_instances"`
+	KeepAliveSec   *int              `json:"keep_alive_seconds"`
+	AvgInferenceMs *float64          `json:"avg_inference_ms"`
+	LoadMs         *float64          `json:"load_ms"`
+}
+
 func NewAPI(cfg *Config, store *Store, mgr *InstanceManager, sched *Scheduler, logger *EventLogger, outputDir, projectRoot string) *API {
 	a := &API{
 		config:      cfg,
@@ -79,8 +97,11 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/reserve", a.listReservations)
 	mux.HandleFunc("DELETE /v1/reserve/{id}", a.releaseReservation)
 	mux.HandleFunc("POST /v1/models", a.registerModel)
+	mux.HandleFunc("GET /v1/models", a.listModels)
+	mux.HandleFunc("GET /v1/models/{model_id}", a.getModel)
 	mux.HandleFunc("PATCH /v1/models/{model_id}", a.updateModel)
 	mux.HandleFunc("DELETE /v1/models/{model_id}", a.removeModel)
+	mux.HandleFunc("POST /v1/models/{model_id}/reload", a.reloadModel)
 	mux.HandleFunc("DELETE /v1/models/{model_id}/queue", a.clearModelQueue)
 	mux.HandleFunc("DELETE /v1/models/{model_id}/running", a.killModelRunning)
 	mux.HandleFunc("DELETE /v1/models/{model_id}/workers", a.hardKillModelWorkers)
@@ -682,6 +703,40 @@ func validateModelConfigRequest(req modelConfigRequest) error {
 	return nil
 }
 
+func (a *API) resolveConfiguredModelID(id string) (string, bool) {
+	if _, ok := a.config.Models[id]; ok {
+		return id, true
+	}
+	llmID := llmModelID(id)
+	if _, ok := a.config.Models[llmID]; ok {
+		return llmID, true
+	}
+	return "", false
+}
+
+func serializeModelConfig(modelID string, cfg ModelConfig) map[string]any {
+	resp := map[string]any{
+		"model_id":           modelID,
+		"memory_gb":          cfg.MemoryGB,
+		"max_concurrent":     cfg.MaxConcurrent,
+		"keep_alive_seconds": cfg.KeepAliveSec,
+		"avg_inference_ms":   cfg.AvgInferenceMs,
+		"load_ms":            cfg.LoadMs,
+		"auto_download":      cfg.AutoDownload,
+		"model_path":         cfg.ModelPath,
+		"group":              cfg.Group,
+		"worker_cmd":         cfg.WorkerCmd,
+		"adapter_params":     cfg.AdapterParams,
+	}
+	if cfg.MaxInstances != nil {
+		resp["max_instances"] = *cfg.MaxInstances
+	}
+	if strings.HasPrefix(modelID, "llm:") {
+		resp["llm_name"] = strings.TrimPrefix(modelID, "llm:")
+	}
+	return resp
+}
+
 func applyModelConfigRequest(cfg ModelConfig, req modelConfigRequest) ModelConfig {
 	if req.MemoryGB != nil {
 		cfg.MemoryGB = *req.MemoryGB
@@ -715,7 +770,14 @@ func applyModelConfigRequest(cfg ModelConfig, req modelConfigRequest) ModelConfi
 		cfg.WorkerCmd = cloneStrings(*req.WorkerCmd)
 	}
 	if req.AdapterParams != nil {
-		cfg.AdapterParams = maps.Clone(*req.AdapterParams)
+		merged := maps.Clone(cfg.AdapterParams)
+		if merged == nil {
+			merged = map[string]string{}
+		}
+		for k, v := range *req.AdapterParams {
+			merged[k] = v
+		}
+		cfg.AdapterParams = merged
 	}
 	return cfg
 }
@@ -774,13 +836,33 @@ func (a *API) registerModel(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
-	modelID := r.PathValue("model_id")
-	current, ok := a.config.Models[modelID]
+func (a *API) listModels(w http.ResponseWriter, r *http.Request) {
+	models := make([]map[string]any, 0, len(a.config.Models))
+	for modelID, cfg := range a.config.Models {
+		models = append(models, serializeModelConfig(modelID, cfg))
+	}
+	if models == nil {
+		models = []map[string]any{}
+	}
+	writeJSON(w, 200, models)
+}
+
+func (a *API) getModel(w http.ResponseWriter, r *http.Request) {
+	modelID, ok := a.resolveConfiguredModelID(r.PathValue("model_id"))
 	if !ok {
-		writeError(w, 404, fmt.Sprintf("model not configured: %s", modelID))
+		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
 		return
 	}
+	writeJSON(w, 200, serializeModelConfig(modelID, a.config.Models[modelID]))
+}
+
+func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
+	modelID, ok := a.resolveConfiguredModelID(r.PathValue("model_id"))
+	if !ok {
+		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
+		return
+	}
+	current, ok := a.config.Models[modelID]
 
 	var req modelConfigRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -858,10 +940,35 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, result)
 }
 
+func (a *API) reloadModel(w http.ResponseWriter, r *http.Request) {
+	modelID, ok := a.resolveConfiguredModelID(r.PathValue("model_id"))
+	if !ok {
+		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
+		return
+	}
+	cfg := a.config.Models[modelID]
+	scaleResult := a.mgr.ReloadModel(modelID, *cfg.MaxInstances, cfg)
+	a.scheduler.rescoreModel(modelID)
+	a.scheduler.Wake()
+	a.logger.Log("model.reloaded", map[string]any{
+		"model_id":  modelID,
+		"added":     scaleResult["added"],
+		"removed":   scaleResult["removed"],
+		"condemned": scaleResult["condemned"],
+	})
+	writeJSON(w, 200, map[string]any{
+		"model_id":  modelID,
+		"added":     scaleResult["added"],
+		"removed":   scaleResult["removed"],
+		"condemned": scaleResult["condemned"],
+		"status":    "reloaded",
+	})
+}
+
 func (a *API) clearModelQueue(w http.ResponseWriter, r *http.Request) {
-	modelID := r.PathValue("model_id")
-	if _, ok := a.config.Models[modelID]; !ok {
-		writeError(w, 404, fmt.Sprintf("model not configured: %s", modelID))
+	modelID, ok := a.resolveConfiguredModelID(r.PathValue("model_id"))
+	if !ok {
+		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
 		return
 	}
 
@@ -883,12 +990,12 @@ func (a *API) clearModelQueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) hardKillModelWorkers(w http.ResponseWriter, r *http.Request) {
-	modelID := r.PathValue("model_id")
-	cfg, ok := a.config.Models[modelID]
+	modelID, ok := a.resolveConfiguredModelID(r.PathValue("model_id"))
 	if !ok {
-		writeError(w, 404, fmt.Sprintf("model not configured: %s", modelID))
+		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
 		return
 	}
+	cfg, ok := a.config.Models[modelID]
 
 	cancelledQueued, err := a.store.CancelQueuedForModel(modelID)
 	if err != nil {
@@ -924,9 +1031,9 @@ func (a *API) hardKillModelWorkers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) killModelRunning(w http.ResponseWriter, r *http.Request) {
-	modelID := r.PathValue("model_id")
-	if _, ok := a.config.Models[modelID]; !ok {
-		writeError(w, 404, fmt.Sprintf("model not configured: %s", modelID))
+	modelID, ok := a.resolveConfiguredModelID(r.PathValue("model_id"))
+	if !ok {
+		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
 		return
 	}
 
@@ -968,12 +1075,12 @@ func removeJobTypeMappings(modelID string) []string {
 }
 
 func (a *API) removeModel(w http.ResponseWriter, r *http.Request) {
-	modelID := r.PathValue("model_id")
-	cfg, ok := a.config.Models[modelID]
+	modelID, ok := a.resolveConfiguredModelID(r.PathValue("model_id"))
 	if !ok {
-		writeError(w, 404, fmt.Sprintf("model not configured: %s", modelID))
+		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
 		return
 	}
+	cfg, ok := a.config.Models[modelID]
 
 	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
 	counts, err := a.store.CountByState(modelID)
@@ -1052,15 +1159,7 @@ func estimateMemoryGB(totalParams int64) float64 {
 }
 
 func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		HFModel   string  `json:"hf_model"`   // e.g., "unsloth/gpt-oss-20b-GGUF"
-		HFFile    string  `json:"hf_file"`    // e.g., "gpt-oss-20b-Q8_0.gguf"
-		ModelPath string  `json:"model_path"` // alternative: local GGUF path
-		Name      string  `json:"name"`       // short name (auto-derived if empty)
-		MemoryGB  float64 `json:"memory_gb"`  // VRAM estimate (auto if 0)
-		CtxSize   int     `json:"ctx_size"`   // context size (default 8192)
-		GPULayers int     `json:"gpu_layers"` // -1 = all (default)
-	}
+	var req llmRegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
@@ -1127,6 +1226,12 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 		gpuLayers = -1
 	}
 	adapterParams["LLM_GPU_LAYERS"] = strconv.Itoa(gpuLayers)
+	if req.LlamaServerBin != "" {
+		adapterParams["LLAMA_SERVER_BIN"] = req.LlamaServerBin
+	}
+	for k, v := range req.AdapterParams {
+		adapterParams[k] = v
+	}
 
 	// Register in config
 	one := 1
@@ -1140,13 +1245,32 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 		WorkerCmd:      []string{llmWorkerBin(a.projectRoot)},
 		AdapterParams:  adapterParams,
 	}
+	if len(req.WorkerCmd) > 0 {
+		cfg.WorkerCmd = cloneStrings(req.WorkerCmd)
+	}
+	if req.MaxConcurrent != nil {
+		cfg.MaxConcurrent = *req.MaxConcurrent
+	}
+	if req.MaxInstances != nil {
+		n := *req.MaxInstances
+		cfg.MaxInstances = &n
+	}
+	if req.KeepAliveSec != nil {
+		cfg.KeepAliveSec = *req.KeepAliveSec
+	}
+	if req.AvgInferenceMs != nil {
+		cfg.AvgInferenceMs = *req.AvgInferenceMs
+	}
+	if req.LoadMs != nil {
+		cfg.LoadMs = *req.LoadMs
+	}
 	a.config.Models[modelID] = cfg
 
 	// Register job type mapping
 	JobTypeToModel["chat-completion:"+name] = modelID
 
 	// Create instance
-	result := a.mgr.ScaleModel(modelID, 1, cfg)
+	result := a.mgr.ScaleModel(modelID, *cfg.MaxInstances, cfg)
 
 	// Persist
 	if err := SaveModelConfig(a.projectRoot, modelID, cfg); err != nil {
@@ -1177,21 +1301,8 @@ func (a *API) listLLMs(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(id, "llm:") {
 			continue
 		}
-		name := strings.TrimPrefix(id, "llm:")
-		entry := map[string]any{
-			"model_id":      id,
-			"name":          name,
-			"memory_gb":     cfg.MemoryGB,
-			"max_instances": *cfg.MaxInstances,
-		}
-		if cfg.AdapterParams != nil {
-			if hf, ok := cfg.AdapterParams["LLM_HF_REPO"]; ok {
-				entry["hf_model"] = hf
-			}
-			if hf, ok := cfg.AdapterParams["LLM_HF_FILE"]; ok {
-				entry["hf_file"] = hf
-			}
-		}
+		entry := serializeModelConfig(id, cfg)
+		entry["name"] = strings.TrimPrefix(id, "llm:")
 		llms = append(llms, entry)
 	}
 	if llms == nil {

@@ -612,6 +612,16 @@ Use the new model immediately by sending it explicitly in job submission:
 
 ---
 
+### GET /v1/models -- List Live Model Config
+
+Returns the currently loaded arbiter model config, including runtime-registered models and LLMs.
+
+### GET /v1/models/{model_id} -- Inspect One Live Model Config
+
+Returns the live config for one model. For LLMs, both `llm:my-model` and bare `my-model` are accepted in the path.
+
+---
+
 ### PATCH /v1/models/{model_id} -- Update Model Configuration
 
 Change a model configuration at runtime. Persists to `local/config.json`.
@@ -664,6 +674,31 @@ You can also roll just that model's workers to pick up new adapter code or env/c
 - **Scale down**: Idle instances are evicted and removed immediately. Instances with active jobs are "condemned" — they finish their work, then auto-evict. No jobs are killed.
 - **`max_instances: 0`**: Disables all dispatch for the model. Queued jobs wait until you scale back up. Useful for temporarily prioritizing other models.
 - **`reload_workers: true`**: Only the targeted model is rotated. Other adapters continue running unchanged.
+- **LLM aliasing**: For LLMs, path IDs accept either `llm:my-model` or plain `my-model`.
+
+---
+
+### POST /v1/models/{model_id}/reload -- Reload One Model
+
+Reload one model's workers using the already-persisted config. This is the explicit per-model reload path when you want new worker settings or adapter code to take effect without editing files or restarting arbiter.
+
+**Request**
+
+```
+POST /v1/models/custom-llm/reload
+```
+
+**Response (200)**
+
+```json
+{
+  "model_id": "llm:custom-llm",
+  "added": 1,
+  "removed": 1,
+  "condemned": 0,
+  "status": "reloaded"
+}
+```
 
 ---
 
