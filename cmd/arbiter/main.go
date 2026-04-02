@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -82,6 +82,10 @@ func main() {
 	if deduped > 0 {
 		slog.Info("deduped recovered jobs", "removed", deduped)
 	}
+	reconciledFollowers := store.ReconcileFollowingJobs(outputDir)
+	if reconciledFollowers > 0 {
+		slog.Info("reconciled follower jobs", "count", reconciledFollowers)
+	}
 
 	// Scheduler
 	sched := NewScheduler(cfg, store, mgr, eventLog, outputDir)
@@ -129,8 +133,9 @@ func main() {
 	}
 
 	eventLog.Log("server.start", map[string]any{
-		"vram_budget_gb": cfg.VRAMBudgetGB,
-		"recovered_jobs": recovered,
+		"vram_budget_gb":       cfg.VRAMBudgetGB,
+		"recovered_jobs":       recovered,
+		"reconciled_followers": reconciledFollowers,
 	})
 	slog.Info("arbiter started", "addr", addr, "vram_budget_gb", cfg.VRAMBudgetGB)
 
@@ -141,6 +146,7 @@ func main() {
 	go func() {
 		<-sigCh
 		slog.Info("shutting down...")
+		sched.MarkShuttingDown()
 		cancel()
 		srv.Shutdown(context.Background())
 	}()

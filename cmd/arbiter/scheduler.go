@@ -4,32 +4,34 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
-	"sync/atomic"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type Scheduler struct {
-	config   *Config
-	store    *Store
-	mgr      *InstanceManager
-	logger   *EventLogger
-	outputDir string
+	config        *Config
+	store         *Store
+	mgr           *InstanceManager
+	logger        *EventLogger
+	outputDir     string
 	wake          chan struct{}
+	shuttingDown  atomic.Bool
 	cooldownMu    sync.Mutex
 	cooldownUntil map[string]time.Time // model -> skip until this time
 }
 
 func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *EventLogger, outputDir string) *Scheduler {
 	return &Scheduler{
-		config:    cfg,
-		store:     store,
-		mgr:       mgr,
-		logger:    logger,
-		outputDir: outputDir,
+		config:        cfg,
+		store:         store,
+		mgr:           mgr,
+		logger:        logger,
+		outputDir:     outputDir,
 		wake:          make(chan struct{}, 1),
 		cooldownUntil: make(map[string]time.Time),
 	}
@@ -41,6 +43,23 @@ func (s *Scheduler) Wake() {
 	case s.wake <- struct{}{}:
 	default:
 	}
+}
+
+func (s *Scheduler) MarkShuttingDown() {
+	s.shuttingDown.Store(true)
+}
+
+func (s *Scheduler) shouldRequeueForShutdown(err error, resp *WorkerResponse) bool {
+	if !s.shuttingDown.Load() {
+		return false
+	}
+	if err != nil {
+		return true
+	}
+	if resp == nil {
+		return false
+	}
+	return resp.Status == "error" && strings.Contains(resp.Error, "subprocess died")
 }
 
 func (s *Scheduler) computePriority(modelID string) float64 {
@@ -202,13 +221,28 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance) {
 	resp, err := inst.InferRaw(job.ID, job.JobType, job.Payload, jobDir)
 	elapsed := time.Since(start).Seconds()
 
+	if s.shouldRequeueForShutdown(err, resp) {
+		s.store.UpdateState(job.ID, "queued")
+		s.logger.Log("job.requeued", map[string]any{
+			"job_id":            job.ID,
+			"model_id":          job.ModelID,
+			"reason":            "arbiter shutdown",
+			"inference_seconds": elapsed,
+		})
+		slog.Warn("requeueing job due to shutdown", "job", job.ID, "model", job.ModelID)
+		return
+	}
+
 	if err != nil {
 		errMsg := fmt.Sprintf("inference error: %s", err)
 		s.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
+		if n := s.store.ResolveFollowers(job.ID, "failed", nil, errMsg, s.outputDir); n > 0 {
+			slog.Info("resolved follower jobs", "original", job.ID, "followers", n, "state", "failed")
+		}
 		s.logger.Log("job.failed", map[string]any{
 			"job_id":            job.ID,
-			"model_id":         job.ModelID,
-			"error":            errMsg,
+			"model_id":          job.ModelID,
+			"error":             errMsg,
 			"inference_seconds": elapsed,
 		})
 		slog.Error("job failed", "job", job.ID, "error", err)
@@ -222,15 +256,15 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance) {
 		s.store.UpdateState(job.ID, "failed", WithError(resp.Error), WithFinishedAt(nowTS()))
 		s.logger.Log("job.failed", map[string]any{
 			"job_id":            job.ID,
-			"model_id":         job.ModelID,
-			"error":            resp.Error,
+			"model_id":          job.ModelID,
+			"error":             resp.Error,
 			"inference_seconds": elapsed,
 		})
 	} else {
 		s.store.UpdateState(job.ID, "completed", WithResult(resp.Result), WithFinishedAt(nowTS()))
 		s.logger.Log("job.completed", map[string]any{
 			"job_id":            job.ID,
-			"model_id":         job.ModelID,
+			"model_id":          job.ModelID,
 			"inference_seconds": elapsed,
 		})
 	}

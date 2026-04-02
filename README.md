@@ -8,6 +8,8 @@ Instead of running one model at a time and wasting 80% of your GPU memory, Arbit
 
 > **[Full API Reference](API.md)** — detailed endpoint docs, request/response schemas, job type params
 >
+> **[Dedup And Follower State Machine](DEDUP.md)** — canonical/original job behavior, restart recovery, failure promotion, and follower edge cases
+>
 > **[spark-view](https://github.com/darrenoakey/spark-view)** — web GUI for monitoring and managing Arbiter
 
 ---

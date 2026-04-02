@@ -302,7 +302,7 @@ func (s *Store) CancelJob(jobID string) (bool, error) {
 	defer s.mu.Unlock()
 	now := nowTS()
 	res, err := s.db.Exec(
-		"UPDATE jobs SET state = 'cancelled', finished_at = ? WHERE id = ? AND state IN ('queued','scheduled')",
+		"UPDATE jobs SET state = 'cancelled', finished_at = ?, error = CASE WHEN state = 'following' THEN 'cancelled while following original job' ELSE error END WHERE id = ? AND state IN ('queued','scheduled','following')",
 		now, jobID,
 	)
 	if err != nil {
@@ -332,6 +332,21 @@ func (s *Store) CancelQueuedForModel(modelID string) (int, error) {
 	res, err := s.db.Exec(
 		"UPDATE jobs SET state = 'cancelled', finished_at = ? WHERE model_id = ? AND state = 'queued'",
 		now, modelID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+func (s *Store) CancelFollowingForModel(modelID, errMsg string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := nowTS()
+	res, err := s.db.Exec(
+		"UPDATE jobs SET state = 'cancelled', error = ?, finished_at = ? WHERE model_id = ? AND state = 'following'",
+		errMsg, now, modelID,
 	)
 	if err != nil {
 		return 0, err
@@ -413,4 +428,29 @@ func (s *Store) GetJobs(ids []string) (map[string]*Job, error) {
 		result[j.ID] = &j
 	}
 	return result, nil
+}
+
+func (s *Store) CompletedJobStats(modelID string) (int, float64, float64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+SELECT
+	COUNT(*),
+	COALESCE(AVG(finished_at - created_at), 0),
+	COALESCE(AVG(CASE WHEN started_at IS NOT NULL THEN finished_at - started_at END), 0)
+FROM jobs
+WHERE state = 'completed' AND finished_at IS NOT NULL
+`
+	var args []any
+	if modelID != "" {
+		query += " AND model_id = ?"
+		args = append(args, modelID)
+	}
+
+	var count int
+	var avgTotal float64
+	var avgExec float64
+	err := s.db.QueryRow(query, args...).Scan(&count, &avgTotal, &avgExec)
+	return count, avgTotal, avgExec, err
 }

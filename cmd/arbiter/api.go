@@ -136,12 +136,24 @@ func (a *API) updatePSCache() {
 	// Add queue counts
 	counts, _ := a.store.CountByState("")
 	snap["queue"] = counts
+	completedJobs, avgTotalSeconds, avgExecSeconds, _ := a.store.CompletedJobStats("")
+	snap["job_stats"] = map[string]any{
+		"completed_jobs":        completedJobs,
+		"avg_total_seconds":     avgTotalSeconds,
+		"avg_execution_seconds": avgExecSeconds,
+		"avg_waiting_seconds":   math.Max(avgTotalSeconds-avgExecSeconds, 0),
+	}
 
 	if models, ok := snap["models"].([]map[string]any); ok {
 		for _, m := range models {
 			if id, ok := m["id"].(string); ok {
 				modelCounts, _ := a.store.CountByState(id)
 				m["queued_jobs"] = modelCounts["queued"]
+				completedJobs, avgTotalSeconds, avgExecSeconds, _ := a.store.CompletedJobStats(id)
+				m["completed_jobs"] = completedJobs
+				m["avg_total_seconds"] = avgTotalSeconds
+				m["avg_execution_seconds"] = avgExecSeconds
+				m["avg_waiting_seconds"] = math.Max(avgTotalSeconds-avgExecSeconds, 0)
 				if cfg, ok := a.config.Models[id]; ok {
 					m["max_instances"] = *cfg.MaxInstances
 					m["max_concurrent"] = cfg.MaxConcurrent
@@ -379,6 +391,9 @@ func (a *API) cancelJob(w http.ResponseWriter, r *http.Request) {
 	// Try to cancel in store (queued/scheduled)
 	cancelled, _ := a.store.CancelJob(jobID)
 	if cancelled {
+		if job.State != "following" {
+			a.store.ResolveFollowers(job.ID, "cancelled", nil, "original cancelled by operator", a.outputDir)
+		}
 		writeJSON(w, 200, map[string]any{"job_id": jobID, "status": "cancelled"})
 		return
 	}
@@ -977,15 +992,22 @@ func (a *API) clearModelQueue(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
+	cancelledFollowing, err := a.store.CancelFollowingForModel(modelID, "cancelled by operator while waiting on deduped original")
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
 
 	a.logger.Log("queue.cleared", map[string]any{
-		"model_id":  modelID,
-		"cancelled": cancelled,
+		"model_id":            modelID,
+		"cancelled":           cancelled,
+		"cancelled_following": cancelledFollowing,
 	})
 
 	writeJSON(w, 200, map[string]any{
-		"model_id":  modelID,
-		"cancelled": cancelled,
+		"model_id":            modelID,
+		"cancelled":           cancelled,
+		"cancelled_following": cancelledFollowing,
 	})
 }
 
@@ -1002,6 +1024,11 @@ func (a *API) hardKillModelWorkers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
+	cancelledFollowing, err := a.store.CancelFollowingForModel(modelID, "adapter hard-killed by operator while waiting on deduped original")
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
 	failedActive, err := a.store.FailActiveForModel(modelID, "adapter hard-killed by operator")
 	if err != nil {
 		writeError(w, 500, err.Error())
@@ -1013,20 +1040,22 @@ func (a *API) hardKillModelWorkers(w http.ResponseWriter, r *http.Request) {
 	a.scheduler.Wake()
 
 	a.logger.Log("model.hard_killed", map[string]any{
-		"model_id":         modelID,
-		"cancelled_queued": cancelledQueued,
-		"failed_active":    failedActive,
-		"killed":           killResult["killed"],
-		"recreated":        killResult["recreated"],
+		"model_id":            modelID,
+		"cancelled_queued":    cancelledQueued,
+		"cancelled_following": cancelledFollowing,
+		"failed_active":       failedActive,
+		"killed":              killResult["killed"],
+		"recreated":           killResult["recreated"],
 	})
 
 	writeJSON(w, 200, map[string]any{
-		"model_id":         modelID,
-		"cancelled_queued": cancelledQueued,
-		"failed_active":    failedActive,
-		"killed_workers":   killResult["killed"],
-		"recreated":        killResult["recreated"],
-		"status":           "hard_killed",
+		"model_id":            modelID,
+		"cancelled_queued":    cancelledQueued,
+		"cancelled_following": cancelledFollowing,
+		"failed_active":       failedActive,
+		"killed_workers":      killResult["killed"],
+		"recreated":           killResult["recreated"],
+		"status":              "hard_killed",
 	})
 }
 
@@ -1039,6 +1068,7 @@ func (a *API) killModelRunning(w http.ResponseWriter, r *http.Request) {
 
 	// Cancel queued/scheduled jobs in the store
 	cancelledQueued, _ := a.store.CancelQueuedForModel(modelID)
+	cancelledFollowing, _ := a.store.CancelFollowingForModel(modelID, "cancelled by operator while waiting on deduped original")
 
 	// Send cancel signal to all instances (kills running inference)
 	instances := a.mgr.GetModelInstances(modelID)
@@ -1051,15 +1081,17 @@ func (a *API) killModelRunning(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.logger.Log("model.killed", map[string]any{
-		"model_id":          modelID,
-		"cancelled_queued":  cancelledQueued,
-		"cancelled_running": cancelledRunning,
+		"model_id":            modelID,
+		"cancelled_queued":    cancelledQueued,
+		"cancelled_following": cancelledFollowing,
+		"cancelled_running":   cancelledRunning,
 	})
 
 	writeJSON(w, 200, map[string]any{
-		"model_id":          modelID,
-		"cancelled_queued":  cancelledQueued,
-		"cancelled_running": cancelledRunning,
+		"model_id":            modelID,
+		"cancelled_queued":    cancelledQueued,
+		"cancelled_following": cancelledFollowing,
+		"cancelled_running":   cancelledRunning,
 	})
 }
 
@@ -1088,16 +1120,22 @@ func (a *API) removeModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
-	activeOrQueued := counts["queued"] + counts["scheduled"] + counts["running"]
+	activeOrQueued := counts["queued"] + counts["scheduled"] + counts["running"] + counts["following"]
 	if activeOrQueued > 0 && !force {
 		writeError(w, 409, "model has queued or active jobs; retry with ?force=1 to remove it")
 		return
 	}
 
 	cancelledQueued := 0
+	cancelledFollowing := 0
 	failedActive := 0
 	if force {
 		cancelledQueued, err = a.store.CancelQueuedForModel(modelID)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		cancelledFollowing, err = a.store.CancelFollowingForModel(modelID, "adapter removed by operator while waiting on deduped original")
 		if err != nil {
 			writeError(w, 500, err.Error())
 			return
@@ -1118,22 +1156,24 @@ func (a *API) removeModel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.logger.Log("model.removed", map[string]any{
-		"model_id":          modelID,
-		"force":             force,
-		"removed_job_types": removedJobTypes,
-		"cancelled_queued":  cancelledQueued,
-		"failed_active":     failedActive,
-		"killed":            killResult["killed"],
+		"model_id":            modelID,
+		"force":               force,
+		"removed_job_types":   removedJobTypes,
+		"cancelled_queued":    cancelledQueued,
+		"cancelled_following": cancelledFollowing,
+		"failed_active":       failedActive,
+		"killed":              killResult["killed"],
 	})
 
 	writeJSON(w, 200, map[string]any{
-		"model_id":          modelID,
-		"force":             force,
-		"removed_job_types": removedJobTypes,
-		"cancelled_queued":  cancelledQueued,
-		"failed_active":     failedActive,
-		"killed_workers":    killResult["killed"],
-		"status":            "removed",
+		"model_id":            modelID,
+		"force":               force,
+		"removed_job_types":   removedJobTypes,
+		"cancelled_queued":    cancelledQueued,
+		"cancelled_following": cancelledFollowing,
+		"failed_active":       failedActive,
+		"killed_workers":      killResult["killed"],
+		"status":              "removed",
 	})
 }
 

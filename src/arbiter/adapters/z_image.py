@@ -30,6 +30,8 @@ class ZImageTurboAdapter(ModelAdapter):
         self._pipe = None
         self._img2img_pipe = None
         self._device = "cuda"
+        self._txt2img_backend = "native"
+        self._img2img_backend = "native"
 
     def load(self, device: str = "cuda") -> None:
         import torch
@@ -40,6 +42,7 @@ class ZImageTurboAdapter(ModelAdapter):
             ZIMAGE_HF_ID,
             torch_dtype=torch.bfloat16,
         ).to(device)
+        self._txt2img_backend = self._enable_fast_attention(self._pipe, pipeline_name="txt2img")
 
         self._device = device
         log.info("Z-Image-Turbo ready.")
@@ -64,8 +67,42 @@ class ZImageTurboAdapter(ModelAdapter):
             ZIMAGE_HF_ID,
             torch_dtype=torch.bfloat16,
         ).to(self._device)
+        self._img2img_backend = self._enable_fast_attention(self._img2img_pipe, pipeline_name="img2img")
 
         return self._img2img_pipe
+
+    def _enable_fast_attention(self, pipe, pipeline_name: str) -> str:
+        transformer = getattr(pipe, "transformer", None)
+        if transformer is None or not hasattr(transformer, "set_attention_backend"):
+            log.info("Z-Image-Turbo %s using default attention; transformer backend switch unsupported", pipeline_name)
+            return "native"
+
+        for backend in ("_native_cudnn", "native"):
+            try:
+                transformer.set_attention_backend(backend)
+                log.info("Z-Image-Turbo %s enabled attention backend: %s", pipeline_name, backend)
+                return backend
+            except Exception as exc:
+                log.info("Z-Image-Turbo %s attention backend %s unavailable: %s", pipeline_name, backend, exc)
+
+        log.warning("Z-Image-Turbo %s could not enable a preferred attention backend; leaving default in place", pipeline_name)
+        return "native"
+
+    def _retry_with_native_attention(self, pipe, pipeline_name: str, exc: Exception):
+        transformer = getattr(pipe, "transformer", None)
+        if transformer is None or not hasattr(transformer, "set_attention_backend"):
+            raise exc
+
+        log.warning(
+            "Z-Image-Turbo %s backend failed (%s); retrying with native backend",
+            pipeline_name,
+            exc,
+        )
+        transformer.set_attention_backend("native")
+        if pipeline_name == "txt2img":
+            self._txt2img_backend = "native"
+        else:
+            self._img2img_backend = "native"
 
     def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
         import torch
@@ -89,23 +126,45 @@ class ZImageTurboAdapter(ModelAdapter):
             input_image = self._resolve_image(params)
             pipe = self._get_img2img_pipe()
             strength = float(params.get("strength", 0.85))
-            result_image = pipe(
-                prompt=prompt,
-                image=input_image.resize((width, height)),
-                strength=strength,
-                num_inference_steps=steps,
-                guidance_scale=guidance,
-                generator=generator,
-            ).images[0]
+            try:
+                result_image = pipe(
+                    prompt=prompt,
+                    image=input_image.resize((width, height)),
+                    strength=strength,
+                    num_inference_steps=steps,
+                    guidance_scale=guidance,
+                    generator=generator,
+                ).images[0]
+            except Exception as exc:
+                self._retry_with_native_attention(pipe, "img2img", exc)
+                result_image = pipe(
+                    prompt=prompt,
+                    image=input_image.resize((width, height)),
+                    strength=strength,
+                    num_inference_steps=steps,
+                    guidance_scale=guidance,
+                    generator=generator,
+                ).images[0]
         else:
-            result_image = self._pipe(
-                prompt=prompt,
-                width=width,
-                height=height,
-                num_inference_steps=steps,
-                guidance_scale=guidance,
-                generator=generator,
-            ).images[0]
+            try:
+                result_image = self._pipe(
+                    prompt=prompt,
+                    width=width,
+                    height=height,
+                    num_inference_steps=steps,
+                    guidance_scale=guidance,
+                    generator=generator,
+                ).images[0]
+            except Exception as exc:
+                self._retry_with_native_attention(self._pipe, "txt2img", exc)
+                result_image = self._pipe(
+                    prompt=prompt,
+                    width=width,
+                    height=height,
+                    num_inference_steps=steps,
+                    guidance_scale=guidance,
+                    generator=generator,
+                ).images[0]
 
         self._check_cancel(cancel_flag)
 

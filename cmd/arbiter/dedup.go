@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -114,6 +115,13 @@ func hashFileContents(path string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+func followerOriginalJobID(errField string) string {
+	if !strings.HasPrefix(errField, "following:") {
+		return ""
+	}
+	return strings.TrimPrefix(errField, "following:")
+}
+
 // Store methods for dedup cache
 
 const dedupSchema = `
@@ -174,7 +182,7 @@ func (s *Store) GetFollowers(originalJobID string) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(
-		"SELECT id FROM jobs WHERE state = 'following' AND error = ?",
+		"SELECT id FROM jobs WHERE state = 'following' AND error = ? ORDER BY created_at ASC",
 		"following:"+originalJobID,
 	)
 	if err != nil {
@@ -211,8 +219,9 @@ func (s *Store) CreateFollowerJob(modelID, jobType string, payload json.RawMessa
 }
 
 // ResolveFollowers handles completion of an original job:
-// - If original completed: all followers complete with same result
-// - If original failed/cancelled: followers become fresh queued jobs
+//   - If original completed: all followers complete with same result
+//   - If original failed/cancelled: oldest follower is promoted to the new canonical
+//     queued job, and remaining followers are repointed to follow it.
 func (s *Store) ResolveFollowers(originalJobID string, originalState string, result *json.RawMessage, errMsg string, outputDir string) int {
 	followers, _ := s.GetFollowers(originalJobID)
 	if len(followers) == 0 {
@@ -225,17 +234,83 @@ func (s *Store) ResolveFollowers(originalJobID string, originalState string, res
 			// Symlink output directory
 			origDir := fmt.Sprintf("%s/jobs/%s", outputDir, originalJobID)
 			followerDir := fmt.Sprintf("%s/jobs/%s", outputDir, fid)
-			os.Symlink(origDir, followerDir)
+			_ = os.RemoveAll(followerDir)
+			_ = os.Symlink(origDir, followerDir)
 
-			s.UpdateState(fid, "completed", WithResult(*result), WithFinishedAt(now))
-		} else {
-			// Original failed/cancelled — promote follower to a real queued job
 			s.mu.Lock()
-			s.db.Exec("UPDATE jobs SET state = 'queued', error = NULL, priority = 0 WHERE id = ?", fid)
+			if result != nil {
+				s.db.Exec(
+					"UPDATE jobs SET state = 'completed', result = ?, error = NULL, finished_at = ? WHERE id = ?",
+					string(*result), now, fid,
+				)
+			} else {
+				s.db.Exec(
+					"UPDATE jobs SET state = 'completed', error = NULL, finished_at = ? WHERE id = ?",
+					now, fid,
+				)
+			}
 			s.mu.Unlock()
 		}
 	}
+
+	if originalState != "completed" {
+		promotedID := followers[0]
+		s.mu.Lock()
+		s.db.Exec(
+			"UPDATE jobs SET state = 'queued', error = NULL, result = NULL, priority = 0, started_at = NULL, finished_at = NULL WHERE id = ?",
+			promotedID,
+		)
+		for _, fid := range followers[1:] {
+			s.db.Exec(
+				"UPDATE jobs SET state = 'following', error = ?, result = NULL, started_at = NULL, finished_at = NULL WHERE id = ?",
+				"following:"+promotedID, fid,
+			)
+		}
+		s.mu.Unlock()
+
+		if promotedJob, err := s.GetJob(promotedID); err == nil && promotedJob != nil {
+			hash := computeJobHash(promotedJob.JobType, promotedJob.Payload)
+			s.DedupRegister(hash, promotedID)
+		}
+	}
 	return len(followers)
+}
+
+// ReconcileFollowingJobs resolves or promotes follower jobs whose originals are already terminal
+// or missing. Followers whose originals are still queued/scheduled/running remain untouched.
+func (s *Store) ReconcileFollowingJobs(outputDir string) int {
+	s.mu.Lock()
+	rows, err := s.db.Query("SELECT DISTINCT error FROM jobs WHERE state = 'following' AND error LIKE 'following:%'")
+	s.mu.Unlock()
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+
+	var originalIDs []string
+	for rows.Next() {
+		var errField string
+		if err := rows.Scan(&errField); err != nil {
+			continue
+		}
+		if originalID := followerOriginalJobID(errField); originalID != "" {
+			originalIDs = append(originalIDs, originalID)
+		}
+	}
+
+	resolved := 0
+	for _, originalID := range originalIDs {
+		orig, err := s.GetJob(originalID)
+		switch {
+		case err == sql.ErrNoRows || orig == nil:
+			resolved += s.ResolveFollowers(originalID, "cancelled", nil, "original job missing", outputDir)
+		case orig.State == "completed":
+			resolved += s.ResolveFollowers(originalID, "completed", orig.Result, orig.Error, outputDir)
+		case orig.State == "failed" || orig.State == "cancelled":
+			resolved += s.ResolveFollowers(originalID, orig.State, nil, orig.Error, outputDir)
+		}
+	}
+	return resolved
 }
 
 // DedupRecoveredJobs scans all queued jobs after crash recovery,
