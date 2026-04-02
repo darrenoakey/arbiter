@@ -166,6 +166,7 @@ The `ref:` prefix is resolved in `_resolve_media()` in `src/arbiter/adapters/bas
 - **Single process, ThreadPoolExecutor**: PyTorch releases GIL during CUDA ops. Threads share GPU memory efficiently.
 - **SJF scheduling**: `priority = avg_inference_ms + (load_ms if not loaded else 0)`. Shortest jobs run first. Already-loaded models get natural priority.
 - **SQLite queue**: Persistent, crash-recoverable. On restart, incomplete jobs are re-queued.
+- **Dedup followers**: Duplicate requests are persisted as jobs with `state=following` and `error=following:<original_job_id>`. Startup recovery must requeue `scheduled`/`running` jobs, then reconcile followers so none remain attached to terminal or missing originals.
 - **Async job API**: Submit → poll → get result. Server crashes are transparent to clients.
 - **LRU eviction**: Models idle past keep_alive_seconds get evicted. When memory is needed, oldest idle model goes first.
 - **Group adapters**: Sonic (8 sub-models) and LTX-2 (phased pipeline) load/unload atomically.
