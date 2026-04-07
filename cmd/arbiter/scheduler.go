@@ -14,26 +14,42 @@ import (
 )
 
 type Scheduler struct {
-	config        *Config
-	store         *Store
-	mgr           *InstanceManager
-	logger        *EventLogger
-	outputDir     string
-	wake          chan struct{}
-	shuttingDown  atomic.Bool
-	cooldownMu    sync.Mutex
-	cooldownUntil map[string]time.Time // model -> skip until this time
+	config          *Config
+	store           *Store
+	mgr             *InstanceManager
+	logger          *EventLogger
+	outputDir       string
+	inboxDir        string // if set, input files are deleted after job completion/failure
+	wake            chan struct{}
+	shuttingDown    atomic.Bool
+	cooldownMu      sync.Mutex
+	cooldownUntil   map[string]time.Time // model -> skip until this time (load failures)
+	pressureMu      sync.Mutex
+	currentPressure float64 // sum of in-flight job pressure indices
+	// Inference failure circuit-breaker
+	failureCountMu      sync.Mutex
+	failureCount        map[string]int       // model -> consecutive inference failures
+	failurePaused       map[string]time.Time // model -> paused until (inference circuit-breaker)
+	failureCooldownLevel map[string]int      // model -> escalation level (0=30s,1=1m,2=5m,3+=15m)
 }
 
 func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *EventLogger, outputDir string) *Scheduler {
+	inboxDir := ""
+	if cfg.ShareMount != "" {
+		inboxDir = filepath.Join(cfg.ShareMount, "inbox")
+	}
 	return &Scheduler{
-		config:        cfg,
-		store:         store,
-		mgr:           mgr,
-		logger:        logger,
-		outputDir:     outputDir,
-		wake:          make(chan struct{}, 1),
-		cooldownUntil: make(map[string]time.Time),
+		config:               cfg,
+		store:                store,
+		mgr:                  mgr,
+		logger:               logger,
+		outputDir:            outputDir,
+		inboxDir:             inboxDir,
+		wake:                 make(chan struct{}, 1),
+		cooldownUntil:        make(map[string]time.Time),
+		failureCount:         make(map[string]int),
+		failurePaused:        make(map[string]time.Time),
+		failureCooldownLevel: make(map[string]int),
 	}
 }
 
@@ -85,7 +101,75 @@ func (s *Scheduler) rescoreAll() {
 	}
 }
 
-// getFullModels returns model IDs that are at total capacity.
+
+// failureCooldownDurations defines escalating pause durations for the inference
+// circuit-breaker. The index maps to failureCooldownLevel.
+var failureCooldownDurations = []time.Duration{
+	30 * time.Second,
+	1 * time.Minute,
+	5 * time.Minute,
+	15 * time.Minute,
+}
+
+// RecordSuccess resets the consecutive failure counter for a model. If the model
+// is currently paused the pause is left in place — it will expire on its own.
+// The failure count is cleared so the next round of failures starts fresh.
+func (s *Scheduler) RecordSuccess(modelID string) {
+	s.failureCountMu.Lock()
+	defer s.failureCountMu.Unlock()
+	s.failureCount[modelID] = 0
+}
+
+// RecordFailure increments the consecutive failure counter for a model. When the
+// count reaches the threshold the model is paused for an escalating duration.
+func (s *Scheduler) RecordFailure(modelID string) {
+	const threshold = 10
+	s.failureCountMu.Lock()
+	defer s.failureCountMu.Unlock()
+	s.failureCount[modelID]++
+	if s.failureCount[modelID] < threshold {
+		return
+	}
+	// Threshold reached — enter cooldown.
+	level := s.failureCooldownLevel[modelID]
+	if level >= len(failureCooldownDurations) {
+		level = len(failureCooldownDurations) - 1
+	}
+	dur := failureCooldownDurations[level]
+	until := time.Now().Add(dur)
+	s.failurePaused[modelID] = until
+	// Escalate for next time, capped at the last level.
+	if s.failureCooldownLevel[modelID] < len(failureCooldownDurations)-1 {
+		s.failureCooldownLevel[modelID]++
+	}
+	// Reset the counter so that after the pause lifts the next N failures
+	// are counted fresh.
+	s.failureCount[modelID] = 0
+	slog.Warn("circuit-breaker: model paused after consecutive failures",
+		"model", modelID,
+		"threshold", threshold,
+		"cooldown", dur,
+		"resume_at", until.Format(time.RFC3339),
+	)
+}
+
+// IsModelPaused reports whether the model's inference circuit-breaker is active.
+// If the pause has expired it is cleared and (false, zero) is returned.
+func (s *Scheduler) IsModelPaused(modelID string) (bool, time.Time) {
+	s.failureCountMu.Lock()
+	defer s.failureCountMu.Unlock()
+	until, ok := s.failurePaused[modelID]
+	if !ok {
+		return false, time.Time{}
+	}
+	if time.Now().After(until) {
+		delete(s.failurePaused, modelID)
+		return false, time.Time{}
+	}
+	return true, until
+}
+
+// getFullModels returns model IDs that are at total capacity or would exceed the pressure budget.
 func (s *Scheduler) getFullModels() map[string]bool {
 	full := make(map[string]bool)
 	now := time.Now()
@@ -98,10 +182,22 @@ func (s *Scheduler) getFullModels() map[string]bool {
 		}
 	}
 	s.cooldownMu.Unlock()
+
+	s.pressureMu.Lock()
+	cp := s.currentPressure
+	s.pressureMu.Unlock()
+
 	for modelID, cfg := range s.config.Models {
+		if full[modelID] {
+			continue
+		}
 		active, _ := s.store.CountActive(modelID)
 		capacity := *cfg.MaxInstances * cfg.MaxConcurrent
 		if active >= capacity {
+			full[modelID] = true
+			continue
+		}
+		if cp+cfg.PressureIndex > 1.0+1e-9 {
 			full[modelID] = true
 		}
 	}
@@ -182,10 +278,22 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 }
 
 // dispatchJobToInstance loads the instance and runs inference.
-// activeJobs is already incremented by the caller to reserve the slot.
-// This function owns the reservation and releases it when done.
-func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance) {
+// activeJobs and currentPressure are already incremented by the caller.
+// This function owns both reservations and releases them when done.
+func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure float64) {
 	defer func() {
+		// Catch any unexpected panic so a single bad job can never crash the server.
+		if r := recover(); r != nil {
+			slog.Error("panic in dispatchJobToInstance — recovered", "panic", r, "job", job.ID, "model", job.ModelID)
+			s.logger.Log("job.panic", map[string]any{"job_id": job.ID, "model_id": job.ModelID, "panic": fmt.Sprintf("%v", r)})
+			s.store.UpdateState(job.ID, "failed", WithError(fmt.Sprintf("internal panic: %v", r)))
+		}
+		s.pressureMu.Lock()
+		s.currentPressure -= pressure
+		if s.currentPressure < 0 {
+			s.currentPressure = 0
+		}
+		s.pressureMu.Unlock()
 		s.mgr.ReleaseAndCheck(inst)
 		s.rescoreModel(job.ModelID)
 	}()
@@ -217,6 +325,25 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance) {
 	jobDir := filepath.Join(s.outputDir, "jobs", job.ID)
 	os.MkdirAll(jobDir, 0o755)
 
+	// Kill the worker if inference exceeds max_runtime_seconds.
+	// This unblocks the goroutine (subprocess death → readLoop broadcasts → sendAndReceive returns).
+	// The DB-level watchdog (RunJobWatchdog) is a secondary check; this is the real fix.
+	if runtimeSec := s.config.Models[job.ModelID].MaxRuntimeSec; runtimeSec > 0 {
+		killTimer := time.AfterFunc(time.Duration(runtimeSec)*time.Second, func() {
+			slog.Warn("inference timeout — killing worker",
+				"job", job.ID, "model", job.ModelID,
+				"instance", inst.InstanceID, "max_runtime_seconds", runtimeSec)
+			s.logger.Log("job.timeout", map[string]any{
+				"job_id":              job.ID,
+				"model_id":            job.ModelID,
+				"instance_id":         inst.InstanceID,
+				"max_runtime_seconds": runtimeSec,
+			})
+			inst.Kill()
+		})
+		defer killTimer.Stop()
+	}
+
 	start := time.Now()
 	resp, err := inst.InferRaw(job.ID, job.JobType, job.Payload, jobDir)
 	elapsed := time.Since(start).Seconds()
@@ -246,12 +373,16 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance) {
 			"inference_seconds": elapsed,
 		})
 		slog.Error("job failed", "job", job.ID, "error", err)
+		s.RecordFailure(job.ModelID)
+		s.cleanupJobInbox(job)
 		return
 	}
 
 	if resp.Status == "cancelled" {
 		s.store.UpdateState(job.ID, "cancelled", WithFinishedAt(nowTS()))
 		s.logger.Log("job.cancelled", map[string]any{"job_id": job.ID, "model_id": job.ModelID})
+		s.cleanupJobInbox(job)
+		// Cancellation is intentional — don't penalise the model.
 	} else if resp.Status == "error" {
 		s.store.UpdateState(job.ID, "failed", WithError(resp.Error), WithFinishedAt(nowTS()))
 		s.logger.Log("job.failed", map[string]any{
@@ -260,13 +391,21 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance) {
 			"error":             resp.Error,
 			"inference_seconds": elapsed,
 		})
+		s.RecordFailure(job.ModelID)
+		s.cleanupJobInbox(job)
 	} else {
 		s.store.UpdateState(job.ID, "completed", WithResult(resp.Result), WithFinishedAt(nowTS()))
-		s.logger.Log("job.completed", map[string]any{
+		rssEntry := map[string]any{
 			"job_id":            job.ID,
 			"model_id":          job.ModelID,
 			"inference_seconds": elapsed,
-		})
+		}
+		if rss := inst.RSSAnon(); rss > 0 {
+			rssEntry["worker_rss_anon_mb"] = rss
+		}
+		s.logger.Log("job.completed", rssEntry)
+		s.RecordSuccess(job.ModelID)
+		s.cleanupJobInbox(job)
 	}
 
 	// Resolve any follower jobs
@@ -359,10 +498,17 @@ func (s *Scheduler) Run(ctx context.Context) {
 		// Reserve the slot immediately so PickInstance won't return it again
 		atomic.AddInt32(&inst.activeJobs, 1)
 
-		go func(j *Job, inst *Instance) {
-			s.dispatchJobToInstance(j, inst)
+		// Reserve pressure immediately (main loop is single-threaded for dispatch decisions)
+		pressure := s.config.Models[job.ModelID].PressureIndex
+		s.pressureMu.Lock()
+		s.currentPressure += pressure
+		s.pressureMu.Unlock()
+		slog.Debug("pressure reserved", "model", job.ModelID, "pressure", pressure, "total", s.currentPressure)
+
+		go func(j *Job, inst *Instance, pressure float64) {
+			s.dispatchJobToInstance(j, inst, pressure)
 			s.Wake()
-		}(job, inst)
+		}(job, inst, pressure)
 
 		// Preload next instance in background
 		s.tryPreload()
@@ -416,6 +562,178 @@ func (s *Scheduler) RunKeepalive(ctx context.Context) {
 					s.rescoreModel(modelID)
 				}
 			}
+		}
+	}
+}
+
+// RunJobWatchdog periodically checks for jobs stuck in "running" state past their
+// model's max_runtime_seconds and marks them as failed.
+func (s *Scheduler) RunJobWatchdog(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		jobs, err := s.store.GetRunningJobs()
+		if err != nil {
+			slog.Warn("watchdog: failed to query running jobs", "error", err)
+			continue
+		}
+
+		now := nowTS()
+		for _, job := range jobs {
+			if job.StartedAt == nil {
+				continue
+			}
+
+			cfg, ok := s.config.Models[job.ModelID]
+			if !ok {
+				continue
+			}
+
+			maxSec := float64(cfg.MaxRuntimeSec)
+			elapsed := now - *job.StartedAt
+			if elapsed < maxSec {
+				continue
+			}
+
+			errMsg := fmt.Sprintf("job timed out after %ds (limit %ds)", int(elapsed), cfg.MaxRuntimeSec)
+			slog.Warn("watchdog: timing out stuck job",
+				"job_id", job.ID,
+				"model_id", job.ModelID,
+				"elapsed_seconds", int(elapsed),
+				"max_runtime_seconds", cfg.MaxRuntimeSec,
+			)
+			s.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(now))
+			s.logger.Log("job.timeout", map[string]any{
+				"job_id":              job.ID,
+				"model_id":            job.ModelID,
+				"elapsed_seconds":     int(elapsed),
+				"max_runtime_seconds": cfg.MaxRuntimeSec,
+			})
+			if n := s.store.ResolveFollowers(job.ID, "failed", nil, errMsg, s.outputDir); n > 0 {
+				slog.Info("watchdog: resolved follower jobs", "original", job.ID, "followers", n)
+			}
+			s.cleanupJobInbox(job)
+		}
+	}
+}
+
+// cleanupJobInbox deletes any files in the inbox directory that are referenced
+// by this job's params, provided no other active job also references them.
+// Called once a job reaches a terminal state (completed, failed, cancelled)
+// but NOT on requeue.
+func (s *Scheduler) cleanupJobInbox(job *Job) {
+	if s.inboxDir == "" || len(job.Payload) == 0 {
+		return
+	}
+	files := extractInboxPaths(job.Payload, s.inboxDir)
+	if len(files) == 0 {
+		return
+	}
+
+	// Build set of inbox paths still referenced by other active jobs.
+	activeJobs, err := s.store.GetActiveJobs()
+	if err != nil {
+		slog.Warn("inbox cleanup: skipping, failed to query active jobs", "error", err)
+		return
+	}
+	stillReferenced := make(map[string]bool)
+	for _, j := range activeJobs {
+		if j.ID == job.ID {
+			continue // skip the job we're cleaning up
+		}
+		for _, f := range extractInboxPaths(j.Payload, s.inboxDir) {
+			stillReferenced[f] = true
+		}
+	}
+
+	for _, f := range files {
+		if stillReferenced[f] {
+			slog.Debug("inbox cleanup: skipping file still referenced by queued jobs", "file", f)
+			continue
+		}
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+			slog.Warn("inbox cleanup: failed to remove file", "file", f, "error", err)
+		} else if err == nil {
+			slog.Debug("inbox cleanup: removed", "file", f)
+		}
+	}
+}
+
+// CleanupOrphanedInboxFiles removes files from the inbox that are not
+// referenced by any queued, scheduled, running, or following job.
+func (s *Scheduler) CleanupOrphanedInboxFiles() (int, error) {
+	if s.inboxDir == "" {
+		return 0, nil
+	}
+
+	// Collect all inbox paths referenced by active jobs.
+	activeJobs, err := s.store.GetActiveJobs()
+	if err != nil {
+		return 0, fmt.Errorf("get active jobs: %w", err)
+	}
+	referenced := make(map[string]bool)
+	for _, j := range activeJobs {
+		for _, f := range extractInboxPaths(j.Payload, s.inboxDir) {
+			referenced[f] = true
+		}
+	}
+
+	entries, err := os.ReadDir(s.inboxDir)
+	if err != nil {
+		return 0, fmt.Errorf("read inbox dir: %w", err)
+	}
+
+	deleted := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		path := filepath.Join(s.inboxDir, e.Name())
+		if referenced[path] {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			slog.Warn("inbox cleanup: failed to remove orphan", "file", path, "error", err)
+		} else if err == nil {
+			deleted++
+		}
+	}
+	return deleted, nil
+}
+
+// extractInboxPaths walks a JSON payload and returns every string value that
+// starts with inboxDir.
+func extractInboxPaths(payload json.RawMessage, inboxDir string) []string {
+	var v any
+	if err := json.Unmarshal(payload, &v); err != nil {
+		return nil
+	}
+	prefix := inboxDir + "/"
+	var out []string
+	walkJSON(v, prefix, &out)
+	return out
+}
+
+func walkJSON(v any, prefix string, out *[]string) {
+	switch t := v.(type) {
+	case string:
+		if strings.HasPrefix(t, prefix) {
+			*out = append(*out, t)
+		}
+	case map[string]any:
+		for _, val := range t {
+			walkJSON(val, prefix, out)
+		}
+	case []any:
+		for _, val := range t {
+			walkJSON(val, prefix, out)
 		}
 	}
 }

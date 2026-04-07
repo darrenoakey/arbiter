@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -79,6 +80,29 @@ func (inst *Instance) ActiveJobs() int {
 	return int(atomic.LoadInt32(&inst.activeJobs))
 }
 
+// RSSAnon returns the anonymous RSS (heap + stack) of the worker subprocess in MB.
+// Returns 0 if not running or on non-Linux platforms.
+func (inst *Instance) RSSAnon() float64 {
+	inst.mu.Lock()
+	cmd := inst.cmd
+	inst.mu.Unlock()
+	if cmd == nil || cmd.Process == nil {
+		return 0
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", cmd.Process.Pid))
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "RssAnon:") {
+			var kb int64
+			fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(line, "RssAnon:")), "%d", &kb)
+			return float64(kb) / 1024
+		}
+	}
+	return 0
+}
+
 func (inst *Instance) HasCapacity() bool {
 	return inst.ActiveJobs() < inst.MaxConcurrent
 }
@@ -132,6 +156,15 @@ func (inst *Instance) Spawn() error {
 	if err := cmd.Start(); err != nil {
 		inst.state = "error"
 		return fmt.Errorf("start subprocess: %w", err)
+	}
+
+	// Make worker subprocesses OOM-kill candidates before arbiter-go or auto.
+	// LTX-2 and other heavy workers can use tens of GB of RAM; we want the OOM
+	// killer to prefer them over the Go server and the auto process manager.
+	// Writing to /proc/<pid>/oom_score_adj is Linux-only; silently ignored elsewhere.
+	if cmd.Process != nil {
+		oomPath := fmt.Sprintf("/proc/%d/oom_score_adj", cmd.Process.Pid)
+		_ = os.WriteFile(oomPath, []byte("500"), 0o644)
 	}
 
 	inst.cmd = cmd
@@ -239,7 +272,26 @@ func (inst *Instance) sendAndReceive(cmd map[string]any) (*WorkerResponse, error
 		return nil, fmt.Errorf("write to subprocess: %w", err)
 	}
 
-	raw := <-ch
+	// Wait for response, but also watch for subprocess death.
+	// Race: readLoop may have already exited before we registered ch (subprocess died
+	// between our pendingMu.Unlock and stdin.Write). In that case nobody will ever
+	// send to ch, so we'd block forever without selecting on readerDone.
+	var raw json.RawMessage
+	select {
+	case raw = <-ch:
+		// Normal path: response arrived (may be a "subprocess died" error from readLoop).
+	case <-inst.readerDone:
+		// readLoop already exited. Check if it sent to ch before closing.
+		inst.pendingMu.Lock()
+		delete(inst.pending, reqID)
+		inst.pendingMu.Unlock()
+		select {
+		case raw = <-ch:
+			// readLoop did manage to send to us just before exiting.
+		default:
+			return nil, fmt.Errorf("subprocess died")
+		}
+	}
 	var resp WorkerResponse
 	json.Unmarshal(raw, &resp)
 	return &resp, nil

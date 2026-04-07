@@ -13,6 +13,7 @@ type ModelConfig struct {
 	MaxConcurrent  int               `json:"max_concurrent"`
 	MaxInstances   *int              `json:"max_instances"`
 	KeepAliveSec   int               `json:"keep_alive_seconds"`
+	MaxRuntimeSec  int               `json:"max_runtime_seconds"`
 	AvgInferenceMs float64           `json:"avg_inference_ms"`
 	LoadMs         float64           `json:"load_ms"`
 	AutoDownload   string            `json:"auto_download"`
@@ -20,12 +21,15 @@ type ModelConfig struct {
 	Group          bool              `json:"group"`
 	WorkerCmd      []string          `json:"worker_cmd,omitempty"`
 	AdapterParams  map[string]string `json:"adapter_params,omitempty"`
+	PressureIndex  float64           `json:"pressure_index"` // 0..1 memory bandwidth fraction; sum across in-flight jobs must stay ≤ 1.0
 }
 
 type Config struct {
 	VRAMBudgetGB float64                `json:"vram_budget_gb"`
 	Host         string                 `json:"host"`
 	Port         int                    `json:"port"`
+	OutputDir    string                 `json:"output_dir"`
+	ShareMount   string                 `json:"share_mount"` // e.g. "/mnt/arbiter-store" — if set, monitored and remounted when unhealthy
 	Models       map[string]ModelConfig `json:"models"`
 }
 
@@ -81,8 +85,14 @@ func LoadConfig(projectRoot string) (*Config, error) {
 			one := 1
 			m.MaxInstances = &one
 		}
+		if m.PressureIndex <= 0 {
+			m.PressureIndex = 1.0 // conservative default: serialize unknown models
+		}
 		if m.KeepAliveSec == 0 {
 			m.KeepAliveSec = 300
+		}
+		if m.MaxRuntimeSec == 0 {
+			m.MaxRuntimeSec = 7200
 		}
 		cfg.Models[id] = m
 	}
@@ -100,6 +110,9 @@ func LoadConfig(projectRoot string) (*Config, error) {
 	}
 	if v := os.Getenv("ARBITER_HOST"); v != "" {
 		cfg.Host = v
+	}
+	if v := os.Getenv("ARBITER_OUTPUT_DIR"); v != "" {
+		cfg.OutputDir = v
 	}
 
 	return cfg, nil

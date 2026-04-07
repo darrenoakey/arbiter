@@ -14,6 +14,13 @@ import (
 )
 
 func main() {
+	// Protect this process from the OOM killer — worker subprocesses are set to
+	// OomScoreAdj=500 (in proc.go) so the kernel will kill them first.
+	if err := os.WriteFile("/proc/self/oom_score_adj", []byte("-200"), 0o644); err != nil {
+		// Non-fatal: may not have permission in all environments
+		slog.Warn("could not set oom_score_adj", "error", err)
+	}
+
 	// Structured logging to stderr
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
@@ -31,8 +38,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Output dirs
+	// Output dirs — jobs/logs/refs go to ARBITER_OUTPUT_DIR if set (e.g. network share),
+	// DB stays local (SQLite over network is unsafe).
 	outputDir := filepath.Join(projectRoot, "output")
+	if cfg.OutputDir != "" {
+		outputDir = cfg.OutputDir
+	}
 	os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755)
 	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
 	os.MkdirAll(filepath.Join(outputDir, "refs"), 0o755)
@@ -41,8 +52,8 @@ func main() {
 	eventLog := NewEventLogger(filepath.Join(outputDir, "logs"))
 	defer eventLog.Close()
 
-	// Store
-	dbPath := filepath.Join(outputDir, "arbiter.db")
+	// Store — DB always on local disk regardless of ARBITER_OUTPUT_DIR
+	dbPath := filepath.Join(projectRoot, "output", "arbiter.db")
 	store, err := NewStore(dbPath)
 	if err != nil {
 		slog.Error("failed to open store", "error", err)
@@ -90,6 +101,16 @@ func main() {
 	// Scheduler
 	sched := NewScheduler(cfg, store, mgr, eventLog, outputDir)
 
+	// Remove inbox files that belong to no active job (runs in background so
+	// it doesn't delay server startup — can be thousands of files after crashes).
+	go func() {
+		if n, err := sched.CleanupOrphanedInboxFiles(); err != nil {
+			slog.Warn("inbox orphan cleanup failed", "error", err)
+		} else if n > 0 {
+			slog.Info("inbox orphan cleanup: removed files", "count", n)
+		}
+	}()
+
 	// API
 	api := NewAPI(cfg, store, mgr, sched, eventLog, outputDir, projectRoot)
 
@@ -100,6 +121,12 @@ func main() {
 	// Start background goroutines
 	go sched.Run(ctx)
 	go sched.RunKeepalive(ctx)
+	go sched.RunJobWatchdog(ctx)
+	if cfg.ShareMount != "" {
+		// Probe the mount root itself — contains inbox/ and output/ subdirs,
+		// so ReadDir always gets a real server round-trip.
+		go RunShareWatchdog(ctx, cfg.ShareMount, cfg.ShareMount, eventLog)
+	}
 
 	// Dedup cache cleanup (hourly)
 	go func() {

@@ -454,3 +454,89 @@ WHERE state = 'completed' AND finished_at IS NOT NULL
 	err := s.db.QueryRow(query, args...).Scan(&count, &avgTotal, &avgExec)
 	return count, avgTotal, avgExec, err
 }
+
+// GetRunningJobs returns all jobs currently in the "running" state with their model_id and started_at.
+func (s *Store) GetRunningJobs() ([]*Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query(
+		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at FROM jobs WHERE state = 'running'",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []*Job
+	for rows.Next() {
+		var j Job
+		var payload, result, errStr sql.NullString
+		var startedAt, finishedAt sql.NullFloat64
+		if err := rows.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
+			&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt); err != nil {
+			return nil, err
+		}
+		if payload.Valid {
+			j.Payload = json.RawMessage(payload.String)
+		}
+		if result.Valid {
+			rm := json.RawMessage(result.String)
+			j.Result = &rm
+		}
+		if errStr.Valid {
+			j.Error = errStr.String
+		}
+		if startedAt.Valid {
+			j.StartedAt = &startedAt.Float64
+		}
+		if finishedAt.Valid {
+			j.FinishedAt = &finishedAt.Float64
+		}
+		jobs = append(jobs, &j)
+	}
+	return jobs, nil
+}
+
+// GetActiveJobs returns all jobs in a non-terminal state (queued, scheduled, running, following).
+func (s *Store) GetActiveJobs() ([]*Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.Query(
+		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at FROM jobs WHERE state IN ('queued','scheduled','running','following')",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []*Job
+	for rows.Next() {
+		var j Job
+		var payload, result, errStr sql.NullString
+		var startedAt, finishedAt sql.NullFloat64
+		if err := rows.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
+			&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt); err != nil {
+			return nil, err
+		}
+		if payload.Valid {
+			j.Payload = json.RawMessage(payload.String)
+		}
+		if result.Valid {
+			rm := json.RawMessage(result.String)
+			j.Result = &rm
+		}
+		if errStr.Valid {
+			j.Error = errStr.String
+		}
+		if startedAt.Valid {
+			j.StartedAt = &startedAt.Float64
+		}
+		if finishedAt.Valid {
+			j.FinishedAt = &finishedAt.Float64
+		}
+		jobs = append(jobs, &j)
+	}
+	return jobs, nil
+}

@@ -71,7 +71,7 @@ for line in sys.stdin:
 
 	inst := mgr.GetModelInstances("demo")[0]
 	atomic.AddInt32(&inst.activeJobs, 1)
-	sched.dispatchJobToInstance(orig, inst)
+	sched.dispatchJobToInstance(orig, inst, 1.0)
 
 	origAfter, _ := store.GetJob(orig.ID)
 	if origAfter.State != "failed" {
@@ -156,7 +156,7 @@ for line in sys.stdin:
 
 	inst := mgr.GetModelInstances("demo")[0]
 	atomic.AddInt32(&inst.activeJobs, 1)
-	sched.dispatchJobToInstance(orig, inst)
+	sched.dispatchJobToInstance(orig, inst, 1.0)
 
 	origAfter, _ := store.GetJob(orig.ID)
 	if origAfter.State != "queued" || origAfter.Error != "" {

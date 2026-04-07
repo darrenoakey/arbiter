@@ -46,6 +46,8 @@ type modelConfigRequest struct {
 	Group          *bool              `json:"group"`
 	WorkerCmd      *[]string          `json:"worker_cmd"`
 	AdapterParams  *map[string]string `json:"adapter_params"`
+	PressureIndex  *float64           `json:"pressure_index"`
+	MaxRuntimeSec  *int               `json:"max_runtime_seconds"`
 	ReloadWorkers  bool               `json:"reload_workers"`
 }
 
@@ -233,6 +235,36 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		req.Params = json.RawMessage("{}")
 	}
 
+	// --- Validate staged file paths ---
+	// Any *_file param must either use the "ref:" prefix (managed reference file)
+	// or point to a path inside ARBITER_INBOX_PATH (the shared NFS/SMB inbox).
+	// Direct SCP to spark's local /tmp is not permitted — all files must be staged
+	// via the arbiter-client service (which writes to the shared inbox mount).
+	if inboxDir := strings.TrimRight(os.Getenv("ARBITER_INBOX_PATH"), "/"); inboxDir != "" {
+		var params map[string]json.RawMessage
+		if err := json.Unmarshal(req.Params, &params); err == nil {
+			for key, raw := range params {
+				if !strings.HasSuffix(key, "_file") {
+					continue
+				}
+				var val string
+				if err := json.Unmarshal(raw, &val); err != nil || val == "" || strings.HasPrefix(val, "ref:") {
+					continue
+				}
+				if !strings.HasPrefix(filepath.Clean(val), inboxDir) {
+					writeError(w, 400, fmt.Sprintf(
+						"invalid file path for param %q: %q is not inside the shared inbox %q. "+
+							"All files must be staged via the arbiter-client service "+
+							"(set ARBITER_CLIENT_URL=http://localhost:8401 and use arbiter_client.stage_file). "+
+							"Direct SCP to spark is not permitted.",
+						key, val, inboxDir,
+					))
+					return
+				}
+			}
+		}
+	}
+
 	// --- Dedup check ---
 	var forceNew bool
 	{
@@ -263,7 +295,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 						a.logger.Log("job.dedup_hit", map[string]any{
 							"job_id": newJob.ID, "original_id": origID, "type": "cached",
 						})
-						writeJSON(w, 202, map[string]any{
+						writeJSON(w, 200, map[string]any{
 							"job_id": newJob.ID, "status": "completed",
 							"model": modelID, "cached": true,
 							"original_job_id": origID,
@@ -277,7 +309,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 						a.logger.Log("job.dedup_hit", map[string]any{
 							"job_id": follower.ID, "original_id": origID, "type": "following",
 						})
-						writeJSON(w, 202, map[string]any{
+						writeJSON(w, 200, map[string]any{
 							"job_id": follower.ID, "status": "following",
 							"model":           modelID,
 							"original_job_id": origID,
@@ -317,7 +349,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 
 	a.scheduler.Wake()
 
-	writeJSON(w, 202, map[string]any{
+	writeJSON(w, 200, map[string]any{
 		"job_id":            job.ID,
 		"status":            "queued",
 		"model":             modelID,
@@ -573,7 +605,7 @@ func (a *API) uploadRef(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("ref uploaded", "ref_id", refID, "size", len(data), "filename", filename)
-	writeJSON(w, 201, map[string]any{
+	writeJSON(w, 200, map[string]any{
 		"ref_id":     refID,
 		"size_bytes": len(data),
 		"filename":   filename,
@@ -661,7 +693,7 @@ func (a *API) createReservation(w http.ResponseWriter, r *http.Request) {
 		"label":     req.Label,
 	})
 
-	writeJSON(w, 201, map[string]any{
+	writeJSON(w, 200, map[string]any{
 		"reservation_id": id,
 		"memory_gb":      req.MemoryGB,
 		"label":          req.Label,
@@ -742,6 +774,8 @@ func serializeModelConfig(modelID string, cfg ModelConfig) map[string]any {
 		"group":              cfg.Group,
 		"worker_cmd":         cfg.WorkerCmd,
 		"adapter_params":     cfg.AdapterParams,
+		"pressure_index":      cfg.PressureIndex,
+		"max_runtime_seconds": cfg.MaxRuntimeSec,
 	}
 	if cfg.MaxInstances != nil {
 		resp["max_instances"] = *cfg.MaxInstances
@@ -794,6 +828,12 @@ func applyModelConfigRequest(cfg ModelConfig, req modelConfigRequest) ModelConfi
 		}
 		cfg.AdapterParams = merged
 	}
+	if req.PressureIndex != nil {
+		cfg.PressureIndex = *req.PressureIndex
+	}
+	if req.MaxRuntimeSec != nil {
+		cfg.MaxRuntimeSec = *req.MaxRuntimeSec
+	}
 	return cfg
 }
 
@@ -842,7 +882,7 @@ func (a *API) registerModel(w http.ResponseWriter, r *http.Request) {
 		"worker_cmd":     cfg.WorkerCmd,
 	})
 
-	writeJSON(w, 201, map[string]any{
+	writeJSON(w, 200, map[string]any{
 		"model_id":       req.ModelID,
 		"max_instances":  *cfg.MaxInstances,
 		"max_concurrent": cfg.MaxConcurrent,
@@ -1326,7 +1366,7 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 		"memory_gb": memGB,
 	})
 
-	writeJSON(w, 201, map[string]any{
+	writeJSON(w, 200, map[string]any{
 		"model_id":  modelID,
 		"name":      name,
 		"memory_gb": memGB,
