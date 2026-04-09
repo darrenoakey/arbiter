@@ -1,0 +1,156 @@
+"""LTX-2 encode adapter — first stage of the 3-stage video pipeline.
+
+Runs text encoder (Gemma) + audio VAE encoder. Produces an `encoded.pt` file
+containing prompt contexts + audio latent, consumed by ltx2-denoise1.
+
+Expected params dict:
+    description   : str   — chunk text prompt
+    audio_file    : str   — absolute path to audio on spark local disk
+    start_time    : float — chunk start in seconds
+    end_time      : float — chunk end in seconds
+    fps           : int
+    seed          : int
+    chunk_index   : int
+    start_image_file : str — optional path to start keyframe (carried through)
+    end_image_file   : str — optional path to end keyframe (carried through)
+"""
+from __future__ import annotations
+
+import gc
+import logging
+import sys
+import threading
+from pathlib import Path
+
+from arbiter.adapters.base import (
+    CancelledException,
+    GroupAdapter,
+    InferenceError,
+    LoadError,
+)
+from arbiter.adapters.registry import register
+
+log = logging.getLogger(__name__)
+
+LTX2_SPARK_DIR = Path("/home/darren/src/ltx2-spark")
+
+
+@register
+class LTX2EncodeAdapter(GroupAdapter):
+    """Text + audio encoder only. Lightweight (~12GB)."""
+
+    model_id = "ltx2-encode"
+
+    def __init__(self):
+        self._pipeline = None
+        self._device: str = "cuda"
+
+    def load(self, device: str = "cuda") -> None:
+        self._device = device
+
+        spark_str = str(LTX2_SPARK_DIR)
+        if spark_str not in sys.path:
+            sys.path.insert(0, spark_str)
+
+        try:
+            import ltx_core  # noqa: F401
+            import ltx_pipelines  # noqa: F401
+        except ImportError as e:
+            raise LoadError(f"ltx_core / ltx_pipelines not importable: {e}")
+
+        try:
+            from video_fast_gpu import FastPipeline
+            self._pipeline = FastPipeline()
+            # Pre-load the encoders so subsequent chunks reuse them
+            self._pipeline._ensure_encode_models()
+            log.info("LTX2-encode: encoders loaded")
+        except Exception as e:
+            self._pipeline = None
+            raise LoadError(f"Failed to load encode models: {e}") from e
+
+    def unload(self) -> None:
+        log.info("Unloading LTX2-encode")
+        if self._pipeline is not None:
+            self._pipeline.unload_encode_models()
+            if hasattr(self._pipeline, "components"):
+                del self._pipeline.components
+            if hasattr(self._pipeline, "stage_1_ledger"):
+                del self._pipeline.stage_1_ledger
+            if hasattr(self._pipeline, "stage_2_ledger"):
+                del self._pipeline.stage_2_ledger
+            del self._pipeline
+            self._pipeline = None
+        self._cleanup_gpu()
+
+    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+        if self._pipeline is None:
+            raise InferenceError("encode pipeline not loaded")
+
+        self._check_cancel(cancel_flag)
+
+        audio_file = params.get("audio_file")
+        if not audio_file or not Path(audio_file).exists():
+            raise InferenceError(f"audio_file missing or not found: {audio_file}")
+
+        description = params.get("description", "")
+        if not description:
+            raise InferenceError("description is required")
+
+        start_time = float(params.get("start_time", 0.0))
+        end_time = float(params.get("end_time", 0.0))
+        fps = int(params.get("fps", 24))
+        seed = int(params.get("seed", 42))
+        chunk_index = int(params.get("chunk_index", 0))
+
+        num_frames = max(1, round((end_time - start_time) * fps))
+        if num_frames % 2 == 0:
+            num_frames += 1
+        start_frame = round(start_time * fps)
+
+        chunk = {
+            "index": chunk_index,
+            "description": description,
+            "start_frame": start_frame,
+            "num_frames": num_frames,
+            "start_image": params.get("start_image_file"),
+            "end_image": params.get("end_image_file"),
+        }
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        def _progress(stage, status, **kw):
+            log.info("encode progress: %s/%s %s", stage, status, kw)
+            if cancel_flag.is_set():
+                raise CancelledException(f"Cancelled during {stage}/{status}")
+
+        try:
+            self._pipeline.run_encode(
+                chunk=chunk,
+                audio_path=audio_file,
+                fps=fps,
+                seed=seed,
+                output_dir=str(output_dir),
+                progress_fn=_progress,
+            )
+        except CancelledException:
+            raise
+        except Exception as e:
+            raise InferenceError(f"run_encode failed: {e}") from e
+
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
+        return {
+            "file": "encoded.pt",
+            "format": "pt",
+            "chunk_index": chunk_index,
+            "num_frames": num_frames,
+        }
+
+    def estimate_time(self, params: dict) -> float:
+        return 15_000.0
