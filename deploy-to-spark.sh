@@ -25,8 +25,9 @@ echo "==> Smoke-testing Python adapter package on spark..."
 # This is the exact import sequence that worker_main.py does on startup.
 # If this fails, the deploy is aborted BEFORE we touch the running arbiter —
 # protecting any in-flight queued work from circuit-breaker cancellation.
-rsync -az --delete src/arbiter/adapters/ "$SPARK:/tmp/arbiter-smoke-test/adapters/"
-if ! ssh "$SPARK" "cd /tmp/arbiter-smoke-test && PYTHONPATH=/home/darren/src/arbiter/src /home/darren/src/arbiter/.venv/bin/python -c 'from arbiter.adapters import registry; print(\"adapters loaded OK\")'" 2>&1; then
+ssh "$SPARK" "mkdir -p /tmp/arbiter-smoke-test/arbiter/adapters"
+rsync -az --delete src/arbiter/adapters/ "$SPARK:/tmp/arbiter-smoke-test/arbiter/adapters/"
+if ! ssh "$SPARK" "cd /tmp/arbiter-smoke-test && PYTHONPATH=/tmp/arbiter-smoke-test:/home/darren/src/arbiter/src /home/darren/src/arbiter/.venv/bin/python -c 'from arbiter.adapters import registry; print(\"adapters loaded OK\")'" 2>&1; then
     echo "    FAILED — adapter package has import errors. Deploy aborted."
     echo "    Fix the Python imports locally and re-run deploy."
     exit 1
