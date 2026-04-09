@@ -213,23 +213,22 @@ func TestLoadCircuitBreakerPausesAfterThreeFailures(t *testing.T) {
 		t.Fatal("model should not be paused after 2 failures")
 	}
 
-	// Create a queued job that should get cancelled on CB activation
+	// Create a queued job that should be PRESERVED (not cancelled) on CB activation
 	payload := json.RawMessage(`{"test":true}`)
 	job, _ := store.CreateJob("broken", "image-generate", payload, 1)
 
 	// 3rd failure triggers the circuit-breaker
 	sched.RecordLoadFailure("broken")
-	// Give the async cancellation goroutine a moment
-	time.Sleep(50 * time.Millisecond)
 
 	if paused, _ := sched.IsModelLoadPaused("broken"); !paused {
 		t.Fatal("model should be paused after 3 failures")
 	}
 
-	// Queued job should be cancelled
+	// Queued job should still be queued — the CB pauses scheduling, it does NOT
+	// cancel user work. A human operator decides when to cancel stuck jobs.
 	jobAfter, _ := store.GetJob(job.ID)
-	if jobAfter.State != "cancelled" {
-		t.Fatalf("queued job state = %s, want cancelled", jobAfter.State)
+	if jobAfter.State != "queued" {
+		t.Fatalf("queued job state = %s, want queued (CB must not cancel)", jobAfter.State)
 	}
 
 	// getFullModels should include the paused model

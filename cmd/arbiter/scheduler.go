@@ -178,7 +178,9 @@ func (s *Scheduler) IsModelPaused(modelID string) (bool, time.Time) {
 }
 
 // RecordLoadFailure increments the consecutive load failure counter for a model.
-// Threshold: 3 failures → escalating pause. On activation, cancels queued+following jobs.
+// Threshold: 3 failures → escalating pause. Queued jobs are preserved — only a
+// human operator may cancel them. Pauses escalate 30s → 1m → 5m → 15m so a
+// persistent failure stops spinning the scheduler but doesn't destroy user work.
 func (s *Scheduler) RecordLoadFailure(modelID string) {
 	const threshold = 3
 	s.loadFailureCountMu.Lock()
@@ -198,22 +200,19 @@ func (s *Scheduler) RecordLoadFailure(modelID string) {
 		s.loadFailureCooldownLevel[modelID]++
 	}
 	s.loadFailureCount[modelID] = 0
-	slog.Warn("load circuit-breaker: model paused after consecutive load failures",
+	slog.Warn("load circuit-breaker: model paused after consecutive load failures — queue preserved",
 		"model", modelID, "threshold", threshold, "cooldown", dur,
 		"resume_at", until.Format(time.RFC3339))
 	s.logger.Log("model.load_circuit_breaker", map[string]any{
 		"model_id": modelID,
 		"cooldown": dur.String(),
 	})
-	// Cancel stuck jobs in background
-	go func() {
-		if n, err := s.store.CancelQueuedForModel(modelID); err == nil && n > 0 {
-			slog.Warn("load circuit-breaker: cancelled queued jobs", "model", modelID, "count", n)
-		}
-		if n, err := s.store.CancelFollowingForModel(modelID, "model load circuit-breaker activated"); err == nil && n > 0 {
-			slog.Warn("load circuit-breaker: cancelled following jobs", "model", modelID, "count", n)
-		}
-	}()
+	// NOTE: Deliberately do NOT cancel queued or following jobs here.
+	// A load failure may be transient (bad deployment, missing file, dependency
+	// update in progress, GPU OOM from another model). Cancelling queued work
+	// destroys user data — only a human operator should decide to cancel.
+	// When the cooldown expires, the next scheduling attempt tries to load again;
+	// if the problem persists, the CB re-activates with a longer cooldown.
 }
 
 // RecordLoadSuccess resets the load failure counter and escalation level.

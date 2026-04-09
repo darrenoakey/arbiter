@@ -329,6 +329,14 @@ func (inst *Instance) Load(device string) error {
 	}
 
 	inst.mu.Lock()
+	// Only mark loaded if state is still "loading". The subprocess may have
+	// died between receiving the load response and this point; readLoop would
+	// already have set state to "error" and cleared cmd. Don't overwrite that.
+	if inst.state != "loading" {
+		state := inst.state
+		inst.mu.Unlock()
+		return fmt.Errorf("load failed: subprocess died after load response (state=%s)", state)
+	}
 	inst.state = "loaded"
 	inst.lastActive = time.Now() // start keepalive timer from load time
 	inst.mu.Unlock()

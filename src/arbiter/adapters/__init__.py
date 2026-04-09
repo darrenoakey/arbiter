@@ -1,20 +1,35 @@
-"""Model adapters — auto-import to trigger registration."""
-from . import birefnet  # noqa: F401
-from . import flux  # noqa: F401
-from . import moondream  # noqa: F401
-from . import whisper_large  # noqa: F401
-from . import tts_custom  # noqa: F401
-from . import tts_clone  # noqa: F401
-from . import tts_design  # noqa: F401
-from . import latentsync  # noqa: F401
-from . import sadtalker  # noqa: F401
-from . import sonic  # noqa: F401
-from . import ltx2  # noqa: F401
-from . import aesthetic_scorer  # noqa: F401
-from . import z_image  # noqa: F401
-from . import lora_train  # noqa: F401
-from . import composite  # noqa: F401
-from . import flux_kontext  # noqa: F401
-from . import flux_lora  # noqa: F401
-from . import ltx2_stage1  # noqa: F401
-from . import ltx2_stage2  # noqa: F401
+"""Model adapters — auto-import to trigger registration.
+
+Each adapter is imported in isolation. If one adapter has a broken import
+(missing file, syntax error, bad dependency), it does NOT take down the
+whole package — it's logged and skipped. Workers for other models will
+still start fine.
+"""
+import importlib
+import logging
+
+_log = logging.getLogger(__name__)
+
+_ADAPTERS = [
+    "birefnet",
+    "flux",
+    "moondream",
+    "whisper_large",
+    "tts_custom",
+    "tts_clone",
+    "tts_design",
+    "latentsync",
+    "sadtalker",
+    "sonic",
+    "ltx2",
+    "aesthetic_scorer",
+    "z_image",
+    "lora_train",
+    "composite",
+]
+
+for _name in _ADAPTERS:
+    try:
+        importlib.import_module(f".{_name}", __name__)
+    except Exception as e:  # noqa: BLE001
+        _log.warning("adapter %s failed to import: %s", _name, e)

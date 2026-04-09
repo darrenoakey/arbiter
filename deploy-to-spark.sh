@@ -17,9 +17,21 @@ REMOTE=/home/darren/src/arbiter
 
 cd "$(dirname "$0")"
 
-echo "==> Running tests..."
+echo "==> Running Go tests..."
 go test ./cmd/arbiter/ -count=1 >/dev/null
-echo "    tests passed"
+echo "    go tests passed"
+
+echo "==> Smoke-testing Python adapter package on spark..."
+# This is the exact import sequence that worker_main.py does on startup.
+# If this fails, the deploy is aborted BEFORE we touch the running arbiter —
+# protecting any in-flight queued work from circuit-breaker cancellation.
+rsync -az --delete src/arbiter/adapters/ "$SPARK:/tmp/arbiter-smoke-test/adapters/"
+if ! ssh "$SPARK" "cd /tmp/arbiter-smoke-test && PYTHONPATH=/home/darren/src/arbiter/src /home/darren/src/arbiter/.venv/bin/python -c 'from arbiter.adapters import registry; print(\"adapters loaded OK\")'" 2>&1; then
+    echo "    FAILED — adapter package has import errors. Deploy aborted."
+    echo "    Fix the Python imports locally and re-run deploy."
+    exit 1
+fi
+echo "    python smoke test passed"
 
 echo "==> Cross-compiling binaries..."
 GOOS=linux GOARCH=arm64 go build -o arbiter-linux-arm64 ./cmd/arbiter/
