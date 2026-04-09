@@ -90,6 +90,10 @@ class LTX2Denoise2Adapter(GroupAdapter):
     def __init__(self):
         self._pipeline = None
         self._device: str = "cuda"
+        # Serialises the GPU phase only. The biggest pipelining win on this
+        # adapter is overlapping ffmpeg mp4 encode/mux (all CPU/nvenc, slow)
+        # with the next job's GPU denoise + decode.
+        self._gpu_lock = threading.Lock()
 
     def load(self, device: str = "cuda") -> None:
         self._device = device
@@ -167,11 +171,15 @@ class LTX2Denoise2Adapter(GroupAdapter):
                 raise CancelledException(f"Cancelled during {stage}/{status}")
 
         try:
-            frames_np = self._pipeline.run_stage2(
-                stage1_path=denoise1_file,
-                output_path=tmp_npy,
-                progress_fn=_progress,
-            )
+            # PHASE 1 (CPU/IO): torch.load stage1_output.pt.
+            data = self._pipeline.load_stage2_input(denoise1_file)
+            self._check_cancel(cancel_flag)
+
+            # PHASE 2 (GPU): stage-2 denoise loop + video decode.
+            # Serialised; the next job's load_stage2_input overlaps with this.
+            with self._gpu_lock:
+                self._check_cancel(cancel_flag)
+                frames_np = self._pipeline.run_stage2_gpu(data, progress_fn=_progress)
         except CancelledException:
             raise
         except Exception as e:
@@ -179,6 +187,9 @@ class LTX2Denoise2Adapter(GroupAdapter):
 
         self._check_cancel(cancel_flag)
 
+        # PHASE 3 (CPU/nvenc): ffmpeg encode raw frames + mux audio into mp4.
+        # Runs OUTSIDE the GPU lock — the next job can hold the lock and do
+        # its GPU denoise while this thread finishes ffmpeg.
         result_path = output_dir / "result.mp4"
         _assemble_single_chunk_mp4(
             frames=frames_np,
@@ -189,7 +200,8 @@ class LTX2Denoise2Adapter(GroupAdapter):
             fps=fps,
         )
 
-        # Clean up the temp .npy
+        # Clean up the temp .npy (it's no longer written; keep the unlink a no-op
+        # for backwards compat in case an old path lingers).
         Path(tmp_npy).unlink(missing_ok=True)
 
         h, w = frames_np.shape[1], frames_np.shape[2]

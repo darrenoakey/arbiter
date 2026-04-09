@@ -43,6 +43,10 @@ class LTX2Denoise1Adapter(GroupAdapter):
     def __init__(self):
         self._pipeline = None
         self._device: str = "cuda"
+        # Serialises the GPU phase only. With max_concurrent=2, the second
+        # infer() can do its torch.load encoded.pt from NFS while the first
+        # is holding the lock and running the denoise loop.
+        self._gpu_lock = threading.Lock()
 
     def load(self, device: str = "cuda") -> None:
         self._device = device
@@ -103,13 +107,22 @@ class LTX2Denoise1Adapter(GroupAdapter):
                 raise CancelledException(f"Cancelled during {stage}/{status}")
 
         try:
-            self._pipeline.run_denoise1(
-                encoded_path=encoded_file,
-                width=width,
-                height=height,
-                output_dir=str(output_dir),
-                progress_fn=_progress,
-            )
+            # PHASE 1 (CPU/IO): load encoded.pt from disk. No GPU work.
+            data = self._pipeline.load_denoise1_input(encoded_file)
+            self._check_cancel(cancel_flag)
+
+            # PHASE 2 (GPU): image conditioning + denoise loop + upsample.
+            # Serialised against any other concurrent infer() on this adapter.
+            with self._gpu_lock:
+                self._check_cancel(cancel_flag)
+                result = self._pipeline.run_denoise1_gpu(
+                    data, width, height, progress_fn=_progress,
+                )
+
+            self._check_cancel(cancel_flag)
+
+            # PHASE 3 (CPU/IO): torch.save stage1_output.pt to disk.
+            self._pipeline.save_denoise1_output(result, str(output_dir))
         except CancelledException:
             raise
         except Exception as e:

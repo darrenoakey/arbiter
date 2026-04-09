@@ -44,6 +44,11 @@ class LTX2EncodeAdapter(GroupAdapter):
     def __init__(self):
         self._pipeline = None
         self._device: str = "cuda"
+        # Serialises GPU-bound work across parallel infer() calls.
+        # max_concurrent=2 lets the arbiter dispatch 2 jobs concurrently;
+        # one holds this lock and runs on the GPU while the other does CPU
+        # prep (audio decode) and tail save in parallel.
+        self._gpu_lock = threading.Lock()
 
     def load(self, device: str = "cuda") -> None:
         self._device = device
@@ -124,14 +129,24 @@ class LTX2EncodeAdapter(GroupAdapter):
                 raise CancelledException(f"Cancelled during {stage}/{status}")
 
         try:
-            self._pipeline.run_encode(
-                chunk=chunk,
-                audio_path=audio_file,
-                fps=fps,
-                seed=seed,
-                output_dir=str(output_dir),
-                progress_fn=_progress,
-            )
+            # PHASE 1 (CPU): decode audio via ffmpeg — can overlap with
+            # another infer call's GPU phase.
+            prep = self._pipeline.load_encode_input(chunk, audio_file, fps)
+            self._check_cancel(cancel_flag)
+
+            # PHASE 2 (GPU): text + audio encoder forward passes. Must be
+            # serialised against any other concurrent infer() on this adapter.
+            with self._gpu_lock:
+                self._check_cancel(cancel_flag)
+                result = self._pipeline.run_encode_gpu(
+                    prep=prep, fps=fps, seed=seed, progress_fn=_progress,
+                )
+
+            self._check_cancel(cancel_flag)
+
+            # PHASE 3 (CPU): torch.save encoded.pt — can overlap with the
+            # next infer() acquiring the GPU lock.
+            self._pipeline.save_encode_output(result, str(output_dir))
         except CancelledException:
             raise
         except Exception as e:

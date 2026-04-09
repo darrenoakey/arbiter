@@ -53,6 +53,7 @@ var JobTypeToModel = map[string]string{
 	"video-encode":           "ltx2-encode",
 	"video-denoise1":         "ltx2-denoise1",
 	"video-denoise2":         "ltx2-denoise2",
+	"face-restore":           "face-restore",
 	"aesthetic-score":        "aesthetic-scorer",
 	"tts-voxtral":            "tts-voxtral",
 	"lora-train":             "lora-train",
