@@ -50,6 +50,8 @@ var JobTypeToModel = map[string]string{
 	"talking-head-sadtalker": "sadtalker",
 	"lipsync":                "latentsync",
 	"video-generate":         "ltx2",
+	"video-stage1":           "ltx2-stage1",
+	"video-stage2":           "ltx2-stage2",
 	"aesthetic-score":        "aesthetic-scorer",
 	"tts-voxtral":            "tts-voxtral",
 	"lora-train":             "lora-train",

@@ -251,7 +251,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 				if err := json.Unmarshal(raw, &val); err != nil || val == "" || strings.HasPrefix(val, "ref:") {
 					continue
 				}
-				if !strings.HasPrefix(filepath.Clean(val), inboxDir) {
+				if !strings.HasPrefix(filepath.Clean(val), inboxDir) && !strings.HasPrefix(filepath.Clean(val), a.outputDir) {
 					writeError(w, 400, fmt.Sprintf(
 						"invalid file path for param %q: %q is not inside the shared inbox %q. "+
 							"All files must be staged via the arbiter-client service "+

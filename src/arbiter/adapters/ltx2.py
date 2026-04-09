@@ -131,6 +131,33 @@ def _assemble_mp4(
     return total_frames, h, w
 
 
+def _assemble_single_chunk_mp4(frames, audio_path, start_time, end_time, output_path, fps):
+    """Assemble numpy frames + audio slice into an mp4."""
+    import subprocess, tempfile, os
+    tmp_vid = tempfile.mktemp(suffix=".mp4")
+    h, w = frames.shape[1], frames.shape[2]
+    proc = subprocess.Popen(
+        ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+         "-s", f"{w}x{h}", "-r", str(fps), "-pix_fmt", "rgb24",
+         "-i", "-", "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p", tmp_vid],
+        stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    for frame in frames:
+        proc.stdin.write(frame.tobytes())
+    proc.stdin.close()
+    proc.wait()
+
+    # Mux with audio
+    duration = end_time - start_time
+    subprocess.run([
+        "ffmpeg", "-y", "-i", tmp_vid,
+        "-ss", str(start_time), "-t", str(duration), "-i", audio_path,
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-map", "0:v", "-map", "1:a", "-shortest", output_path,
+    ], capture_output=True)
+    os.unlink(tmp_vid)
+
+
 @register
 class LTX2Adapter(GroupAdapter):
     """LTX-2 video generation with phased sub-model loading.
@@ -180,6 +207,8 @@ class LTX2Adapter(GroupAdapter):
             from video_fast_gpu import FastPipeline
 
             self._pipeline = FastPipeline()
+            # Models loaded per-phase in infer()
+            # Pre-load disabled — using stage1/stage2 split instead
             log.info("LTX-2 FastPipeline config objects created (no heavy weights yet)")
         except Exception as e:
             self._pipeline = None
@@ -225,6 +254,11 @@ class LTX2Adapter(GroupAdapter):
             raise InferenceError("LTX-2 pipeline not loaded — call load() first")
 
         self._check_cancel(cancel_flag)
+
+        # Single-segment fast path (all models pre-loaded)
+        segments_check = params.get("segments", [])
+        if len(segments_check) == 1 and hasattr(self._pipeline, '_transformer_s1'):
+            return self._infer_single_chunk(params, output_dir, cancel_flag)
 
         # -- Read params -----------------------------------------------
         segments = params.get("segments", [])
@@ -362,6 +396,101 @@ class LTX2Adapter(GroupAdapter):
     # ------------------------------------------------------------------
     # estimate_time
     # ------------------------------------------------------------------
+
+
+    def _infer_single_chunk(self, params, output_dir, cancel_flag):
+        """Fast path: generate a single chunk with all models pre-loaded."""
+        import base64, numpy as np, tempfile, shutil
+        from pathlib import Path
+        from PIL import Image
+
+        seg = params["segments"][0]
+        audio_b64 = params.get("audio_b64", "")
+        fps = int(params.get("fps", 25))
+        seed = int(params.get("seed", 42))
+        resolution = params.get("resolution", "small")
+
+        from constants import RESOLUTION_PRESETS
+        height, width = RESOLUTION_PRESETS.get(resolution, (512, 768))
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        tmp = tempfile.mkdtemp(prefix="ltx2_sc_")
+        work = Path(tmp)
+
+        # Decode audio
+        audio_path = str(work / "audio.mp3")
+        raw = audio_b64
+        if raw.startswith("data:"):
+            raw = raw.split(",", 1)[1]
+        with open(audio_path, "wb") as f:
+            f.write(base64.b64decode(raw))
+
+        # Decode images
+        start_img_path = str(work / "start.png")
+        end_img_path = str(work / "end.png")
+        for key, path in [("start_image_b64", start_img_path), ("end_image_b64", end_img_path)]:
+            raw = seg.get(key, "")
+            if raw.startswith("data:"):
+                raw = raw.split(",", 1)[1]
+            img_bytes = base64.b64decode(raw)
+            Image.open(__import__("io").BytesIO(img_bytes)).convert("RGB").save(path)
+
+        # Build chunk dict for generate_single_chunk
+        start_time = float(seg.get("start_time", 0))
+        end_time = float(seg.get("end_time", 5))
+        num_frames = max(1, round((end_time - start_time) * fps))
+        # Ensure odd frame count for LTX2
+        if num_frames % 2 == 0:
+            num_frames += 1
+
+        chunk = {
+            "index": 0,
+            "description": seg.get("description", ""),
+            "start_frame": round(start_time * fps),
+            "num_frames": num_frames,
+            "start_image": start_img_path,
+            "end_image": end_img_path,
+        }
+
+        output_npy = str(work / "chunk.npy")
+
+        def _progress(stage, status, **kw):
+            log.info("LTX-2 progress: %s/%s %s", stage, status, kw)
+            if cancel_flag.is_set():
+                from arbiter.adapters.base import CancelledException
+                raise CancelledException(f"Cancelled during {stage}/{status}")
+
+        try:
+            self._pipeline.generate_single_chunk(
+                chunk=chunk, audio_path=audio_path,
+                height=height, width=width, fps=fps, seed=seed,
+                output_path=output_npy, progress_fn=_progress,
+            )
+        except Exception as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise InferenceError(f"Single chunk failed: {e}") from e
+
+        # Load frames and assemble to mp4
+        frames = np.load(output_npy)
+        result_path = output_dir / "result.mp4"
+
+        from ltx_pipelines.utils.media_io import decode_audio_from_file
+        _assemble_single_chunk_mp4(frames, audio_path, start_time, end_time, str(result_path), fps)
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+        h, w = frames.shape[1], frames.shape[2]
+        duration = round(len(frames) / fps, 2)
+        return {
+            "format": "mp4",
+            "file": "result.mp4",
+            "width": w,
+            "height": h,
+            "fps": fps,
+            "duration_seconds": duration,
+            "total_frames": len(frames),
+            "num_chunks": 1,
+        }
 
     def estimate_time(self, params: dict) -> float:
         """Rough estimate: ~800 ms per output frame."""

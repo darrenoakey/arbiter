@@ -222,10 +222,17 @@ func (inst *Instance) readLoop() {
 		}
 	}
 
-	// Subprocess died — unblock all pending requests with an error response
+	// Subprocess died — clean up references and unblock all pending requests.
 	slog.Warn("readLoop exited, subprocess died", "instance", inst.InstanceID)
 	inst.mu.Lock()
 	inst.state = "error"
+	// Clear dead process references so Snapshot doesn't report a stale PID.
+	// The process is already dead (stdout pipe closed), so just nil the refs.
+	if inst.stdin != nil {
+		inst.stdin.Close()
+		inst.stdin = nil
+	}
+	inst.cmd = nil
 	inst.mu.Unlock()
 
 	inst.pendingMu.Lock()
@@ -597,6 +604,66 @@ func (m *InstanceManager) FreeGB() float64 {
 	return m.budgetGB - m.usedGB - m.reservedGB
 }
 
+// BudgetGB returns the total VRAM budget.
+func (m *InstanceManager) BudgetGB() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.budgetGB
+}
+
+// actualVRAMFromPidMap sums actual VRAM for all known worker PIDs.
+// Caller must hold m.mu.RLock.
+func (m *InstanceManager) actualVRAMFromPidMap(pidVRAM map[int]int64) float64 {
+	var total float64
+	for _, inst := range m.instances {
+		inst.mu.Lock()
+		if inst.cmd != nil && inst.cmd.Process != nil {
+			if vram, ok := pidVRAM[inst.cmd.Process.Pid]; ok {
+				total += float64(vram) / (1024 * 1024 * 1024)
+			}
+		}
+		inst.mu.Unlock()
+	}
+	return total
+}
+
+// ActualVRAMGB returns the total actual VRAM in GB used by all known worker
+// subprocesses, as reported by nvidia-smi. Returns 0 if nvidia-smi fails.
+func (m *InstanceManager) ActualVRAMGB() float64 {
+	pidVRAM := GetPerProcessVRAM()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.actualVRAMFromPidMap(pidVRAM)
+}
+
+// EffectiveUsedGB returns max(actual VRAM, bookkeeping allocated) + reserved.
+// This is the "true pressure" on the GPU.
+func (m *InstanceManager) EffectiveUsedGB() (effective, actual, allocated, reserved float64) {
+	actual = m.ActualVRAMGB()
+	m.mu.RLock()
+	allocated = m.usedGB
+	reserved = m.reservedGB
+	m.mu.RUnlock()
+	if actual > allocated {
+		effective = actual + reserved
+	} else {
+		effective = allocated + reserved
+	}
+	return
+}
+
+// ReconcileUsedGB adjusts bookkeeping usedGB upward if actual VRAM exceeds it
+// by more than the given tolerance. Prevents bookkeeping from going stale.
+func (m *InstanceManager) ReconcileUsedGB(actualGB, tolerance float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if actualGB > m.usedGB+tolerance {
+		slog.Warn("vram reconcile: adjusting bookkeeping upward",
+			"old_used_gb", m.usedGB, "actual_gb", actualGB)
+		m.usedGB = actualGB
+	}
+}
+
 // ReserveMemory reserves VRAM if it fits under the budget.
 func (m *InstanceManager) ReserveMemory(gb float64) bool {
 	m.mu.Lock()
@@ -735,6 +802,88 @@ func (m *InstanceManager) EvictForGB(needed float64) error {
 		return fmt.Errorf("need %.1fGB but can only free %.1fGB (%d idle instances)", needed, freed, len(candidates))
 	}
 	return nil
+}
+
+// EvictForGBWithQueueInfo frees VRAM by unloading idle instances, preferring
+// models with no queued jobs before models with queued jobs.
+// Within each group, eviction is LRU (longest idle first).
+func (m *InstanceManager) EvictForGBWithQueueInfo(needed float64, queuedJobs map[string]int) (float64, error) {
+	m.mu.RLock()
+	type candidate struct {
+		inst     *Instance
+		lastUsed time.Time
+		queued   int
+	}
+	var candidates []candidate
+	for _, inst := range m.instances {
+		st := inst.State()
+		active := inst.ActiveJobs()
+		if st != "loaded" || active > 0 {
+			continue
+		}
+		la := inst.LastActive()
+		if la.IsZero() {
+			continue
+		}
+		candidates = append(candidates, candidate{
+			inst:     inst,
+			lastUsed: la,
+			queued:   queuedJobs[inst.ModelID],
+		})
+	}
+	m.mu.RUnlock()
+
+	// Partition: no queued jobs first, then has queued jobs
+	var noQueue, hasQueue []candidate
+	for _, c := range candidates {
+		if c.queued == 0 {
+			noQueue = append(noQueue, c)
+		} else {
+			hasQueue = append(hasQueue, c)
+		}
+	}
+
+	// Sort each group by LRU (oldest idle first)
+	sortLRU := func(s []candidate) {
+		for i := 0; i < len(s); i++ {
+			for j := i + 1; j < len(s); j++ {
+				if s[j].lastUsed.Before(s[i].lastUsed) {
+					s[i], s[j] = s[j], s[i]
+				}
+			}
+		}
+	}
+	sortLRU(noQueue)
+	sortLRU(hasQueue)
+
+	ordered := append(noQueue, hasQueue...)
+	freed := 0.0
+	for _, c := range ordered {
+		if freed >= needed {
+			break
+		}
+		idle := time.Since(c.lastUsed).Seconds()
+		group := "no_queue"
+		if c.queued > 0 {
+			group = fmt.Sprintf("has_queue(%d)", c.queued)
+		}
+		slog.Info("vram watchdog: evicting for memory pressure",
+			"instance", c.inst.InstanceID, "memory_gb", c.inst.memoryGB,
+			"idle_seconds", idle, "group", group)
+		if err := c.inst.Unload(); err != nil {
+			slog.Error("vram watchdog: eviction unload failed",
+				"instance", c.inst.InstanceID, "error", err)
+			continue
+		}
+		m.ReleaseMemory(c.inst.memoryGB)
+		freed += c.inst.memoryGB
+	}
+
+	if freed < needed {
+		return freed, fmt.Errorf("need %.1fGB but can only free %.1fGB (%d idle instances)",
+			needed, freed, len(candidates))
+	}
+	return freed, nil
 }
 
 // CreateReservation reserves VRAM budget space, evicting models if needed.
@@ -968,12 +1117,20 @@ func (m *InstanceManager) Snapshot() map[string]any {
 		}
 
 		stateStr := "unloaded"
+		errorCount := 0
+		for _, inst := range g.instances {
+			if inst.State() == "error" {
+				errorCount++
+			}
+		}
 		if totalActive > 0 {
 			stateStr = "active"
 		} else if loadedCount > 0 {
 			stateStr = "loaded"
 		} else if len(g.instances) > 0 && g.instances[0].State() == "loading" {
 			stateStr = "loading"
+		} else if errorCount > 0 {
+			stateStr = "error"
 		}
 
 		entry := map[string]any{
@@ -1066,16 +1223,7 @@ func (m *InstanceManager) Snapshot() map[string]any {
 	}
 
 	// Sum actual VRAM from nvidia-smi across all our subprocesses
-	var totalActualVRAM float64
-	for _, inst := range m.instances {
-		inst.mu.Lock()
-		if inst.cmd != nil && inst.cmd.Process != nil {
-			if vram, ok := pidVRAM[inst.cmd.Process.Pid]; ok {
-				totalActualVRAM += float64(vram) / (1024 * 1024 * 1024)
-			}
-		}
-		inst.mu.Unlock()
-	}
+	totalActualVRAM := m.actualVRAMFromPidMap(pidVRAM)
 
 	// Reservations
 	var reservations []map[string]any

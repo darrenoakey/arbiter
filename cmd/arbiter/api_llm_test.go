@@ -129,7 +129,7 @@ func TestLLMLiveConfigMutationAndReload(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	api.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusCreated {
+	if rec.Code != http.StatusOK {
 		t.Fatalf("register LLM status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 

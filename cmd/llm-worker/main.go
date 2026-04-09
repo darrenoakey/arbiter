@@ -105,6 +105,7 @@ func startLlamaServer() error {
 		"-ngl", env("LLM_GPU_LAYERS", "-1"), // all layers on GPU by default
 		"-c", env("LLM_CTX_SIZE", "8192"),
 		"--no-warmup",
+		
 	}
 
 	// Model source: HF repo or local path
@@ -117,6 +118,33 @@ func startLlamaServer() error {
 		}
 	} else {
 		return fmt.Errorf("no model specified: set LLM_HF_REPO or LLM_MODEL_PATH")
+	}
+
+	// Optional extra llama-server flags via environment
+	if ctk := os.Getenv("LLAMA_ARG_CACHE_TYPE_K"); ctk != "" {
+		args = append(args, "-ctk", ctk)
+	}
+	if ctv := os.Getenv("LLAMA_ARG_CACHE_TYPE_V"); ctv != "" {
+		args = append(args, "-ctv", ctv)
+	}
+	if os.Getenv("LLAMA_ARG_FLASH_ATTN") == "off" {
+		// Remove -fa from args if explicitly disabled
+		var filtered []string
+		for _, a := range args {
+			if a != "-fa" {
+				filtered = append(filtered, a)
+			}
+		}
+		args = filtered
+	}
+	if os.Getenv("LLAMA_ARG_JINJA") == "off" {
+		var filtered []string
+		for _, a := range args {
+			if a != "--jinja" {
+				filtered = append(filtered, a)
+			}
+		}
+		args = filtered
 	}
 
 	log.Printf("Starting llama-server on port %d: %s %s", llamaPort, bin, strings.Join(args, " "))

@@ -27,10 +27,15 @@ type Scheduler struct {
 	pressureMu      sync.Mutex
 	currentPressure float64 // sum of in-flight job pressure indices
 	// Inference failure circuit-breaker
-	failureCountMu      sync.Mutex
-	failureCount        map[string]int       // model -> consecutive inference failures
-	failurePaused       map[string]time.Time // model -> paused until (inference circuit-breaker)
-	failureCooldownLevel map[string]int      // model -> escalation level (0=30s,1=1m,2=5m,3+=15m)
+	failureCountMu       sync.Mutex
+	failureCount         map[string]int       // model -> consecutive inference failures
+	failurePaused        map[string]time.Time // model -> paused until (inference circuit-breaker)
+	failureCooldownLevel map[string]int       // model -> escalation level (0=30s,1=1m,2=5m,3+=15m)
+	// Load failure circuit-breaker
+	loadFailureCountMu       sync.Mutex
+	loadFailureCount         map[string]int       // model -> consecutive load failures
+	loadFailurePaused        map[string]time.Time // model -> paused until
+	loadFailureCooldownLevel map[string]int       // model -> escalation level
 }
 
 func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *EventLogger, outputDir string) *Scheduler {
@@ -46,10 +51,13 @@ func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *Event
 		outputDir:            outputDir,
 		inboxDir:             inboxDir,
 		wake:                 make(chan struct{}, 1),
-		cooldownUntil:        make(map[string]time.Time),
-		failureCount:         make(map[string]int),
-		failurePaused:        make(map[string]time.Time),
-		failureCooldownLevel: make(map[string]int),
+		cooldownUntil:            make(map[string]time.Time),
+		failureCount:             make(map[string]int),
+		failurePaused:            make(map[string]time.Time),
+		failureCooldownLevel:     make(map[string]int),
+		loadFailureCount:         make(map[string]int),
+		loadFailurePaused:        make(map[string]time.Time),
+		loadFailureCooldownLevel: make(map[string]int),
 	}
 }
 
@@ -169,6 +177,68 @@ func (s *Scheduler) IsModelPaused(modelID string) (bool, time.Time) {
 	return true, until
 }
 
+// RecordLoadFailure increments the consecutive load failure counter for a model.
+// Threshold: 3 failures → escalating pause. On activation, cancels queued+following jobs.
+func (s *Scheduler) RecordLoadFailure(modelID string) {
+	const threshold = 3
+	s.loadFailureCountMu.Lock()
+	defer s.loadFailureCountMu.Unlock()
+	s.loadFailureCount[modelID]++
+	if s.loadFailureCount[modelID] < threshold {
+		return
+	}
+	level := s.loadFailureCooldownLevel[modelID]
+	if level >= len(failureCooldownDurations) {
+		level = len(failureCooldownDurations) - 1
+	}
+	dur := failureCooldownDurations[level]
+	until := time.Now().Add(dur)
+	s.loadFailurePaused[modelID] = until
+	if s.loadFailureCooldownLevel[modelID] < len(failureCooldownDurations)-1 {
+		s.loadFailureCooldownLevel[modelID]++
+	}
+	s.loadFailureCount[modelID] = 0
+	slog.Warn("load circuit-breaker: model paused after consecutive load failures",
+		"model", modelID, "threshold", threshold, "cooldown", dur,
+		"resume_at", until.Format(time.RFC3339))
+	s.logger.Log("model.load_circuit_breaker", map[string]any{
+		"model_id": modelID,
+		"cooldown": dur.String(),
+	})
+	// Cancel stuck jobs in background
+	go func() {
+		if n, err := s.store.CancelQueuedForModel(modelID); err == nil && n > 0 {
+			slog.Warn("load circuit-breaker: cancelled queued jobs", "model", modelID, "count", n)
+		}
+		if n, err := s.store.CancelFollowingForModel(modelID, "model load circuit-breaker activated"); err == nil && n > 0 {
+			slog.Warn("load circuit-breaker: cancelled following jobs", "model", modelID, "count", n)
+		}
+	}()
+}
+
+// RecordLoadSuccess resets the load failure counter and escalation level.
+func (s *Scheduler) RecordLoadSuccess(modelID string) {
+	s.loadFailureCountMu.Lock()
+	defer s.loadFailureCountMu.Unlock()
+	s.loadFailureCount[modelID] = 0
+	s.loadFailureCooldownLevel[modelID] = 0
+}
+
+// IsModelLoadPaused reports whether the model's load circuit-breaker is active.
+func (s *Scheduler) IsModelLoadPaused(modelID string) (bool, time.Time) {
+	s.loadFailureCountMu.Lock()
+	defer s.loadFailureCountMu.Unlock()
+	until, ok := s.loadFailurePaused[modelID]
+	if !ok {
+		return false, time.Time{}
+	}
+	if time.Now().After(until) {
+		delete(s.loadFailurePaused, modelID)
+		return false, time.Time{}
+	}
+	return true, until
+}
+
 // getFullModels returns model IDs that are at total capacity or would exceed the pressure budget.
 func (s *Scheduler) getFullModels() map[string]bool {
 	full := make(map[string]bool)
@@ -189,6 +259,16 @@ func (s *Scheduler) getFullModels() map[string]bool {
 
 	for modelID, cfg := range s.config.Models {
 		if full[modelID] {
+			continue
+		}
+		// Check load circuit-breaker
+		if paused, _ := s.IsModelLoadPaused(modelID); paused {
+			full[modelID] = true
+			continue
+		}
+		// Check inference circuit-breaker
+		if paused, _ := s.IsModelPaused(modelID); paused {
+			full[modelID] = true
 			continue
 		}
 		active, _ := s.store.CountActive(modelID)
@@ -305,12 +385,14 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 	if err := s.ensureLoaded(inst); err != nil {
 		slog.Warn("can't load instance, requeueing", "instance", inst.InstanceID, "job", job.ID, "error", err)
 		s.store.UpdateState(job.ID, "queued")
+		s.RecordLoadFailure(job.ModelID)
 		// Cooldown: mark model as temporarily full to prevent scheduler spin
 		s.cooldownMu.Lock()
 		s.cooldownUntil[job.ModelID] = time.Now().Add(5 * time.Second)
 		s.cooldownMu.Unlock()
 		return
 	}
+	s.RecordLoadSuccess(job.ModelID)
 
 	// Mark running
 	now := nowTS()
@@ -621,6 +703,146 @@ func (s *Scheduler) RunJobWatchdog(ctx context.Context) {
 			}
 			s.cleanupJobInbox(job)
 		}
+	}
+}
+
+// RunModelHealthWatchdog periodically checks for models in broken states
+// and resets them so the next job attempt starts fresh.
+func (s *Scheduler) RunModelHealthWatchdog(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		for modelID, modelCfg := range s.config.Models {
+			for _, inst := range s.mgr.GetModelInstances(modelID) {
+				state := inst.State()
+
+				// Check 1: Instance in "error" state with no active jobs — kill and
+				// reset to stopped so next ensureLoaded starts fresh.
+				if state == "error" && inst.ActiveJobs() == 0 {
+					slog.Warn("health watchdog: resetting errored instance",
+						"instance", inst.InstanceID, "model", modelID)
+					inst.Kill()
+					s.mgr.ReleaseMemory(inst.memoryGB)
+					s.logger.Log("model.health_reset", map[string]any{
+						"model_id":    modelID,
+						"instance_id": inst.InstanceID,
+						"reason":      "error_state_reset",
+					})
+				}
+
+				// Check 2: Instance stuck in "loading" for too long.
+				if state == "loading" {
+					maxLoadSec := modelCfg.LoadMs / 1000.0 * 2
+					if maxLoadSec < 60 {
+						maxLoadSec = 60
+					}
+					if maxLoadSec > 600 {
+						maxLoadSec = 600
+					}
+					la := inst.LastActive()
+					if !la.IsZero() && time.Since(la).Seconds() > maxLoadSec {
+						slog.Warn("health watchdog: loading stuck, killing instance",
+							"instance", inst.InstanceID, "model", modelID,
+							"loading_seconds", time.Since(la).Seconds())
+						inst.Kill()
+						s.mgr.ReleaseMemory(inst.memoryGB)
+						s.logger.Log("model.health_reset", map[string]any{
+							"model_id":    modelID,
+							"instance_id": inst.InstanceID,
+							"reason":      "loading_stuck",
+						})
+					}
+				}
+			}
+		}
+
+		// Periodically reconcile following jobs whose originals are stuck
+		if n := s.store.ReconcileFollowingJobs(s.outputDir); n > 0 {
+			slog.Info("health watchdog: reconciled following jobs", "count", n)
+		}
+	}
+}
+
+// RunVRAMWatchdog periodically checks effective VRAM usage and proactively
+// evicts idle models when memory pressure is too high, preventing OOM crashes.
+func (s *Scheduler) RunVRAMWatchdog(ctx context.Context) {
+	const (
+		interval   = 15 * time.Second
+		headroomGB = 2.0 // evict when effective usage is within 2GB of budget
+	)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		effective, actual, allocated, reserved := s.mgr.EffectiveUsedGB()
+		budget := s.mgr.BudgetGB()
+		overage := effective - (budget - headroomGB)
+
+		if overage <= 0 {
+			// Reconcile bookkeeping drift even when not under pressure
+			s.mgr.ReconcileUsedGB(actual, 1.0)
+			continue
+		}
+
+		slog.Warn("vram watchdog: memory pressure detected",
+			"effective_gb", effective,
+			"actual_gb", actual,
+			"allocated_gb", allocated,
+			"reserved_gb", reserved,
+			"budget_gb", budget,
+			"overage_gb", overage,
+		)
+		s.logger.Log("vram.pressure", map[string]any{
+			"effective_gb": effective,
+			"actual_gb":    actual,
+			"allocated_gb": allocated,
+			"reserved_gb":  reserved,
+			"budget_gb":    budget,
+			"overage_gb":   overage,
+		})
+
+		// Reconcile bookkeeping before eviction
+		s.mgr.ReconcileUsedGB(actual, 1.0)
+
+		// Build queue counts for eviction priority
+		queuedJobs := make(map[string]int)
+		for modelID := range s.config.Models {
+			counts, err := s.store.CountByState(modelID)
+			if err != nil {
+				continue
+			}
+			queuedJobs[modelID] = counts["queued"] + counts["scheduled"]
+		}
+
+		freed, err := s.mgr.EvictForGBWithQueueInfo(overage, queuedJobs)
+		if err != nil {
+			slog.Warn("vram watchdog: could not free enough memory",
+				"needed_gb", overage, "freed_gb", freed, "error", err)
+		} else {
+			slog.Info("vram watchdog: eviction complete",
+				"freed_gb", freed, "needed_gb", overage)
+		}
+		s.logger.Log("vram.eviction", map[string]any{
+			"freed_gb":  freed,
+			"needed_gb": overage,
+			"success":   err == nil,
+		})
+
+		s.rescoreAll()
 	}
 }
 

@@ -122,6 +122,8 @@ func main() {
 	go sched.Run(ctx)
 	go sched.RunKeepalive(ctx)
 	go sched.RunJobWatchdog(ctx)
+	go sched.RunModelHealthWatchdog(ctx)
+	go sched.RunVRAMWatchdog(ctx)
 	if cfg.ShareMount != "" {
 		// Probe the mount root itself — contains inbox/ and output/ subdirs,
 		// so ReadDir always gets a real server round-trip.

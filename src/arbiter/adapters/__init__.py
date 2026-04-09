@@ -14,3 +14,7 @@ from . import aesthetic_scorer  # noqa: F401
 from . import z_image  # noqa: F401
 from . import lora_train  # noqa: F401
 from . import composite  # noqa: F401
+from . import flux_kontext  # noqa: F401
+from . import flux_lora  # noqa: F401
+from . import ltx2_stage1  # noqa: F401
+from . import ltx2_stage2  # noqa: F401

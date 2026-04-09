@@ -47,15 +47,17 @@ class SonicAdapter(GroupAdapter):
         try:
             from sonic import Sonic
 
+            if device == "cpu":
+                raise LoadError("Sonic requires CUDA — refusing to load on CPU")
             device_id = 0
             if device.startswith("cuda:"):
                 device_id = int(device.split(":")[1])
-            elif device == "cuda":
-                device_id = 0
-            elif device == "cpu":
-                device_id = -1
 
-            self._sonic = Sonic(device_id=device_id, enable_interpolate_frame=True)
+            self._sonic = Sonic(
+                device_id=device_id,
+                enable_interpolate_frame=True,
+                enable_compile=False,  # Enable after first successful test
+            )
             self._device = device
             log.info("Sonic ready (%s).", device)
         except Exception as exc:
@@ -102,7 +104,10 @@ class SonicAdapter(GroupAdapter):
             audio:          base64-encoded WAV audio
             dynamic_scale:  (optional) motion intensity, default 1.0
             seed:           (optional) RNG seed
-            min_resolution: (optional) minimum resolution, default 256
+            min_resolution: (optional) minimum resolution, default 512
+            inference_steps: (optional) denoising steps, default 25 (try 15 for speed)
+            step:           (optional) frame stride, default 2 (try 3 for speed)
+            scheduler:      (optional) "dpm++" for faster convergence, "euler" for default
         """
         if self._sonic is None:
             raise InferenceError("Sonic model is not loaded")
@@ -180,6 +185,8 @@ class SonicAdapter(GroupAdapter):
                 inference_steps=int(params.get("inference_steps", 25)),
                 dynamic_scale=dynamic_scale,
                 seed=seed,
+                step=params.get("step"),
+                scheduler=params.get("scheduler"),
             )
 
             if rc != 0:
