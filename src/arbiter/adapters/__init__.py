@@ -26,6 +26,7 @@ _ADAPTERS = [
     "ltx2_denoise1",
     "ltx2_denoise2",
     "face_restore",
+    "face_restore_codeformer",
     "aesthetic_scorer",
     "z_image",
     "lora_train",
