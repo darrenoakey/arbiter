@@ -189,7 +189,13 @@ func (s *Store) PickNextJob(excludeModels map[string]bool) (*Job, error) {
 			args = append(args, m)
 		}
 	}
-	query += " ORDER BY priority ASC, created_at ASC LIMIT 1"
+	// FCFS: oldest queued job wins regardless of model. The per-model
+	// `priority` column is left in place for observability but is NOT used
+	// for ordering. SJF (shortest-job-first) caused fast models to jump
+	// ahead of slow batch work that had been submitted earlier, which in
+	// practice made batch pipelines like ltx2 get interrupted by unrelated
+	// image jobs that were queued later.
+	query += " ORDER BY created_at ASC LIMIT 1"
 
 	row := s.db.QueryRow(query, args...)
 	j, err := s.scanJob(row)
