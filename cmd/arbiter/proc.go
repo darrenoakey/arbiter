@@ -222,10 +222,21 @@ func (inst *Instance) readLoop() {
 		}
 	}
 
-	// Subprocess died — clean up references and unblock all pending requests.
-	slog.Warn("readLoop exited, subprocess died", "instance", inst.InstanceID)
+	// stdout closed — subprocess is gone. Clean up references and unblock all
+	// pending requests. Distinguish a deliberate shutdown (Unload/Kill already
+	// transitioned state to "unloading"/"stopped") from an unexpected death:
+	// only flag the instance as "error" in the latter case. Otherwise the
+	// readLoop's exit on a normal eviction would overwrite Kill()'s "stopped"
+	// state and trigger a spurious model.health_reset(error_state_reset)
+	// event a few seconds later when the health watchdog tidied it up.
 	inst.mu.Lock()
-	inst.state = "error"
+	deliberateShutdown := inst.state == "unloading" || inst.state == "stopped"
+	if deliberateShutdown {
+		slog.Info("readLoop exited after deliberate shutdown", "instance", inst.InstanceID, "state", inst.state)
+	} else {
+		slog.Warn("readLoop exited, subprocess died", "instance", inst.InstanceID, "prior_state", inst.state)
+		inst.state = "error"
+	}
 	// Clear dead process references so Snapshot doesn't report a stale PID.
 	// The process is already dead (stdout pipe closed), so just nil the refs.
 	if inst.stdin != nil {
