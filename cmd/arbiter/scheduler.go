@@ -309,11 +309,24 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 
 		// Try reserve
 		if !s.mgr.ReserveMemory(needed) {
-			// Evict idle models
+			// Evict idle models. Use the queue-aware evictor so that a model
+			// which still has queued/running work is preserved over a model
+			// with nothing waiting for it.
 			deficit := needed - s.mgr.FreeGB()
 			if deficit > 0 {
+				queuedJobs := make(map[string]int)
+				for modelID := range s.config.Models {
+					counts, err := s.store.CountByState(modelID)
+					if err != nil {
+						continue
+					}
+					queuedJobs[modelID] = counts["queued"] + counts["scheduled"] + counts["running"]
+				}
 				slog.Info("ensureLoaded: evicting idle models", "instance", inst.InstanceID, "deficit_gb", deficit)
-				s.mgr.EvictForGB(deficit)
+				if _, err := s.mgr.EvictForGBWithQueueInfo(deficit, queuedJobs); err != nil {
+					slog.Warn("ensureLoaded: queue-aware eviction insufficient",
+						"instance", inst.InstanceID, "error", err)
+				}
 			}
 
 			// Retry
@@ -597,6 +610,15 @@ func (s *Scheduler) Run(ctx context.Context) {
 }
 
 // RunKeepalive evicts idle models past their keep_alive_seconds.
+//
+// Safety rules (learned the hard way):
+//   - NEVER evict a model that has queued or scheduled work. Idle time while
+//     jobs are waiting is not "really" idle — it just means the scheduler is
+//     paused for some reason (cooldown, in-flight dispatch, etc.).
+//   - NEVER evict a model whose inference or load circuit-breaker is active.
+//     Cooldown time is artificial idleness; evicting forces a cold reload
+//     (minutes) the instant the cooldown expires.
+//   - NEVER evict while active > 0 (existing rule).
 func (s *Scheduler) RunKeepalive(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -610,6 +632,31 @@ func (s *Scheduler) RunKeepalive(ctx context.Context) {
 
 		now := time.Now()
 		for modelID, cfg := range s.config.Models {
+			// Skip if a circuit-breaker is currently holding dispatch back —
+			// the model only looks idle because we stopped feeding it.
+			if paused, until := s.IsModelPaused(modelID); paused {
+				slog.Debug("keepalive skip: inference cooldown active",
+					"model", modelID, "resume_at", until.Format(time.RFC3339))
+				continue
+			}
+			if paused, until := s.IsModelLoadPaused(modelID); paused {
+				slog.Debug("keepalive skip: load cooldown active",
+					"model", modelID, "resume_at", until.Format(time.RFC3339))
+				continue
+			}
+
+			// Skip if there is pending work queued for this model — evicting
+			// now would force an expensive cold reload for jobs we already have.
+			pending := 0
+			if counts, err := s.store.CountByState(modelID); err == nil {
+				pending = counts["queued"] + counts["scheduled"] + counts["running"]
+			}
+			if pending > 0 {
+				slog.Debug("keepalive skip: pending work",
+					"model", modelID, "pending_jobs", pending)
+				continue
+			}
+
 			for _, inst := range s.mgr.GetModelInstances(modelID) {
 				st := inst.State()
 				active := inst.ActiveJobs()
@@ -817,14 +864,19 @@ func (s *Scheduler) RunVRAMWatchdog(ctx context.Context) {
 		// Reconcile bookkeeping before eviction
 		s.mgr.ReconcileUsedGB(actual, 1.0)
 
-		// Build queue counts for eviction priority
+		// Build queue counts for eviction priority. Include running jobs so
+		// that a model actively working through a batch is still counted as
+		// "has queued work" between individual job completions — otherwise a
+		// model can momentarily show queued=0 (right as one job finishes and
+		// the next is picked) and be evicted in favour of a model with zero
+		// pending work.
 		queuedJobs := make(map[string]int)
 		for modelID := range s.config.Models {
 			counts, err := s.store.CountByState(modelID)
 			if err != nil {
 				continue
 			}
-			queuedJobs[modelID] = counts["queued"] + counts["scheduled"]
+			queuedJobs[modelID] = counts["queued"] + counts["scheduled"] + counts["running"]
 		}
 
 		freed, err := s.mgr.EvictForGBWithQueueInfo(overage, queuedJobs)
