@@ -784,13 +784,16 @@ func (s *Scheduler) RunModelHealthWatchdog(ctx context.Context) {
 				}
 
 				// Check 2: Instance stuck in "loading" for too long.
+				// Allowance is 3× the configured load_ms with a 60-second floor.
+				// No upper clamp: ltx2-denoise1's calibrated load_ms is 420s, so
+				// the previous 600s clamp left almost no headroom for variance and
+				// would kill perfectly healthy slow loads. The instance's
+				// lastActive is reset when state transitions to "loading", so this
+				// measures from the start of THIS load attempt only.
 				if state == "loading" {
-					maxLoadSec := modelCfg.LoadMs / 1000.0 * 2
+					maxLoadSec := modelCfg.LoadMs / 1000.0 * 3
 					if maxLoadSec < 60 {
 						maxLoadSec = 60
-					}
-					if maxLoadSec > 600 {
-						maxLoadSec = 600
 					}
 					la := inst.LastActive()
 					if !la.IsZero() && time.Since(la).Seconds() > maxLoadSec {

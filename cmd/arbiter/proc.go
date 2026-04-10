@@ -312,6 +312,12 @@ func (inst *Instance) Load(device string) error {
 
 	inst.mu.Lock()
 	inst.state = "loading"
+	// Reset the activity timestamp so the model-health watchdog measures the
+	// "loading stuck" timeout from the start of THIS load attempt, not from
+	// the last successful job (which may have completed hours ago, instantly
+	// tripping the stuck-loading kill on any re-load of a previously-active
+	// model — observed on z-image-turbo killing itself ~5s into a fresh load).
+	inst.lastActive = time.Now()
 	inst.mu.Unlock()
 
 	resp, err := inst.sendAndReceive(map[string]any{"cmd": "load", "device": device})
