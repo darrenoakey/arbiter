@@ -41,7 +41,10 @@ class ZImageTurboAdapter(ModelAdapter):
         self._pipe = ZImagePipeline.from_pretrained(
             ZIMAGE_HF_ID,
             torch_dtype=torch.bfloat16,
-        ).to(device)
+        )
+        # GB10 mmap→cuda workaround: clone each tensor off mmap-backed
+        # storage before moving to device. See base._pipe_to_cuda_cloned.
+        self._pipe_to_cuda_cloned(self._pipe, device)
         self._txt2img_backend = self._enable_fast_attention(self._pipe, pipeline_name="txt2img")
 
         self._device = device
@@ -66,7 +69,8 @@ class ZImageTurboAdapter(ModelAdapter):
         self._img2img_pipe = ZImageImg2ImgPipeline.from_pretrained(
             ZIMAGE_HF_ID,
             torch_dtype=torch.bfloat16,
-        ).to(self._device)
+        )
+        self._pipe_to_cuda_cloned(self._img2img_pipe, self._device)
         self._img2img_backend = self._enable_fast_attention(self._img2img_pipe, pipeline_name="img2img")
 
         return self._img2img_pipe

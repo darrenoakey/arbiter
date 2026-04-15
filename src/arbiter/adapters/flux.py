@@ -42,7 +42,10 @@ class FluxSchnellAdapter(ModelAdapter):
         self._pipe = DiffusionPipeline.from_pretrained(
             FLUX_HF_ID,
             torch_dtype=torch.bfloat16,
-        ).to(device)
+        )
+        # GB10 mmap→cuda workaround: clone each tensor off mmap-backed
+        # storage before moving to device. See base._pipe_to_cuda_cloned.
+        self._pipe_to_cuda_cloned(self._pipe, device)
 
         try:
             self._pipe.enable_xformers_memory_efficient_attention()
@@ -71,7 +74,8 @@ class FluxSchnellAdapter(ModelAdapter):
         self._img2img_pipe = FluxImg2ImgPipeline.from_pretrained(
             FLUX_HF_ID,
             torch_dtype=torch.bfloat16,
-        ).to(self._device)
+        )
+        self._pipe_to_cuda_cloned(self._img2img_pipe, self._device)
 
         try:
             self._img2img_pipe.enable_xformers_memory_efficient_attention()

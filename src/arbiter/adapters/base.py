@@ -141,6 +141,69 @@ class ModelAdapter(ABC):
         except ImportError:
             pass
 
+    @staticmethod
+    def _pipe_to_cuda_cloned(pipe, device: str = "cuda") -> None:
+        """Move a diffusers Pipeline to `device`, bypassing the GB10
+        mmap→cuda pathological slow path.
+
+        Background: on GB10 with torch 2.10.0+cu130 (cuda cap 12.1), moving
+        a safetensors-mmap-backed CPU tensor directly via ``.to("cuda")``
+        triggers per-4KB-page fault-in during cudaMemcpy, collapsing host→device
+        bandwidth to ~170 MB/s. Cloning the tensor first (which does a fast
+        sequential memcpy out of mmap into a heap-allocated tensor) lets the
+        subsequent ``.to("cuda")`` run at normal DRAM bandwidth (~8-16 GB/s).
+
+        This function walks every nn.Module attribute of the pipe, clones
+        each parameter and buffer individually, then moves it to the target
+        device — so peak extra memory is the size of one tensor, not the
+        whole state dict. Measured speedup on 2026-04-15: z-image-turbo
+        46s→4s (10.9x), flux-schnell 184s→9s (21.1x).
+
+        Reference: performance.md (LTX-2 Encode Load Performance Investigation)
+        where this same mmap→cuda bug was diagnosed for the ltx2 pipeline
+        and fixed inside ltx-core's sft_loader.py with .clone().
+        """
+        import torch
+        import torch.nn as nn
+
+        seen = set()
+        for attr in dir(pipe):
+            if attr.startswith("_"):
+                continue
+            try:
+                obj = getattr(pipe, attr, None)
+            except Exception:
+                continue
+            if not isinstance(obj, nn.Module):
+                continue
+            if id(obj) in seen:
+                continue
+            seen.add(id(obj))
+
+            for p in obj.parameters(recurse=True):
+                if p.data.device.type != device:
+                    p.data = p.data.clone().to(device, non_blocking=False)
+
+            # Buffers must be replaced via setattr on their parent module
+            for name, b in list(obj.named_buffers(recurse=True)):
+                if b.device.type != device:
+                    new_b = b.clone().to(device, non_blocking=False)
+                    parts = name.split(".")
+                    mod = obj
+                    for pn in parts[:-1]:
+                        mod = getattr(mod, pn)
+                    setattr(mod, parts[-1], new_b)
+
+        # Sanity call — after the per-tensor move above this is a no-op,
+        # but it lets the pipeline update any internal device-tracking state
+        # that diffusers relies on.
+        try:
+            pipe.to(device)
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
 
 class GroupAdapter(ModelAdapter):
     """Adapter for co-dependent sub-models loaded/unloaded atomically.
