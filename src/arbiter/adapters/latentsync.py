@@ -91,6 +91,9 @@ class LatentSyncAdapter(ModelAdapter):
         tmp_audio = os.path.join(tmp_dir, "input.wav")
         tmp_output = os.path.join(tmp_dir, "output.mp4")
 
+        duration_s = 0.0
+        timeout_s = 1800
+
         try:
             with open(tmp_video, "wb") as f:
                 f.write(video_bytes)
@@ -98,6 +101,17 @@ class LatentSyncAdapter(ModelAdapter):
                 f.write(audio_bytes)
 
             self._check_cancel(cancel_flag)
+
+            # Scale the subprocess timeout by video duration. LatentSync is
+            # ~50 s of inference per 1 s of 512 px video at 20 steps, so a
+            # 2-minute input needs ~100 min. A hardcoded 1800 s ceiling
+            # silently killed any input longer than ~30 s of video. We use
+            # 100 s per second of video (~2x the measured rate as headroom)
+            # plus a 10-minute buffer for model load, file I/O, and ffmpeg.
+            # 30-minute floor covers very short inputs where overhead
+            # dominates.
+            duration_s = self._probe_duration(tmp_video)
+            timeout_s = max(1800, int(duration_s * 100 + 600))
 
             cmd = [
                 str(LATENTSYNC_PYTHON),
@@ -113,8 +127,8 @@ class LatentSyncAdapter(ModelAdapter):
             ]
 
             log.info(
-                "Running LatentSync: steps=%d, guidance=%.1f",
-                inference_steps, guidance_scale,
+                "Running LatentSync: steps=%d, guidance=%.1f, duration=%.1fs, timeout=%ds",
+                inference_steps, guidance_scale, duration_s, timeout_s,
             )
 
             proc = subprocess.run(
@@ -122,7 +136,7 @@ class LatentSyncAdapter(ModelAdapter):
                 cwd=str(LATENTSYNC_DIR),
                 capture_output=True,
                 text=True,
-                timeout=1800,  # 30 minute timeout
+                timeout=timeout_s,
             )
 
             if proc.returncode != 0:
@@ -152,7 +166,10 @@ class LatentSyncAdapter(ModelAdapter):
             }
 
         except subprocess.TimeoutExpired:
-            raise InferenceError("LatentSync subprocess timed out after 1800s")
+            raise InferenceError(
+                f"LatentSync subprocess timed out after {timeout_s}s "
+                f"(scaled from video duration {duration_s:.1f}s)"
+            )
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -174,6 +191,19 @@ class LatentSyncAdapter(ModelAdapter):
             except Exception:
                 pass
         return 60000  # default: 60 seconds
+
+    @staticmethod
+    def _probe_duration(path: str) -> float:
+        """Use ffprobe to get video duration in seconds. Returns 60 on failure."""
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, timeout=10,
+            )
+            return float(result.stdout.strip())
+        except Exception:
+            return 60.0
 
     @staticmethod
     def _probe_video_dimensions(path: str) -> tuple[int, int]:
