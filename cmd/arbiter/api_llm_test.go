@@ -4,11 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func newTestAPI(t *testing.T) (*API, func()) {
@@ -82,6 +86,34 @@ for line in sys.stdin:
 `
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake worker: %v", err)
+	}
+}
+
+func writeFakeStreamingLLMWorker(t *testing.T, path string) {
+	t.Helper()
+	script := `#!/usr/bin/env python3
+import json
+import os
+import sys
+
+port = int(os.environ["FAKE_STREAM_PORT"])
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    cmd = msg.get("cmd")
+    req_id = msg.get("req_id", "_default")
+    if cmd == "load":
+        print(json.dumps({"status": "ok", "req_id": req_id}), flush=True)
+    elif cmd == "unload":
+        print(json.dumps({"status": "ok", "req_id": req_id}), flush=True)
+    elif cmd == "shutdown":
+        print(json.dumps({"status": "ok", "req_id": req_id}), flush=True)
+        break
+    elif cmd == "get_port":
+        print(json.dumps({"status": "ok", "req_id": req_id, "result": {"port": port}}), flush=True)
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake streaming worker: %v", err)
 	}
 }
 
@@ -191,5 +223,187 @@ func TestLLMLiveConfigMutationAndReload(t *testing.T) {
 	}
 	if got := last["LLM_HF_REPO"]; got != "example/custom-llm-GGUF" {
 		t.Fatalf("reloaded LLM_HF_REPO = %v", got)
+	}
+}
+
+// TestRegisterLLMSetsDefaultMaxRuntimeSec verifies that POST /v1/llm/models
+// without an explicit max_runtime_seconds sets a non-zero default (600s) so
+// the watchdog will never immediately kill the job due to maxSec==0.
+func TestRegisterLLMSetsDefaultMaxRuntimeSec(t *testing.T) {
+	api, cleanup := newTestAPI(t)
+	defer cleanup()
+
+	workerPath := filepath.Join(t.TempDir(), "noop-worker.py")
+	script := `#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    cmd = msg.get("cmd")
+    req_id = msg.get("req_id", "_default")
+    if cmd == "load":
+        print(json.dumps({"status": "ok", "req_id": req_id}), flush=True)
+    elif cmd in ("unload", "shutdown"):
+        print(json.dumps({"status": "ok", "req_id": req_id}), flush=True)
+        break
+`
+	if err := os.WriteFile(workerPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write worker: %v", err)
+	}
+
+	// Register without specifying max_runtime_seconds.
+	body := map[string]any{
+		"name":       "my-dynamic-llm",
+		"hf_model":   "example/my-dynamic-llm-GGUF",
+		"worker_cmd": []string{"python3", workerPath},
+	}
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/v1/llm/models", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("register LLM status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	modelID := llmModelID("my-dynamic-llm")
+	cfg, ok := api.config.Models[modelID]
+	if !ok {
+		t.Fatalf("model %q not found in config after registration", modelID)
+	}
+	if cfg.MaxRuntimeSec == 0 {
+		t.Fatal("MaxRuntimeSec must not be 0 for dynamically-registered LLM; watchdog would kill all jobs immediately")
+	}
+	// Default should be the 600s we set.
+	if cfg.MaxRuntimeSec != 600 {
+		t.Fatalf("MaxRuntimeSec = %d, want 600 (default for dynamic LLMs)", cfg.MaxRuntimeSec)
+	}
+}
+
+// TestRegisterLLMRespectsExplicitMaxRuntimeSec verifies that when the caller
+// provides max_runtime_seconds the value is honoured.
+func TestRegisterLLMRespectsExplicitMaxRuntimeSec(t *testing.T) {
+	api, cleanup := newTestAPI(t)
+	defer cleanup()
+
+	workerPath := filepath.Join(t.TempDir(), "noop-worker2.py")
+	script := `#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    cmd = msg.get("cmd")
+    req_id = msg.get("req_id", "_default")
+    if cmd == "load":
+        print(json.dumps({"status": "ok", "req_id": req_id}), flush=True)
+    elif cmd in ("unload", "shutdown"):
+        print(json.dumps({"status": "ok", "req_id": req_id}), flush=True)
+        break
+`
+	if err := os.WriteFile(workerPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write worker: %v", err)
+	}
+
+	maxSec := 1800
+	body := map[string]any{
+		"name":                "my-custom-timeout-llm",
+		"hf_model":            "example/my-custom-timeout-llm-GGUF",
+		"worker_cmd":          []string{"python3", workerPath},
+		"max_runtime_seconds": maxSec,
+	}
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/v1/llm/models", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("register LLM status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	modelID := llmModelID("my-custom-timeout-llm")
+	cfg, ok := api.config.Models[modelID]
+	if !ok {
+		t.Fatalf("model %q not found in config after registration", modelID)
+	}
+	if cfg.MaxRuntimeSec != maxSec {
+		t.Fatalf("MaxRuntimeSec = %d, want %d (explicit value must be preserved)", cfg.MaxRuntimeSec, maxSec)
+	}
+}
+
+func TestChatCompletionStreamReservesInstanceWhileStreaming(t *testing.T) {
+	api, cleanup := newTestAPI(t)
+	defer cleanup()
+
+	upstreamDone := make(chan struct{})
+	upstreamRelease := make(chan struct{})
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	upstream := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			close(upstreamDone)
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher, _ := w.(http.Flusher)
+			_, _ = io.WriteString(w, "data: hello\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			<-upstreamRelease
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}),
+	}
+	defer upstream.Close()
+	go upstream.Serve(listener)
+
+	streamPort := listener.Addr().(*net.TCPAddr).Port
+	workerPath := filepath.Join(t.TempDir(), "fake-stream-worker.py")
+	writeFakeStreamingLLMWorker(t, workerPath)
+
+	api.config.Models["llm:test-stream"] = ModelConfig{
+		MemoryGB:      1,
+		MaxConcurrent: 1,
+		MaxInstances:  intPtr(1),
+		WorkerCmd:     []string{"python3", workerPath},
+		AdapterParams: map[string]string{"FAKE_STREAM_PORT": fmt.Sprintf("%d", streamPort)},
+	}
+	api.mgr.ScaleModel("llm:test-stream", 1, api.config.Models["llm:test-stream"])
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte(`{"stream":true}`)))
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		api.chatCompletionStream(rec, req, "llm:test-stream", []byte(`{"stream":true}`))
+		close(done)
+	}()
+
+	select {
+	case <-upstreamDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for upstream stream to start")
+	}
+
+	insts := api.mgr.GetModelInstances("llm:test-stream")
+	if len(insts) != 1 {
+		t.Fatalf("instances = %d, want 1", len(insts))
+	}
+	if got := insts[0].ActiveJobs(); got != 1 {
+		t.Fatalf("active jobs during stream = %d, want 1", got)
+	}
+
+	close(upstreamRelease)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for stream handler to finish")
+	}
+
+	if got := insts[0].ActiveJobs(); got != 0 {
+		t.Fatalf("active jobs after stream = %d, want 0", got)
 	}
 }

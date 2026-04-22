@@ -65,6 +65,7 @@ type llmRegisterRequest struct {
 	MaxConcurrent  *int              `json:"max_concurrent"`
 	MaxInstances   *int              `json:"max_instances"`
 	KeepAliveSec   *int              `json:"keep_alive_seconds"`
+	MaxRuntimeSec  *int              `json:"max_runtime_seconds"`
 	AvgInferenceMs *float64          `json:"avg_inference_ms"`
 	LoadMs         *float64          `json:"load_ms"`
 }
@@ -763,17 +764,17 @@ func (a *API) resolveConfiguredModelID(id string) (string, bool) {
 
 func serializeModelConfig(modelID string, cfg ModelConfig) map[string]any {
 	resp := map[string]any{
-		"model_id":           modelID,
-		"memory_gb":          cfg.MemoryGB,
-		"max_concurrent":     cfg.MaxConcurrent,
-		"keep_alive_seconds": cfg.KeepAliveSec,
-		"avg_inference_ms":   cfg.AvgInferenceMs,
-		"load_ms":            cfg.LoadMs,
-		"auto_download":      cfg.AutoDownload,
-		"model_path":         cfg.ModelPath,
-		"group":              cfg.Group,
-		"worker_cmd":         cfg.WorkerCmd,
-		"adapter_params":     cfg.AdapterParams,
+		"model_id":            modelID,
+		"memory_gb":           cfg.MemoryGB,
+		"max_concurrent":      cfg.MaxConcurrent,
+		"keep_alive_seconds":  cfg.KeepAliveSec,
+		"avg_inference_ms":    cfg.AvgInferenceMs,
+		"load_ms":             cfg.LoadMs,
+		"auto_download":       cfg.AutoDownload,
+		"model_path":          cfg.ModelPath,
+		"group":               cfg.Group,
+		"worker_cmd":          cfg.WorkerCmd,
+		"adapter_params":      cfg.AdapterParams,
 		"pressure_index":      cfg.PressureIndex,
 		"max_runtime_seconds": cfg.MaxRuntimeSec,
 	}
@@ -1320,6 +1321,7 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 		MaxConcurrent:  1,
 		MaxInstances:   &one,
 		KeepAliveSec:   3600,
+		MaxRuntimeSec:  600,
 		AvgInferenceMs: 5000,
 		LoadMs:         120000, // LLMs can take a while to download + load
 		WorkerCmd:      []string{llmWorkerBin(a.projectRoot)},
@@ -1337,6 +1339,9 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.KeepAliveSec != nil {
 		cfg.KeepAliveSec = *req.KeepAliveSec
+	}
+	if req.MaxRuntimeSec != nil {
+		cfg.MaxRuntimeSec = *req.MaxRuntimeSec
 	}
 	if req.AvgInferenceMs != nil {
 		cfg.AvgInferenceMs = *req.AvgInferenceMs
@@ -1510,6 +1515,12 @@ func (a *API) chatCompletionStream(w http.ResponseWriter, r *http.Request, model
 		writeError(w, 503, fmt.Sprintf("model not ready: %s", err))
 		return
 	}
+
+	// Streaming bypasses the scheduler's normal job accounting, so reserve the
+	// instance here to keep keepalive and condemn/evict paths from unloading the
+	// worker while the SSE stream is still active.
+	inst.ReserveExternal()
+	defer inst.ReleaseExternal()
 
 	// Get the llama-server port from the worker
 	port, err := inst.GetPort()

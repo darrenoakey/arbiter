@@ -44,13 +44,13 @@ func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *Event
 		inboxDir = filepath.Join(cfg.ShareMount, "inbox")
 	}
 	return &Scheduler{
-		config:               cfg,
-		store:                store,
-		mgr:                  mgr,
-		logger:               logger,
-		outputDir:            outputDir,
-		inboxDir:             inboxDir,
-		wake:                 make(chan struct{}, 1),
+		config:                   cfg,
+		store:                    store,
+		mgr:                      mgr,
+		logger:                   logger,
+		outputDir:                outputDir,
+		inboxDir:                 inboxDir,
+		wake:                     make(chan struct{}, 1),
 		cooldownUntil:            make(map[string]time.Time),
 		failureCount:             make(map[string]int),
 		failurePaused:            make(map[string]time.Time),
@@ -108,7 +108,6 @@ func (s *Scheduler) rescoreAll() {
 		s.rescoreModel(modelID)
 	}
 }
-
 
 // failureCooldownDurations defines escalating pause durations for the inference
 // circuit-breaker. The index maps to failureCooldownLevel.
@@ -726,7 +725,7 @@ func (s *Scheduler) RunJobWatchdog(ctx context.Context) {
 
 			maxSec := float64(cfg.MaxRuntimeSec)
 			elapsed := now - *job.StartedAt
-			if elapsed < maxSec {
+			if maxSec == 0 || elapsed < maxSec {
 				continue
 			}
 

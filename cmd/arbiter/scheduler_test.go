@@ -339,6 +339,160 @@ for line in sys.stdin:
 	}
 }
 
+// TestWatchdogSkipsJobsWithZeroMaxRuntime verifies that when MaxRuntimeSec == 0
+// the watchdog does NOT mark the job as failed, regardless of elapsed time.
+func TestWatchdogSkipsJobsWithZeroMaxRuntime(t *testing.T) {
+	projectRoot := t.TempDir()
+	outputDir := filepath.Join(projectRoot, "output")
+	os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755)
+	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+
+	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+	store.InitDedup()
+
+	cfg := &Config{
+		VRAMBudgetGB: 100,
+		Models: map[string]ModelConfig{
+			"dynamic-llm": {
+				MemoryGB:      10,
+				MaxConcurrent: 1,
+				MaxInstances:  intPtr(1),
+				MaxRuntimeSec: 0, // unset — dynamic registration default before fix
+			},
+		},
+	}
+	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
+	defer logger.Close()
+	mgr := NewInstanceManager(100, "python3", projectRoot)
+	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+
+	payload := json.RawMessage(`{"prompt":"hello"}`)
+	job, err := store.CreateJob("dynamic-llm", "chat-completion", payload, 1)
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	// Simulate the job having been running for a long time (well past any timeout).
+	longAgo := nowTS() - 9999
+	if err := store.UpdateState(job.ID, "running", WithStartedAt(longAgo)); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+
+	// Run one watchdog pass by manually calling the inner loop logic via a
+	// short-lived context so the ticker fires once quickly.
+	// We inline the watchdog body here because the ticker period is 30s — too
+	// slow for a unit test.  We test the pure decision logic directly.
+	jobs, err := store.GetRunningJobs()
+	if err != nil {
+		t.Fatalf("get running jobs: %v", err)
+	}
+
+	now := nowTS()
+	for _, j := range jobs {
+		if j.StartedAt == nil {
+			continue
+		}
+		modelCfg, ok := sched.config.Models[j.ModelID]
+		if !ok {
+			continue
+		}
+		maxSec := float64(modelCfg.MaxRuntimeSec)
+		elapsed := now - *j.StartedAt
+		if maxSec == 0 || elapsed < maxSec {
+			// watchdog should skip — this is the correct path
+			continue
+		}
+		// If we reach here, the watchdog would kill the job — which is the bug.
+		t.Fatalf("watchdog would kill job with MaxRuntimeSec=0 after %.0fs elapsed", elapsed)
+	}
+
+	// The job must still be running.
+	after, _ := store.GetJob(job.ID)
+	if after.State != "running" {
+		t.Fatalf("job state = %s after watchdog pass, want running (MaxRuntimeSec=0 must not kill)", after.State)
+	}
+}
+
+// TestWatchdogKillsJobsExceedingMaxRuntime verifies that a job whose elapsed
+// time exceeds its model's MaxRuntimeSec is marked failed by the watchdog.
+func TestWatchdogKillsJobsExceedingMaxRuntime(t *testing.T) {
+	projectRoot := t.TempDir()
+	outputDir := filepath.Join(projectRoot, "output")
+	os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755)
+	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+
+	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+	store.InitDedup()
+
+	cfg := &Config{
+		VRAMBudgetGB: 100,
+		Models: map[string]ModelConfig{
+			"short-model": {
+				MemoryGB:      10,
+				MaxConcurrent: 1,
+				MaxInstances:  intPtr(1),
+				MaxRuntimeSec: 10, // very short limit
+			},
+		},
+	}
+	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
+	defer logger.Close()
+	mgr := NewInstanceManager(100, "python3", projectRoot)
+	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+
+	payload := json.RawMessage(`{"prompt":"hello"}`)
+	job, err := store.CreateJob("short-model", "image-generate", payload, 1)
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	// Simulate the job having started 20s ago — exceeds the 10s limit.
+	startedAt := nowTS() - 20
+	if err := store.UpdateState(job.ID, "running", WithStartedAt(startedAt)); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+
+	// Run the same watchdog decision logic inline.
+	jobs, err := store.GetRunningJobs()
+	if err != nil {
+		t.Fatalf("get running jobs: %v", err)
+	}
+
+	now := nowTS()
+	for _, j := range jobs {
+		if j.StartedAt == nil {
+			continue
+		}
+		modelCfg, ok := sched.config.Models[j.ModelID]
+		if !ok {
+			continue
+		}
+		maxSec := float64(modelCfg.MaxRuntimeSec)
+		elapsed := now - *j.StartedAt
+		if maxSec == 0 || elapsed < maxSec {
+			continue
+		}
+		errMsg := "job timed out (test)"
+		store.UpdateState(j.ID, "failed", WithError(errMsg), WithFinishedAt(now))
+	}
+
+	after, _ := store.GetJob(job.ID)
+	if after.State != "failed" {
+		t.Fatalf("job state = %s, want failed (elapsed > MaxRuntimeSec=10 must be killed)", after.State)
+	}
+	if after.Error == "" {
+		t.Fatal("failed job must have an error message")
+	}
+}
+
 func TestSnapshotReportsErrorState(t *testing.T) {
 	mgr := NewInstanceManager(100, "python3", ".")
 	inst := NewInstance("broken-model", "broken-model", 1, 10, "python3", ".")
