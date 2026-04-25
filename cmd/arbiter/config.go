@@ -25,12 +25,13 @@ type ModelConfig struct {
 }
 
 type Config struct {
-	VRAMBudgetGB float64                `json:"vram_budget_gb"`
-	Host         string                 `json:"host"`
-	Port         int                    `json:"port"`
-	OutputDir    string                 `json:"output_dir"`
-	ShareMount   string                 `json:"share_mount"` // e.g. "/mnt/arbiter-store" — if set, monitored and remounted when unhealthy
-	Models       map[string]ModelConfig `json:"models"`
+	VRAMBudgetGB      float64                `json:"vram_budget_gb"`
+	SystemRAMBudgetGB float64                `json:"system_ram_budget_gb"` // 0 = disabled. On unified-memory hardware (GB10), this caps total tree-RSS across all worker process trees so CPU-side allocations can't push the GPU driver into NV_ERR_NO_MEMORY.
+	Host              string                 `json:"host"`
+	Port              int                    `json:"port"`
+	OutputDir         string                 `json:"output_dir"`
+	ShareMount        string                 `json:"share_mount"` // e.g. "/mnt/arbiter-store" — if set, monitored and remounted when unhealthy
+	Models            map[string]ModelConfig `json:"models"`
 }
 
 // JobTypeToModel maps job type strings to model IDs.
@@ -172,6 +173,28 @@ func SaveModelConfig(projectRoot, modelID string, cfg ModelConfig) error {
 		data["models"] = models
 	}
 	models[modelID] = cfg
+	return writeConfigData(projectRoot, data)
+}
+
+// PatchModelMemoryGB updates only the memory_gb field for a model in
+// local/config.json, preserving every other key (including ones not in
+// ModelConfig). Used by the drift watchdog to write back observed high-water
+// marks without clobbering hand-edited fields.
+func PatchModelMemoryGB(projectRoot, modelID string, newMemoryGB float64) error {
+	data, err := loadMutableConfigData(projectRoot)
+	if err != nil {
+		return err
+	}
+	models, ok := data["models"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("no models section in config")
+	}
+	entry, ok := models[modelID].(map[string]any)
+	if !ok {
+		entry = make(map[string]any)
+		models[modelID] = entry
+	}
+	entry["memory_gb"] = newMemoryGB
 	return writeConfigData(projectRoot, data)
 }
 

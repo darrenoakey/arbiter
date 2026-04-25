@@ -73,7 +73,7 @@ for line in sys.stdin:
 	}
 	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
 	defer logger.Close()
-	mgr := NewInstanceManager(100, "python3", projectRoot)
+	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 100}, "python3", projectRoot)
 	mgr.ScaleModel("demo", 1, cfg.Models["demo"])
 	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
 
@@ -157,7 +157,7 @@ for line in sys.stdin:
 	}
 	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
 	defer logger.Close()
-	mgr := NewInstanceManager(100, "python3", projectRoot)
+	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 100}, "python3", projectRoot)
 	mgr.ScaleModel("demo", 1, cfg.Models["demo"])
 	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
 	sched.MarkShuttingDown()
@@ -218,7 +218,7 @@ func TestLoadCircuitBreakerPausesAfterThreeFailures(t *testing.T) {
 	}
 	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
 	defer logger.Close()
-	mgr := NewInstanceManager(100, "python3", projectRoot)
+	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 100}, "python3", projectRoot)
 	mgr.ScaleModel("broken", 1, cfg.Models["broken"])
 	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
 
@@ -305,7 +305,7 @@ func TestEvictIdleNoQueueModelsPrefersQueuedModelResidency(t *testing.T) {
 	workerPath := filepath.Join(projectRoot, "idle_worker.py")
 	writeIdleWorker(t, workerPath)
 
-	mgr := NewInstanceManager(100, "python3", projectRoot)
+	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 100}, "python3", projectRoot)
 
 	instA := NewInstance("model-a", "model-a", 1, 20, "python3", projectRoot)
 	instA.workerCmd = []string{"python3", workerPath}
@@ -349,7 +349,7 @@ func TestEvictIdleNoQueueModelsPrefersQueuedModelResidency(t *testing.T) {
 }
 
 func TestEvictForGBWithQueueInfoPrefersNoQueue(t *testing.T) {
-	mgr := NewInstanceManager(100, "python3", ".")
+	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 100}, "python3", ".")
 
 	// Create two models, each loaded and idle
 	instA := NewInstance("model-a", "model-a", 1, 20, "python3", ".")
@@ -472,7 +472,7 @@ func TestWatchdogSkipsJobsWithZeroMaxRuntime(t *testing.T) {
 	}
 	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
 	defer logger.Close()
-	mgr := NewInstanceManager(100, "python3", projectRoot)
+	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 100}, "python3", projectRoot)
 	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
 
 	payload := json.RawMessage(`{"prompt":"hello"}`)
@@ -550,7 +550,7 @@ func TestWatchdogKillsJobsExceedingMaxRuntime(t *testing.T) {
 	}
 	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
 	defer logger.Close()
-	mgr := NewInstanceManager(100, "python3", projectRoot)
+	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 100}, "python3", projectRoot)
 	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
 
 	payload := json.RawMessage(`{"prompt":"hello"}`)
@@ -599,7 +599,7 @@ func TestWatchdogKillsJobsExceedingMaxRuntime(t *testing.T) {
 }
 
 func TestSnapshotReportsErrorState(t *testing.T) {
-	mgr := NewInstanceManager(100, "python3", ".")
+	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 100}, "python3", ".")
 	inst := NewInstance("broken-model", "broken-model", 1, 10, "python3", ".")
 	inst.mu.Lock()
 	inst.state = "error"

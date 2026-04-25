@@ -388,7 +388,7 @@ func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
 		// Inline result file as base64 if present
 		if job.State == "completed" && result != nil {
 			if fmt, ok := result["format"].(string); ok && fmt != "" {
-				resultFile := filepath.Join(a.outputDir, "jobs", job.ID, "result."+fmt)
+				resultFile := filepath.Join(resolveJobDir(a.config, a.outputDir, job.ID), "result."+fmt)
 				result["result_path"] = resultFile
 				skipData := r.URL.Query().Get("no_data") == "1"
 				if !skipData {

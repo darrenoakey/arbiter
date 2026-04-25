@@ -34,7 +34,7 @@ func newTestAPI(t *testing.T) (*API, func()) {
 		Port:         8400,
 		Models:       map[string]ModelConfig{},
 	}
-	mgr := NewInstanceManager(100, "python3", projectRoot)
+	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 100}, "python3", projectRoot)
 	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
 	api := NewAPI(cfg, store, mgr, sched, logger, outputDir, projectRoot)
 

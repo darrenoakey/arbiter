@@ -539,6 +539,13 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 		s.RecordFailure(job.ModelID)
 		s.cleanupJobInbox(job)
 	} else {
+		// Relocate the job output to the share mount so spark's local disk
+		// doesn't accumulate result files. Done before persisting state so
+		// the stored result reflects the final path.
+		newDir := relocateJobOutput(s.config, job.ID, jobDir)
+		if newDir != jobDir {
+			resp.Result = rewriteResultPaths(resp.Result, jobDir, newDir)
+		}
 		s.store.UpdateState(job.ID, "completed", WithResult(resp.Result), WithFinishedAt(nowTS()))
 		rssEntry := map[string]any{
 			"job_id":            job.ID,
@@ -547,6 +554,9 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 		}
 		if rss := inst.RSSAnon(); rss > 0 {
 			rssEntry["worker_rss_anon_mb"] = rss
+		}
+		if newDir != jobDir {
+			rssEntry["output_relocated_to"] = newDir
 		}
 		s.logger.Log("job.completed", rssEntry)
 		s.RecordSuccess(job.ModelID)

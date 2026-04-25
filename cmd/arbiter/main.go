@@ -126,7 +126,7 @@ func main() {
 	}
 
 	// Instance manager
-	mgr := NewInstanceManager(cfg.VRAMBudgetGB, pythonBin, projectRoot)
+	mgr := NewInstanceManager(cfg, pythonBin, projectRoot)
 	setupInstances(cfg, mgr, pythonBin, projectRoot)
 
 	// Register job type mappings for LLM models (restored from config)
@@ -178,6 +178,7 @@ func main() {
 	go sched.RunJobWatchdog(ctx)
 	go sched.RunModelHealthWatchdog(ctx)
 	go sched.RunVRAMWatchdog(ctx)
+	go NewMemoryWatchdog(cfg, mgr, eventLog, projectRoot).Run(ctx, 30*time.Second)
 	if cfg.ShareMount != "" {
 		// Probe the mount root itself — contains inbox/ and output/ subdirs,
 		// so ReadDir always gets a real server round-trip.

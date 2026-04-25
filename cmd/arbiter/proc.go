@@ -80,8 +80,11 @@ func (inst *Instance) ActiveJobs() int {
 	return int(atomic.LoadInt32(&inst.activeJobs))
 }
 
-// RSSAnon returns the anonymous RSS (heap + stack) of the worker subprocess in MB.
-// Returns 0 if not running or on non-Linux platforms.
+// RSSAnon returns the anonymous RSS (heap + stack) of the worker process tree
+// (root + all descendants) in MB. Subprocess accounting matters: workers like
+// llm-worker shell out to llama-server, and Python adapters fork CUDA helpers
+// — without tree summation, large child allocations stay invisible to the
+// arbiter's memory bookkeeping. Returns 0 if not running or on non-Linux.
 func (inst *Instance) RSSAnon() float64 {
 	inst.mu.Lock()
 	cmd := inst.cmd
@@ -89,18 +92,7 @@ func (inst *Instance) RSSAnon() float64 {
 	if cmd == nil || cmd.Process == nil {
 		return 0
 	}
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", cmd.Process.Pid))
-	if err != nil {
-		return 0
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "RssAnon:") {
-			var kb int64
-			fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(line, "RssAnon:")), "%d", &kb)
-			return float64(kb) / 1024
-		}
-	}
-	return 0
+	return treeRSSAnonMB(cmd.Process.Pid)
 }
 
 func (inst *Instance) HasCapacity() bool {
@@ -547,9 +539,10 @@ func reapWorkersExcept(excludePid int) {
 			if err != nil || pid == selfPid || pid == excludePid {
 				continue
 			}
-			// Belt-and-braces: only kill processes that are NOT children of the
-			// running arbiter. A healthy current-arbiter child has PPID == selfPid.
-			if ppid := parentPid(pid); ppid == selfPid {
+			// Belt-and-braces: only kill processes that are NOT descendants of
+			// the running arbiter. llm-worker owns llama-server as a grandchild,
+			// so checking only direct PPID kills healthy newly loaded LLMs.
+			if hasAncestor(pid, selfPid) {
 				continue
 			}
 			if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
@@ -580,6 +573,20 @@ func parentPid(pid int) int {
 	return ppid
 }
 
+func hasAncestor(pid int, ancestorPid int) bool {
+	for pid > 1 {
+		ppid := parentPid(pid)
+		if ppid == ancestorPid {
+			return true
+		}
+		if ppid <= 1 || ppid == pid {
+			return false
+		}
+		pid = ppid
+	}
+	return false
+}
+
 // Reservation represents a VRAM budget reservation.
 // Reservations block the scheduler from using the reserved memory for model loads.
 type Reservation struct {
@@ -601,17 +608,19 @@ type InstanceManager struct {
 	reservedGB   float64
 	pythonBin    string
 	projectRoot  string
+	config       *Config // shared with the rest of the arbiter; mutated under m.mu
 }
 
-func NewInstanceManager(budgetGB float64, pythonBin, projectRoot string) *InstanceManager {
+func NewInstanceManager(cfg *Config, pythonBin, projectRoot string) *InstanceManager {
 	return &InstanceManager{
 		instances:    make(map[string]*Instance),
 		byModel:      make(map[string][]string),
 		condemned:    make(map[string]bool),
-		budgetGB:     budgetGB,
+		budgetGB:     cfg.VRAMBudgetGB,
 		reservations: make(map[string]*Reservation),
 		pythonBin:    pythonBin,
 		projectRoot:  projectRoot,
+		config:       cfg,
 	}
 }
 
@@ -725,13 +734,85 @@ func (m *InstanceManager) actualVRAMFromPidMap(pidVRAM map[int]int64) float64 {
 	for _, inst := range m.instances {
 		inst.mu.Lock()
 		if inst.cmd != nil && inst.cmd.Process != nil {
-			if vram, ok := pidVRAM[inst.cmd.Process.Pid]; ok {
-				total += float64(vram) / (1024 * 1024 * 1024)
-			}
+			// Tree-sum: worker may have spawned subprocesses (llama-server,
+			// CUDA forks, ffmpeg) that hold VRAM independently.
+			bytes := treeVRAMBytes(inst.cmd.Process.Pid, pidVRAM)
+			total += float64(bytes) / (1024 * 1024 * 1024)
 		}
 		inst.mu.Unlock()
 	}
 	return total
+}
+
+// instanceMemSnapshot captures actual memory usage for a single loaded
+// instance. Used by the memory watchdog to detect drift between configured
+// estimates and reality.
+type instanceMemSnapshot struct {
+	InstanceID   string
+	ModelID      string
+	PID          int
+	TreeVRAMGB   float64
+	TreeRSSGB    float64
+	ConfiguredGB float64
+}
+
+// snapshotInstanceMemory returns one entry per loaded instance with current
+// process-tree VRAM and RSS. pidVRAM is passed in so callers can amortise the
+// nvidia-smi exec across multiple consumers.
+func (m *InstanceManager) snapshotInstanceMemory(pidVRAM map[int]int64) []instanceMemSnapshot {
+	type pending struct {
+		id      string
+		modelID string
+		pid     int
+	}
+	m.mu.RLock()
+	var pendings []pending
+	for _, inst := range m.instances {
+		if inst.State() != "loaded" && inst.State() != "active" {
+			continue
+		}
+		inst.mu.Lock()
+		if inst.cmd != nil && inst.cmd.Process != nil {
+			pendings = append(pendings, pending{
+				id:      inst.InstanceID,
+				modelID: inst.ModelID,
+				pid:     inst.cmd.Process.Pid,
+			})
+		}
+		inst.mu.Unlock()
+	}
+	configuredByModel := make(map[string]float64)
+	for id, mc := range m.config.Models {
+		configuredByModel[id] = mc.MemoryGB
+	}
+	m.mu.RUnlock()
+
+	out := make([]instanceMemSnapshot, 0, len(pendings))
+	for _, p := range pendings {
+		out = append(out, instanceMemSnapshot{
+			InstanceID:   p.id,
+			ModelID:      p.modelID,
+			PID:          p.pid,
+			TreeVRAMGB:   float64(treeVRAMBytes(p.pid, pidVRAM)) / (1024 * 1024 * 1024),
+			TreeRSSGB:    treeRSSAnonMB(p.pid) / 1024,
+			ConfiguredGB: configuredByModel[p.modelID],
+		})
+	}
+	return out
+}
+
+// UpdateModelMemoryGB replaces the in-memory MemoryGB for a model. Used by the
+// memory watchdog after it patches local/config.json so subsequent dispatch
+// decisions use the new value without an arbiter restart.
+func (m *InstanceManager) UpdateModelMemoryGB(modelID string, newGB float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mc, ok := m.config.Models[modelID]
+	if !ok {
+		return
+	}
+	mc.MemoryGB = newGB
+	m.config.Models[modelID] = mc
 }
 
 // ActualVRAMGB returns the total actual VRAM in GB used by all known worker
@@ -1344,8 +1425,9 @@ func (m *InstanceManager) Snapshot() map[string]any {
 			if inst.cmd != nil && inst.cmd.Process != nil {
 				pid := inst.cmd.Process.Pid
 				ie["pid"] = pid
-				if vram, ok := pidVRAM[pid]; ok {
-					vramGB := float64(vram) / (1024 * 1024 * 1024)
+				bytes := treeVRAMBytes(pid, pidVRAM)
+				if bytes > 0 {
+					vramGB := float64(bytes) / (1024 * 1024 * 1024)
 					ie["vram_gb"] = vramGB
 					totalVRAMActual += vramGB
 				}

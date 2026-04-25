@@ -21,7 +21,7 @@ func containsString(values []string, want string) bool {
 }
 
 func TestReloadModelReplacesDispatchInstances(t *testing.T) {
-	mgr := NewInstanceManager(70, "python3", t.TempDir())
+	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 70}, "python3", t.TempDir())
 	cfg := ModelConfig{
 		MemoryGB:      4,
 		MaxConcurrent: 1,
@@ -61,7 +61,7 @@ func TestReloadModelReplacesDispatchInstances(t *testing.T) {
 }
 
 func TestHardKillModelRecreatesConfiguredSlots(t *testing.T) {
-	mgr := NewInstanceManager(70, "python3", t.TempDir())
+	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 70}, "python3", t.TempDir())
 	cfg := ModelConfig{
 		MemoryGB:      4,
 		MaxConcurrent: 1,
