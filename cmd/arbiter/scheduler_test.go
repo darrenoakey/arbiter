@@ -9,6 +9,27 @@ import (
 	"time"
 )
 
+func writeIdleWorker(t *testing.T, path string) {
+	t.Helper()
+	script := `#!/usr/bin/env python3
+import json
+import sys
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    cmd = msg.get("cmd")
+    req_id = msg.get("req_id", "_default")
+    if cmd in ("load", "unload", "ping"):
+        print(json.dumps({"status": "ok", "req_id": req_id}), flush=True)
+    elif cmd == "shutdown":
+        print(json.dumps({"status": "ok", "req_id": req_id}), flush=True)
+        break
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write idle worker: %v", err)
+	}
+}
+
 func TestDispatchJobPromotesFollowerWhenWorkerDies(t *testing.T) {
 	projectRoot := t.TempDir()
 	outputDir := filepath.Join(projectRoot, "output")
@@ -241,6 +262,90 @@ func TestLoadCircuitBreakerPausesAfterThreeFailures(t *testing.T) {
 	sched.RecordLoadSuccess("broken")
 	// CB pause is time-based, not reset by success — but count+level are reset.
 	// After the pause expires, it should not be paused.
+}
+
+func TestRecoverStuckScheduledRequeuesOldScheduledJobs(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "arbiter.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+
+	job, err := store.CreateJob("demo", "face-embed", json.RawMessage(`{}`), 1)
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	old := nowTS() - 60
+	if err := store.UpdateState(job.ID, "scheduled", WithStartedAt(old)); err != nil {
+		t.Fatalf("set scheduled: %v", err)
+	}
+
+	recovered, err := store.RecoverStuckScheduled(15)
+	if err != nil {
+		t.Fatalf("RecoverStuckScheduled: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered = %d, want 1", recovered)
+	}
+
+	after, err := store.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if after.State != "queued" {
+		t.Fatalf("state = %s, want queued", after.State)
+	}
+	if after.StartedAt != nil {
+		t.Fatalf("started_at = %v, want nil", after.StartedAt)
+	}
+}
+
+func TestEvictIdleNoQueueModelsPrefersQueuedModelResidency(t *testing.T) {
+	projectRoot := t.TempDir()
+	workerPath := filepath.Join(projectRoot, "idle_worker.py")
+	writeIdleWorker(t, workerPath)
+
+	mgr := NewInstanceManager(100, "python3", projectRoot)
+
+	instA := NewInstance("model-a", "model-a", 1, 20, "python3", projectRoot)
+	instA.workerCmd = []string{"python3", workerPath}
+	if err := instA.Load("cuda"); err != nil {
+		t.Fatalf("load model-a: %v", err)
+	}
+	instA.mu.Lock()
+	instA.lastActive = time.Now().Add(-5 * time.Minute)
+	instA.mu.Unlock()
+	mgr.Register(instA)
+
+	instB := NewInstance("model-b", "model-b", 1, 30, "python3", projectRoot)
+	instB.workerCmd = []string{"python3", workerPath}
+	if err := instB.Load("cuda"); err != nil {
+		t.Fatalf("load model-b: %v", err)
+	}
+	instB.mu.Lock()
+	instB.lastActive = time.Now().Add(-2 * time.Minute)
+	instB.mu.Unlock()
+	mgr.Register(instB)
+
+	evicted, err := mgr.EvictIdleNoQueueModels(map[string]int{
+		"model-a": 5,
+		"model-b": 0,
+	})
+	if err != nil {
+		t.Fatalf("EvictIdleNoQueueModels: %v", err)
+	}
+	if evicted != 1 {
+		t.Fatalf("evicted = %d, want 1", evicted)
+	}
+	if instA.State() != "loaded" {
+		t.Fatalf("model-a state = %s, want loaded", instA.State())
+	}
+	if instB.State() != "stopped" {
+		t.Fatalf("model-b state = %s, want stopped", instB.State())
+	}
+
+	instA.Kill()
+	instB.Kill()
 }
 
 func TestEvictForGBWithQueueInfoPrefersNoQueue(t *testing.T) {

@@ -21,7 +21,7 @@ type ModelConfig struct {
 	Group          bool              `json:"group"`
 	WorkerCmd      []string          `json:"worker_cmd,omitempty"`
 	AdapterParams  map[string]string `json:"adapter_params,omitempty"`
-	PressureIndex  float64           `json:"pressure_index"` // 0..1 memory bandwidth fraction; sum across in-flight jobs must stay ≤ 1.0
+	PressureIndex  *float64          `json:"pressure_index"` // 0..1 memory bandwidth fraction; sum across in-flight jobs must stay ≤ 1.0. Omitted/nil defaults to 1.0 (serialize). Explicit 0 means "no pressure" — runs alongside anything.
 }
 
 type Config struct {
@@ -59,6 +59,7 @@ var JobTypeToModel = map[string]string{
 	"tts-voxtral":            "tts-voxtral",
 	"lora-train":             "lora-train",
 	"composite":              "composite",
+	"embed-text":             "embed-text",
 }
 
 func LoadConfig(projectRoot string) (*Config, error) {
@@ -90,8 +91,9 @@ func LoadConfig(projectRoot string) (*Config, error) {
 			one := 1
 			m.MaxInstances = &one
 		}
-		if m.PressureIndex <= 0 {
-			m.PressureIndex = 1.0 // conservative default: serialize unknown models
+		if m.PressureIndex == nil {
+			one := 1.0 // conservative default: serialize unknown models
+			m.PressureIndex = &one
 		}
 		if m.KeepAliveSec == 0 {
 			m.KeepAliveSec = 300

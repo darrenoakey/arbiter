@@ -37,8 +37,10 @@ echo "    python smoke test passed"
 echo "==> Cross-compiling binaries..."
 GOOS=linux GOARCH=arm64 go build -o arbiter-linux-arm64 ./cmd/arbiter/
 GOOS=linux GOARCH=arm64 go build -o llm-worker-linux-arm64 ./cmd/llm-worker/
+GOOS=linux GOARCH=arm64 go build -o vllm-chat-worker-linux-arm64 ./cmd/vllm-chat-worker/
 echo "    $(md5 -q arbiter-linux-arm64 2>/dev/null || md5sum arbiter-linux-arm64 | awk '{print $1}') arbiter"
 echo "    $(md5 -q llm-worker-linux-arm64 2>/dev/null || md5sum llm-worker-linux-arm64 | awk '{print $1}') llm-worker"
+echo "    $(md5 -q vllm-chat-worker-linux-arm64 2>/dev/null || md5sum vllm-chat-worker-linux-arm64 | awk '{print $1}') vllm-chat-worker"
 
 echo "==> Stopping arbiter on spark..."
 ssh "$SPARK" "/home/darren/local/auto/run stop arbiter" 2>&1 | tail -1 || true
@@ -49,7 +51,8 @@ rsync -az --delete src/arbiter/ "$SPARK:$REMOTE/src/arbiter/"
 echo "==> Uploading binaries..."
 scp -q arbiter-linux-arm64 "$SPARK:$REMOTE/arbiter-go"
 scp -q llm-worker-linux-arm64 "$SPARK:$REMOTE/llm-worker"
-ssh "$SPARK" "chmod +x $REMOTE/arbiter-go $REMOTE/llm-worker"
+scp -q vllm-chat-worker-linux-arm64 "$SPARK:$REMOTE/vllm-chat-worker"
+ssh "$SPARK" "chmod +x $REMOTE/arbiter-go $REMOTE/llm-worker $REMOTE/vllm-chat-worker"
 
 echo "==> Starting arbiter on spark..."
 ssh "$SPARK" "/home/darren/local/auto/run start arbiter" 2>&1 | tail -1

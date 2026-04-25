@@ -103,10 +103,19 @@ class ModelAdapter(ABC):
             file_path = str(Path("output/refs") / file_path[4:])
         if file_path:
             p = Path(file_path)
+            # The shared inbox is a CIFS mount; the client writes the file on
+            # the Mac side then immediately submits the job, but spark's CIFS
+            # attribute cache can lag briefly. Poll for up to 10s before
+            # giving up — dropping to base64 fallback (which isn't sent by
+            # most clients) was previously swallowing every transient miss
+            # as "No image or image_file provided".
+            deadline = time.monotonic() + 10.0
+            while not p.is_file() and time.monotonic() < deadline:
+                time.sleep(0.2)
             if p.is_file():
                 _base_log.debug("Reading %s from file: %s", key, p)
                 return p.read_bytes()
-            _base_log.warning("%s file not found, falling back to base64: %s", key, p)
+            _base_log.warning("%s file not found after wait, falling back to base64: %s", key, p)
         # Fall back to base64
         b64_data = params.get(key) or params.get(f"{key}_url", "")
         if not b64_data:

@@ -28,6 +28,7 @@ class JobType(str, Enum):
     AESTHETIC_SCORE = "aesthetic-score"
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
+    EMBED_TEXT = "embed-text"
 
 
 # Maps job type to model_id
@@ -50,6 +51,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "aesthetic-score": "aesthetic-scorer",
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
+    "embed-text": "embed-text",
 }
 
 
@@ -278,6 +280,13 @@ class LoraTrainParams(BaseModel):
     chat_template: Optional[str] = None
 
 
+class EmbedTextParams(BaseModel):
+    texts: Optional[list[str]] = None
+    text: Optional[str] = None
+    task: str = "search_document"
+    batch_size: int = 16
+
+
 # Maps job type to its parameter validation schema
 JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "image-generate": ImageGenerateParams,
@@ -298,4 +307,5 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "aesthetic-score": AestheticScoreParams,
     "tts-voxtral": TTSVoxtralParams,
     "lora-train": LoraTrainParams,
+    "embed-text": EmbedTextParams,
 }

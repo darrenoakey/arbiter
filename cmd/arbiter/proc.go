@@ -382,6 +382,21 @@ func (inst *Instance) Infer(jobID, jobType string, params json.RawMessage, outpu
 	})
 }
 
+// ReserveExternal increments activeJobs for request paths that bypass the normal
+// job dispatch flow, such as direct streaming proxies to llama-server.
+func (inst *Instance) ReserveExternal() {
+	atomic.AddInt32(&inst.activeJobs, 1)
+}
+
+// ReleaseExternal decrements activeJobs and refreshes lastActive for request
+// paths that bypass Infer/ReleaseAndCheck.
+func (inst *Instance) ReleaseExternal() {
+	atomic.AddInt32(&inst.activeJobs, -1)
+	inst.mu.Lock()
+	inst.lastActive = time.Now()
+	inst.mu.Unlock()
+}
+
 // InferRaw sends an inference command without managing activeJobs.
 // Used when the caller (scheduler) manages the reservation itself.
 func (inst *Instance) InferRaw(jobID, jobType string, params json.RawMessage, outputDir string) (*WorkerResponse, error) {
@@ -473,11 +488,14 @@ func (inst *Instance) Unload() error {
 	return nil
 }
 
-// Kill terminates the subprocess.
+// Kill terminates the subprocess AND any grandchildren it spawned (e.g. the
+// llm-worker Go binary spawns llama-server; if llm-worker exits, llama-server
+// is reparented to init and keeps holding VRAM unless we hunt it down).
 func (inst *Instance) Kill() {
 	inst.mu.Lock()
-	defer inst.mu.Unlock()
+	var directPid int
 	if inst.cmd != nil && inst.cmd.Process != nil {
+		directPid = inst.cmd.Process.Pid
 		// Try graceful shutdown first
 		if inst.stdin != nil {
 			data, _ := json.Marshal(map[string]any{"cmd": "shutdown"})
@@ -496,6 +514,70 @@ func (inst *Instance) Kill() {
 	inst.state = "stopped"
 	inst.stdin = nil
 	inst.cmd = nil
+	inst.mu.Unlock()
+
+	// Kill any workers that survived the direct-child shutdown. This covers
+	// llama-server spawned by a just-dead llm-worker, vllm-chat-worker children,
+	// and any embedded Python subprocess. We match by pattern rather than PID
+	// tree because after reparenting the tree link is already gone.
+	reapWorkersExcept(directPid)
+}
+
+// reapWorkersExcept scans for leftover arbiter worker processes and kills any
+// that aren't the named PID (which might still be winding down). Called from
+// Instance.Kill after the direct child is reaped.
+func reapWorkersExcept(excludePid int) {
+	patterns := []string{
+		"llama.cpp/build/bin/llama-server",
+		"arbiter/vllm-chat-worker",
+		"arbiter/llm-worker",
+		"arbiter.worker_main",
+	}
+	selfPid := os.Getpid()
+	for _, pattern := range patterns {
+		output, err := exec.Command("pgrep", "-f", pattern).Output()
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+			if line == "" {
+				continue
+			}
+			pid, err := strconv.Atoi(line)
+			if err != nil || pid == selfPid || pid == excludePid {
+				continue
+			}
+			// Belt-and-braces: only kill processes that are NOT children of the
+			// running arbiter. A healthy current-arbiter child has PPID == selfPid.
+			if ppid := parentPid(pid); ppid == selfPid {
+				continue
+			}
+			if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
+				slog.Warn("reaped orphan worker", "pid", pid, "pattern", pattern)
+			}
+		}
+	}
+}
+
+// parentPid returns the parent PID of pid, or 0 if unavailable.
+func parentPid(pid int) int {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0
+	}
+	// /proc/PID/stat format: pid (comm) state ppid ...
+	// comm can contain spaces/parens, so find the LAST ')' and split after it.
+	s := string(data)
+	idx := strings.LastIndexByte(s, ')')
+	if idx < 0 || idx+2 >= len(s) {
+		return 0
+	}
+	fields := strings.Fields(s[idx+2:])
+	if len(fields) < 2 {
+		return 0
+	}
+	ppid, _ := strconv.Atoi(fields[1])
+	return ppid
 }
 
 // Reservation represents a VRAM budget reservation.
@@ -909,6 +991,67 @@ func (m *InstanceManager) EvictForGBWithQueueInfo(needed float64, queuedJobs map
 			needed, freed, len(candidates))
 	}
 	return freed, nil
+}
+
+// EvictIdleNoQueueModels unloads every loaded idle instance whose model has no
+// queued, scheduled, or running work, but only when some other model does have
+// pending work. This keeps warm-model residency subordinate to real queue
+// pressure even when there is still nominal free VRAM.
+func (m *InstanceManager) EvictIdleNoQueueModels(queuedJobs map[string]int) (int, error) {
+	hasPending := false
+	for _, n := range queuedJobs {
+		if n > 0 {
+			hasPending = true
+			break
+		}
+	}
+	if !hasPending {
+		return 0, nil
+	}
+
+	m.mu.RLock()
+	type candidate struct {
+		inst     *Instance
+		lastUsed time.Time
+	}
+	var candidates []candidate
+	for _, inst := range m.instances {
+		if queuedJobs[inst.ModelID] > 0 {
+			continue
+		}
+		if inst.State() != "loaded" || inst.ActiveJobs() > 0 {
+			continue
+		}
+		la := inst.LastActive()
+		if la.IsZero() {
+			continue
+		}
+		candidates = append(candidates, candidate{inst: inst, lastUsed: la})
+	}
+	m.mu.RUnlock()
+
+	for i := 0; i < len(candidates); i++ {
+		for j := i + 1; j < len(candidates); j++ {
+			if candidates[j].lastUsed.Before(candidates[i].lastUsed) {
+				candidates[i], candidates[j] = candidates[j], candidates[i]
+			}
+		}
+	}
+
+	evicted := 0
+	for _, c := range candidates {
+		slog.Info("queue-priority eviction",
+			"instance", c.inst.InstanceID,
+			"model", c.inst.ModelID,
+			"idle_seconds", time.Since(c.lastUsed).Seconds())
+		if err := c.inst.Unload(); err != nil {
+			slog.Error("queue-priority eviction failed", "instance", c.inst.InstanceID, "error", err)
+			continue
+		}
+		m.ReleaseMemory(c.inst.memoryGB)
+		evicted++
+	}
+	return evicted, nil
 }
 
 // CreateReservation reserves VRAM budget space, evicting models if needed.

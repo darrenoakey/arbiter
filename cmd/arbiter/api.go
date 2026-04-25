@@ -830,7 +830,8 @@ func applyModelConfigRequest(cfg ModelConfig, req modelConfigRequest) ModelConfi
 		cfg.AdapterParams = merged
 	}
 	if req.PressureIndex != nil {
-		cfg.PressureIndex = *req.PressureIndex
+		v := *req.PressureIndex
+		cfg.PressureIndex = &v
 	}
 	if req.MaxRuntimeSec != nil {
 		cfg.MaxRuntimeSec = *req.MaxRuntimeSec
@@ -1455,7 +1456,7 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 	a.scheduler.Wake()
 
 	// Wait for completion (synchronous)
-	timeout := time.After(5 * time.Minute)
+	timeout := time.After(15 * time.Minute)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 

@@ -36,7 +36,16 @@ type Scheduler struct {
 	loadFailureCount         map[string]int       // model -> consecutive load failures
 	loadFailurePaused        map[string]time.Time // model -> paused until
 	loadFailureCooldownLevel map[string]int       // model -> escalation level
+	// Per-job load-failure attempts — bounds the retry loop when a fresh worker
+	// dies during load because the previous inference poisoned the CUDA state.
+	// Without this, a single bad input could loop forever: subprocess dies
+	// during load → requeue → subprocess dies during load → ... and every job
+	// behind it is starved. Map is reset on successful load or terminal state.
+	loadAttemptsMu sync.Mutex
+	loadAttempts   map[string]int
 }
+
+const maxLoadAttempts = 3
 
 func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *EventLogger, outputDir string) *Scheduler {
 	inboxDir := ""
@@ -58,6 +67,7 @@ func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *Event
 		loadFailureCount:         make(map[string]int),
 		loadFailurePaused:        make(map[string]time.Time),
 		loadFailureCooldownLevel: make(map[string]int),
+		loadAttempts:             make(map[string]int),
 	}
 }
 
@@ -107,6 +117,18 @@ func (s *Scheduler) rescoreAll() {
 	for modelID := range s.config.Models {
 		s.rescoreModel(modelID)
 	}
+}
+
+func (s *Scheduler) pendingJobsByModel() map[string]int {
+	pending := make(map[string]int, len(s.config.Models))
+	for modelID := range s.config.Models {
+		counts, err := s.store.CountByState(modelID)
+		if err != nil {
+			continue
+		}
+		pending[modelID] = counts["queued"] + counts["scheduled"] + counts["running"]
+	}
+	return pending
 }
 
 // failureCooldownDurations defines escalating pause durations for the inference
@@ -275,7 +297,7 @@ func (s *Scheduler) getFullModels() map[string]bool {
 			full[modelID] = true
 			continue
 		}
-		if cp+cfg.PressureIndex > 1.0+1e-9 {
+		if cp+*cfg.PressureIndex > 1.0+1e-9 {
 			full[modelID] = true
 		}
 	}
@@ -394,15 +416,45 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 
 	// Ensure loaded
 	if err := s.ensureLoaded(inst); err != nil {
-		slog.Warn("can't load instance, requeueing", "instance", inst.InstanceID, "job", job.ID, "error", err)
-		s.store.UpdateState(job.ID, "queued")
+		s.loadAttemptsMu.Lock()
+		s.loadAttempts[job.ID]++
+		attempts := s.loadAttempts[job.ID]
+		s.loadAttemptsMu.Unlock()
+
 		s.RecordLoadFailure(job.ModelID)
-		// Cooldown: mark model as temporarily full to prevent scheduler spin
 		s.cooldownMu.Lock()
 		s.cooldownUntil[job.ModelID] = time.Now().Add(5 * time.Second)
 		s.cooldownMu.Unlock()
+
+		if attempts >= maxLoadAttempts {
+			errMsg := fmt.Sprintf("load failed after %d attempts: %s", attempts, err)
+			slog.Error("giving up on job after repeated load failures",
+				"instance", inst.InstanceID, "job", job.ID, "attempts", attempts, "error", err)
+			s.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
+			if n := s.store.ResolveFollowers(job.ID, "failed", nil, errMsg, s.outputDir); n > 0 {
+				slog.Info("resolved follower jobs", "original", job.ID, "followers", n, "state", "failed")
+			}
+			s.logger.Log("job.failed", map[string]any{
+				"job_id":   job.ID,
+				"model_id": job.ModelID,
+				"error":    errMsg,
+				"attempts": attempts,
+			})
+			s.loadAttemptsMu.Lock()
+			delete(s.loadAttempts, job.ID)
+			s.loadAttemptsMu.Unlock()
+			s.cleanupJobInbox(job)
+			return
+		}
+
+		slog.Warn("can't load instance, requeueing",
+			"instance", inst.InstanceID, "job", job.ID, "attempt", attempts, "error", err)
+		s.store.UpdateState(job.ID, "queued")
 		return
 	}
+	s.loadAttemptsMu.Lock()
+	delete(s.loadAttempts, job.ID)
+	s.loadAttemptsMu.Unlock()
 	s.RecordLoadSuccess(job.ModelID)
 
 	// Mark running
@@ -568,6 +620,13 @@ func (s *Scheduler) Run(ctx context.Context) {
 		case <-ticker.C:
 		}
 
+		// Real queued work outranks warm residency. If there is backlog for any
+		// model, immediately evict loaded idle models that have zero pending
+		// work instead of waiting for keepalive expiry or explicit VRAM pressure.
+		if evicted, err := s.mgr.EvictIdleNoQueueModels(s.pendingJobsByModel()); err == nil && evicted > 0 {
+			s.rescoreAll()
+		}
+
 		// Pick and dispatch one job at a time
 		full := s.getFullModels()
 		job, err := s.store.PickNextJob(full)
@@ -575,8 +634,9 @@ func (s *Scheduler) Run(ctx context.Context) {
 			continue
 		}
 
-		// Mark scheduled so it won't be re-picked
-		s.store.UpdateState(job.ID, "scheduled")
+		// Mark scheduled so it won't be re-picked. Stamp the dispatch time so a
+		// watchdog can recover orphaned scheduled jobs if the dispatch path wedges.
+		s.store.UpdateState(job.ID, "scheduled", WithStartedAt(nowTS()))
 
 		// Pick instance NOW (synchronous) so concurrent goroutines
 		// don't race to pick the same instance
@@ -592,7 +652,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 		atomic.AddInt32(&inst.activeJobs, 1)
 
 		// Reserve pressure immediately (main loop is single-threaded for dispatch decisions)
-		pressure := s.config.Models[job.ModelID].PressureIndex
+		pressure := *s.config.Models[job.ModelID].PressureIndex
 		s.pressureMu.Lock()
 		s.currentPressure += pressure
 		s.pressureMu.Unlock()
@@ -605,6 +665,36 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 		// Preload next instance in background
 		s.tryPreload()
+	}
+}
+
+// RunScheduledWatchdog requeues jobs stuck in "scheduled" long enough that
+// they are almost certainly orphaned from a dead or wedged dispatch path.
+func (s *Scheduler) RunScheduledWatchdog(ctx context.Context) {
+	const (
+		interval = 5 * time.Second
+		staleSec = 15.0
+	)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		recovered, err := s.store.RecoverStuckScheduled(staleSec)
+		if err != nil {
+			slog.Warn("scheduled watchdog: failed to recover stuck jobs", "error", err)
+			continue
+		}
+		if recovered > 0 {
+			slog.Warn("scheduled watchdog: requeued stuck scheduled jobs", "count", recovered)
+			s.Wake()
+		}
 	}
 }
 

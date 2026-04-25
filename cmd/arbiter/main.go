@@ -6,12 +6,60 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
+
+// reapOrphanWorkers kills any worker subprocesses left over from a previous
+// arbiter lifetime. When the Go server is killed (crash, SIGKILL, auto-restart
+// timeout), its worker children are reparented to init and keep holding VRAM
+// and ports. Next arbiter startup can't evict them because it doesn't own them,
+// and can't reserve VRAM because they're consuming it — so every subsequent
+// load fails with "VRAM reserve failed", the circuit breaker trips after 3
+// tries, and every queued job is parked indefinitely.
+//
+// The reaper finds any llama-server, vllm-chat-worker, or arbiter.worker_main
+// process that isn't a child of this arbiter pid and SIGKILLs it. This is safe:
+// those binaries only run as arbiter-spawned workers. User-launched ones would
+// be caught by pgrep too, but this is a machine-dedicated role (spark) so any
+// match is an orphan from a prior arbiter.
+func reapOrphanWorkers() {
+	patterns := []string{
+		"llama.cpp/build/bin/llama-server",
+		"arbiter/vllm-chat-worker",
+		"arbiter/llm-worker",
+		"arbiter.worker_main",
+	}
+	selfPid := os.Getpid()
+	killed := 0
+	for _, pattern := range patterns {
+		output, err := exec.Command("pgrep", "-f", pattern).Output()
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+			if line == "" {
+				continue
+			}
+			pid, err := strconv.Atoi(line)
+			if err != nil || pid == selfPid {
+				continue
+			}
+			if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
+				slog.Warn("reaped orphan worker from prior arbiter", "pid", pid, "pattern", pattern)
+				killed++
+			}
+		}
+	}
+	if killed > 0 {
+		time.Sleep(2 * time.Second) // let VRAM actually release before the scheduler starts
+	}
+}
 
 func main() {
 	// Protect this process from the OOM killer — worker subprocesses are set to
@@ -23,6 +71,11 @@ func main() {
 
 	// Structured logging to stderr
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
+	// Kill any leftover worker subprocesses from a prior arbiter lifetime.
+	// If this arbiter was hard-killed, its workers survive as init-children
+	// and keep holding VRAM, which makes every subsequent model load fail.
+	reapOrphanWorkers()
 
 	// Find project root (directory containing go.mod)
 	projectRoot, _ := filepath.Abs(".")
@@ -120,6 +173,7 @@ func main() {
 
 	// Start background goroutines
 	go sched.Run(ctx)
+	go sched.RunScheduledWatchdog(ctx)
 	go sched.RunKeepalive(ctx)
 	go sched.RunJobWatchdog(ctx)
 	go sched.RunModelHealthWatchdog(ctx)
@@ -186,6 +240,10 @@ func main() {
 
 	// Cleanup
 	mgr.KillAll()
+	// Catch any grandchildren that got reparented to init when their direct
+	// worker parent died — same pattern as startup reaper. Without this pass,
+	// a shutdown leaves llama-server / vllm processes holding VRAM forever.
+	reapOrphanWorkers()
 	eventLog.Log("server.stop", map[string]any{
 		"uptime_seconds": time.Since(api.startTime).Seconds(),
 	})

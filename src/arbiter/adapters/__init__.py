@@ -31,6 +31,8 @@ _ADAPTERS = [
     "z_image",
     "lora_train",
     "composite",
+    "insightface",
+    "embed_text",
 ]
 
 for _name in _ADAPTERS:
