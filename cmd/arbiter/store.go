@@ -43,11 +43,14 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_priority ON jobs(priority) WHERE state = 'queued';
 CREATE INDEX IF NOT EXISTS idx_jobs_model ON jobs(model_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_completed_model ON jobs(state, model_id) WHERE state = 'completed';
+CREATE INDEX IF NOT EXISTS idx_jobs_completed_stats ON jobs(state, finished_at, started_at, created_at) WHERE state = 'completed' AND finished_at IS NOT NULL;
 `
 
 type Store struct {
 	db *sql.DB
-	mu sync.Mutex
+	mu sync.RWMutex
 }
 
 func NewStore(dbPath string) (*Store, error) {
@@ -91,8 +94,8 @@ func (s *Store) CreateJob(modelID, jobType string, payload json.RawMessage, prio
 }
 
 func (s *Store) GetJob(id string) (*Job, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.scanJob(s.db.QueryRow("SELECT * FROM jobs WHERE id = ?", id))
 }
 
@@ -125,8 +128,8 @@ func (s *Store) scanJob(row *sql.Row) (*Job, error) {
 }
 
 func (s *Store) ListJobs(state, modelID string, limit int) ([]*Job, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	query := "SELECT * FROM jobs WHERE 1=1"
 	var args []any
@@ -178,8 +181,8 @@ func (s *Store) ListJobs(state, modelID string, limit int) ([]*Job, error) {
 }
 
 func (s *Store) PickNextJob(excludeModels map[string]bool) (*Job, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	query := "SELECT * FROM jobs WHERE state = 'queued'"
 	var args []any
@@ -218,6 +221,8 @@ func (s *Store) UpdateState(jobID, state string, opts ...func(*stateUpdate)) err
 	if u.startedAt != nil {
 		sets += ", started_at = ?"
 		args = append(args, *u.startedAt)
+	} else if u.clearStartedAt {
+		sets += ", started_at = NULL"
 	}
 	if u.finishedAt != nil {
 		sets += ", finished_at = ?"
@@ -241,10 +246,12 @@ type stateUpdate struct {
 	finishedAt *float64
 	result     *json.RawMessage
 	error      string
+	clearStartedAt bool
 }
 
 func WithStartedAt(t float64) func(*stateUpdate)  { return func(u *stateUpdate) { u.startedAt = &t } }
 func WithFinishedAt(t float64) func(*stateUpdate) { return func(u *stateUpdate) { u.finishedAt = &t } }
+func WithClearStartedAt() func(*stateUpdate)      { return func(u *stateUpdate) { u.clearStartedAt = true } }
 func WithResult(r json.RawMessage) func(*stateUpdate) {
 	return func(u *stateUpdate) { u.result = &r }
 }
@@ -265,8 +272,8 @@ func (s *Store) UpdatePriority(modelID string, priority float64) (int, error) {
 }
 
 func (s *Store) CountByState(modelID string) (map[string]int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	query := "SELECT state, COUNT(*) FROM jobs"
 	var args []any
@@ -293,8 +300,8 @@ func (s *Store) CountByState(modelID string) (map[string]int, error) {
 }
 
 func (s *Store) CountActive(modelID string) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var count int
 	err := s.db.QueryRow(
 		"SELECT COUNT(*) FROM jobs WHERE model_id = ? AND state IN ('scheduled','running')",
@@ -323,6 +330,21 @@ func (s *Store) RecoverFromCrash() (int, error) {
 	defer s.mu.Unlock()
 	res, err := s.db.Exec(
 		"UPDATE jobs SET state = 'queued', started_at = NULL WHERE state IN ('scheduled','running')",
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+func (s *Store) RecoverStuckScheduled(olderThanSec float64) (int, error) {
+	cutoff := nowTS() - olderThanSec
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		"UPDATE jobs SET state = 'queued', started_at = NULL WHERE state = 'scheduled' AND started_at IS NOT NULL AND started_at < ?",
+		cutoff,
 	)
 	if err != nil {
 		return 0, err
@@ -386,8 +408,8 @@ func (s *Store) GetJobs(ids []string) (map[string]*Job, error) {
 	if len(ids) == 0 {
 		return map[string]*Job{}, nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	placeholders := ""
 	args := make([]any, len(ids))
@@ -437,8 +459,8 @@ func (s *Store) GetJobs(ids []string) (map[string]*Job, error) {
 }
 
 func (s *Store) CompletedJobStats(modelID string) (int, float64, float64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	query := `
 SELECT
@@ -463,8 +485,8 @@ WHERE state = 'completed' AND finished_at IS NOT NULL
 
 // GetRunningJobs returns all jobs currently in the "running" state with their model_id and started_at.
 func (s *Store) GetRunningJobs() ([]*Job, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(
 		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at FROM jobs WHERE state = 'running'",
@@ -506,8 +528,8 @@ func (s *Store) GetRunningJobs() ([]*Job, error) {
 
 // GetActiveJobs returns all jobs in a non-terminal state (queued, scheduled, running, following).
 func (s *Store) GetActiveJobs() ([]*Job, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(
 		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at FROM jobs WHERE state IN ('queued','scheduled','running','following')",

@@ -143,8 +143,8 @@ func (s *Store) InitDedup() {
 // DedupLookup checks for an existing job with the same input hash.
 // Returns the job_id if found within TTL, or empty string.
 func (s *Store) DedupLookup(hash string, ttlSeconds float64) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	cutoff := nowTS() - ttlSeconds
 	var jobID string
 	err := s.db.QueryRow(
@@ -179,8 +179,8 @@ func (s *Store) DedupCleanup(ttlSeconds float64) int {
 
 // GetFollowers returns all job IDs that are following a given original job.
 func (s *Store) GetFollowers(originalJobID string) ([]string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	rows, err := s.db.Query(
 		"SELECT id FROM jobs WHERE state = 'following' AND error = ? ORDER BY created_at ASC",
 		"following:"+originalJobID,
@@ -279,9 +279,9 @@ func (s *Store) ResolveFollowers(originalJobID string, originalState string, res
 // ReconcileFollowingJobs resolves or promotes follower jobs whose originals are already terminal
 // or missing. Followers whose originals are still queued/scheduled/running remain untouched.
 func (s *Store) ReconcileFollowingJobs(outputDir string) int {
-	s.mu.Lock()
+	s.mu.RLock()
 	rows, err := s.db.Query("SELECT DISTINCT error FROM jobs WHERE state = 'following' AND error LIKE 'following:%'")
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	if err != nil {
 		return 0
 	}
