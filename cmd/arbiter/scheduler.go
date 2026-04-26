@@ -47,6 +47,16 @@ type Scheduler struct {
 
 const maxLoadAttempts = 3
 
+type insufficientMemoryError struct {
+	instanceID string
+	neededGB   float64
+	freeGB     float64
+}
+
+func (err insufficientMemoryError) Error() string {
+	return fmt.Sprintf("can't load %s: need %.1fGB, only %.1fGB free", err.instanceID, err.neededGB, err.freeGB)
+}
+
 func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *EventLogger, outputDir string) *Scheduler {
 	inboxDir := ""
 	if cfg.ShareMount != "" {
@@ -354,8 +364,11 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 			if !s.mgr.ReserveMemoryFor(inst, needed) {
 				slog.Warn("ensureLoaded: can't reserve VRAM after eviction",
 					"instance", inst.InstanceID, "needed_gb", needed, "free_gb", s.mgr.FreeGB())
-				return fmt.Errorf("can't load %s: need %.1fGB, only %.1fGB free",
-					inst.InstanceID, needed, s.mgr.FreeGB())
+				return insufficientMemoryError{
+					instanceID: inst.InstanceID,
+					neededGB:   needed,
+					freeGB:     s.mgr.FreeGB(),
+				}
 			}
 		}
 
@@ -416,6 +429,16 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 
 	// Ensure loaded
 	if err := s.ensureLoaded(inst); err != nil {
+		if _, ok := err.(insufficientMemoryError); ok {
+			slog.Warn("can't load instance yet, leaving job queued until memory is available",
+				"instance", inst.InstanceID, "job", job.ID, "error", err)
+			s.store.UpdateState(job.ID, "queued")
+			s.cooldownMu.Lock()
+			s.cooldownUntil[job.ModelID] = time.Now().Add(30 * time.Second)
+			s.cooldownMu.Unlock()
+			return
+		}
+
 		s.loadAttemptsMu.Lock()
 		s.loadAttempts[job.ID]++
 		attempts := s.loadAttempts[job.ID]

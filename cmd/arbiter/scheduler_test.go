@@ -264,6 +264,67 @@ func TestLoadCircuitBreakerPausesAfterThreeFailures(t *testing.T) {
 	// After the pause expires, it should not be paused.
 }
 
+func TestDispatchJobLeavesInsufficientMemoryQueued(t *testing.T) {
+	projectRoot := t.TempDir()
+	outputDir := filepath.Join(projectRoot, "output")
+	os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755)
+	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+
+	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+	store.InitDedup()
+
+	cfg := &Config{
+		VRAMBudgetGB: 25,
+		Models: map[string]ModelConfig{
+			"big": {
+				MemoryGB:      30,
+				MaxConcurrent: 1,
+				MaxInstances:  intPtr(1),
+			},
+		},
+	}
+	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
+	defer logger.Close()
+	mgr := NewInstanceManager(cfg, "python3", projectRoot)
+	mgr.ScaleModel("big", 1, cfg.Models["big"])
+	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+
+	payload := json.RawMessage(`{"test":true}`)
+	job, err := store.CreateJob("big", "chat-completion", payload, 1)
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	follower, err := store.CreateFollowerJob("big", "chat-completion", payload, job.ID)
+	if err != nil {
+		t.Fatalf("create follower: %v", err)
+	}
+
+	inst := mgr.GetModelInstances("big")[0]
+	for attempt := 0; attempt < maxLoadAttempts+2; attempt++ {
+		atomic.AddInt32(&inst.activeJobs, 1)
+		sched.dispatchJobToInstance(job, inst, 1.0)
+		after, err := store.GetJob(job.ID)
+		if err != nil {
+			t.Fatalf("get job after attempt %d: %v", attempt, err)
+		}
+		if after.State != "queued" || after.Error != "" {
+			t.Fatalf("attempt %d state=%s error=%q, want queued/no error", attempt, after.State, after.Error)
+		}
+	}
+
+	followerAfter, err := store.GetJob(follower.ID)
+	if err != nil {
+		t.Fatalf("get follower: %v", err)
+	}
+	if followerAfter.State != "following" || followerAfter.Error != "following:"+job.ID {
+		t.Fatalf("follower state=%s error=%q, want following original", followerAfter.State, followerAfter.Error)
+	}
+}
+
 func TestRecoverStuckScheduledRequeuesOldScheduledJobs(t *testing.T) {
 	store, err := NewStore(filepath.Join(t.TempDir(), "arbiter.db"))
 	if err != nil {
