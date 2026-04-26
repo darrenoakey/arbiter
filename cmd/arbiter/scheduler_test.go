@@ -366,9 +366,10 @@ func TestEvictForGBWithQueueInfoPrefersNoQueue(t *testing.T) {
 	instB.mu.Unlock()
 	mgr.Register(instB)
 
-	// Reserve the memory in bookkeeping to match loaded state
-	mgr.ReserveMemory(20) // model-a
-	mgr.ReserveMemory(30) // model-b
+	// Reserve the memory in bookkeeping to match loaded state — use the
+	// instance-aware variant so eviction's ReleaseMemoryFor finds vramHeld.
+	mgr.ReserveMemoryFor(instA, 20)
+	mgr.ReserveMemoryFor(instB, 30)
 
 	// model-a has queued jobs, model-b has none
 	queuedJobs := map[string]int{

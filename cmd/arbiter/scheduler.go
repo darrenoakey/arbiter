@@ -325,11 +325,11 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 			"needed_gb", needed, "free_gb", freeGB, "state", state)
 
 		if state == "error" {
-			s.mgr.ReleaseMemory(needed)
+			s.mgr.ReleaseMemoryFor(inst)
 		}
 
 		// Try reserve
-		if !s.mgr.ReserveMemory(needed) {
+		if !s.mgr.ReserveMemoryFor(inst, needed) {
 			// Evict idle models. Use the queue-aware evictor so that a model
 			// which still has queued/running work is preserved over a model
 			// with nothing waiting for it.
@@ -351,7 +351,7 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 			}
 
 			// Retry
-			if !s.mgr.ReserveMemory(needed) {
+			if !s.mgr.ReserveMemoryFor(inst, needed) {
 				slog.Warn("ensureLoaded: can't reserve VRAM after eviction",
 					"instance", inst.InstanceID, "needed_gb", needed, "free_gb", s.mgr.FreeGB())
 				return fmt.Errorf("can't load %s: need %.1fGB, only %.1fGB free",
@@ -368,7 +368,7 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 		})
 
 		if err := inst.Load("cuda"); err != nil {
-			s.mgr.ReleaseMemory(inst.memoryGB)
+			s.mgr.ReleaseMemoryFor(inst)
 			slog.Error("ensureLoaded: load failed", "instance", inst.InstanceID, "error", err)
 			s.logger.Log("model.load_error", map[string]any{
 				"model_id":    inst.ModelID,
@@ -780,7 +780,7 @@ func (s *Scheduler) RunKeepalive(ctx context.Context) {
 						slog.Error("keepalive unload failed", "instance", inst.InstanceID, "error", err)
 						continue
 					}
-					s.mgr.ReleaseMemory(inst.memoryGB)
+					s.mgr.ReleaseMemoryFor(inst)
 					s.logger.Log("model.evict_done", map[string]any{
 						"model_id":    inst.ModelID,
 						"instance_id": inst.InstanceID,
@@ -874,7 +874,7 @@ func (s *Scheduler) RunModelHealthWatchdog(ctx context.Context) {
 					slog.Warn("health watchdog: resetting errored instance",
 						"instance", inst.InstanceID, "model", modelID)
 					inst.Kill()
-					s.mgr.ReleaseMemory(inst.memoryGB)
+					s.mgr.ReleaseMemoryFor(inst)
 					s.logger.Log("model.health_reset", map[string]any{
 						"model_id":    modelID,
 						"instance_id": inst.InstanceID,
@@ -900,7 +900,7 @@ func (s *Scheduler) RunModelHealthWatchdog(ctx context.Context) {
 							"instance", inst.InstanceID, "model", modelID,
 							"loading_seconds", time.Since(la).Seconds())
 						inst.Kill()
-						s.mgr.ReleaseMemory(inst.memoryGB)
+						s.mgr.ReleaseMemoryFor(inst)
 						s.logger.Log("model.health_reset", map[string]any{
 							"model_id":    modelID,
 							"instance_id": inst.InstanceID,
@@ -934,6 +934,17 @@ func (s *Scheduler) RunVRAMWatchdog(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		}
+
+		// Reclaim leaked bookkeeping from dead instances every tick. This is
+		// the safety net that prevents the failure mode where workers crash
+		// without releasing their reservation and the budget appears full
+		// forever (queue stalls, 15min circuit-breaker repeats).
+		if leaked := s.mgr.ReconcileFromInstances(); leaked > 0 {
+			s.logger.Log("vram.reconciled_orphan", map[string]any{
+				"freed_gb": leaked,
+			})
+			s.Wake()
 		}
 
 		effective, actual, allocated, reserved := s.mgr.EffectiveUsedGB()

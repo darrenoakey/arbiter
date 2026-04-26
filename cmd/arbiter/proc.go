@@ -29,6 +29,7 @@ type Instance struct {
 	activeJobs int32  // atomic
 	lastActive time.Time
 	memoryGB   float64
+	vramHeld   bool // true while this instance's memoryGB is counted in InstanceManager.usedGB
 
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -228,6 +229,11 @@ func (inst *Instance) readLoop() {
 	} else {
 		slog.Warn("readLoop exited, subprocess died", "instance", inst.InstanceID, "prior_state", inst.state)
 		inst.state = "error"
+		// Drop the bookkeeping flag immediately. ReconcileFromInstances (run
+		// by the VRAM watchdog) will reclaim the leaked usedGB on its next
+		// tick. Before this fix, an unexpected worker death left vramHeld
+		// true and usedGB inflated forever — eventually no model could load.
+		inst.vramHeld = false
 	}
 	// Clear dead process references so Snapshot doesn't report a stale PID.
 	// The process is already dead (stdout pipe closed), so just nil the refs.
@@ -852,7 +858,9 @@ func (m *InstanceManager) ReconcileUsedGB(actualGB, tolerance float64) {
 	}
 }
 
-// ReserveMemory reserves VRAM if it fits under the budget.
+// ReserveMemory reserves VRAM if it fits under the budget. Prefer
+// ReserveMemoryFor when a specific instance owns the reservation — that path
+// also marks the instance so death-path cleanup is automatic.
 func (m *InstanceManager) ReserveMemory(gb float64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -867,6 +875,19 @@ func (m *InstanceManager) ReserveMemory(gb float64) bool {
 	return true
 }
 
+// ReserveMemoryFor reserves VRAM and tags the instance so the reservation can
+// be matched back to it during reconciliation or death-path cleanup. Use this
+// for any reservation tied to an instance lifetime.
+func (m *InstanceManager) ReserveMemoryFor(inst *Instance, gb float64) bool {
+	if !m.ReserveMemory(gb) {
+		return false
+	}
+	inst.mu.Lock()
+	inst.vramHeld = true
+	inst.mu.Unlock()
+	return true
+}
+
 func (m *InstanceManager) ReleaseMemory(gb float64) {
 	m.mu.Lock()
 	m.usedGB -= gb
@@ -875,6 +896,54 @@ func (m *InstanceManager) ReleaseMemory(gb float64) {
 	}
 	m.mu.Unlock()
 	slog.Info("VRAM released", "gb", gb, "used_gb_now", m.usedGB)
+}
+
+// ReleaseMemoryFor releases the VRAM reservation owned by an instance. It is
+// idempotent: only the first call after a matching ReserveMemoryFor frees the
+// memory. Returns the GB freed (0 when no reservation was held).
+func (m *InstanceManager) ReleaseMemoryFor(inst *Instance) float64 {
+	inst.mu.Lock()
+	if !inst.vramHeld {
+		inst.mu.Unlock()
+		return 0
+	}
+	gb := inst.memoryGB
+	inst.vramHeld = false
+	inst.mu.Unlock()
+	m.ReleaseMemory(gb)
+	return gb
+}
+
+// ReconcileFromInstances forces InstanceManager.usedGB to equal the sum of
+// memoryGB across instances currently flagged vramHeld. This is the safety
+// net for accounting leaks: any historical bug or new code path that drops a
+// reservation without releasing it will be reclaimed within one watchdog
+// interval. Returns the GB freed (0 when bookkeeping was already truthful).
+//
+// Why this is the source of truth: vramHeld is set inside ReserveMemoryFor
+// under the same locks that bump usedGB, and cleared inside ReleaseMemoryFor
+// under the same locks that decrement usedGB. So any divergence between
+// usedGB and sum(vramHeld * memoryGB) is by definition a leak.
+func (m *InstanceManager) ReconcileFromInstances() float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	expected := 0.0
+	for _, inst := range m.instances {
+		inst.mu.Lock()
+		if inst.vramHeld {
+			expected += inst.memoryGB
+		}
+		inst.mu.Unlock()
+	}
+	const tolerance = 0.5 // GB; ignore tiny float drift
+	if m.usedGB > expected+tolerance {
+		freed := m.usedGB - expected
+		slog.Warn("vram reconcile: reclaiming orphan bookkeeping",
+			"old_used_gb", m.usedGB, "expected_gb", expected, "freed_gb", freed)
+		m.usedGB = expected
+		return freed
+	}
+	return 0
 }
 
 // EvictForGB tries to free enough memory by unloading idle instances.
@@ -976,8 +1045,7 @@ func (m *InstanceManager) EvictForGB(needed float64) error {
 			slog.Error("eviction unload failed", "instance", c.inst.InstanceID, "error", err)
 			continue
 		}
-		m.ReleaseMemory(c.inst.memoryGB)
-		freed += c.inst.memoryGB
+				freed += m.ReleaseMemoryFor(c.inst)
 		// Update loadedCount for remaining candidates of the same model
 		for i := range ordered {
 			if ordered[i].inst.ModelID == c.inst.ModelID {
@@ -1063,8 +1131,7 @@ func (m *InstanceManager) EvictForGBWithQueueInfo(needed float64, queuedJobs map
 				"instance", c.inst.InstanceID, "error", err)
 			continue
 		}
-		m.ReleaseMemory(c.inst.memoryGB)
-		freed += c.inst.memoryGB
+				freed += m.ReleaseMemoryFor(c.inst)
 	}
 
 	if freed < needed {
@@ -1129,7 +1196,7 @@ func (m *InstanceManager) EvictIdleNoQueueModels(queuedJobs map[string]int) (int
 			slog.Error("queue-priority eviction failed", "instance", c.inst.InstanceID, "error", err)
 			continue
 		}
-		m.ReleaseMemory(c.inst.memoryGB)
+		m.ReleaseMemoryFor(c.inst)
 		evicted++
 	}
 	return evicted, nil
@@ -1307,8 +1374,7 @@ func (m *InstanceManager) EvictForReservation(needed float64, keepAliveSecs map[
 			slog.Error("reservation eviction failed", "instance", c.inst.InstanceID, "error", err)
 			continue
 		}
-		m.ReleaseMemory(c.inst.memoryGB)
-		freed += c.inst.memoryGB
+				freed += m.ReleaseMemoryFor(c.inst)
 	}
 
 	if freed < needed {
@@ -1688,7 +1754,7 @@ func (m *InstanceManager) HardKillModel(modelID string, recreate bool, cfg *Mode
 
 		state := inst.State()
 		if state == "loaded" || state == "loading" || state == "unloading" {
-			m.ReleaseMemory(inst.memoryGB)
+			m.ReleaseMemoryFor(inst)
 		}
 		inst.Kill()
 		result["killed"] = result["killed"].(int) + 1
@@ -1741,7 +1807,7 @@ func (m *InstanceManager) evictCondemned(inst *Instance) {
 		if err := inst.Unload(); err != nil {
 			slog.Error("condemned unload failed", "instance", inst.InstanceID, "error", err)
 		}
-		m.ReleaseMemory(inst.memoryGB)
+		m.ReleaseMemoryFor(inst)
 	}
 
 	// Scale-down: remove entirely
