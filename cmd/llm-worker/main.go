@@ -193,15 +193,30 @@ func stopLlamaServer() {
 	}
 }
 
-// stripStream removes the "stream" key from JSON params so llama-server
-// returns a single JSON response instead of SSE events.
-func stripStream(params json.RawMessage) json.RawMessage {
+// defaultMaxTokensCap is applied when a chat-completion request omits
+// max_tokens / n_predict. Without a cap, llama-server happily generates until
+// the context window fills (or max_runtime_seconds kills the worker), which is
+// exactly what jammed gemma4-26b for ~30 minutes per request and triggered
+// the cascading queue-stall outage. 4096 is generous for any reasonable
+// summary, chat reply, or planning task.
+const defaultMaxTokensCap = 4096
+
+// prepareParams cleans and bounds the chat-completion params before forwarding
+// to llama-server. It removes streaming flags (arbiter handles streaming
+// separately) and injects a default max_tokens when the caller omitted both
+// max_tokens and n_predict, preventing runaway generation.
+func prepareParams(params json.RawMessage) json.RawMessage {
 	var m map[string]any
 	if err := json.Unmarshal(params, &m); err != nil {
 		return params
 	}
 	delete(m, "stream")
 	delete(m, "stream_options")
+	if _, ok := m["max_tokens"]; !ok {
+		if _, ok := m["n_predict"]; !ok {
+			m["max_tokens"] = defaultMaxTokensCap
+		}
+	}
 	out, _ := json.Marshal(m)
 	return out
 }
@@ -209,8 +224,10 @@ func stripStream(params json.RawMessage) json.RawMessage {
 func proxyChat(reqID string, params json.RawMessage) Response {
 	url := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", llamaPort)
 
-	// Strip stream from params — arbiter handles streaming separately
-	cleanParams := stripStream(params)
+	// Clean stream flags and bound max_tokens — arbiter handles streaming
+	// separately, and an unbounded request would let the model run until
+	// max_runtime_seconds kills the worker.
+	cleanParams := prepareParams(params)
 
 	resp, err := http.Post(url, "application/json", bytes.NewReader(cleanParams))
 	if err != nil {
