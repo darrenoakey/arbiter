@@ -110,7 +110,10 @@ func startVLLM() error {
 	vllmCmd.Stderr = os.Stderr
 	vllmCmd.Stdout = os.Stderr
 
-	// Build env: inherit, strip CLAUDECODE, ensure CUDA paths
+	// Build env: inherit, strip CLAUDECODE, ensure CUDA paths and the vllm
+	// venv's bin (so JIT-spawned tools like ninja are on PATH).
+	venvBin := filepath.Dir(vllmBin) // e.g. ~/src/arbiter/.venv-vllm/bin
+	pathPrefix := venvBin + ":/usr/local/cuda/bin"
 	filtered := make([]string, 0, len(os.Environ())+4)
 	hasCudaPath := false
 	hasTorchArch := false
@@ -119,9 +122,7 @@ func startVLLM() error {
 			continue
 		}
 		if strings.HasPrefix(e, "PATH=") {
-			if !strings.Contains(e, "/usr/local/cuda/bin") {
-				e = "PATH=/usr/local/cuda/bin:" + e[5:]
-			}
+			e = "PATH=" + pathPrefix + ":" + e[5:]
 			hasCudaPath = true
 		}
 		if strings.HasPrefix(e, "TORCH_CUDA_ARCH_LIST=") {
@@ -130,7 +131,7 @@ func startVLLM() error {
 		filtered = append(filtered, e)
 	}
 	if !hasCudaPath {
-		filtered = append(filtered, "PATH=/usr/local/cuda/bin:"+os.Getenv("PATH"))
+		filtered = append(filtered, "PATH="+pathPrefix+":"+os.Getenv("PATH"))
 	}
 	if !hasTorchArch {
 		filtered = append(filtered, "TORCH_CUDA_ARCH_LIST=12.0")

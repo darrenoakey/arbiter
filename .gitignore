@@ -24,3 +24,4 @@ gfpgan/weights/
 benchmark_partial.json
 benchmark_report.html
 benchmark_report.json
+/vllm-chat-worker
