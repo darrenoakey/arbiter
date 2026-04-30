@@ -1738,17 +1738,33 @@ func (a *API) adminBenchmarkChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "no instances for model — preload first")
 		return
 	}
-	// Pick a loaded instance. If the only instance isn't loaded, fail fast.
-	var inst *Instance
-	for _, i := range insts {
-		if i.State() == "loaded" {
-			inst = i
-			break
+	// Pick the first instance and ensure it's loaded. Benchmark traffic must
+	// not depend on the scheduler/watchdog leaving the model resident — the
+	// memory_watchdog and idle-eviction paths run independently of dispatch
+	// pause and could evict a freshly-preloaded model right under us. So we
+	// load lazily here if needed.
+	inst := insts[0]
+	// Wait up to 5 minutes for the instance to be loaded. If it's currently
+	// loading (e.g. concurrent benchmark traffic triggered ensureLoaded),
+	// poll the state. If unloaded, kick off ensureLoaded ourselves.
+	deadline := time.Now().Add(5 * time.Minute)
+	for inst.State() != "loaded" {
+		state := inst.State()
+		if state == "unloaded" {
+			if err := a.scheduler.ensureLoaded(inst); err != nil {
+				// "already loading" means another goroutine beat us to it —
+				// fall through and poll.
+				if !strings.Contains(err.Error(), "already loading") {
+					writeError(w, 503, fmt.Sprintf("instance not loadable: %s", err))
+					return
+				}
+			}
 		}
-	}
-	if inst == nil {
-		writeError(w, 503, "no loaded instance — call /v1/admin/models/preload first")
-		return
+		if time.Now().After(deadline) {
+			writeError(w, 503, fmt.Sprintf("instance not loaded after 5min (state=%s)", state))
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 	inst.ReserveExternal()
 	defer inst.ReleaseExternal()
@@ -1762,8 +1778,27 @@ func (a *API) adminBenchmarkChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, fmt.Sprintf("get worker port: %s", err))
 		return
 	}
+	// vLLM requires the params.model to match what's actually loaded (e.g.
+	// "RedHatAI/gemma-4-26B-A4B-it-NVFP4"); llama-server accepts any name.
+	// Rewrite params.model to the registered VLLM_MODEL / LLM_HF_REPO so the
+	// caller can use the friendly arbiter name unchanged.
+	cfg := a.config.Models[body.ModelID]
+	canonical := cfg.AdapterParams["VLLM_MODEL"]
+	if canonical == "" {
+		canonical = cfg.AdapterParams["LLM_HF_REPO"]
+	}
+	rewritten := body.Params
+	if canonical != "" {
+		var pm map[string]any
+		if err := json.Unmarshal(body.Params, &pm); err == nil {
+			pm["model"] = canonical
+			if buf, err := json.Marshal(pm); err == nil {
+				rewritten = buf
+			}
+		}
+	}
 	target := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", port)
-	proxyReq, err := http.NewRequestWithContext(r.Context(), "POST", target, bytes.NewReader(body.Params))
+	proxyReq, err := http.NewRequestWithContext(r.Context(), "POST", target, bytes.NewReader(rewritten))
 	if err != nil {
 		writeError(w, 500, fmt.Sprintf("build proxy request: %s", err))
 		return
