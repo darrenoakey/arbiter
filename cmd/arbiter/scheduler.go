@@ -324,10 +324,17 @@ func (s *Scheduler) getFullModels() map[string]bool {
 		active, _ := s.store.CountActive(modelID)
 		capacity := *cfg.MaxInstances * cfg.MaxConcurrent
 		if active >= capacity {
+			slog.Debug("scheduler.full: model at capacity",
+				"model", modelID, "active", active, "capacity", capacity,
+				"max_concurrent", cfg.MaxConcurrent, "max_instances", *cfg.MaxInstances)
 			full[modelID] = true
 			continue
 		}
 		if cp+*cfg.PressureIndex > 1.0+1e-9 {
+			slog.Debug("scheduler.full: model would exceed pressure budget",
+				"model", modelID, "current_pressure", cp,
+				"model_pressure_index", *cfg.PressureIndex,
+				"sum", cp+*cfg.PressureIndex, "budget", 1.0)
 			full[modelID] = true
 		}
 	}
@@ -343,8 +350,29 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 	}
 
 	if state == "loading" {
-		slog.Info("ensureLoaded: already loading", "instance", inst.InstanceID)
-		return fmt.Errorf("instance %s is already loading", inst.InstanceID)
+		// Another caller (preload, prior dispatch) already kicked off the load.
+		// Wait for it to finish rather than failing — failing here counts as a
+		// load failure for the dispatcher, which after 3 attempts trips the
+		// load circuit-breaker and pauses the model for 30s+. That's how we
+		// ended up never getting concurrent dispatch on vLLM: the first job
+		// triggers load, the 2nd-Nth jobs picked while still loading all
+		// "fail", scheduler gives up, queue stalls.
+		slog.Info("ensureLoaded.wait_for_in_progress_load", "instance", inst.InstanceID)
+		deadline := time.Now().Add(10 * time.Minute)
+		for time.Now().Before(deadline) {
+			s2 := inst.State()
+			if s2 == "loaded" {
+				slog.Info("ensureLoaded.in_progress_load_completed", "instance", inst.InstanceID)
+				return nil
+			}
+			if s2 == "stopped" || s2 == "error" || s2 == "unloaded" {
+				slog.Warn("ensureLoaded.in_progress_load_failed",
+					"instance", inst.InstanceID, "final_state", s2)
+				return fmt.Errorf("instance %s in-progress load ended in state=%s", inst.InstanceID, s2)
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		return fmt.Errorf("instance %s still loading after 10min", inst.InstanceID)
 	}
 
 	if state == "stopped" || state == "unloaded" || state == "error" {
@@ -690,9 +718,15 @@ func (s *Scheduler) Run(ctx context.Context) {
 		// Pick and dispatch one job at a time
 		full := s.getFullModels()
 		job, err := s.store.PickNextJob(full)
-		if err != nil || job == nil {
+		if err != nil {
+			slog.Warn("scheduler.pick_next_job error", "error", err)
 			continue
 		}
+		if job == nil {
+			continue
+		}
+		slog.Info("scheduler.picked_job",
+			"job_id", job.ID, "model", job.ModelID, "type", job.JobType, "priority", job.Priority)
 
 		// Mark scheduled so it won't be re-picked. Stamp the dispatch time so a
 		// watchdog can recover orphaned scheduled jobs if the dispatch path wedges.
@@ -702,10 +736,16 @@ func (s *Scheduler) Run(ctx context.Context) {
 		// don't race to pick the same instance
 		inst := s.mgr.PickInstance(job.ModelID)
 		if inst == nil {
-			slog.Debug("no instance available, requeueing", "job", job.ID, "model", job.ModelID)
+			slog.Info("scheduler.requeue: no instance available",
+				"job", job.ID, "model", job.ModelID,
+				"reason", "PickInstance returned nil — all instances at max_concurrent or none exist")
 			s.store.UpdateState(job.ID, "queued")
 			continue
 		}
+		slog.Info("scheduler.dispatch",
+			"job", job.ID, "model", job.ModelID,
+			"instance", inst.InstanceID, "instance_state", inst.State(),
+			"active_jobs_before", inst.ActiveJobs())
 		slog.Info("picked instance for job", "job", job.ID, "model", job.ModelID,
 			"instance", inst.InstanceID, "state", inst.State(), "active_jobs", inst.ActiveJobs())
 		// Reserve the slot immediately so PickInstance won't return it again

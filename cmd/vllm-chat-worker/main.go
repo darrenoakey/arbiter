@@ -35,6 +35,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -58,10 +59,16 @@ var (
 	vllmCmd    *exec.Cmd
 	vllmPort   int
 	cancelFlag bool
+	stdoutMu   sync.Mutex
 )
 
+// respond serialises one Response line on stdout. Multiple in-flight infer
+// goroutines call this concurrently; the mutex prevents JSON line interleaving
+// from corrupting the arbiter's stdout parser.
 func respond(r Response) {
 	data, _ := json.Marshal(r)
+	stdoutMu.Lock()
+	defer stdoutMu.Unlock()
 	fmt.Println(string(data))
 }
 
@@ -183,20 +190,29 @@ func stopVLLM() {
 	}
 }
 
-func stripStream(params json.RawMessage) json.RawMessage {
+// stripStreamAndRewriteModel cleans stream flags AND overwrites params.model
+// with the canonical VLLM_MODEL env value. vLLM is strict about the model
+// field — it must match the path/HF id passed to `vllm serve`. Callers (the
+// arbiter dispatcher) routinely pass friendly names like "gemma4-26b", which
+// vllm rejects with 404. llama-server is lenient and ignores model field, so
+// the same bug doesn't surface there.
+func stripStreamAndRewriteModel(params json.RawMessage) json.RawMessage {
 	var m map[string]any
 	if err := json.Unmarshal(params, &m); err != nil {
 		return params
 	}
 	delete(m, "stream")
 	delete(m, "stream_options")
+	if canonical := os.Getenv("VLLM_MODEL"); canonical != "" {
+		m["model"] = canonical
+	}
 	out, _ := json.Marshal(m)
 	return out
 }
 
 func proxyChat(reqID string, params json.RawMessage) Response {
 	url := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", vllmPort)
-	cleanParams := stripStream(params)
+	cleanParams := stripStreamAndRewriteModel(params)
 
 	client := &http.Client{Timeout: 30 * time.Minute}
 	resp, err := client.Post(url, "application/json", bytes.NewReader(cleanParams))
@@ -286,12 +302,18 @@ func main() {
 			}
 
 		case "infer":
+			// Run inference in a goroutine so the main loop can keep accepting
+			// new infer commands. vLLM batches concurrent HTTP requests
+			// internally; the worker just needs to not serialise them at the
+			// stdin protocol layer.
 			cancelFlag = false
-			resp := proxyChat(req.ReqID, req.Params)
-			if cancelFlag {
-				resp = Response{Status: "cancelled", ReqID: req.ReqID}
-			}
-			respond(resp)
+			reqID := req.ReqID
+			params := req.Params
+			go func() {
+				resp := proxyChat(reqID, params)
+				respond(resp)
+			}()
+			continue
 
 		case "get_port":
 			portResult, _ := json.Marshal(map[string]any{"port": vllmPort})
