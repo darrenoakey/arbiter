@@ -45,8 +45,16 @@ from urllib.error import HTTPError, URLError
 
 DEFAULT_ARBITER = os.environ.get("ARBITER_URL", "http://10.0.0.254:8400")
 
-# Concurrency sweep — geometric so we can spot the knee.
-CONCURRENCY_LEVELS = [1, 2, 4, 8, 16, 32]
+# Concurrency sweep — geometric so we can spot the knee. Capped at 16 because
+# llama-server's --parallel slots default to 8; N>16 just measures HTTP queue.
+CONCURRENCY_LEVELS = [1, 2, 4, 8, 16]
+
+# Hard wall-clock cap per cell. Without this, one slow cell can hang the run.
+CELL_TIMEOUT_S = 180
+
+# Per-request HTTP timeout — keeps a single wedged request from blocking the
+# whole cell.
+REQUEST_TIMEOUT_S = 90
 
 # Prompt sizes (approx tokens) → (label, prompt_text_builder, completion_max_tokens)
 # We seed each prompt with a unique planted token the model is asked to echo
@@ -63,6 +71,15 @@ PROMPT_SIZES = [
     ("small",  256,    128),  # ~256 prompt tokens, 128 completion
     ("medium", 4096,   256),  # ~4k prompt tokens
 ]
+
+# Whether to ask the model to do chain-of-thought reasoning. Some backends
+# honor `chat_template_kwargs.enable_thinking`; some don't. We measure both
+# modes — if a backend ignores the toggle (reasoning_content present when we
+# said disable, or absent when we said enable) that's itself a finding.
+# Order matters: we run OFF first because it's the production-typical case
+# and finishes faster, so even if the run is interrupted we have the most
+# important numbers.
+REASONING_MODES = [False, True]
 
 PLANT_TOKEN = "ZX9PLANT42"
 
@@ -88,14 +105,16 @@ class RunResult:
     ttft_s: float = 0.0  # time-to-first-token (non-streaming: same as elapsed)
     error: str = ""
     valid: bool = False  # planted-token echo present
+    had_reasoning: bool = False  # reasoning_content was non-empty in the response
 
 
 @dataclass
 class CellResult:
-    """One (model, prompt_size, N) cell of the sweep."""
+    """One (model, prompt_size, N, reasoning) cell of the sweep."""
     model: str
     prompt_label: str
     n_concurrent: int
+    reasoning: bool = False
     runs: list[RunResult] = field(default_factory=list)
 
     @property
@@ -200,27 +219,34 @@ def memory_for_model(ps: dict, model_id: str) -> dict[str, float]:
     return out
 
 
-def chat_once(base: str, model_name: str, prompt: str, max_tokens: int) -> RunResult:
-    """Send one chat completion. model_name is 'gemma4-26b' (no llm: prefix)."""
-    payload = {
+def chat_once(base: str, model_id: str, model_name: str, prompt: str,
+              max_tokens: int, reasoning: bool) -> RunResult:
+    """Send one chat completion via the benchmark-direct endpoint, bypassing
+    the scheduler/queue (which is paused during a benchmark run).
+    `reasoning=True` asks the model to chain-of-think; False tries to suppress."""
+    inner = {
         "model": model_name,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.0,
+        "chat_template_kwargs": {"enable_thinking": reasoning},
     }
+    payload = {"model_id": model_id, "params": inner}
     t0 = time.perf_counter()
     try:
-        resp = _http_post(f"{base}/v1/chat/completions", payload, timeout=1800)
+        resp = _http_post(f"{base}/v1/admin/benchmark/chat", payload, timeout=REQUEST_TIMEOUT_S)
     except Exception as e:
         return RunResult(ok=False, elapsed_s=time.perf_counter() - t0, error=str(e))
     elapsed = time.perf_counter() - t0
-    text = ""
+    content_text = ""
+    reasoning_text = ""
     usage = resp.get("usage", {}) if isinstance(resp, dict) else {}
     choices = resp.get("choices", []) if isinstance(resp, dict) else []
     if choices and isinstance(choices, list):
         msg = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
-        text = msg.get("content") or msg.get("reasoning_content") or ""
-    valid = PLANT_TOKEN in text
+        content_text = msg.get("content") or ""
+        reasoning_text = msg.get("reasoning_content") or ""
+    valid = (PLANT_TOKEN in content_text) or (PLANT_TOKEN in reasoning_text)
     return RunResult(
         ok=True,
         elapsed_s=elapsed,
@@ -228,19 +254,32 @@ def chat_once(base: str, model_name: str, prompt: str, max_tokens: int) -> RunRe
         completion_tokens=int(usage.get("completion_tokens", 0) or 0),
         ttft_s=elapsed,
         valid=valid,
+        had_reasoning=bool(reasoning_text.strip()),
     )
 
 
-def sweep_concurrency(base: str, model_name: str, prompt: str, max_tokens: int,
-                      n: int, runs_per_n: int = 1) -> CellResult:
-    cell = CellResult(model=model_name, prompt_label="", n_concurrent=n)
+def sweep_concurrency(base: str, model_id: str, model_name: str, prompt: str, max_tokens: int,
+                      n: int, reasoning: bool, runs_per_n: int = 1) -> CellResult:
+    cell = CellResult(model=model_name, prompt_label="", n_concurrent=n, reasoning=reasoning)
     t0 = time.perf_counter()
     with cf.ThreadPoolExecutor(max_workers=n) as ex:
-        futures = []
-        for _ in range(n * runs_per_n):
-            futures.append(ex.submit(chat_once, base, model_name, prompt, max_tokens))
-        for f in cf.as_completed(futures):
-            cell.runs.append(f.result())
+        futures = [
+            ex.submit(chat_once, base, model_id, model_name, prompt, max_tokens, reasoning)
+            for _ in range(n * runs_per_n)
+        ]
+        try:
+            for f in cf.as_completed(futures, timeout=CELL_TIMEOUT_S):
+                cell.runs.append(f.result())
+        except cf.TimeoutError:
+            for f in futures:
+                if not f.done():
+                    f.cancel()
+                else:
+                    try:
+                        cell.runs.append(f.result(timeout=0))
+                    except Exception:
+                        pass
+            print(f"  [TIMEOUT] cell n={n} reasoning={reasoning} after {CELL_TIMEOUT_S}s — partial results: {len(cell.runs)}/{n*runs_per_n}", flush=True)
     cell.set_wall_clock(time.perf_counter() - t0)
     return cell
 
@@ -301,17 +340,35 @@ def run_for_model(base: str, model_id: str, name: str, backend: str) -> ModelRep
 
     rep.memory_after_load = memory_for_model(get_ps(base), model_id)
 
-    # For each prompt size, sweep N
-    for label, prompt_tokens, max_tokens in PROMPT_SIZES:
-        prompt = build_prompt(prompt_tokens)
-        for n in CONCURRENCY_LEVELS:
-            cell = sweep_concurrency(base, name, prompt, max_tokens, n)
-            cell.prompt_label = label
-            rep.cells.append(cell)
+    # For each (prompt size, reasoning mode), sweep N. Save a partial JSON
+    # snapshot after each cell so a hang doesn't lose all the data.
+    snapshot_path = Path(os.environ.get("BENCH_SNAPSHOT_PATH",
+                                       str(Path.home() / "src/arbiter/benchmark_partial.json")))
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    for reasoning in REASONING_MODES:
+        for label, prompt_tokens, max_tokens in PROMPT_SIZES:
+            prompt = build_prompt(prompt_tokens)
+            for n in CONCURRENCY_LEVELS:
+                t_cell = time.perf_counter()
+                cell = sweep_concurrency(base, model_id, name, prompt, max_tokens, n, reasoning)
+                cell.prompt_label = label
+                rep.cells.append(cell)
+                tps = cell.aggregate_throughput_tps
+                print(f"  cell {label} N={n} reasoning={'ON' if reasoning else 'OFF'} → "
+                      f"{tps:.1f} tok/s, p50={cell.p50:.1f}s, valid={sum(1 for r in cell.runs if r.valid)}/{len(cell.runs)}, "
+                      f"took {time.perf_counter()-t_cell:.1f}s",
+                      flush=True)
+                # Snapshot after each cell.
+                try:
+                    snapshot_path.write_text(json.dumps(asdict(rep), default=str, indent=2))
+                except Exception as e:
+                    print(f"  [snapshot write failed: {e}]", flush=True)
 
-    # Recommend max_concurrent based on the medium-prompt sweep.
+    # Recommend max_concurrent based on the medium-prompt + reasoning-OFF sweep
+    # (the most common production case).
     cells_med: dict[int, CellResult] = {
-        c.n_concurrent: c for c in rep.cells if c.prompt_label == "medium"
+        c.n_concurrent: c for c in rep.cells
+        if c.prompt_label == "medium" and not c.reasoning
     }
     rep.recommended_max_concurrent = recommend_max_concurrent(cells_med)
 
@@ -321,8 +378,10 @@ def run_for_model(base: str, model_id: str, name: str, backend: str) -> ModelRep
 
 def render_html(reports: list[ModelReport], out_path: Path) -> None:
     def cell_to_dict(c: CellResult) -> dict[str, Any]:
+        had_reason = sum(1 for r in c.runs if r.had_reasoning)
         return {
             "model": c.model, "prompt": c.prompt_label, "n": c.n_concurrent,
+            "reasoning": c.reasoning,
             "throughput_tps": round(c.aggregate_throughput_tps, 2),
             "p50_s": round(c.p50, 3), "p95_s": round(c.p95, 3),
             "wall_s": round(c.wall_clock_s, 3),
@@ -330,6 +389,7 @@ def render_html(reports: list[ModelReport], out_path: Path) -> None:
             "valid": sum(1 for r in c.runs if r.valid),
             "total": len(c.runs),
             "completion_tokens": c.aggregate_completion_tokens,
+            "had_reasoning_count": had_reason,
         }
 
     data = []
@@ -407,31 +467,49 @@ for (const m of data) {{
   html += `<h2>${{m.name}} — ${{m.backend}}</h2>`;
   html += `<p>Cold load: <b>${{m.cold_load_s}}s</b>, warm load: ${{m.warm_load_s}}s. VRAM after load: ${{(m.memory && m.memory.vram_gb) || '?'}} GB, RSS: ${{(m.memory && m.memory.rss_gb) || '?'}} GB.</p>`;
   html += `<p>Recommended max_concurrent: <b>${{m.recommended_max_concurrent}}</b></p>`;
-  // throughput / latency table per prompt size
-  const sizes = [...new Set(m.cells.map(c => c.prompt))];
-  for (const s of sizes) {{
-    html += `<h3>Prompt: ${{s}}</h3>`;
-    const rows = m.cells.filter(c => c.prompt === s).sort((a,b)=>a.n-b.n).map(c => [
-      c.n,
-      c.throughput_tps,
-      c.p50_s,
-      c.p95_s,
-      c.wall_s,
-      `${{c.valid}}/${{c.total}}`,
-      c.completion_tokens,
-    ]);
-    html += tbl(["N","throughput tok/s","p50 s","p95 s","wall s","valid/total","tokens"], rows);
+  // honors-reasoning-toggle finding
+  const onCells = m.cells.filter(c => c.reasoning);
+  const offCells = m.cells.filter(c => !c.reasoning);
+  const onHadAny = onCells.some(c => c.had_reasoning_count > 0);
+  const offHadAny = offCells.some(c => c.had_reasoning_count > 0);
+  let toggleNote = "";
+  if (onHadAny && !offHadAny) toggleNote = "✓ honors enable_thinking toggle (reasoning ON → reasoning_content present, OFF → empty)";
+  else if (!onHadAny && !offHadAny) toggleNote = "model never produced reasoning_content (reasoning may be disabled at model level)";
+  else if (onHadAny && offHadAny) toggleNote = "reasoning_content present even with enable_thinking=False — backend ignores the toggle";
+  else toggleNote = "reasoning_content empty even with enable_thinking=True — model not producing thinking output";
+  html += `<p class="muted"><b>Reasoning toggle:</b> ${{toggleNote}}</p>`;
+
+  // throughput / latency table per (reasoning, prompt size)
+  for (const reasoning of [true, false]) {{
+    const tag = reasoning ? "ON" : "OFF";
+    html += `<h3>Reasoning: ${{tag}}</h3>`;
+    const sizes = [...new Set(m.cells.filter(c=>c.reasoning===reasoning).map(c => c.prompt))];
+    for (const s of sizes) {{
+      html += `<h4>Prompt: ${{s}}</h4>`;
+      const rows = m.cells.filter(c => c.prompt === s && c.reasoning === reasoning)
+                          .sort((a,b)=>a.n-b.n).map(c => [
+        c.n,
+        c.throughput_tps,
+        c.p50_s,
+        c.p95_s,
+        c.wall_s,
+        `${{c.valid}}/${{c.total}}`,
+        c.completion_tokens,
+        `${{c.had_reasoning_count}}/${{c.total}}`,
+      ]);
+      html += tbl(["N","throughput tok/s","p50 s","p95 s","wall s","valid/total","tokens","reasoning/total"], rows);
+    }}
   }}
 }}
 
-// Side-by-side
+// Side-by-side (medium prompt, reasoning OFF — production-typical)
 if (data.length >= 2) {{
-  html += "<h2>Side-by-side throughput (medium prompt)</h2>";
+  html += "<h2>Side-by-side throughput (medium prompt, reasoning OFF)</h2>";
   const a = data[0], b = data[1];
-  const ns = [...new Set(a.cells.filter(c=>c.prompt==='medium').map(c=>c.n))].sort((x,y)=>x-y);
+  const ns = [...new Set(a.cells.filter(c=>c.prompt==='medium' && !c.reasoning).map(c=>c.n))].sort((x,y)=>x-y);
   const rows = ns.map(n => {{
-    const ca = a.cells.find(c => c.prompt==='medium' && c.n===n) || {{throughput_tps:'-', p95_s:'-'}};
-    const cb = b.cells.find(c => c.prompt==='medium' && c.n===n) || {{throughput_tps:'-', p95_s:'-'}};
+    const ca = a.cells.find(c => c.prompt==='medium' && c.n===n && !c.reasoning) || {{throughput_tps:'-', p95_s:'-'}};
+    const cb = b.cells.find(c => c.prompt==='medium' && c.n===n && !c.reasoning) || {{throughput_tps:'-', p95_s:'-'}};
     return [n, ca.throughput_tps, cb.throughput_tps, ca.p95_s, cb.p95_s];
   }});
   html += tbl(["N", a.name+" tok/s", b.name+" tok/s", a.name+" p95 s", b.name+" p95 s"], rows);

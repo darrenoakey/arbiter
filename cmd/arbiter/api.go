@@ -19,7 +19,15 @@ import (
 	"time"
 )
 
+// portCacheEntry is one row of the per-instance worker-port cache.
+type portCacheEntry struct {
+	port    int
+	loadedAt time.Time
+}
+
 type API struct {
+	portCacheMu sync.Mutex
+	portCache   map[string]portCacheEntry // instance_id -> port
 	config      *Config
 	store       *Store
 	mgr         *InstanceManager
@@ -122,6 +130,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/admin/benchmark/disable", a.benchmarkDisable)
 	mux.HandleFunc("POST /v1/admin/models/unload_all", a.adminUnloadAll)
 	mux.HandleFunc("POST /v1/admin/models/preload", a.adminPreload)
+	mux.HandleFunc("POST /v1/admin/benchmark/chat", a.adminBenchmarkChat)
 	mux.HandleFunc("GET /v1/health", a.health)
 	return withLogging(mux)
 }
@@ -1682,6 +1691,95 @@ func (a *API) adminUnloadAll(w http.ResponseWriter, r *http.Request) {
 	}
 	a.logger.Log("admin.unload_all", map[string]any{"killed": totalKilled})
 	writeJSON(w, 200, map[string]any{"killed_workers": totalKilled, "models_count": len(models)})
+}
+
+// cachedWorkerPort returns the worker's HTTP port, looking it up via the
+// stdin/stdout protocol on first access and caching subsequent lookups.
+// Concurrent benchmark requests would otherwise race on the protocol's
+// non-unique default reqID and corrupt each other's responses.
+func (a *API) cachedWorkerPort(inst *Instance) (int, error) {
+	a.portCacheMu.Lock()
+	if a.portCache == nil {
+		a.portCache = make(map[string]portCacheEntry)
+	}
+	if entry, ok := a.portCache[inst.InstanceID]; ok {
+		a.portCacheMu.Unlock()
+		return entry.port, nil
+	}
+	a.portCacheMu.Unlock()
+	port, err := inst.GetPort()
+	if err != nil {
+		return 0, err
+	}
+	a.portCacheMu.Lock()
+	a.portCache[inst.InstanceID] = portCacheEntry{port: port, loadedAt: time.Now()}
+	a.portCacheMu.Unlock()
+	return port, nil
+}
+
+// adminBenchmarkChat proxies a chat-completion request directly to the
+// already-loaded worker, bypassing the scheduler/queue. This is what the
+// benchmark runner uses while dispatch is paused — the queue grows as
+// external jobs arrive but the runner's measurement traffic still flows.
+//
+// Body shape: {"model_id": "...", "params": {<openai chat completion>}}.
+// Response is the worker's raw OpenAI response.
+func (a *API) adminBenchmarkChat(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ModelID string          `json:"model_id"`
+		Params  json.RawMessage `json:"params"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ModelID == "" || len(body.Params) == 0 {
+		writeError(w, 400, "model_id and params required")
+		return
+	}
+	insts := a.mgr.GetModelInstances(body.ModelID)
+	if len(insts) == 0 {
+		writeError(w, 404, "no instances for model — preload first")
+		return
+	}
+	// Pick a loaded instance. If the only instance isn't loaded, fail fast.
+	var inst *Instance
+	for _, i := range insts {
+		if i.State() == "loaded" {
+			inst = i
+			break
+		}
+	}
+	if inst == nil {
+		writeError(w, 503, "no loaded instance — call /v1/admin/models/preload first")
+		return
+	}
+	inst.ReserveExternal()
+	defer inst.ReleaseExternal()
+
+	// Cache the worker port per instance — GetPort uses the worker stdin/stdout
+	// protocol with a non-unique default reqID, so calling it from concurrent
+	// goroutines races (one channel overwrites the other). Once a model is
+	// loaded the port is stable, so a one-shot lookup is safe.
+	port, err := a.cachedWorkerPort(inst)
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("get worker port: %s", err))
+		return
+	}
+	target := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", port)
+	proxyReq, err := http.NewRequestWithContext(r.Context(), "POST", target, bytes.NewReader(body.Params))
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("build proxy request: %s", err))
+		return
+	}
+	proxyReq.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 30 * time.Minute}
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		writeError(w, 502, fmt.Sprintf("worker error: %s", err))
+		return
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(out)
 }
 
 // adminPreload loads a model without running a job. Returns load time and a

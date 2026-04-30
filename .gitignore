@@ -21,3 +21,6 @@ cmd/arbiter/arbiter
 _unsloth_temporary_saved_buffers/
 unsloth_compiled_cache/
 gfpgan/weights/
+benchmark_partial.json
+benchmark_report.html
+benchmark_report.json

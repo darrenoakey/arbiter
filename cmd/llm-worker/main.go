@@ -104,8 +104,8 @@ func startLlamaServer() error {
 		"--host", "127.0.0.1",
 		"-ngl", env("LLM_GPU_LAYERS", "-1"), // all layers on GPU by default
 		"-c", env("LLM_CTX_SIZE", "8192"),
+		"--parallel", env("LLM_PARALLEL", "8"),
 		"--no-warmup",
-		
 	}
 
 	// Model source: HF repo or local path
