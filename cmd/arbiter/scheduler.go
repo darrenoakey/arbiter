@@ -22,6 +22,7 @@ type Scheduler struct {
 	inboxDir        string // if set, input files are deleted after job completion/failure
 	wake            chan struct{}
 	shuttingDown    atomic.Bool
+	dispatchPaused  atomic.Bool // benchmark mode: queue grows but no dispatch
 	cooldownMu      sync.Mutex
 	cooldownUntil   map[string]time.Time // model -> skip until this time (load failures)
 	pressureMu      sync.Mutex
@@ -91,6 +92,25 @@ func (s *Scheduler) Wake() {
 
 func (s *Scheduler) MarkShuttingDown() {
 	s.shuttingDown.Store(true)
+}
+
+// PauseDispatch halts new job dispatch. Queued jobs remain queued; in-flight
+// jobs run to completion. Used for benchmark mode so external work pauses
+// without being lost. Resets to false on process restart.
+func (s *Scheduler) PauseDispatch() {
+	s.dispatchPaused.Store(true)
+}
+
+// ResumeDispatch resumes normal dispatch. Wakes the scheduler so the queue
+// drains immediately.
+func (s *Scheduler) ResumeDispatch() {
+	s.dispatchPaused.Store(false)
+	s.Wake()
+}
+
+// IsDispatchPaused reports whether benchmark mode is active.
+func (s *Scheduler) IsDispatchPaused() bool {
+	return s.dispatchPaused.Load()
 }
 
 func (s *Scheduler) shouldRequeueForShutdown(err error, resp *WorkerResponse) bool {
@@ -651,6 +671,13 @@ func (s *Scheduler) Run(ctx context.Context) {
 			return
 		case <-s.wake:
 		case <-ticker.C:
+		}
+
+		// Benchmark mode: queue still accepts jobs but dispatch is suspended.
+		// In-flight jobs already dispatched run to completion via their own
+		// goroutines; only this picker stops handing out new work.
+		if s.dispatchPaused.Load() {
+			continue
 		}
 
 		// Real queued work outranks warm residency. If there is backlog for any

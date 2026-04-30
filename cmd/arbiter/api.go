@@ -68,6 +68,11 @@ type llmRegisterRequest struct {
 	MaxRuntimeSec  *int              `json:"max_runtime_seconds"`
 	AvgInferenceMs *float64          `json:"avg_inference_ms"`
 	LoadMs         *float64          `json:"load_ms"`
+	// Backend selects the inference engine: "llamacpp" (default, uses
+	// llm-worker → llama-server) or "vllm" (uses vllm-chat-worker → vllm serve).
+	Backend       string `json:"backend"`
+	VllmModel     string `json:"vllm_model"`      // VLLM_MODEL env (HF id or repo:file GGUF spec); defaults from HFModel
+	VllmExtraArgs string `json:"vllm_extra_args"` // VLLM_EXTRA_ARGS env (e.g., "--max-model-len 32768 --quantization awq")
 }
 
 func NewAPI(cfg *Config, store *Store, mgr *InstanceManager, sched *Scheduler, logger *EventLogger, outputDir, projectRoot string) *API {
@@ -112,6 +117,11 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/llm/models", a.listLLMs)
 	mux.HandleFunc("DELETE /v1/llm/models/{name}", a.deregisterLLM)
 	mux.HandleFunc("POST /v1/chat/completions", a.chatCompletion)
+	mux.HandleFunc("GET /v1/admin/benchmark", a.benchmarkStatus)
+	mux.HandleFunc("POST /v1/admin/benchmark/enable", a.benchmarkEnable)
+	mux.HandleFunc("POST /v1/admin/benchmark/disable", a.benchmarkDisable)
+	mux.HandleFunc("POST /v1/admin/models/unload_all", a.adminUnloadAll)
+	mux.HandleFunc("POST /v1/admin/models/preload", a.adminPreload)
 	mux.HandleFunc("GET /v1/health", a.health)
 	return withLogging(mux)
 }
@@ -1234,6 +1244,21 @@ func llmWorkerBin(projectRoot string) string {
 	return "llm-worker" // hope it's in PATH
 }
 
+func defaultLLMWorkerBin(backend, projectRoot string) string {
+	if backend == "vllm" {
+		return vllmChatWorkerBin(projectRoot)
+	}
+	return llmWorkerBin(projectRoot)
+}
+
+func vllmChatWorkerBin(projectRoot string) string {
+	bin := filepath.Join(projectRoot, "vllm-chat-worker")
+	if _, err := os.Stat(bin); err == nil {
+		return bin
+	}
+	return "vllm-chat-worker"
+}
+
 func estimateMemoryGB(totalParams int64) float64 {
 	// fp16: 2 bytes per param + 20% overhead, rounded up to nearest 5GB
 	gb := float64(totalParams) * 2.0 / (1024 * 1024 * 1024) * 1.2
@@ -1246,8 +1271,20 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	if req.HFModel == "" && req.ModelPath == "" {
+	backend := strings.ToLower(strings.TrimSpace(req.Backend))
+	if backend == "" {
+		backend = "llamacpp"
+	}
+	if backend != "llamacpp" && backend != "vllm" {
+		writeError(w, 400, "backend must be 'llamacpp' or 'vllm'")
+		return
+	}
+	if backend == "llamacpp" && req.HFModel == "" && req.ModelPath == "" {
 		writeError(w, 400, "hf_model or model_path required")
+		return
+	}
+	if backend == "vllm" && req.VllmModel == "" && req.HFModel == "" && req.ModelPath == "" {
+		writeError(w, 400, "vllm_model, hf_model, or model_path required for vllm backend")
 		return
 	}
 
@@ -1287,30 +1324,57 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("no memory_gb specified for LLM, using default", "model", name, "memory_gb", memGB)
 	}
 
-	// Build adapter params (env vars for the worker)
+	// Build adapter params (env vars for the worker). The set of env vars
+	// depends on the backend — llama.cpp consumes LLM_*, vllm consumes VLLM_*.
 	adapterParams := make(map[string]string)
-	if req.HFModel != "" {
-		adapterParams["LLM_HF_REPO"] = req.HFModel
-	}
-	if req.HFFile != "" {
-		adapterParams["LLM_HF_FILE"] = req.HFFile
-	}
-	if req.ModelPath != "" {
-		adapterParams["LLM_MODEL_PATH"] = req.ModelPath
-	}
 	ctx := req.CtxSize
 	if ctx == 0 {
 		ctx = 8192
 	}
-	adapterParams["LLM_CTX_SIZE"] = strconv.Itoa(ctx)
-	gpuLayers := req.GPULayers
-	if gpuLayers == 0 {
-		gpuLayers = -1
+	if backend == "llamacpp" {
+		if req.HFModel != "" {
+			adapterParams["LLM_HF_REPO"] = req.HFModel
+		}
+		if req.HFFile != "" {
+			adapterParams["LLM_HF_FILE"] = req.HFFile
+		}
+		if req.ModelPath != "" {
+			adapterParams["LLM_MODEL_PATH"] = req.ModelPath
+		}
+		adapterParams["LLM_CTX_SIZE"] = strconv.Itoa(ctx)
+		gpuLayers := req.GPULayers
+		if gpuLayers == 0 {
+			gpuLayers = -1
+		}
+		adapterParams["LLM_GPU_LAYERS"] = strconv.Itoa(gpuLayers)
+		if req.LlamaServerBin != "" {
+			adapterParams["LLAMA_SERVER_BIN"] = req.LlamaServerBin
+		}
+	} else { // vllm
+		vmodel := req.VllmModel
+		if vmodel == "" {
+			if req.HFModel != "" && req.HFFile != "" {
+				vmodel = req.HFModel + ":" + req.HFFile
+			} else if req.HFModel != "" {
+				vmodel = req.HFModel
+			} else {
+				vmodel = req.ModelPath
+			}
+		}
+		adapterParams["VLLM_MODEL"] = vmodel
+		extra := strings.TrimSpace(req.VllmExtraArgs)
+		// Inject context size if caller didn't explicitly set --max-model-len.
+		if !strings.Contains(extra, "--max-model-len") {
+			if extra == "" {
+				extra = "--max-model-len " + strconv.Itoa(ctx)
+			} else {
+				extra = "--max-model-len " + strconv.Itoa(ctx) + " " + extra
+			}
+		}
+		adapterParams["VLLM_EXTRA_ARGS"] = extra
+		adapterParams["LLM_CTX_SIZE"] = strconv.Itoa(ctx) // for visibility/inspection
 	}
-	adapterParams["LLM_GPU_LAYERS"] = strconv.Itoa(gpuLayers)
-	if req.LlamaServerBin != "" {
-		adapterParams["LLAMA_SERVER_BIN"] = req.LlamaServerBin
-	}
+	adapterParams["LLM_BACKEND"] = backend
 	for k, v := range req.AdapterParams {
 		adapterParams[k] = v
 	}
@@ -1325,7 +1389,7 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 		MaxRuntimeSec:  600,
 		AvgInferenceMs: 5000,
 		LoadMs:         120000, // LLMs can take a while to download + load
-		WorkerCmd:      []string{llmWorkerBin(a.projectRoot)},
+		WorkerCmd:      []string{defaultLLMWorkerBin(backend, a.projectRoot)},
 		AdapterParams:  adapterParams,
 	}
 	if len(req.WorkerCmd) > 0 {
@@ -1573,6 +1637,87 @@ func (a *API) chatCompletionStream(w http.ResponseWriter, r *http.Request, model
 			break
 		}
 	}
+}
+
+// --- Benchmark / Admin ---
+//
+// Benchmark mode pauses dispatch so external jobs queue but do not run,
+// freeing the GPU/CPU for controlled performance measurement. The admin
+// endpoints also let the operator unload all models (clean baseline) and
+// preload a single model without running a job (fair load-time measurement).
+
+func (a *API) benchmarkStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{
+		"paused": a.scheduler.IsDispatchPaused(),
+	})
+}
+
+func (a *API) benchmarkEnable(w http.ResponseWriter, r *http.Request) {
+	a.scheduler.PauseDispatch()
+	a.logger.Log("benchmark.enable", map[string]any{})
+	writeJSON(w, 200, map[string]any{"paused": true})
+}
+
+func (a *API) benchmarkDisable(w http.ResponseWriter, r *http.Request) {
+	a.scheduler.ResumeDispatch()
+	a.logger.Log("benchmark.disable", map[string]any{})
+	writeJSON(w, 200, map[string]any{"paused": false})
+}
+
+func (a *API) adminUnloadAll(w http.ResponseWriter, r *http.Request) {
+	totalKilled := 0
+	models := make([]string, 0, len(a.config.Models))
+	for id := range a.config.Models {
+		models = append(models, id)
+	}
+	// recreate=true preserves the instance shells (so subsequent preload still
+	// finds an instance to load into) but kills the running workers and frees
+	// VRAM/RSS — exactly the "clean baseline" benchmark mode wants.
+	for _, id := range models {
+		cfg := a.config.Models[id]
+		res := a.mgr.HardKillModel(id, true, &cfg)
+		if k, ok := res["killed"].(int); ok {
+			totalKilled += k
+		}
+	}
+	a.logger.Log("admin.unload_all", map[string]any{"killed": totalKilled})
+	writeJSON(w, 200, map[string]any{"killed_workers": totalKilled, "models_count": len(models)})
+}
+
+// adminPreload loads a model without running a job. Returns load time and a
+// memory snapshot taken immediately after readiness — fair input for comparing
+// load cost across backends.
+func (a *API) adminPreload(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ModelID string `json:"model_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ModelID == "" {
+		writeError(w, 400, "model_id required")
+		return
+	}
+	if _, ok := a.config.Models[body.ModelID]; !ok {
+		writeError(w, 404, "unknown model: "+body.ModelID)
+		return
+	}
+	insts := a.mgr.GetModelInstances(body.ModelID)
+	if len(insts) == 0 {
+		writeError(w, 500, "no instances for model")
+		return
+	}
+	inst := insts[0]
+	start := time.Now()
+	if err := a.scheduler.ensureLoaded(inst); err != nil {
+		writeError(w, 503, fmt.Sprintf("load failed: %s", err))
+		return
+	}
+	loadMs := time.Since(start).Milliseconds()
+	a.logger.Log("admin.preload", map[string]any{"model_id": body.ModelID, "load_ms": loadMs})
+	writeJSON(w, 200, map[string]any{
+		"model_id":    body.ModelID,
+		"instance_id": inst.InstanceID,
+		"load_ms":     loadMs,
+		"already_loaded": loadMs < 100, // heuristic — sub-100ms means it was already up
+	})
 }
 
 func (a *API) health(w http.ResponseWriter, r *http.Request) {
