@@ -213,7 +213,7 @@ def memory_for_model(ps: dict, model_id: str) -> dict[str, float]:
     return out
 
 
-def chat_once(base: str, model_id: str, model_name: str, prompt: str,
+def chat_once(base: str, model_name: str, prompt: str,
               max_tokens: int, reasoning: bool) -> RunResult:
     """Send one chat completion via the normal /v1/chat/completions endpoint.
     The arbiter has one queue and one MaxConcurrent — there is no benchmark
@@ -253,13 +253,13 @@ def chat_once(base: str, model_id: str, model_name: str, prompt: str,
     )
 
 
-def sweep_concurrency(base: str, model_id: str, model_name: str, prompt: str, max_tokens: int,
+def sweep_concurrency(base: str, model_name: str, prompt: str, max_tokens: int,
                       n: int, reasoning: bool, runs_per_n: int = 1) -> CellResult:
     cell = CellResult(model=model_name, prompt_label="", n_concurrent=n, reasoning=reasoning)
     t0 = time.perf_counter()
     with cf.ThreadPoolExecutor(max_workers=n) as ex:
         futures = [
-            ex.submit(chat_once, base, model_id, model_name, prompt, max_tokens, reasoning)
+            ex.submit(chat_once, base, model_name, prompt, max_tokens, reasoning)
             for _ in range(n * runs_per_n)
         ]
         try:
@@ -345,7 +345,7 @@ def run_for_model(base: str, model_id: str, name: str, backend: str) -> ModelRep
             prompt = build_prompt(prompt_tokens)
             for n in CONCURRENCY_LEVELS:
                 t_cell = time.perf_counter()
-                cell = sweep_concurrency(base, model_id, name, prompt, max_tokens, n, reasoning)
+                cell = sweep_concurrency(base, name, prompt, max_tokens, n, reasoning)
                 cell.prompt_label = label
                 rep.cells.append(cell)
                 tps = cell.aggregate_throughput_tps
