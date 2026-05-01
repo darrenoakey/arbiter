@@ -199,8 +199,6 @@ def memory_for_model(ps: dict, model_id: str) -> dict[str, float]:
     it as a single memory_gb field per model (process-tree aggregate); we
     surface it as vram_gb since on the GB10 unified-memory box VRAM == RSS."""
     out = {"vram_gb": 0.0, "rss_gb": 0.0}
-    if not isinstance(ps, dict):
-        return out
     for m in ps.get("models", []) or []:
         if not isinstance(m, dict):
             continue
@@ -551,9 +549,13 @@ def main() -> int:
     render_html(reports, out)
     print(f"\nReport: {out}\nJSON: {json_out}", flush=True)
     if not args.no_open:
+        # webbrowser.open works on every platform; on macOS we prefer `open`
+        # so the report opens in the user's default browser regardless of any
+        # weird BROWSER env override.
+        opened = False
         if sys.platform == "darwin":
-            subprocess.run(["open", str(out)], check=False)
-        else:
+            opened = subprocess.run(["open", str(out)], check=False).returncode == 0
+        if not opened:
             webbrowser.open(out.as_uri())
     return 0
 

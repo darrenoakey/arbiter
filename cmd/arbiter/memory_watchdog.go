@@ -26,7 +26,8 @@ type MemoryWatchdog struct {
 	projectRoot string
 
 	driftMu        sync.Mutex
-	consecutive    map[string]int     // model_id -> consecutive intervals over threshold
+	consecutive    map[string]int     // model_id -> consecutive intervals over threshold (upward)
+	underUtil      map[string]int     // instance_id -> consecutive intervals well below configured (downward)
 	writebackDone  map[string]bool    // model_id -> already patched this session
 	pressureLastAt time.Time          // throttle system.memory_pressure events
 	lastWriteback  map[string]float64 // model_id -> last patched memory_gb
@@ -39,6 +40,13 @@ const (
 	driftWritebackCap   = 0.8                                // never write a value larger than VRAMBudgetGB * cap
 	pressureThreshold   = 0.95                               // emit pressure event when total RAM > budget * threshold
 	pressureMinInterval = 30 * time.Second                   // throttle pressure events
+	// Downward shrink — reclaim over-reservation from instances that have
+	// stabilised well below their declared memory_gb (e.g. vLLM with
+	// gpu-memory-utilization=0.30 declared at 80GB but using 25GB).
+	shrinkRatio       = 0.6  // shrink only if observed < configured * this (i.e. >40% headroom wasted)
+	shrinkConsecutive = 4    // require 4 stable samples (~2 min at 30s cadence) before shrinking
+	shrinkSafetyBuf   = 1.3  // new memoryGB = observed * this (30% safety margin above peak observed)
+	shrinkMinFreedGB  = 2.0  // don't bother for tiny gains
 )
 
 // NewMemoryWatchdog constructs a watchdog. Caller starts it with Run.
@@ -49,6 +57,7 @@ func NewMemoryWatchdog(cfg *Config, mgr *InstanceManager, logger *EventLogger, p
 		logger:        logger,
 		projectRoot:   projectRoot,
 		consecutive:   make(map[string]int),
+		underUtil:     make(map[string]int),
 		writebackDone: make(map[string]bool),
 		lastWriteback: make(map[string]float64),
 	}
@@ -79,8 +88,69 @@ func (w *MemoryWatchdog) tick() {
 	for _, s := range snaps {
 		totalRAM += s.TreeRSSGB
 		w.checkDrift(s)
+		w.checkUnderUtilization(s)
 	}
 	w.checkSystemPressure(totalRAM)
+}
+
+// checkUnderUtilization shrinks an instance's reservation when actual usage
+// has been well below configured for several consecutive samples. The
+// motivation: vLLM workers with gpu-memory-utilization=0.30 declared at the
+// old 80GB ceiling were holding 55GB of unused budget hostage, blocking
+// other models from preloading. After the shrink, that VRAM is free for
+// real work — and if usage later climbs back, the upward drift watchdog
+// will catch it and writeback a higher value.
+func (w *MemoryWatchdog) checkUnderUtilization(s instanceMemSnapshot) {
+	if s.ConfiguredGB <= 0 {
+		return
+	}
+	observed := s.TreeVRAMGB
+	if observed <= 0 {
+		// Worker isn't reporting VRAM yet (just spawned, or nvidia-smi failed).
+		// Treat as no signal — don't touch the counter either way.
+		w.driftMu.Lock()
+		w.underUtil[s.InstanceID] = 0
+		w.driftMu.Unlock()
+		return
+	}
+	w.driftMu.Lock()
+	defer w.driftMu.Unlock()
+
+	if observed >= s.ConfiguredGB*shrinkRatio {
+		// Within tolerance — reset streak.
+		w.underUtil[s.InstanceID] = 0
+		return
+	}
+	w.underUtil[s.InstanceID]++
+	if w.underUtil[s.InstanceID] < shrinkConsecutive {
+		return
+	}
+
+	target := observed * shrinkSafetyBuf
+	if target >= s.ConfiguredGB {
+		w.underUtil[s.InstanceID] = 0
+		return
+	}
+	if s.ConfiguredGB-target < shrinkMinFreedGB {
+		w.underUtil[s.InstanceID] = 0
+		return
+	}
+	inst := w.mgr.Get(s.InstanceID)
+	if inst == nil {
+		return
+	}
+	freed := w.mgr.ShrinkReservationFor(inst, target)
+	if freed > 0 {
+		w.logger.Log("model.memory_shrunk", map[string]any{
+			"model_id":      s.ModelID,
+			"instance_id":   s.InstanceID,
+			"configured_gb": s.ConfiguredGB,
+			"observed_gb":   observed,
+			"new_gb":        target,
+			"freed_gb":      freed,
+		})
+	}
+	w.underUtil[s.InstanceID] = 0
 }
 
 func (w *MemoryWatchdog) checkDrift(s instanceMemSnapshot) {

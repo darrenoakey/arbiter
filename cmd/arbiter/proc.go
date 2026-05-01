@@ -1023,6 +1023,46 @@ func (m *InstanceManager) ReleaseMemoryFor(inst *Instance) float64 {
 	return gb
 }
 
+// ShrinkReservationFor lowers an instance's declared memoryGB to targetGB
+// and credits the difference back to free VRAM. Used by the memory watchdog
+// after observing sustained over-declaration: e.g. vLLM with
+// gpu-memory-utilization=0.30 and a 80GB declaration only ever uses ~25GB,
+// so the other 55GB shouldn't be reserved indefinitely.
+//
+// Caller must have evidence (multiple samples) that actual usage is bounded
+// by targetGB plus a safety margin — once we shrink, future loads will plan
+// for the smaller footprint and an unexpectedly large allocation will OOM.
+//
+// No-op if instance doesn't currently hold VRAM, or if targetGB >= current.
+// Returns the GB freed.
+func (m *InstanceManager) ShrinkReservationFor(inst *Instance, targetGB float64) float64 {
+	inst.mu.Lock()
+	if !inst.vramHeld {
+		inst.mu.Unlock()
+		return 0
+	}
+	current := inst.memoryGB
+	if targetGB >= current {
+		inst.mu.Unlock()
+		return 0
+	}
+	freed := current - targetGB
+	inst.memoryGB = targetGB
+	inst.mu.Unlock()
+
+	m.mu.Lock()
+	m.usedGB -= freed
+	if m.usedGB < 0 {
+		m.usedGB = 0
+	}
+	used := m.usedGB
+	m.mu.Unlock()
+	slog.Info("VRAM reservation shrunk to actual",
+		"instance", inst.InstanceID, "from_gb", current, "to_gb", targetGB,
+		"freed_gb", freed, "used_gb_now", used)
+	return freed
+}
+
 // ReconcileFromInstances forces InstanceManager.usedGB to equal the sum of
 // memoryGB across instances currently flagged vramHeld. This is the safety
 // net for accounting leaks: any historical bug or new code path that drops a
