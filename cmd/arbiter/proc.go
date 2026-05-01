@@ -408,77 +408,73 @@ func (inst *Instance) Cancel() error {
 	return nil
 }
 
-// Unload sends the unload command, waits for response, then kills the process.
-// State transitions: loaded -> unloading -> stopped. Never leaves a ghost process.
+// Unload IS process tree obliteration. There is no "soft unload" or "hard
+// unload" — the act of unloading from the arbiter's perspective is the act
+// of killing the worker subprocess and every descendant, then verifying they
+// are gone. The unload is not complete until the tree is empty.
+//
+// The "unload" stdin command sent to the worker is a courtesy hint so it
+// can release CUDA cleanly if it wants to; we don't wait for it. Kill()
+// handles the rest with retries.
+//
+// Refuses only when running this would corrupt in-flight work (active jobs)
+// or race with a concurrent load.
 func (inst *Instance) Unload() error {
-	oldState := inst.State()
-	if oldState == "unloading" || oldState == "stopped" {
-		slog.Info("unload: already in state", "instance", inst.InstanceID, "state", oldState)
-		return nil
-	}
 	if inst.ActiveJobs() > 0 {
 		return fmt.Errorf("refusing to unload %s: %d active jobs", inst.InstanceID, inst.ActiveJobs())
 	}
-	if oldState == "loading" {
+	if inst.State() == "loading" {
 		return fmt.Errorf("refusing to unload %s: currently loading", inst.InstanceID)
 	}
 
 	inst.mu.Lock()
 	inst.state = "unloading"
+	stdin := inst.stdin
 	inst.mu.Unlock()
-	slog.Info("unloading model", "instance", inst.InstanceID, "old_state", oldState)
+	slog.Info("unloading model — initiating tree kill", "instance", inst.InstanceID)
 
-	// Send unload command with timeout
-	done := make(chan error, 1)
-	go func() {
-		resp, err := inst.sendAndReceive(map[string]any{"cmd": "unload"})
-		if err != nil {
-			done <- err
-		} else if resp.Status != "ok" {
-			done <- fmt.Errorf("unload response: %s", resp.Error)
-		} else {
-			done <- nil
-		}
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			slog.Warn("unload command failed, killing process", "instance", inst.InstanceID, "error", err)
-		} else {
-			slog.Info("unload command succeeded, killing process", "instance", inst.InstanceID)
-		}
-	case <-time.After(30 * time.Second):
-		slog.Warn("unload command timed out after 30s, killing process", "instance", inst.InstanceID)
+	// Fire-and-forget courtesy hint to the worker. Don't wait — Kill() has
+	// its own grace window and will SIGKILL anything that doesn't exit on
+	// its own.
+	if stdin != nil {
+		go func() {
+			data, _ := json.Marshal(map[string]any{"cmd": "unload"})
+			stdin.Write(append(data, '\n'))
+		}()
 	}
 
-	// Always kill the process to ensure no ghost workers
+	// THE unload: tree kill with retries until the entire subtree is gone.
 	inst.Kill()
-	slog.Info("model unloaded and process stopped", "instance", inst.InstanceID)
+	slog.Info("unload complete — process tree obliterated", "instance", inst.InstanceID)
 	return nil
 }
 
-// Kill terminates the subprocess AND any grandchildren it spawned (e.g. the
-// llm-worker Go binary spawns llama-server; if llm-worker exits, llama-server
-// is reparented to init and keeps holding VRAM unless we hunt it down).
+// Kill terminates the subprocess AND every descendant (vllm serve →
+// VLLM::EngineCore → N child threads, llm-worker → llama-server, etc.) and
+// retries until the entire tree is gone. The contract: when this returns,
+// no process from this instance's tree is holding the GPU.
+//
+// Strategy:
+//  1. Send graceful "shutdown" via stdin (one-shot, gives the worker a chance
+//     to checkpoint cleanly).
+//  2. Wait briefly for the root to exit on its own.
+//  3. Walk the descendant tree (leaves-first) and SIGKILL every PID. Repeat
+//     until the tree is empty or we hit the retry cap.
+//  4. Sweep by pattern in case anything reparented to init before we walked
+//     the tree (e.g. vLLM's EngineCore subprocess).
+//
+// This is the "release the GPU at all costs" path — we don't trust state
+// transitions, we verify by polling /proc.
 func (inst *Instance) Kill() {
 	inst.mu.Lock()
-	var directPid int
+	var rootPid int
 	if inst.cmd != nil && inst.cmd.Process != nil {
-		directPid = inst.cmd.Process.Pid
-		// Try graceful shutdown first
+		rootPid = inst.cmd.Process.Pid
+		// One graceful attempt — well-behaved workers will release CUDA cleanly.
 		if inst.stdin != nil {
 			data, _ := json.Marshal(map[string]any{"cmd": "shutdown"})
 			inst.stdin.Write(append(data, '\n'))
 			inst.stdin.Close()
-		}
-		// Give it a moment, then force kill
-		done := make(chan error, 1)
-		go func() { done <- inst.cmd.Wait() }()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			inst.cmd.Process.Kill()
 		}
 	}
 	inst.state = "stopped"
@@ -486,22 +482,119 @@ func (inst *Instance) Kill() {
 	inst.cmd = nil
 	inst.mu.Unlock()
 
-	// Kill any workers that survived the direct-child shutdown. This covers
-	// llama-server spawned by a just-dead llm-worker, vllm-chat-worker children,
-	// and any embedded Python subprocess. We match by pattern rather than PID
-	// tree because after reparenting the tree link is already gone.
-	reapWorkersExcept(directPid)
+	if rootPid == 0 {
+		return
+	}
+
+	// Brief grace period for graceful shutdown.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !pidAlive(rootPid) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// SIGKILL the whole descendant tree, then verify and retry. 15 attempts
+	// at 500ms each = ~7.5s wall-clock max — at that point any survivor is
+	// stuck in uninterruptible sleep (D-state) and the kernel needs help.
+	const maxAttempts = 15
+	var lastSurvivors []int
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		descendants := collectDescendants(rootPid)
+		if len(descendants) == 0 {
+			if attempt > 1 {
+				slog.Info("Kill: tree cleared", "root", rootPid, "attempts", attempt)
+			}
+			break
+		}
+		lastSurvivors = descendants
+		slog.Warn("Kill: SIGKILL descendant tree",
+			"root", rootPid, "attempt", attempt, "pids", descendants)
+		for _, pid := range descendants {
+			syscall.Kill(pid, syscall.SIGKILL)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if len(lastSurvivors) > 0 && pidAlive(rootPid) {
+		// We tried our best and something refuses to die. Log loudly so the
+		// VRAM audit + ops can investigate (probably a D-state thread).
+		slog.Error("Kill: tree NOT fully reaped after retries — possible D-state survivor",
+			"root", rootPid, "survivors", lastSurvivors)
+	}
+
+	// Pattern sweep for anything that escaped the tree walk (e.g. EngineCore
+	// already reparented to init when we started). Excludes new in-flight
+	// loads via the hasAncestor check inside reapWorkersExcept.
+	reapWorkersExcept(0)
+}
+
+// pidAlive returns true if a process with this PID exists and we can signal it.
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	return syscall.Kill(pid, 0) == nil
+}
+
+// collectDescendants returns rootPid plus every currently-alive transitive
+// descendant, in post-order (leaves first). This ordering matters: killing
+// leaves first prevents reparenting from breaking the tree mid-walk.
+func collectDescendants(rootPid int) []int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		// Non-Linux fallback: just the root if alive.
+		if pidAlive(rootPid) {
+			return []int{rootPid}
+		}
+		return nil
+	}
+	childrenOf := make(map[int][]int)
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		ppid := parentPid(pid)
+		if ppid > 0 {
+			childrenOf[ppid] = append(childrenOf[ppid], pid)
+		}
+	}
+	var out []int
+	visited := make(map[int]bool)
+	var walk func(p int)
+	walk = func(p int) {
+		if visited[p] {
+			return
+		}
+		visited[p] = true
+		for _, c := range childrenOf[p] {
+			walk(c)
+		}
+		if pidAlive(p) {
+			out = append(out, p)
+		}
+	}
+	walk(rootPid)
+	return out
 }
 
 // reapWorkersExcept scans for leftover arbiter worker processes and kills any
 // that aren't the named PID (which might still be winding down). Called from
-// Instance.Kill after the direct child is reaped.
+// Instance.Kill as a belt-and-braces sweep after the descendant-tree walk.
+//
+// Patterns include the Python multiprocessing children of vLLM (which rename
+// themselves to "VLLM::EngineCore" via setproctitle), since those reparent to
+// init the moment vllm serve dies and then aren't reachable via PPID walks.
 func reapWorkersExcept(excludePid int) {
 	patterns := []string{
 		"llama.cpp/build/bin/llama-server",
 		"arbiter/vllm-chat-worker",
 		"arbiter/llm-worker",
 		"arbiter.worker_main",
+		".venv-vllm/bin/vllm",
+		"VLLM::EngineCore",
+		"vllm.entrypoints",
 	}
 	selfPid := os.Getpid()
 	for _, pattern := range patterns {
@@ -517,9 +610,8 @@ func reapWorkersExcept(excludePid int) {
 			if err != nil || pid == selfPid || pid == excludePid {
 				continue
 			}
-			// Belt-and-braces: only kill processes that are NOT descendants of
-			// the running arbiter. llm-worker owns llama-server as a grandchild,
-			// so checking only direct PPID kills healthy newly loaded LLMs.
+			// Skip processes still rooted under the running arbiter — those
+			// are healthy in-flight loads, not orphans.
 			if hasAncestor(pid, selfPid) {
 				continue
 			}
