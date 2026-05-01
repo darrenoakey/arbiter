@@ -238,3 +238,15 @@ auto stop arbiter          # Stop
 auto restart arbiter       # Restart
 auto log arbiter           # View logs
 ```
+
+## Invariants (do not break)
+
+**One queue, one path.** Every inference (chat completion, streaming, image, TTS — everything) goes through `store.CreateJob` → scheduler picks → dispatch goroutine → release. No "fast paths," no "admin bypasses," no endpoints that proxy directly to a worker. The activeJobs counter is the only gate; nothing else may touch it. If you find yourself adding a `ReserveExternal`-style helper, stop — it always becomes a leak vector.
+
+**Streaming chat** uses the same queue via the stream-handoff registry: API handler creates a `chat-completion-stream` job, registers a handoff under the job ID, the scheduler's dispatch goroutine hands the picked instance back through `instCh` and blocks on `doneCh` until the handler finishes proxying SSE. Slot accounting is identical to non-streaming.
+
+**PickInstance** must never return an instance that lacks capacity. Loading instances at capacity also count — piling jobs onto a not-yet-loaded worker just stacks them up to fire all at once when load completes.
+
+**VRAM bookkeeping.** `usedGB` must equal sum(`memoryGB` for instances where `vramHeld == true`) ± float-drift tolerance. If no instance holds VRAM, `usedGB` must be zero. `AuditVRAMConsistency(ctx)` enforces this on every load/unload — if it fires, dump every instance's state and root-cause the leaking path.
+
+**Note on this CLAUDE.md.** Sections above describe the older Python architecture in `src/arbiter/`. The live system is the Go server in `cmd/arbiter/` (scheduler.go, proc.go, api.go, store.go). Treat the Python file paths as historical until that section is rewritten.
