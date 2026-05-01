@@ -354,11 +354,16 @@ func (s *Scheduler) getFullModels() map[string]bool {
 			full[modelID] = true
 			continue
 		}
-		active, _ := s.store.CountActive(modelID)
-		capacity := *cfg.MaxInstances * cfg.MaxConcurrent
-		if active >= capacity {
-			slog.Debug("scheduler.full: model at capacity",
-				"model", modelID, "active", active, "capacity", capacity,
+		// Capacity check uses the instance manager (atomic counters), NOT
+		// store.CountActive — they diverge during dispatch races, and the
+		// dispatcher gates on PickInstance which uses HasCapacity. If we use
+		// store state here, the scheduler picks a job for a model that has
+		// no instance capacity, then PickInstance returns nil, then the job
+		// bounces back to "queued" — and meanwhile other models with ready
+		// work and loaded instances are starved.
+		if !s.mgr.ModelHasAnyCapacity(modelID) {
+			slog.Debug("scheduler.full: no instance with capacity",
+				"model", modelID,
 				"max_concurrent", cfg.MaxConcurrent, "max_instances", *cfg.MaxInstances)
 			full[modelID] = true
 			continue
@@ -754,30 +759,59 @@ func (s *Scheduler) dispatchStreamHandoff(job *Job, inst *Instance) {
 }
 
 // tryPreload speculatively loads the next needed instance in the background.
+// tryPreload speculatively loads every model that has queued work and fits
+// in remaining free VRAM. Spare GPU memory is wasted memory — if there's
+// room for the next thing we're going to need, load it now while the current
+// thing is processing. The dispatcher will pick it up the moment a slot
+// opens, no cold-start latency on the critical path.
+//
+// Greedy by design: iterates all distinct models with pending work, loading
+// each that has an unloaded/stopped instance and fits. Multiple loads may
+// kick off in parallel; ensureLoaded's reservation path is atomic so the
+// race is benign — at worst one of them backs off when the budget is hit.
 func (s *Scheduler) tryPreload() {
-	full := s.getFullModels()
-	job, _ := s.store.PickNextJob(full)
-	if job == nil {
+	pending := s.pendingJobsByModel()
+	if len(pending) == 0 {
 		return
 	}
 
-	inst := s.mgr.PickInstance(job.ModelID)
-	if inst == nil {
-		return
-	}
+	// Reserve a small buffer so a real dispatch about to need VRAM isn't
+	// starved by speculative loads. 1GB is enough for small adapters.
+	const reserveBufferGB = 1.0
 
-	state := inst.State()
-	if state == "loaded" || state == "loading" {
-		return
-	}
-
-	if s.mgr.FreeGB() >= inst.memoryGB { // only preload if fits under budget
-		slog.Debug("preloading", "instance", inst.InstanceID)
-		go func() {
-			if err := s.ensureLoaded(inst); err != nil {
-				slog.Debug("preload failed", "instance", inst.InstanceID, "error", err)
+	for modelID, count := range pending {
+		if count == 0 {
+			continue
+		}
+		// Skip models the scheduler can't touch right now (circuit breakers,
+		// pressure budget). We deliberately do NOT use getFullModels here —
+		// "full" excludes models at MaxConcurrent, but those still have
+		// loaded instances; preloading them is a no-op anyway because their
+		// instances are already loaded. We just want to find unloaded
+		// instances we can warm up.
+		if paused, _ := s.IsModelLoadPaused(modelID); paused {
+			continue
+		}
+		inst := s.mgr.PickInstance(modelID)
+		if inst == nil {
+			continue
+		}
+		state := inst.State()
+		if state == "loaded" || state == "loading" {
+			continue
+		}
+		freeGB := s.mgr.FreeGB() - reserveBufferGB
+		if freeGB < inst.memoryGB {
+			continue
+		}
+		slog.Info("preloading next-needed model",
+			"instance", inst.InstanceID, "memory_gb", inst.memoryGB,
+			"free_gb_after_buffer", freeGB, "queued_jobs", count)
+		go func(i *Instance) {
+			if err := s.ensureLoaded(i); err != nil {
+				slog.Debug("preload failed", "instance", i.InstanceID, "error", err)
 			}
-		}()
+		}(inst)
 	}
 }
 

@@ -728,6 +728,30 @@ func (m *InstanceManager) GetModelInstances(modelID string) []*Instance {
 
 // PickInstance finds the best instance for a new job.
 // Returns nil if all instances are at capacity.
+// ModelHasAnyCapacity returns true if at least one instance for this model
+// could accept a new job right now: a loaded/loading instance with HasCapacity,
+// OR an unloaded/stopped instance (which has trivial capacity, just needs a
+// cold start). Used by the scheduler's getFullModels so the "full" decision
+// stays consistent with what PickInstance will actually return.
+func (m *InstanceManager) ModelHasAnyCapacity(modelID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	ids := m.byModel[modelID]
+	for _, id := range ids {
+		inst := m.instances[id]
+		state := inst.State()
+		switch state {
+		case "loaded", "loading":
+			if inst.HasCapacity() {
+				return true
+			}
+		case "unloaded", "stopped":
+			return true
+		}
+	}
+	return false
+}
+
 func (m *InstanceManager) PickInstance(modelID string) *Instance {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
