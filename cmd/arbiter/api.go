@@ -125,12 +125,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/llm/models", a.listLLMs)
 	mux.HandleFunc("DELETE /v1/llm/models/{name}", a.deregisterLLM)
 	mux.HandleFunc("POST /v1/chat/completions", a.chatCompletion)
-	mux.HandleFunc("GET /v1/admin/benchmark", a.benchmarkStatus)
-	mux.HandleFunc("POST /v1/admin/benchmark/enable", a.benchmarkEnable)
-	mux.HandleFunc("POST /v1/admin/benchmark/disable", a.benchmarkDisable)
 	mux.HandleFunc("POST /v1/admin/models/unload_all", a.adminUnloadAll)
 	mux.HandleFunc("POST /v1/admin/models/preload", a.adminPreload)
-	mux.HandleFunc("POST /v1/admin/benchmark/chat", a.adminBenchmarkChat)
 	mux.HandleFunc("GET /v1/health", a.health)
 	return withLogging(mux)
 }
@@ -1574,53 +1570,73 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// chatCompletionStream handles streaming chat completions by proxying SSE
-// directly from llama-server to the client, bypassing the job system.
+// chatCompletionStream enqueues a chat-completion-stream job and waits for
+// the scheduler to dispatch it. The scheduler calls dispatchStreamHandoff,
+// which hands the picked instance back to this handler via the handoff
+// registry. This handler then proxies SSE from the worker to the client and
+// signals completion. There is one queue and one MaxConcurrent — streaming
+// and non-streaming jobs share it.
 func (a *API) chatCompletionStream(w http.ResponseWriter, r *http.Request, modelID string, body []byte) {
-	// Ensure model is loaded
-	instances := a.scheduler.mgr.GetModelInstances(modelID)
-	if len(instances) == 0 {
-		writeError(w, 500, "no instances for model")
+	priority := a.scheduler.computePriority(modelID)
+	job, err := a.store.CreateJob(modelID, "chat-completion-stream", json.RawMessage(body), priority)
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("create job: %s", err))
 		return
 	}
-	inst := instances[0]
+	handoff := a.scheduler.RegisterStreamHandoff(job.ID)
+	a.scheduler.Wake()
 
-	if err := a.scheduler.ensureLoaded(inst); err != nil {
-		writeError(w, 503, fmt.Sprintf("model not ready: %s", err))
+	// Wait for the scheduler to dispatch (i.e. for a slot to open under
+	// MaxConcurrent). Honour client cancellation so we don't hold a slot
+	// for a client that gave up.
+	var inst *Instance
+	select {
+	case inst = <-handoff.instCh:
+	case <-r.Context().Done():
+		// Client gave up before we got a slot. The scheduler's handoff wait
+		// will time out; mark the job cancelled now so it doesn't sit as
+		// "running" forever once dispatched.
+		a.scheduler.UnregisterStreamHandoff(job.ID)
+		a.store.UpdateState(job.ID, "cancelled", WithFinishedAt(nowTS()))
+		return
+	case <-time.After(15 * time.Minute):
+		a.scheduler.UnregisterStreamHandoff(job.ID)
+		a.store.UpdateState(job.ID, "failed",
+			WithError("queued >15min waiting for slot"), WithFinishedAt(nowTS()))
+		writeError(w, 504, "chat completion timed out waiting for slot")
 		return
 	}
 
-	// Streaming bypasses the scheduler's normal job accounting, so reserve the
-	// instance here to keep keepalive and condemn/evict paths from unloading the
-	// worker while the SSE stream is still active.
-	inst.ReserveExternal()
-	defer inst.ReleaseExternal()
+	// Got a slot. Proxy SSE from the worker to the client, then signal done.
+	streamErr := proxyStreamFromInstance(w, r, inst, body)
+	handoff.doneCh <- streamErr
+}
 
-	// Get the llama-server port from the worker
+// proxyStreamFromInstance opens an HTTP stream against the worker's
+// llama-server / vLLM port and pipes SSE bytes through to the client. Returns
+// any transport-level error so the scheduler can mark the job appropriately.
+func proxyStreamFromInstance(w http.ResponseWriter, r *http.Request, inst *Instance, body []byte) error {
 	port, err := inst.GetPort()
 	if err != nil {
-		writeError(w, 500, fmt.Sprintf("get llama-server port: %s", err))
-		return
+		writeError(w, 500, fmt.Sprintf("get worker port: %s", err))
+		return err
 	}
-
-	// Proxy the request directly to llama-server
-	llamaURL := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", port)
-	proxyReq, err := http.NewRequestWithContext(r.Context(), "POST", llamaURL, bytes.NewReader(body))
+	target := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", port)
+	proxyReq, err := http.NewRequestWithContext(r.Context(), "POST", target, bytes.NewReader(body))
 	if err != nil {
 		writeError(w, 500, fmt.Sprintf("create proxy request: %s", err))
-		return
+		return err
 	}
 	proxyReq.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Minute}
+	client := &http.Client{Timeout: 30 * time.Minute}
 	resp, err := client.Do(proxyReq)
 	if err != nil {
-		writeError(w, 502, fmt.Sprintf("llama-server error: %s", err))
-		return
+		writeError(w, 502, fmt.Sprintf("worker error: %s", err))
+		return err
 	}
 	defer resp.Body.Close()
 
-	// Copy headers from llama-server response
 	for k, vv := range resp.Header {
 		for _, v := range vv {
 			w.Header().Add(k, v)
@@ -1628,50 +1644,31 @@ func (a *API) chatCompletionStream(w http.ResponseWriter, r *http.Request, model
 	}
 	w.WriteHeader(resp.StatusCode)
 
-	// Stream the response body directly to the client
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		io.Copy(w, resp.Body)
-		return
+		_, copyErr := io.Copy(w, resp.Body)
+		return copyErr
 	}
-
 	buf := make([]byte, 4096)
 	for {
-		n, err := resp.Body.Read(buf)
+		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			w.Write(buf[:n])
 			flusher.Flush()
 		}
-		if err != nil {
-			break
+		if rerr != nil {
+			if rerr == io.EOF {
+				return nil
+			}
+			return rerr
 		}
 	}
 }
 
-// --- Benchmark / Admin ---
+// --- Admin ---
 //
-// Benchmark mode pauses dispatch so external jobs queue but do not run,
-// freeing the GPU/CPU for controlled performance measurement. The admin
-// endpoints also let the operator unload all models (clean baseline) and
+// Admin endpoints let the operator unload all models (clean baseline) and
 // preload a single model without running a job (fair load-time measurement).
-
-func (a *API) benchmarkStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{
-		"paused": a.scheduler.IsDispatchPaused(),
-	})
-}
-
-func (a *API) benchmarkEnable(w http.ResponseWriter, r *http.Request) {
-	a.scheduler.PauseDispatch()
-	a.logger.Log("benchmark.enable", map[string]any{})
-	writeJSON(w, 200, map[string]any{"paused": true})
-}
-
-func (a *API) benchmarkDisable(w http.ResponseWriter, r *http.Request) {
-	a.scheduler.ResumeDispatch()
-	a.logger.Log("benchmark.disable", map[string]any{})
-	writeJSON(w, 200, map[string]any{"paused": false})
-}
 
 func (a *API) adminUnloadAll(w http.ResponseWriter, r *http.Request) {
 	totalKilled := 0
@@ -1715,106 +1712,6 @@ func (a *API) cachedWorkerPort(inst *Instance) (int, error) {
 	a.portCache[inst.InstanceID] = portCacheEntry{port: port, loadedAt: time.Now()}
 	a.portCacheMu.Unlock()
 	return port, nil
-}
-
-// adminBenchmarkChat proxies a chat-completion request directly to the
-// already-loaded worker, bypassing the scheduler/queue. This is what the
-// benchmark runner uses while dispatch is paused — the queue grows as
-// external jobs arrive but the runner's measurement traffic still flows.
-//
-// Body shape: {"model_id": "...", "params": {<openai chat completion>}}.
-// Response is the worker's raw OpenAI response.
-func (a *API) adminBenchmarkChat(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		ModelID string          `json:"model_id"`
-		Params  json.RawMessage `json:"params"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ModelID == "" || len(body.Params) == 0 {
-		writeError(w, 400, "model_id and params required")
-		return
-	}
-	insts := a.mgr.GetModelInstances(body.ModelID)
-	if len(insts) == 0 {
-		writeError(w, 404, "no instances for model — preload first")
-		return
-	}
-	// Pick the first instance and ensure it's loaded. Benchmark traffic must
-	// not depend on the scheduler/watchdog leaving the model resident — the
-	// memory_watchdog and idle-eviction paths run independently of dispatch
-	// pause and could evict a freshly-preloaded model right under us. So we
-	// load lazily here if needed.
-	inst := insts[0]
-	// Wait up to 5 minutes for the instance to be loaded. If it's currently
-	// loading (e.g. concurrent benchmark traffic triggered ensureLoaded),
-	// poll the state. If unloaded, kick off ensureLoaded ourselves.
-	deadline := time.Now().Add(5 * time.Minute)
-	for inst.State() != "loaded" {
-		state := inst.State()
-		if state == "unloaded" {
-			if err := a.scheduler.ensureLoaded(inst); err != nil {
-				// "already loading" means another goroutine beat us to it —
-				// fall through and poll.
-				if !strings.Contains(err.Error(), "already loading") {
-					writeError(w, 503, fmt.Sprintf("instance not loadable: %s", err))
-					return
-				}
-			}
-		}
-		if time.Now().After(deadline) {
-			writeError(w, 503, fmt.Sprintf("instance not loaded after 5min (state=%s)", state))
-			return
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	inst.ReserveExternal()
-	defer inst.ReleaseExternal()
-
-	// Cache the worker port per instance — GetPort uses the worker stdin/stdout
-	// protocol with a non-unique default reqID, so calling it from concurrent
-	// goroutines races (one channel overwrites the other). Once a model is
-	// loaded the port is stable, so a one-shot lookup is safe.
-	port, err := a.cachedWorkerPort(inst)
-	if err != nil {
-		writeError(w, 500, fmt.Sprintf("get worker port: %s", err))
-		return
-	}
-	// vLLM requires the params.model to match what's actually loaded (e.g.
-	// "RedHatAI/gemma-4-26B-A4B-it-NVFP4"); llama-server accepts any name.
-	// Rewrite params.model to the registered VLLM_MODEL / LLM_HF_REPO so the
-	// caller can use the friendly arbiter name unchanged.
-	cfg := a.config.Models[body.ModelID]
-	canonical := cfg.AdapterParams["VLLM_MODEL"]
-	if canonical == "" {
-		canonical = cfg.AdapterParams["LLM_HF_REPO"]
-	}
-	rewritten := body.Params
-	if canonical != "" {
-		var pm map[string]any
-		if err := json.Unmarshal(body.Params, &pm); err == nil {
-			pm["model"] = canonical
-			if buf, err := json.Marshal(pm); err == nil {
-				rewritten = buf
-			}
-		}
-	}
-	target := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", port)
-	proxyReq, err := http.NewRequestWithContext(r.Context(), "POST", target, bytes.NewReader(rewritten))
-	if err != nil {
-		writeError(w, 500, fmt.Sprintf("build proxy request: %s", err))
-		return
-	}
-	proxyReq.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 30 * time.Minute}
-	resp, err := client.Do(proxyReq)
-	if err != nil {
-		writeError(w, 502, fmt.Sprintf("worker error: %s", err))
-		return
-	}
-	defer resp.Body.Close()
-	out, _ := io.ReadAll(resp.Body)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	w.Write(out)
 }
 
 // adminPreload loads a model without running a job. Returns load time and a

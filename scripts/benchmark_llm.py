@@ -11,16 +11,18 @@ both serving the same checkpoint at the same quant) across:
   - VRAM + RSS snapshots from /v1/ps
 
 Procedure:
-  1. POST /v1/admin/benchmark/enable      → pause external dispatch
-  2. POST /v1/admin/models/unload_all     → clean baseline
-  3. For each model under test:
+  1. POST /v1/admin/models/unload_all     → clean baseline
+  2. For each model under test:
        - POST /v1/admin/models/preload    → cold load time + memory
        - POST /v1/admin/models/preload    → warm load time
-       - For each prompt size: 3 runs single-request, record tokens/sec
+       - For each prompt size: 3 runs single-request via /v1/chat/completions
        - For each N in concurrency sweep: time aggregate, record throughput + p50/p95
        - POST /v1/admin/models/unload_all
-  4. POST /v1/admin/benchmark/disable
-  5. Write JSON + self-contained HTML report; open HTML in browser.
+  3. Write JSON + self-contained HTML report; open HTML in browser.
+
+Note: there is no benchmark bypass. Every chat call runs through the same
+queue + MaxConcurrent gate as production traffic. To get clean numbers, run
+the script when the arbiter is otherwise idle.
 
 The report's headline output per backend is the recommended max_concurrent —
 the largest N where throughput gain over N/2 is >= 5% AND p95 latency stays
@@ -177,14 +179,6 @@ def _http_get(url: str, timeout: float = 30) -> dict:
         return json.loads(resp.read())
 
 
-def admin_enable_benchmark(base: str) -> None:
-    _http_post(f"{base}/v1/admin/benchmark/enable")
-
-
-def admin_disable_benchmark(base: str) -> None:
-    _http_post(f"{base}/v1/admin/benchmark/disable")
-
-
 def admin_unload_all(base: str) -> dict:
     return _http_post(f"{base}/v1/admin/models/unload_all")
 
@@ -221,20 +215,21 @@ def memory_for_model(ps: dict, model_id: str) -> dict[str, float]:
 
 def chat_once(base: str, model_id: str, model_name: str, prompt: str,
               max_tokens: int, reasoning: bool) -> RunResult:
-    """Send one chat completion via the benchmark-direct endpoint, bypassing
-    the scheduler/queue (which is paused during a benchmark run).
+    """Send one chat completion via the normal /v1/chat/completions endpoint.
+    The arbiter has one queue and one MaxConcurrent — there is no benchmark
+    bypass. To get clean numbers, pause non-benchmark traffic via
+    /v1/admin/benchmark/enable before the run.
     `reasoning=True` asks the model to chain-of-think; False tries to suppress."""
-    inner = {
+    payload = {
         "model": model_name,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "chat_template_kwargs": {"enable_thinking": reasoning},
     }
-    payload = {"model_id": model_id, "params": inner}
     t0 = time.perf_counter()
     try:
-        resp = _http_post(f"{base}/v1/admin/benchmark/chat", payload, timeout=REQUEST_TIMEOUT_S)
+        resp = _http_post(f"{base}/v1/chat/completions", payload, timeout=REQUEST_TIMEOUT_S)
     except Exception as e:
         return RunResult(ok=False, elapsed_s=time.perf_counter() - t0, error=str(e))
     elapsed = time.perf_counter() - t0
@@ -533,30 +528,21 @@ def main() -> int:
     model_ids = [m.strip() for m in args.models.split(",") if m.strip()]
 
     print(f"Arbiter: {base}", flush=True)
-    print(f"Enabling benchmark mode (external dispatch will pause)...", flush=True)
-    admin_enable_benchmark(base)
-    try:
-        reports: list[ModelReport] = []
-        for mid in model_ids:
-            print(f"\n=== Running {mid} ===", flush=True)
-            # Look up backend + name from the live config (URL-quote the colon).
-            from urllib.parse import quote
-            try:
-                cfg = _http_get(f"{base}/v1/models/{quote(mid, safe='')}")
-            except Exception:
-                cfg = {}
-            name = cfg.get("llm_name") or mid.split(":", 1)[-1]
-            backend = (cfg.get("adapter_params", {}) or {}).get("LLM_BACKEND", "llamacpp")
-            rep = run_for_model(base, mid, name, backend)
-            reports.append(rep)
-            print(f"  cold load: {rep.cold_load_s:.1f}s | recommended max_concurrent: {rep.recommended_max_concurrent}",
-                  flush=True)
-    finally:
-        print("\nDisabling benchmark mode (queue will drain)...", flush=True)
+    reports: list[ModelReport] = []
+    for mid in model_ids:
+        print(f"\n=== Running {mid} ===", flush=True)
+        # Look up backend + name from the live config (URL-quote the colon).
+        from urllib.parse import quote
         try:
-            admin_disable_benchmark(base)
-        except Exception as e:
-            print(f"  WARN: failed to disable benchmark mode: {e}", file=sys.stderr)
+            cfg = _http_get(f"{base}/v1/models/{quote(mid, safe='')}")
+        except Exception:
+            cfg = {}
+        name = cfg.get("llm_name") or mid.split(":", 1)[-1]
+        backend = (cfg.get("adapter_params", {}) or {}).get("LLM_BACKEND", "llamacpp")
+        rep = run_for_model(base, mid, name, backend)
+        reports.append(rep)
+        print(f"  cold load: {rep.cold_load_s:.1f}s | recommended max_concurrent: {rep.recommended_max_concurrent}",
+              flush=True)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

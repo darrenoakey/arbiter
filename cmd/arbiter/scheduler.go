@@ -22,7 +22,6 @@ type Scheduler struct {
 	inboxDir        string // if set, input files are deleted after job completion/failure
 	wake            chan struct{}
 	shuttingDown    atomic.Bool
-	dispatchPaused  atomic.Bool // benchmark mode: queue grows but no dispatch
 	cooldownMu      sync.Mutex
 	cooldownUntil   map[string]time.Time // model -> skip until this time (load failures)
 	pressureMu      sync.Mutex
@@ -44,6 +43,18 @@ type Scheduler struct {
 	// behind it is starved. Map is reset on successful load or terminal state.
 	loadAttemptsMu sync.Mutex
 	loadAttempts   map[string]int
+	// Stream handoff: when a chat-completion-stream job is dispatched the
+	// scheduler hands the picked instance to the API handler via instCh,
+	// then blocks on doneCh until the handler finishes proxying SSE. The
+	// slot remains reserved (via the same activeJobs accounting as any
+	// other job) for the entire stream duration.
+	streamMu       sync.Mutex
+	streamHandoffs map[string]*streamHandoff
+}
+
+type streamHandoff struct {
+	instCh chan *Instance
+	doneCh chan error
 }
 
 const maxLoadAttempts = 3
@@ -79,6 +90,47 @@ func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *Event
 		loadFailurePaused:        make(map[string]time.Time),
 		loadFailureCooldownLevel: make(map[string]int),
 		loadAttempts:             make(map[string]int),
+		streamHandoffs:           make(map[string]*streamHandoff),
+	}
+}
+
+// RegisterStreamHandoff is called by the streaming-chat API handler before it
+// waits for dispatch. The returned handoff carries the instance from the
+// scheduler to the handler (instCh) and the completion signal back (doneCh).
+func (s *Scheduler) RegisterStreamHandoff(jobID string) *streamHandoff {
+	h := &streamHandoff{
+		instCh: make(chan *Instance, 1),
+		doneCh: make(chan error, 1),
+	}
+	s.streamMu.Lock()
+	s.streamHandoffs[jobID] = h
+	s.streamMu.Unlock()
+	return h
+}
+
+// UnregisterStreamHandoff removes a handoff entry. Idempotent.
+func (s *Scheduler) UnregisterStreamHandoff(jobID string) {
+	s.streamMu.Lock()
+	delete(s.streamHandoffs, jobID)
+	s.streamMu.Unlock()
+}
+
+// waitForStreamHandoff polls briefly for the API handler to register a
+// handoff. Returns nil if the handler never registered (handler abandoned
+// before the scheduler picked the job, or crashed).
+func (s *Scheduler) waitForStreamHandoff(jobID string, timeout time.Duration) *streamHandoff {
+	deadline := time.Now().Add(timeout)
+	for {
+		s.streamMu.Lock()
+		h := s.streamHandoffs[jobID]
+		s.streamMu.Unlock()
+		if h != nil {
+			return h
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -92,25 +144,6 @@ func (s *Scheduler) Wake() {
 
 func (s *Scheduler) MarkShuttingDown() {
 	s.shuttingDown.Store(true)
-}
-
-// PauseDispatch halts new job dispatch. Queued jobs remain queued; in-flight
-// jobs run to completion. Used for benchmark mode so external work pauses
-// without being lost. Resets to false on process restart.
-func (s *Scheduler) PauseDispatch() {
-	s.dispatchPaused.Store(true)
-}
-
-// ResumeDispatch resumes normal dispatch. Wakes the scheduler so the queue
-// drains immediately.
-func (s *Scheduler) ResumeDispatch() {
-	s.dispatchPaused.Store(false)
-	s.Wake()
-}
-
-// IsDispatchPaused reports whether benchmark mode is active.
-func (s *Scheduler) IsDispatchPaused() bool {
-	return s.dispatchPaused.Load()
 }
 
 func (s *Scheduler) shouldRequeueForShutdown(err error, resp *WorkerResponse) bool {
@@ -445,6 +478,7 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 			"instance_id": inst.InstanceID,
 			"memory_gb":   inst.memoryGB,
 		})
+		s.mgr.AuditVRAMConsistency("post-load:" + inst.InstanceID)
 		s.rescoreModel(inst.ModelID)
 	}
 
@@ -536,6 +570,14 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 		"model_id":    job.ModelID,
 		"instance_id": inst.InstanceID,
 	})
+
+	// Streaming chat goes through the queue like everything else. The API
+	// handler did the SSE proxying; the scheduler just holds the slot until
+	// the handler signals done. Same activeJobs accounting as any other job.
+	if job.JobType == "chat-completion-stream" {
+		s.dispatchStreamHandoff(job, inst)
+		return
+	}
 
 	// Run inference (blocking) — we use InferRaw which skips activeJobs management
 	jobDir := filepath.Join(s.outputDir, "jobs", job.ID)
@@ -656,6 +698,61 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 	s.Wake() // check for more work
 }
 
+// dispatchStreamHandoff hands the picked instance to the API handler that's
+// waiting on a chat-completion-stream job, then blocks until the handler
+// reports the SSE stream is finished. The slot is held for the entire
+// duration via the same activeJobs reservation as any other job.
+func (s *Scheduler) dispatchStreamHandoff(job *Job, inst *Instance) {
+	const handoffWait = 5 * time.Second
+	const streamMax = 30 * time.Minute
+
+	h := s.waitForStreamHandoff(job.ID, handoffWait)
+	if h == nil {
+		errMsg := "stream handler did not register handoff"
+		s.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
+		s.logger.Log("job.failed", map[string]any{
+			"job_id": job.ID, "model_id": job.ModelID, "error": errMsg,
+		})
+		slog.Warn("stream handoff timeout — handler abandoned", "job", job.ID)
+		return
+	}
+	defer s.UnregisterStreamHandoff(job.ID)
+
+	// Hand the instance to the API handler.
+	h.instCh <- inst
+
+	// Wait for the handler to finish proxying SSE (or error / disconnect).
+	start := time.Now()
+	select {
+	case err := <-h.doneCh:
+		elapsed := time.Since(start).Seconds()
+		if err != nil {
+			errMsg := fmt.Sprintf("stream error: %s", err)
+			s.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
+			s.logger.Log("job.failed", map[string]any{
+				"job_id": job.ID, "model_id": job.ModelID,
+				"error": errMsg, "inference_seconds": elapsed,
+			})
+			s.RecordFailure(job.ModelID)
+			return
+		}
+		s.store.UpdateState(job.ID, "completed", WithFinishedAt(nowTS()))
+		s.logger.Log("job.completed", map[string]any{
+			"job_id": job.ID, "model_id": job.ModelID,
+			"inference_seconds": elapsed, "stream": true,
+		})
+		s.RecordSuccess(job.ModelID)
+	case <-time.After(streamMax):
+		errMsg := fmt.Sprintf("stream exceeded %s", streamMax)
+		s.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
+		s.logger.Log("job.failed", map[string]any{
+			"job_id": job.ID, "model_id": job.ModelID, "error": errMsg,
+		})
+		s.RecordFailure(job.ModelID)
+		slog.Warn("stream handoff timeout — handler stuck", "job", job.ID)
+	}
+}
+
 // tryPreload speculatively loads the next needed instance in the background.
 func (s *Scheduler) tryPreload() {
 	full := s.getFullModels()
@@ -699,13 +796,6 @@ func (s *Scheduler) Run(ctx context.Context) {
 			return
 		case <-s.wake:
 		case <-ticker.C:
-		}
-
-		// Benchmark mode: queue still accepts jobs but dispatch is suspended.
-		// In-flight jobs already dispatched run to completion via their own
-		// goroutines; only this picker stops handing out new work.
-		if s.dispatchPaused.Load() {
-			continue
 		}
 
 		// Real queued work outranks warm residency. If there is backlog for any

@@ -216,33 +216,8 @@ func (inst *Instance) readLoop() {
 	}
 
 	// stdout closed — subprocess is gone. Clean up references and unblock all
-	// pending requests. Distinguish a deliberate shutdown (Unload/Kill already
-	// transitioned state to "unloading"/"stopped") from an unexpected death:
-	// only flag the instance as "error" in the latter case. Otherwise the
-	// readLoop's exit on a normal eviction would overwrite Kill()'s "stopped"
-	// state and trigger a spurious model.health_reset(error_state_reset)
-	// event a few seconds later when the health watchdog tidied it up.
-	inst.mu.Lock()
-	deliberateShutdown := inst.state == "unloading" || inst.state == "stopped"
-	if deliberateShutdown {
-		slog.Info("readLoop exited after deliberate shutdown", "instance", inst.InstanceID, "state", inst.state)
-	} else {
-		slog.Warn("readLoop exited, subprocess died", "instance", inst.InstanceID, "prior_state", inst.state)
-		inst.state = "error"
-		// Drop the bookkeeping flag immediately. ReconcileFromInstances (run
-		// by the VRAM watchdog) will reclaim the leaked usedGB on its next
-		// tick. Before this fix, an unexpected worker death left vramHeld
-		// true and usedGB inflated forever — eventually no model could load.
-		inst.vramHeld = false
-	}
-	// Clear dead process references so Snapshot doesn't report a stale PID.
-	// The process is already dead (stdout pipe closed), so just nil the refs.
-	if inst.stdin != nil {
-		inst.stdin.Close()
-		inst.stdin = nil
-	}
-	inst.cmd = nil
-	inst.mu.Unlock()
+	// pending requests.
+	inst.markSubprocessExited()
 
 	inst.pendingMu.Lock()
 	for reqID, ch := range inst.pending {
@@ -255,6 +230,38 @@ func (inst *Instance) readLoop() {
 		delete(inst.pending, reqID)
 	}
 	inst.pendingMu.Unlock()
+}
+
+// markSubprocessExited finalises an instance whose worker subprocess has gone
+// away. Called by readLoop on stdout close. It distinguishes a deliberate
+// shutdown (Unload/Kill already transitioned state to "unloading"/"stopped")
+// from an unexpected death: only the latter flips state to "error". The VRAM
+// bookkeeping flag is cleared in BOTH cases — a dead subprocess holds zero
+// VRAM regardless of who killed it.
+//
+// Before this was unconditional, code paths that called Kill() without pairing
+// with ReleaseMemoryFor (e.g. the inference-timeout watchdog at
+// scheduler.go:558) left vramHeld=true on a stopped instance forever, and
+// because ReconcileFromInstances sums vramHeld instances into `expected`, the
+// leak was indistinguishable from a live reservation. Repeated timeouts then
+// exhausted the budget with phantom allocations (observed: 83 GB phantom from
+// llm:gemma4-26b @ 80.8 GB after one max_runtime_seconds kill).
+func (inst *Instance) markSubprocessExited() {
+	inst.mu.Lock()
+	deliberateShutdown := inst.state == "unloading" || inst.state == "stopped"
+	if deliberateShutdown {
+		slog.Info("readLoop exited after deliberate shutdown", "instance", inst.InstanceID, "state", inst.state)
+	} else {
+		slog.Warn("readLoop exited, subprocess died", "instance", inst.InstanceID, "prior_state", inst.state)
+		inst.state = "error"
+	}
+	inst.vramHeld = false
+	if inst.stdin != nil {
+		inst.stdin.Close()
+		inst.stdin = nil
+	}
+	inst.cmd = nil
+	inst.mu.Unlock()
 }
 
 // sendAndReceive sends a command and waits for the response.
@@ -358,41 +365,6 @@ func (inst *Instance) Load(device string) error {
 
 	slog.Info("model loaded", "instance", inst.InstanceID)
 	return nil
-}
-
-// Infer sends an inference command. Increments/decrements activeJobs.
-func (inst *Instance) Infer(jobID, jobType string, params json.RawMessage, outputDir string) (*WorkerResponse, error) {
-	atomic.AddInt32(&inst.activeJobs, 1)
-	defer func() {
-		atomic.AddInt32(&inst.activeJobs, -1)
-		inst.mu.Lock()
-		inst.lastActive = time.Now()
-		inst.mu.Unlock()
-	}()
-
-	return inst.sendAndReceive(map[string]any{
-		"cmd":        "infer",
-		"req_id":     jobID,
-		"params":     json.RawMessage(params),
-		"output_dir": outputDir,
-		"job_id":     jobID,
-		"job_type":   jobType,
-	})
-}
-
-// ReserveExternal increments activeJobs for request paths that bypass the normal
-// job dispatch flow, such as direct streaming proxies to llama-server.
-func (inst *Instance) ReserveExternal() {
-	atomic.AddInt32(&inst.activeJobs, 1)
-}
-
-// ReleaseExternal decrements activeJobs and refreshes lastActive for request
-// paths that bypass Infer/ReleaseAndCheck.
-func (inst *Instance) ReleaseExternal() {
-	atomic.AddInt32(&inst.activeJobs, -1)
-	inst.mu.Lock()
-	inst.lastActive = time.Now()
-	inst.mu.Unlock()
 }
 
 // InferRaw sends an inference command without managing activeJobs.
@@ -673,11 +645,22 @@ func (m *InstanceManager) PickInstance(modelID string) *Instance {
 		return nil
 	}
 
+	// MaxConcurrent applies regardless of lifecycle state. A loading
+	// instance that already has MaxConcurrent jobs reserved against it
+	// must not get more piled on — they would all unblock simultaneously
+	// once the load finishes and overwhelm the worker. So every branch
+	// below checks HasCapacity().
+
 	// 1. Loaded with capacity (least busy first)
 	var bestLoaded *Instance
+	anyOnPath := false // a loaded or loading instance exists, even if full
 	for _, id := range ids {
 		inst := m.instances[id]
-		if inst.State() == "loaded" && inst.HasCapacity() {
+		state := inst.State()
+		if state == "loaded" || state == "loading" {
+			anyOnPath = true
+		}
+		if state == "loaded" && inst.HasCapacity() {
 			if bestLoaded == nil || inst.ActiveJobs() < bestLoaded.ActiveJobs() {
 				bestLoaded = inst
 			}
@@ -695,16 +678,26 @@ func (m *InstanceManager) PickInstance(modelID string) *Instance {
 		}
 	}
 
-	// 3. Unloaded or stopped with capacity (needs cold start)
+	// If a loaded/loading instance exists but all are at capacity, refuse
+	// to dispatch — wait for a slot to free up rather than cold-starting
+	// a redundant instance or piling more onto a wedged one.
+	if anyOnPath {
+		return nil
+	}
+
+	// 3. Unloaded or stopped (needs cold start). HasCapacity is trivially
+	// true for these (activeJobs == 0), but we still gate on it so the
+	// rule "no instance is ever picked while at capacity" holds uniformly.
 	for _, id := range ids {
 		inst := m.instances[id]
 		s := inst.State()
-		if s == "unloaded" || s == "stopped" {
+		if (s == "unloaded" || s == "stopped") && inst.HasCapacity() {
 			return inst
 		}
 	}
 
-	// 4. All errored — return first for retry
+	// 4. All errored — return first for retry. Only reachable when no
+	// instance is loaded, loading, unloaded, or stopped.
 	return m.instances[ids[0]]
 }
 
@@ -940,10 +933,68 @@ func (m *InstanceManager) ReconcileFromInstances() float64 {
 		freed := m.usedGB - expected
 		slog.Warn("vram reconcile: reclaiming orphan bookkeeping",
 			"old_used_gb", m.usedGB, "expected_gb", expected, "freed_gb", freed)
+		m.dumpVRAMStateLocked("reconcile-mismatch")
 		m.usedGB = expected
 		return freed
 	}
 	return 0
+}
+
+// AuditVRAMConsistency asserts that bookkeeping (usedGB) matches the sum of
+// memoryGB across instances flagged vramHeld. Call this after every load,
+// unload, eviction, or anything that touches the VRAM ledger. The whole point:
+// it should be trivially impossible for the ledger to drift, so if this ever
+// fires we want a full snapshot of every instance's state to root-cause it.
+//
+// ctx is a short label ("post-load", "post-unload", "shutdown") used in the
+// log so we can identify which path produced the drift.
+func (m *InstanceManager) AuditVRAMConsistency(ctx string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	expected := 0.0
+	holders := 0
+	for _, inst := range m.instances {
+		inst.mu.Lock()
+		if inst.vramHeld {
+			expected += inst.memoryGB
+			holders++
+		}
+		inst.mu.Unlock()
+	}
+	const tolerance = 0.5
+	drift := m.usedGB - expected
+	if drift < 0 {
+		drift = -drift
+	}
+	if drift > tolerance {
+		slog.Error("VRAM audit FAILED — bookkeeping drift",
+			"ctx", ctx, "used_gb", m.usedGB, "expected_gb", expected,
+			"drift_gb", drift, "holders", holders)
+		m.dumpVRAMStateLocked("audit-drift:" + ctx)
+		return
+	}
+	// Stronger invariant: when no instance holds VRAM, usedGB MUST be zero.
+	if holders == 0 && m.usedGB > tolerance {
+		slog.Error("VRAM audit FAILED — usedGB non-zero with no holders",
+			"ctx", ctx, "used_gb", m.usedGB)
+		m.dumpVRAMStateLocked("audit-no-holders:" + ctx)
+	}
+}
+
+// dumpVRAMStateLocked logs every instance's VRAM-relevant state. Caller must
+// hold m.mu. Used by audit/reconcile when a mismatch is detected so we can
+// see which paths leaked.
+func (m *InstanceManager) dumpVRAMStateLocked(reason string) {
+	slog.Error("VRAM state dump", "reason", reason,
+		"used_gb", m.usedGB, "reserved_gb", m.reservedGB, "budget_gb", m.budgetGB)
+	for _, inst := range m.instances {
+		inst.mu.Lock()
+		slog.Error("  instance",
+			"id", inst.InstanceID, "model", inst.ModelID,
+			"state", inst.state, "vram_held", inst.vramHeld,
+			"memory_gb", inst.memoryGB, "active_jobs", atomic.LoadInt32(&inst.activeJobs))
+		inst.mu.Unlock()
+	}
 }
 
 // EvictForGB tries to free enough memory by unloading idle instances.

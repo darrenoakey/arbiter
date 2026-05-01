@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -332,6 +333,13 @@ func TestChatCompletionStreamReservesInstanceWhileStreaming(t *testing.T) {
 	api, cleanup := newTestAPI(t)
 	defer cleanup()
 
+	// Streaming chat now goes through the queue like everything else, so the
+	// scheduler must be running to dispatch the job and hand the picked
+	// instance back to the API handler via the stream-handoff registry.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go api.scheduler.Run(ctx)
+
 	upstreamDone := make(chan struct{})
 	upstreamRelease := make(chan struct{})
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -363,10 +371,12 @@ func TestChatCompletionStreamReservesInstanceWhileStreaming(t *testing.T) {
 	workerPath := filepath.Join(t.TempDir(), "fake-stream-worker.py")
 	writeFakeStreamingLLMWorker(t, workerPath)
 
+	pressure := 0.5
 	api.config.Models["llm:test-stream"] = ModelConfig{
 		MemoryGB:      1,
 		MaxConcurrent: 1,
 		MaxInstances:  intPtr(1),
+		PressureIndex: &pressure,
 		WorkerCmd:     []string{"python3", workerPath},
 		AdapterParams: map[string]string{"FAKE_STREAM_PORT": fmt.Sprintf("%d", streamPort)},
 	}
@@ -383,7 +393,7 @@ func TestChatCompletionStreamReservesInstanceWhileStreaming(t *testing.T) {
 
 	select {
 	case <-upstreamDone:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for upstream stream to start")
 	}
 
@@ -399,10 +409,19 @@ func TestChatCompletionStreamReservesInstanceWhileStreaming(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for stream handler to finish")
 	}
 
+	// Wait briefly for the scheduler's dispatch goroutine to run its deferred
+	// ReleaseAndCheck (decrementing activeJobs).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if insts[0].ActiveJobs() == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	if got := insts[0].ActiveJobs(); got != 0 {
 		t.Fatalf("active jobs after stream = %d, want 0", got)
 	}

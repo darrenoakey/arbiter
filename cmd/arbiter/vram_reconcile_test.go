@@ -94,6 +94,62 @@ func TestReconcileFromInstances_ToleratesFloatDrift(t *testing.T) {
 	}
 }
 
+// Regression test for the leak that exhausted the VRAM budget after the
+// inference-timeout watchdog (scheduler.go) called inst.Kill() without pairing
+// it with ReleaseMemoryFor. Kill set state="stopped", so the readLoop's
+// death-path treated the exit as deliberate and (before the fix) skipped
+// clearing vramHeld. ReconcileFromInstances then summed the dead instance's
+// memoryGB into `expected`, hiding the phantom forever.
+//
+// The fix: markSubprocessExited always clears vramHeld, regardless of whether
+// the shutdown was deliberate. Reconcile then catches the orphan within one
+// watchdog tick.
+func TestMarkSubprocessExited_ClearsVRAMOnDeliberateShutdown(t *testing.T) {
+	cfg := &Config{VRAMBudgetGB: 100, Models: map[string]ModelConfig{}}
+	mgr := NewInstanceManager(cfg, "python3", ".")
+	inst := makeLoadedInstance(t, mgr, "doomed", 80)
+
+	// Simulate Kill(): state -> stopped, no ReleaseMemoryFor called.
+	inst.mu.Lock()
+	inst.state = "stopped"
+	inst.mu.Unlock()
+
+	// Simulate the readLoop noticing the subprocess is gone.
+	inst.markSubprocessExited()
+
+	if inst.vramHeld {
+		t.Fatalf("vramHeld must be cleared after subprocess exit even on deliberate shutdown")
+	}
+	if inst.state != "stopped" {
+		t.Fatalf("deliberate shutdown should preserve state=stopped, got %q", inst.state)
+	}
+
+	// Reconcile within one watchdog tick reclaims the phantom.
+	freed := mgr.ReconcileFromInstances()
+	if freed < 80-0.01 || freed > 80+0.01 {
+		t.Fatalf("expected ~80GB reclaimed from dead instance, got %v", freed)
+	}
+	if mgr.usedGB > 0.01 {
+		t.Fatalf("usedGB should be ~0 after reconcile, got %v", mgr.usedGB)
+	}
+}
+
+// markSubprocessExited on an unexpected death (state was loaded/loading) must
+// flip state to "error" AND clear vramHeld.
+func TestMarkSubprocessExited_ClearsVRAMOnUnexpectedDeath(t *testing.T) {
+	cfg := &Config{VRAMBudgetGB: 100, Models: map[string]ModelConfig{}}
+	mgr := NewInstanceManager(cfg, "python3", ".")
+	inst := makeLoadedInstance(t, mgr, "crashed", 50)
+	// state is already "loaded" from makeLoadedInstance.
+	inst.markSubprocessExited()
+	if inst.vramHeld {
+		t.Fatalf("vramHeld must be cleared after subprocess exit")
+	}
+	if inst.state != "error" {
+		t.Fatalf("unexpected death should flip state to error, got %q", inst.state)
+	}
+}
+
 func TestReserveMemoryFor_FailsAtBudget(t *testing.T) {
 	cfg := &Config{VRAMBudgetGB: 50, Models: map[string]ModelConfig{}}
 	mgr := NewInstanceManager(cfg, "python3", ".")
