@@ -299,6 +299,37 @@ func (s *Store) CountByState(modelID string) (map[string]int, error) {
 	return counts, nil
 }
 
+// OldestQueuedAgeByModel returns the wait time (seconds since created_at) of
+// the oldest currently-queued job per model. Models with no queued jobs are
+// absent from the map. Used by the scheduler to age the pressure budget so
+// long-waiting jobs aren't starved by continuous low-pressure traffic.
+func (s *Store) OldestQueuedAgeByModel() (map[string]float64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(
+		"SELECT model_id, MIN(created_at) FROM jobs WHERE state = 'queued' GROUP BY model_id",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	now := nowTS()
+	out := make(map[string]float64)
+	for rows.Next() {
+		var modelID string
+		var oldestTs float64
+		if err := rows.Scan(&modelID, &oldestTs); err != nil {
+			return nil, err
+		}
+		age := now - oldestTs
+		if age < 0 {
+			age = 0
+		}
+		out[modelID] = age
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) CountActive(modelID string) (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

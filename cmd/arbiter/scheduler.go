@@ -322,6 +322,17 @@ func (s *Scheduler) IsModelLoadPaused(modelID string) (bool, time.Time) {
 	return true, until
 }
 
+// pressureAgeRate is how fast a model's effective pressure budget grows per
+// second its oldest queued job has been waiting. With rate=0.01 / s a job
+// waiting 100s adds 1.0 to the budget — enough to fit a PI=1.0 "exclusive"
+// model alongside any amount of low-pressure traffic.
+//
+// This prevents starvation: without aging, a heavy-pressure model
+// (ltx2-encode at PI=1.0) is permanently blocked by any low-pressure
+// traffic (gemma at PI=0.01) because cp + 1.0 > 1.0 always. With aging the
+// blocked job's budget grows linearly with wait time until it fits.
+const pressureAgeRate = 0.01
+
 // getFullModels returns model IDs that are at total capacity or would exceed the pressure budget.
 func (s *Scheduler) getFullModels() map[string]bool {
 	full := make(map[string]bool)
@@ -339,6 +350,10 @@ func (s *Scheduler) getFullModels() map[string]bool {
 	s.pressureMu.Lock()
 	cp := s.currentPressure
 	s.pressureMu.Unlock()
+
+	// Per-model oldest queued age — used to age the pressure budget so a
+	// long-waiting job earns more allowance.
+	ages, _ := s.store.OldestQueuedAgeByModel()
 
 	for modelID, cfg := range s.config.Models {
 		if full[modelID] {
@@ -368,11 +383,18 @@ func (s *Scheduler) getFullModels() map[string]bool {
 			full[modelID] = true
 			continue
 		}
-		if cp+*cfg.PressureIndex > 1.0+1e-9 {
+		// Age the budget by the oldest queued job's wait time. A model with
+		// queued work that's been sitting for a while gets more allowance,
+		// guaranteeing eventual dispatch even under sustained low-pressure
+		// load. This is the multiplier-style aging the user asked for: a job's
+		// effective weight grows linearly with wait time, no thresholds.
+		budget := 1.0 + ages[modelID]*pressureAgeRate
+		if cp+*cfg.PressureIndex > budget+1e-9 {
 			slog.Debug("scheduler.full: model would exceed pressure budget",
 				"model", modelID, "current_pressure", cp,
 				"model_pressure_index", *cfg.PressureIndex,
-				"sum", cp+*cfg.PressureIndex, "budget", 1.0)
+				"sum", cp+*cfg.PressureIndex,
+				"aged_budget", budget, "wait_seconds", ages[modelID])
 			full[modelID] = true
 		}
 	}
