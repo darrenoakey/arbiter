@@ -468,8 +468,10 @@ func (inst *Instance) Unload() error {
 func (inst *Instance) Kill() {
 	inst.mu.Lock()
 	var rootPid int
+	var rootCmd *exec.Cmd
 	if inst.cmd != nil && inst.cmd.Process != nil {
 		rootPid = inst.cmd.Process.Pid
+		rootCmd = inst.cmd
 		// One graceful attempt — well-behaved workers will release CUDA cleanly.
 		if inst.stdin != nil {
 			data, _ := json.Marshal(map[string]any{"cmd": "shutdown"})
@@ -484,6 +486,17 @@ func (inst *Instance) Kill() {
 
 	if rootPid == 0 {
 		return
+	}
+
+	// CRITICAL: spawn a goroutine that calls Wait() on the root cmd. Without
+	// this the root process becomes a zombie when it exits — and the NVIDIA
+	// driver keeps the zombie's CUDA allocations marked "in use" until the
+	// parent reaps it. Symptom: dmesg fills with "NVRM: Out of memory" and
+	// new vLLM loads fail because the driver thinks VRAM is full even though
+	// nvidia-smi shows nothing running. Wait() in a goroutine is fire-and-
+	// forget — once the kernel reaps the entry the GPU memory is released.
+	if rootCmd != nil {
+		go func() { _ = rootCmd.Wait() }()
 	}
 
 	// Brief grace period for graceful shutdown.
@@ -529,12 +542,34 @@ func (inst *Instance) Kill() {
 	reapWorkersExcept(0)
 }
 
-// pidAlive returns true if a process with this PID exists and we can signal it.
+// pidAlive returns true if the process exists AND is not a zombie. A zombie
+// (defunct) process still has a /proc entry and accepts kill(0) — but it's
+// already dead, just waiting to be reaped. Treating zombies as alive sends
+// the SIGKILL-retry loop into a 7.5s no-op spin. Worse, until the parent
+// calls Wait() the kernel keeps the zombie's resources (including CUDA
+// allocations) marked in-use, which is what triggers the NVIDIA OOM cascade.
 func pidAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	return syscall.Kill(pid, 0) == nil
+	if syscall.Kill(pid, 0) != nil {
+		return false
+	}
+	// Skip zombies. /proc/PID/status line "State:  Z (zombie)".
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "State:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 && (fields[1] == "Z" || fields[1] == "X") {
+				return false
+			}
+			break
+		}
+	}
+	return true
 }
 
 // collectDescendants returns rootPid plus every currently-alive transitive
