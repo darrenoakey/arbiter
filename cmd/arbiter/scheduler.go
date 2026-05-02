@@ -1097,28 +1097,49 @@ func (s *Scheduler) RunModelHealthWatchdog(ctx context.Context) {
 				}
 
 				// Check 2: Instance stuck in "loading" for too long.
-				// Allowance is 3× the configured load_ms with a 60-second floor.
-				// No upper clamp: ltx2-denoise1's calibrated load_ms is 420s, so
-				// the previous 600s clamp left almost no headroom for variance and
-				// would kill perfectly healthy slow loads. The instance's
-				// lastActive is reset when state transitions to "loading", so this
-				// measures from the start of THIS load attempt only.
+				// Allowance is the maximum of:
+				//   • 3× the configured load_ms (so calibrated estimates win
+				//     when they're high — e.g. ltx2-denoise1 at 420s)
+				//   • size-based estimate: 60s framework overhead + 8s per GB
+				//     of declared memory_gb. Covers reading weights from disk
+				//     (~250 MB/s shared FS), framework init, and GPU upload.
+				//
+				// Examples with the size formula:
+				//   1 GB  →  68 s    (small adapter)
+				//   17 GB → 196 s   (moondream)
+				//   23 GB → 244 s   (z-image-turbo)
+				//   40 GB → 380 s   (gemma 26B with 0.32 util)
+				//   80 GB → 700 s   (gemma 26B with 0.85 util)
+				//
+				// The previous 60-second floor was way too aggressive for any
+				// non-trivial model — vLLM cold-start of a 13 GB checkpoint
+				// alone takes ~30s before it even starts allocating KV cache.
+				// Killing during legitimate loading caused the moondream
+				// double-spawn cascade described in 2af5feb.
+				//
+				// The instance's lastActive is reset when state transitions to
+				// "loading", so this measures from the start of THIS load
+				// attempt only.
 				if state == "loading" {
 					maxLoadSec := modelCfg.LoadMs / 1000.0 * 3
-					if maxLoadSec < 60 {
-						maxLoadSec = 60
+					sizeBased := 60.0 + modelCfg.MemoryGB*8.0
+					if sizeBased > maxLoadSec {
+						maxLoadSec = sizeBased
 					}
 					la := inst.LastActive()
 					if !la.IsZero() && time.Since(la).Seconds() > maxLoadSec {
 						slog.Warn("health watchdog: loading stuck, killing instance",
 							"instance", inst.InstanceID, "model", modelID,
-							"loading_seconds", time.Since(la).Seconds())
+							"loading_seconds", time.Since(la).Seconds(),
+							"max_load_sec", maxLoadSec,
+							"memory_gb", modelCfg.MemoryGB)
 						inst.Kill()
 						s.mgr.ReleaseMemoryFor(inst)
 						s.logger.Log("model.health_reset", map[string]any{
-							"model_id":    modelID,
-							"instance_id": inst.InstanceID,
-							"reason":      "loading_stuck",
+							"model_id":     modelID,
+							"instance_id":  inst.InstanceID,
+							"reason":       "loading_stuck",
+							"max_load_sec": maxLoadSec,
 						})
 					}
 				}
