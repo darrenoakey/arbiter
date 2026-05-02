@@ -81,6 +81,15 @@ func (w *MemoryWatchdog) Run(ctx context.Context, interval time.Duration) {
 }
 
 // tick performs a single sampling pass.
+//
+// Note: there is no downward shrink path. The declared memory_gb is the
+// worst-case ceiling — what the worker COULD grow to under load (e.g. vLLM
+// with gpu-memory-utilization=0.66 will eventually pre-allocate ~80GB of
+// KV pool even if it currently uses 17GB). Shrinking the reservation based
+// on observed-low usage would over-promise free VRAM to other models, then
+// when the original worker grows into its declared budget the GPU OOMs and
+// everything dies. Keep the conservative reservation; the upward drift
+// watchdog catches under-declaration but the inverse is safer left alone.
 func (w *MemoryWatchdog) tick() {
 	pidVRAM := GetPerProcessVRAM()
 	snaps := w.mgr.snapshotInstanceMemory(pidVRAM)
@@ -88,69 +97,8 @@ func (w *MemoryWatchdog) tick() {
 	for _, s := range snaps {
 		totalRAM += s.TreeRSSGB
 		w.checkDrift(s)
-		w.checkUnderUtilization(s)
 	}
 	w.checkSystemPressure(totalRAM)
-}
-
-// checkUnderUtilization shrinks an instance's reservation when actual usage
-// has been well below configured for several consecutive samples. The
-// motivation: vLLM workers with gpu-memory-utilization=0.30 declared at the
-// old 80GB ceiling were holding 55GB of unused budget hostage, blocking
-// other models from preloading. After the shrink, that VRAM is free for
-// real work — and if usage later climbs back, the upward drift watchdog
-// will catch it and writeback a higher value.
-func (w *MemoryWatchdog) checkUnderUtilization(s instanceMemSnapshot) {
-	if s.ConfiguredGB <= 0 {
-		return
-	}
-	observed := s.TreeVRAMGB
-	if observed <= 0 {
-		// Worker isn't reporting VRAM yet (just spawned, or nvidia-smi failed).
-		// Treat as no signal — don't touch the counter either way.
-		w.driftMu.Lock()
-		w.underUtil[s.InstanceID] = 0
-		w.driftMu.Unlock()
-		return
-	}
-	w.driftMu.Lock()
-	defer w.driftMu.Unlock()
-
-	if observed >= s.ConfiguredGB*shrinkRatio {
-		// Within tolerance — reset streak.
-		w.underUtil[s.InstanceID] = 0
-		return
-	}
-	w.underUtil[s.InstanceID]++
-	if w.underUtil[s.InstanceID] < shrinkConsecutive {
-		return
-	}
-
-	target := observed * shrinkSafetyBuf
-	if target >= s.ConfiguredGB {
-		w.underUtil[s.InstanceID] = 0
-		return
-	}
-	if s.ConfiguredGB-target < shrinkMinFreedGB {
-		w.underUtil[s.InstanceID] = 0
-		return
-	}
-	inst := w.mgr.Get(s.InstanceID)
-	if inst == nil {
-		return
-	}
-	freed := w.mgr.ShrinkReservationFor(inst, target)
-	if freed > 0 {
-		w.logger.Log("model.memory_shrunk", map[string]any{
-			"model_id":      s.ModelID,
-			"instance_id":   s.InstanceID,
-			"configured_gb": s.ConfiguredGB,
-			"observed_gb":   observed,
-			"new_gb":        target,
-			"freed_gb":      freed,
-		})
-	}
-	w.underUtil[s.InstanceID] = 0
 }
 
 func (w *MemoryWatchdog) checkDrift(s instanceMemSnapshot) {
