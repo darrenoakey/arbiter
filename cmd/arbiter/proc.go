@@ -115,6 +115,20 @@ func (inst *Instance) Spawn() error {
 		return nil // already running
 	}
 
+	// Defence-in-depth: refuse to spawn if a prior OS process is still
+	// alive. If we get here it means Kill failed silently and we'd
+	// otherwise create a second worker holding GPU memory in parallel
+	// with the first (observed: two moondream processes both at 17 GB).
+	// Better to fail the load and surface the bug than to silently leak.
+	if inst.cmd != nil && inst.cmd.Process != nil {
+		oldPid := inst.cmd.Process.Pid
+		if pidAlive(oldPid) {
+			slog.Error("Spawn: refusing — previous worker still alive",
+				"instance", inst.InstanceID, "old_pid", oldPid, "state", inst.state)
+			return fmt.Errorf("previous worker pid %d still alive — Kill failed", oldPid)
+		}
+	}
+
 	inst.state = "starting"
 	slog.Info("spawning adapter subprocess", "instance", inst.InstanceID, "model", inst.ModelID)
 
@@ -469,6 +483,7 @@ func (inst *Instance) Kill() {
 	inst.mu.Lock()
 	var rootPid int
 	var rootCmd *exec.Cmd
+	prevReaderDone := inst.readerDone
 	if inst.cmd != nil && inst.cmd.Process != nil {
 		rootPid = inst.cmd.Process.Pid
 		rootCmd = inst.cmd
@@ -484,7 +499,11 @@ func (inst *Instance) Kill() {
 	inst.cmd = nil
 	inst.mu.Unlock()
 
+	slog.Info("Kill: invoked", "instance", inst.InstanceID, "root_pid", rootPid)
 	if rootPid == 0 {
+		// Nothing in inst.cmd, but a previous Kill might have left an OS process
+		// alive that we've forgotten about. Pattern sweep is the safety net.
+		reapWorkersExcept(0)
 		return
 	}
 
@@ -493,52 +512,64 @@ func (inst *Instance) Kill() {
 	// driver keeps the zombie's CUDA allocations marked "in use" until the
 	// parent reaps it. Symptom: dmesg fills with "NVRM: Out of memory" and
 	// new vLLM loads fail because the driver thinks VRAM is full even though
-	// nvidia-smi shows nothing running. Wait() in a goroutine is fire-and-
-	// forget — once the kernel reaps the entry the GPU memory is released.
+	// nvidia-smi shows nothing running.
 	if rootCmd != nil {
 		go func() { _ = rootCmd.Wait() }()
 	}
 
-	// Brief grace period for graceful shutdown.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if !pidAlive(rootPid) {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	// ALWAYS send SIGKILL to the root at least once. The earlier "grace + then
+	// only SIGKILL if pidAlive" pattern silently bailed when pidAlive returned
+	// false (e.g. transient /proc read failure, or the worker was in mid-fork
+	// when we sampled). That left the OS process alive and the next ensureLoaded
+	// happily spawned a SECOND worker (observed: two moondream processes both
+	// holding 17 GB). SIGKILL on a dead PID is harmless (ESRCH); SIGKILL on a
+	// live PID is what we need.
+	syscall.Kill(rootPid, syscall.SIGKILL)
 
-	// SIGKILL the whole descendant tree, then verify and retry. 15 attempts
-	// at 500ms each = ~7.5s wall-clock max — at that point any survivor is
-	// stuck in uninterruptible sleep (D-state) and the kernel needs help.
-	const maxAttempts = 15
+	// Now verify-and-retry: walk the descendant tree, SIGKILL everything,
+	// and keep going until /proc shows none of them. 30 attempts × 500ms =
+	// 15s cap. We retry forever within that window because Python+CUDA can
+	// take a few seconds to actually exit after SIGKILL while CUDA cleanup
+	// runs in a kernel D-state thread.
+	const maxAttempts = 30
 	var lastSurvivors []int
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		descendants := collectDescendants(rootPid)
 		if len(descendants) == 0 {
-			if attempt > 1 {
-				slog.Info("Kill: tree cleared", "root", rootPid, "attempts", attempt)
-			}
+			slog.Info("Kill: tree cleared", "instance", inst.InstanceID, "root", rootPid, "attempts", attempt)
+			lastSurvivors = nil
 			break
 		}
 		lastSurvivors = descendants
 		slog.Warn("Kill: SIGKILL descendant tree",
-			"root", rootPid, "attempt", attempt, "pids", descendants)
+			"instance", inst.InstanceID, "root", rootPid, "attempt", attempt, "pids", descendants)
 		for _, pid := range descendants {
 			syscall.Kill(pid, syscall.SIGKILL)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	if len(lastSurvivors) > 0 && pidAlive(rootPid) {
-		// We tried our best and something refuses to die. Log loudly so the
-		// VRAM audit + ops can investigate (probably a D-state thread).
+	if len(lastSurvivors) > 0 {
 		slog.Error("Kill: tree NOT fully reaped after retries — possible D-state survivor",
-			"root", rootPid, "survivors", lastSurvivors)
+			"instance", inst.InstanceID, "root", rootPid, "survivors", lastSurvivors)
+	}
+
+	// Wait for the previous readLoop goroutine to actually exit before
+	// returning. Otherwise a fast Spawn() that follows can race: the old
+	// readLoop is still reading from inst.stdout, and when Spawn reassigns
+	// inst.stdout the old loop may consume responses meant for the new
+	// process or call markSubprocessExited at the wrong time, nilifying
+	// inst.cmd of the new process.
+	if prevReaderDone != nil {
+		select {
+		case <-prevReaderDone:
+		case <-time.After(5 * time.Second):
+			slog.Warn("Kill: readLoop did not exit within 5s",
+				"instance", inst.InstanceID, "root", rootPid)
+		}
 	}
 
 	// Pattern sweep for anything that escaped the tree walk (e.g. EngineCore
-	// already reparented to init when we started). Excludes new in-flight
-	// loads via the hasAncestor check inside reapWorkersExcept.
+	// already reparented to init when we started).
 	reapWorkersExcept(0)
 }
 
