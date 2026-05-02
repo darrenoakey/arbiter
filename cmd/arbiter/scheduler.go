@@ -658,7 +658,9 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 			"inference_seconds": elapsed,
 		})
 		slog.Error("job failed", "job", job.ID, "error", err)
-		s.RecordFailure(job.ModelID)
+		if !isClientError(errMsg) {
+			s.RecordFailure(job.ModelID)
+		}
 		s.cleanupJobInbox(job)
 		return
 	}
@@ -676,7 +678,9 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 			"error":             resp.Error,
 			"inference_seconds": elapsed,
 		})
-		s.RecordFailure(job.ModelID)
+		if !isClientError(resp.Error) {
+			s.RecordFailure(job.ModelID)
+		}
 		s.cleanupJobInbox(job)
 	} else {
 		// Relocate the job output to the share mount so spark's local disk
@@ -1267,50 +1271,86 @@ func (s *Scheduler) RunVRAMWatchdog(ctx context.Context) {
 	}
 }
 
-// cleanupJobInbox deletes any files in the inbox directory that are referenced
-// by this job's params, provided no other active job also references them.
-// Called once a job reaches a terminal state (completed, failed, cancelled)
-// but NOT on requeue.
+// cleanupJobInbox is a no-op kept for call-site compatibility.
+//
+// It used to delete this job's inbox inputs the instant the job reached a
+// terminal state, after checking only "is any *currently active* job still
+// referencing this file?". That race deletes inputs out from under
+// multi-stage clients that batch their submissions: e.g. ltx2 stages a
+// boundary jpg, submits encode, encode completes, cleanup deletes the jpg,
+// THEN ltx2 submits denoise1 referencing that jpg → "No such file".
+//
+// Inbox cleanup is now done exclusively by CleanupOrphanedInboxFiles
+// (orphan sweep) which only deletes files that have no active references
+// AND are older than inboxOrphanMinAge. That gives every file a grace
+// period in which a follow-up job can reference it before it's eligible
+// for deletion.
 func (s *Scheduler) cleanupJobInbox(job *Job) {
-	if s.inboxDir == "" || len(job.Payload) == 0 {
-		return
-	}
-	files := extractInboxPaths(job.Payload, s.inboxDir)
-	if len(files) == 0 {
-		return
-	}
+	_ = job
+}
 
-	// Build set of inbox paths still referenced by other active jobs.
-	activeJobs, err := s.store.GetActiveJobs()
-	if err != nil {
-		slog.Warn("inbox cleanup: skipping, failed to query active jobs", "error", err)
+// inboxOrphanMinAge is how old an inbox file must be before the orphan
+// sweep is allowed to delete it. Sized to cover the worst-case pipeline
+// latency under heavy queue contention — e.g. an ltx2 music_video that
+// stages boundary jpgs, then submits encode → defect-check (gemma) →
+// denoise1 → denoise2 in serial waves. With shared GPU contention from
+// other workloads (tts queues etc.) the gap between first submission
+// and last reference can run several hours. Will be replaced by the
+// arbiter-client lease ledger; 24h is the safe-by-default conservative
+// fallback in the meantime.
+const inboxOrphanMinAge = 24 * time.Hour
+
+// isClientError returns true when an inference error string indicates a
+// fatal client-side problem (bad input, missing file) rather than a model
+// fault. These should NOT count toward the inference circuit breaker — the
+// model is fine, the caller submitted bad data. Penalising the model would
+// pause it for 15 minutes and starve every other queued job.
+func isClientError(s string) bool {
+	low := strings.ToLower(s)
+	switch {
+	case strings.Contains(low, "no such file or directory"):
+		return true
+	case strings.Contains(low, "[errno 2]"):
+		return true
+	case strings.Contains(low, "filenotfounderror"):
+		return true
+	case strings.Contains(low, "input file(s) missing"):
+		return true
+	}
+	return false
+}
+
+// RunInboxWatchdog periodically cleans orphaned inbox files AND fails any
+// queued jobs whose declared inputs have disappeared. The two operations
+// share the same active-job snapshot, and failing missing-input jobs here
+// (rather than at dispatch) prevents 10 such jobs from cascading into a
+// 15-minute inference circuit-breaker trip.
+//
+// Cadence: every 60 seconds. Cheap when the queue is small.
+func (s *Scheduler) RunInboxWatchdog(ctx context.Context) {
+	if s.inboxDir == "" {
 		return
 	}
-	stillReferenced := make(map[string]bool)
-	for _, j := range activeJobs {
-		if j.ID == job.ID {
-			continue // skip the job we're cleaning up
-		}
-		for _, f := range extractInboxPaths(j.Payload, s.inboxDir) {
-			stillReferenced[f] = true
-		}
-	}
-
-	for _, f := range files {
-		if stillReferenced[f] {
-			slog.Debug("inbox cleanup: skipping file still referenced by queued jobs", "file", f)
-			continue
-		}
-		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
-			slog.Warn("inbox cleanup: failed to remove file", "file", f, "error", err)
-		} else if err == nil {
-			slog.Debug("inbox cleanup: removed", "file", f)
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if _, err := s.CleanupOrphanedInboxFiles(); err != nil {
+				slog.Warn("inbox watchdog: cleanup failed", "error", err)
+			}
 		}
 	}
 }
 
 // CleanupOrphanedInboxFiles removes files from the inbox that are not
-// referenced by any queued, scheduled, running, or following job.
+// referenced by any queued, scheduled, running, or following job AND are
+// older than inboxOrphanMinAge. After deletion runs, also fail any queued
+// jobs whose declared input files no longer exist — that prevents the
+// worker from cascading 10 "file not found" errors and tripping the
+// inference circuit breaker.
 func (s *Scheduler) CleanupOrphanedInboxFiles() (int, error) {
 	if s.inboxDir == "" {
 		return 0, nil
@@ -1334,6 +1374,7 @@ func (s *Scheduler) CleanupOrphanedInboxFiles() (int, error) {
 	}
 
 	deleted := 0
+	cutoff := time.Now().Add(-inboxOrphanMinAge)
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -1342,13 +1383,71 @@ func (s *Scheduler) CleanupOrphanedInboxFiles() (int, error) {
 		if referenced[path] {
 			continue
 		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			// Too young — give multi-stage clients a chance to register
+			// follow-up jobs that reference this file.
+			continue
+		}
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			slog.Warn("inbox cleanup: failed to remove orphan", "file", path, "error", err)
 		} else if err == nil {
 			deleted++
 		}
 	}
+
+	// Inverse sweep: any queued job whose declared inputs are now missing
+	// will fail the moment it dispatches. Better to fail it here with a
+	// clear error than let 10 such jobs trip the circuit breaker. Always
+	// runs (even when nothing was deleted this cycle) — files can also
+	// disappear due to external causes (mount blip, manual cleanup).
+	failed := s.failQueuedJobsWithMissingInputs(activeJobs)
+	if failed > 0 {
+		slog.Warn("inbox cleanup: failed queued jobs with missing inputs", "count", failed)
+	}
 	return deleted, nil
+}
+
+// failQueuedJobsWithMissingInputs scans the supplied (active) jobs and marks
+// any in state "queued" as failed if a declared input file no longer exists.
+// Returns the number of jobs failed. Caller passes the list it already has
+// to avoid a redundant store query.
+func (s *Scheduler) failQueuedJobsWithMissingInputs(active []*Job) int {
+	if s.inboxDir == "" {
+		return 0
+	}
+	failed := 0
+	for _, j := range active {
+		if j.State != "queued" {
+			continue
+		}
+		paths := extractInboxPaths(j.Payload, s.inboxDir)
+		var missing []string
+		for _, p := range paths {
+			if _, err := os.Stat(p); os.IsNotExist(err) {
+				missing = append(missing, p)
+			}
+		}
+		if len(missing) == 0 {
+			continue
+		}
+		errMsg := fmt.Sprintf("input file(s) missing: %s", strings.Join(missing, ", "))
+		s.store.UpdateState(j.ID, "failed",
+			WithError(errMsg), WithFinishedAt(nowTS()))
+		s.logger.Log("job.failed", map[string]any{
+			"job_id":   j.ID,
+			"model_id": j.ModelID,
+			"reason":   "missing_inputs",
+			"missing":  missing,
+		})
+		slog.Warn("failing queued job — input(s) missing",
+			"job", j.ID, "model", j.ModelID, "missing", missing)
+		failed++
+	}
+	return failed
 }
 
 // extractInboxPaths walks a JSON payload and returns every string value that

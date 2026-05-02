@@ -178,6 +178,7 @@ func main() {
 	go sched.RunJobWatchdog(ctx)
 	go sched.RunModelHealthWatchdog(ctx)
 	go sched.RunVRAMWatchdog(ctx)
+	go sched.RunInboxWatchdog(ctx)
 	go NewMemoryWatchdog(cfg, mgr, eventLog, projectRoot).Run(ctx, 30*time.Second)
 	if cfg.ShareMount != "" {
 		// Probe the mount root itself — contains inbox/ and output/ subdirs,
