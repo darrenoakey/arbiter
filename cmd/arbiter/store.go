@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +25,11 @@ type Job struct {
 	CreatedAt  float64          `json:"created_at"`
 	StartedAt  *float64         `json:"started_at,omitempty"`
 	FinishedAt *float64         `json:"finished_at,omitempty"`
+	// CanonicalJobID is set on dedup-cache-hit jobs to point at the original
+	// job whose result this one inherits. Replaces the previous
+	// os.Symlink(origDir, newDir) hack which left dangling pointers on CIFS
+	// when the orig dir became unreachable. Empty for normal jobs.
+	CanonicalJobID string `json:"canonical_job_id,omitempty"`
 }
 
 const schema = `
@@ -38,7 +44,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     error TEXT,
     created_at REAL NOT NULL,
     started_at REAL,
-    finished_at REAL
+    finished_at REAL,
+    canonical_job_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_priority ON jobs(priority) WHERE state = 'queued';
@@ -46,7 +53,24 @@ CREATE INDEX IF NOT EXISTS idx_jobs_model ON jobs(model_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_completed_model ON jobs(state, model_id) WHERE state = 'completed';
 CREATE INDEX IF NOT EXISTS idx_jobs_completed_stats ON jobs(state, finished_at, started_at, created_at) WHERE state = 'completed' AND finished_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_jobs_canonical ON jobs(canonical_job_id) WHERE canonical_job_id IS NOT NULL;
 `
+
+// migrateAddCanonicalJobID adds the canonical_job_id column to existing
+// databases that pre-date the field. Idempotent — SQLite returns "duplicate
+// column name" if it's already there, which we ignore.
+func migrateAddCanonicalJobID(db *sql.DB) {
+	_, err := db.Exec(`ALTER TABLE jobs ADD COLUMN canonical_job_id TEXT`)
+	if err == nil {
+		return
+	}
+	if !strings.Contains(err.Error(), "duplicate column") {
+		// Anything else is unexpected — log but don't abort startup.
+		// scanJob falls back gracefully if the column is missing.
+		_ = err
+	}
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_jobs_canonical ON jobs(canonical_job_id) WHERE canonical_job_id IS NOT NULL`)
+}
 
 type Store struct {
 	db *sql.DB
@@ -59,6 +83,10 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	db.SetMaxOpenConns(1) // SQLite doesn't support concurrent writers
+	// Migrate BEFORE the schema block runs — the schema's CREATE INDEX on
+	// canonical_job_id will fail if the column doesn't exist on a pre-
+	// existing jobs table that was created without it.
+	migrateAddCanonicalJobID(db)
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
@@ -101,10 +129,10 @@ func (s *Store) GetJob(id string) (*Job, error) {
 
 func (s *Store) scanJob(row *sql.Row) (*Job, error) {
 	var j Job
-	var payload, result, errStr sql.NullString
+	var payload, result, errStr, canonical sql.NullString
 	var startedAt, finishedAt sql.NullFloat64
 	err := row.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
-		&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt)
+		&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt, &canonical)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +152,37 @@ func (s *Store) scanJob(row *sql.Row) (*Job, error) {
 	if finishedAt.Valid {
 		j.FinishedAt = &finishedAt.Float64
 	}
+	if canonical.Valid {
+		j.CanonicalJobID = canonical.String
+	}
 	return &j, nil
+}
+
+// SetCanonicalJobID marks a job as a dedup-cache-hit pointer to origID.
+// Replaces the previous dedup symlink hack — the lookup is now in the DB
+// and survives unmount / FS issues that broke filesystem symlinks.
+func (s *Store) SetCanonicalJobID(jobID, origID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`UPDATE jobs SET canonical_job_id = ? WHERE id = ?`,
+		origID, jobID,
+	)
+	return err
+}
+
+// CountCanonicalReferences returns how many jobs point at origID via
+// canonical_job_id. Used by output-cleanup paths so the orig dir can't
+// be removed while followers still reference its result paths.
+func (s *Store) CountCanonicalReferences(origID string) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM jobs WHERE canonical_job_id = ?`,
+		origID,
+	).Scan(&n)
+	return n, err
 }
 
 func (s *Store) ListJobs(state, modelID string, limit int) ([]*Job, error) {
@@ -152,32 +210,47 @@ func (s *Store) ListJobs(state, modelID string, limit int) ([]*Job, error) {
 
 	var jobs []*Job
 	for rows.Next() {
-		var j Job
-		var payload, result, errStr sql.NullString
-		var startedAt, finishedAt sql.NullFloat64
-		if err := rows.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
-			&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt); err != nil {
+		j, err := scanJobFromRows(rows)
+		if err != nil {
 			return nil, err
 		}
-		if payload.Valid {
-			j.Payload = json.RawMessage(payload.String)
-		}
-		if result.Valid {
-			rm := json.RawMessage(result.String)
-			j.Result = &rm
-		}
-		if errStr.Valid {
-			j.Error = errStr.String
-		}
-		if startedAt.Valid {
-			j.StartedAt = &startedAt.Float64
-		}
-		if finishedAt.Valid {
-			j.FinishedAt = &finishedAt.Float64
-		}
-		jobs = append(jobs, &j)
+		jobs = append(jobs, j)
 	}
 	return jobs, nil
+}
+
+// scanJobFromRows is the shared row-scan helper. Centralised so adding
+// columns to the schema only requires changing one place — the previous
+// open-coded scans in 4 places drift apart immediately when the column
+// list changes.
+func scanJobFromRows(rows *sql.Rows) (*Job, error) {
+	var j Job
+	var payload, result, errStr, canonical sql.NullString
+	var startedAt, finishedAt sql.NullFloat64
+	if err := rows.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
+		&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt, &canonical); err != nil {
+		return nil, err
+	}
+	if payload.Valid {
+		j.Payload = json.RawMessage(payload.String)
+	}
+	if result.Valid {
+		rm := json.RawMessage(result.String)
+		j.Result = &rm
+	}
+	if errStr.Valid {
+		j.Error = errStr.String
+	}
+	if startedAt.Valid {
+		j.StartedAt = &startedAt.Float64
+	}
+	if finishedAt.Valid {
+		j.FinishedAt = &finishedAt.Float64
+	}
+	if canonical.Valid {
+		j.CanonicalJobID = canonical.String
+	}
+	return &j, nil
 }
 
 func (s *Store) PickNextJob(excludeModels map[string]bool) (*Job, error) {
@@ -461,30 +534,11 @@ func (s *Store) GetJobs(ids []string) (map[string]*Job, error) {
 
 	result := make(map[string]*Job, len(ids))
 	for rows.Next() {
-		var j Job
-		var payload, res, errStr sql.NullString
-		var startedAt, finishedAt sql.NullFloat64
-		if err := rows.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
-			&payload, &res, &errStr, &j.CreatedAt, &startedAt, &finishedAt); err != nil {
+		j, err := scanJobFromRows(rows)
+		if err != nil {
 			return nil, err
 		}
-		if payload.Valid {
-			j.Payload = json.RawMessage(payload.String)
-		}
-		if res.Valid {
-			rm := json.RawMessage(res.String)
-			j.Result = &rm
-		}
-		if errStr.Valid {
-			j.Error = errStr.String
-		}
-		if startedAt.Valid {
-			j.StartedAt = &startedAt.Float64
-		}
-		if finishedAt.Valid {
-			j.FinishedAt = &finishedAt.Float64
-		}
-		result[j.ID] = &j
+		result[j.ID] = j
 	}
 	return result, nil
 }
@@ -520,7 +574,7 @@ func (s *Store) GetRunningJobs() ([]*Job, error) {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(
-		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at FROM jobs WHERE state = 'running'",
+		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at, canonical_job_id FROM jobs WHERE state = 'running'",
 	)
 	if err != nil {
 		return nil, err
@@ -529,30 +583,11 @@ func (s *Store) GetRunningJobs() ([]*Job, error) {
 
 	var jobs []*Job
 	for rows.Next() {
-		var j Job
-		var payload, result, errStr sql.NullString
-		var startedAt, finishedAt sql.NullFloat64
-		if err := rows.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
-			&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt); err != nil {
+		j, err := scanJobFromRows(rows)
+		if err != nil {
 			return nil, err
 		}
-		if payload.Valid {
-			j.Payload = json.RawMessage(payload.String)
-		}
-		if result.Valid {
-			rm := json.RawMessage(result.String)
-			j.Result = &rm
-		}
-		if errStr.Valid {
-			j.Error = errStr.String
-		}
-		if startedAt.Valid {
-			j.StartedAt = &startedAt.Float64
-		}
-		if finishedAt.Valid {
-			j.FinishedAt = &finishedAt.Float64
-		}
-		jobs = append(jobs, &j)
+		jobs = append(jobs, j)
 	}
 	return jobs, nil
 }
@@ -563,7 +598,7 @@ func (s *Store) GetActiveJobs() ([]*Job, error) {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(
-		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at FROM jobs WHERE state IN ('queued','scheduled','running','following')",
+		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at, canonical_job_id FROM jobs WHERE state IN ('queued','scheduled','running','following')",
 	)
 	if err != nil {
 		return nil, err
@@ -572,30 +607,11 @@ func (s *Store) GetActiveJobs() ([]*Job, error) {
 
 	var jobs []*Job
 	for rows.Next() {
-		var j Job
-		var payload, result, errStr sql.NullString
-		var startedAt, finishedAt sql.NullFloat64
-		if err := rows.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
-			&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt); err != nil {
+		j, err := scanJobFromRows(rows)
+		if err != nil {
 			return nil, err
 		}
-		if payload.Valid {
-			j.Payload = json.RawMessage(payload.String)
-		}
-		if result.Valid {
-			rm := json.RawMessage(result.String)
-			j.Result = &rm
-		}
-		if errStr.Valid {
-			j.Error = errStr.String
-		}
-		if startedAt.Valid {
-			j.StartedAt = &startedAt.Float64
-		}
-		if finishedAt.Valid {
-			j.FinishedAt = &finishedAt.Float64
-		}
-		jobs = append(jobs, &j)
+		jobs = append(jobs, j)
 	}
 	return jobs, nil
 }

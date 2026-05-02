@@ -309,12 +309,26 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 			if origJob != nil {
 				switch origJob.State {
 				case "completed":
-					// Instant cache hit — create pre-completed job
+					// Instant cache hit — create pre-completed job. Store the
+					// canonical job id in the DB instead of creating a
+					// filesystem symlink: previous os.Symlink(origDir, newDir)
+					// left dangling pointers on the CIFS mount when the orig
+					// dir became unreachable, causing downstream jobs that
+					// referenced /output/jobs/<new_id>/file to get EINVAL
+					// from the broken symlink and fail their entire model's
+					// queue via the inference circuit breaker.
+					//
+					// The result JSON we copy in already references the orig's
+					// canonical output paths directly, so no aliasing is
+					// needed for correctness — and now CountCanonicalReferences
+					// gives output cleanup a way to know "don't delete this
+					// orig dir, N followers depend on it".
 					newJob, err := a.store.CreateJob(modelID, req.Type, req.Params, 0)
 					if err == nil {
-						origDir := filepath.Join(a.outputDir, "jobs", origID)
-						newDir := filepath.Join(a.outputDir, "jobs", newJob.ID)
-						os.Symlink(origDir, newDir)
+						if err := a.store.SetCanonicalJobID(newJob.ID, origID); err != nil {
+							slog.Warn("dedup: failed to set canonical_job_id",
+								"job", newJob.ID, "orig", origID, "error", err)
+						}
 						if origJob.Result != nil {
 							a.store.UpdateState(newJob.ID, "completed", WithResult(*origJob.Result), WithFinishedAt(nowTS()))
 						}

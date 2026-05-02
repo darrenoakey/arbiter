@@ -1300,31 +1300,129 @@ func (s *Scheduler) cleanupJobInbox(job *Job) {
 // fallback in the meantime.
 const inboxOrphanMinAge = 24 * time.Hour
 
-// ValidateJobInputs returns an error if any inbox path declared in the
-// payload doesn't exist on disk. Called at job-submission time so a job
-// with missing inputs is rejected with HTTP 400 instead of being queued,
-// dispatched, and then failing — which would also waste a model load.
+// ValidateJobInputs returns a detailed error if any file path declared in
+// the payload can't be opened. Checks every absolute path under known
+// share-mount prefixes — both inbox/ (originally-staged inputs) AND
+// output/ (outputs of previous pipeline stages, e.g. ltx2-encode →
+// ltx2-denoise1 reading encoded.pt). Each path is os.Stat'd and the
+// specific failure (missing / broken symlink / permission / I/O) is
+// surfaced verbatim so the caller knows exactly what's wrong.
 //
-// Returns nil if inboxDir isn't configured (no validation possible) or
-// the payload contains no inbox path references.
+// Called at job-submission time so a job with bad paths is rejected with
+// HTTP 400 BEFORE entering the queue — no model load, no dispatch, no
+// circuit-breaker risk. Also called by the inbox watchdog as a safety
+// net for paths that disappear after submission.
 func (s *Scheduler) ValidateJobInputs(payload json.RawMessage) error {
-	if s.inboxDir == "" {
+	prefixes := s.checkablePathPrefixes()
+	if len(prefixes) == 0 {
 		return nil
 	}
-	paths := extractInboxPaths(payload, s.inboxDir)
+	paths := extractCheckablePaths(payload, prefixes)
 	if len(paths) == 0 {
 		return nil
 	}
-	var missing []string
+	var failures []string
 	for _, p := range paths {
-		if _, err := os.Stat(p); os.IsNotExist(err) {
-			missing = append(missing, p)
+		if _, err := os.Stat(p); err != nil {
+			// Build a precise reason. os.Stat returns *PathError whose
+			// inner err encodes the syscall errno (ENOENT, EINVAL, etc.).
+			// Surface the underlying error string verbatim so the caller
+			// sees e.g. "no such file or directory" vs "invalid argument
+			// (broken symlink on CIFS — target was deleted)".
+			reason := classifyStatError(p, err)
+			failures = append(failures, fmt.Sprintf("%s: %s", p, reason))
 		}
 	}
-	if len(missing) > 0 {
-		return fmt.Errorf("input file(s) missing: %s", strings.Join(missing, ", "))
+	if len(failures) > 0 {
+		return fmt.Errorf("job rejected: %d input path(s) unreadable:\n  %s",
+			len(failures), strings.Join(failures, "\n  "))
 	}
 	return nil
+}
+
+// checkablePathPrefixes returns the absolute path prefixes the validator
+// will scan for. Currently the share mount root (covers inbox/ and
+// output/) and the local output directory (for non-share deployments).
+func (s *Scheduler) checkablePathPrefixes() []string {
+	var out []string
+	if s.config != nil && s.config.ShareMount != "" {
+		out = append(out, strings.TrimRight(s.config.ShareMount, "/")+"/")
+	}
+	if s.outputDir != "" {
+		clean := strings.TrimRight(s.outputDir, "/") + "/"
+		// Avoid a duplicate when outputDir is under ShareMount.
+		dup := false
+		for _, p := range out {
+			if strings.HasPrefix(clean, p) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, clean)
+		}
+	}
+	return out
+}
+
+// extractCheckablePaths walks the payload for any string starting with one
+// of the supplied absolute prefixes.
+func extractCheckablePaths(payload json.RawMessage, prefixes []string) []string {
+	var v any
+	if err := json.Unmarshal(payload, &v); err != nil {
+		return nil
+	}
+	var out []string
+	walkJSONMulti(v, prefixes, &out)
+	return out
+}
+
+func walkJSONMulti(v any, prefixes []string, out *[]string) {
+	switch t := v.(type) {
+	case string:
+		for _, p := range prefixes {
+			if strings.HasPrefix(t, p) {
+				*out = append(*out, t)
+				return
+			}
+		}
+	case map[string]any:
+		for _, val := range t {
+			walkJSONMulti(val, prefixes, out)
+		}
+	case []any:
+		for _, val := range t {
+			walkJSONMulti(val, prefixes, out)
+		}
+	}
+}
+
+// classifyStatError turns a stat() error into a human-readable reason
+// that explains what's actually wrong, not just "stat failed".
+func classifyStatError(path string, err error) string {
+	if os.IsNotExist(err) {
+		return "no such file or directory"
+	}
+	if os.IsPermission(err) {
+		return "permission denied"
+	}
+	low := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(low, "invalid argument"):
+		// On CIFS with symlink=native, EINVAL is what you get for a
+		// symlink whose target was deleted. Spell that out — the caller
+		// almost certainly cares (this is the dedup-symlink lifecycle bug).
+		if lst, lerr := os.Lstat(path); lerr == nil && lst.Mode()&os.ModeSymlink != 0 {
+			tgt, _ := os.Readlink(path)
+			return fmt.Sprintf("invalid argument — broken symlink → %q (target gone or unreachable on this mount)", tgt)
+		}
+		return "invalid argument (likely broken symlink or unmounted path)"
+	case strings.Contains(low, "stale file handle"):
+		return "stale NFS/CIFS file handle (mount needs refresh)"
+	case strings.Contains(low, "i/o error"):
+		return "I/O error (storage / mount problem)"
+	}
+	return err.Error()
 }
 
 // isClientError returns true when an inference error string indicates a
@@ -1456,11 +1554,14 @@ func (s *Scheduler) CleanupOrphanedInboxFiles() (int, error) {
 }
 
 // failQueuedJobsWithMissingInputs scans the supplied (active) jobs and marks
-// any in state "queued" as failed if a declared input file no longer exists.
-// Returns the number of jobs failed. Caller passes the list it already has
-// to avoid a redundant store query.
+// any in state "queued" as failed if any declared input file is unreadable.
+// Uses the same ValidateJobInputs check as job submission, so the inverse
+// sweep catches paths that were valid at submission but disappeared since
+// (e.g. a previous pipeline stage's output dir cleaned up, mount blip, etc).
+// Returns the number of jobs failed. Caller passes the list to avoid a
+// redundant store query.
 func (s *Scheduler) failQueuedJobsWithMissingInputs(active []*Job) int {
-	if s.inboxDir == "" {
+	if len(s.checkablePathPrefixes()) == 0 {
 		return 0
 	}
 	failed := 0
@@ -1468,27 +1569,21 @@ func (s *Scheduler) failQueuedJobsWithMissingInputs(active []*Job) int {
 		if j.State != "queued" {
 			continue
 		}
-		paths := extractInboxPaths(j.Payload, s.inboxDir)
-		var missing []string
-		for _, p := range paths {
-			if _, err := os.Stat(p); os.IsNotExist(err) {
-				missing = append(missing, p)
-			}
-		}
-		if len(missing) == 0 {
+		err := s.ValidateJobInputs(j.Payload)
+		if err == nil {
 			continue
 		}
-		errMsg := fmt.Sprintf("input file(s) missing: %s", strings.Join(missing, ", "))
+		errMsg := err.Error()
 		s.store.UpdateState(j.ID, "failed",
 			WithError(errMsg), WithFinishedAt(nowTS()))
 		s.logger.Log("job.failed", map[string]any{
 			"job_id":   j.ID,
 			"model_id": j.ModelID,
-			"reason":   "missing_inputs",
-			"missing":  missing,
+			"reason":   "unreachable_inputs",
+			"detail":   errMsg,
 		})
-		slog.Warn("failing queued job — input(s) missing",
-			"job", j.ID, "model", j.ModelID, "missing", missing)
+		slog.Warn("failing queued job — input(s) unreachable",
+			"job", j.ID, "model", j.ModelID, "error", errMsg)
 		failed++
 	}
 	return failed
