@@ -1300,6 +1300,33 @@ func (s *Scheduler) cleanupJobInbox(job *Job) {
 // fallback in the meantime.
 const inboxOrphanMinAge = 24 * time.Hour
 
+// ValidateJobInputs returns an error if any inbox path declared in the
+// payload doesn't exist on disk. Called at job-submission time so a job
+// with missing inputs is rejected with HTTP 400 instead of being queued,
+// dispatched, and then failing — which would also waste a model load.
+//
+// Returns nil if inboxDir isn't configured (no validation possible) or
+// the payload contains no inbox path references.
+func (s *Scheduler) ValidateJobInputs(payload json.RawMessage) error {
+	if s.inboxDir == "" {
+		return nil
+	}
+	paths := extractInboxPaths(payload, s.inboxDir)
+	if len(paths) == 0 {
+		return nil
+	}
+	var missing []string
+	for _, p := range paths {
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			missing = append(missing, p)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("input file(s) missing: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 // isClientError returns true when an inference error string indicates a
 // fatal client-side problem (bad input, missing file) rather than a model
 // fault. These should NOT count toward the inference circuit breaker — the

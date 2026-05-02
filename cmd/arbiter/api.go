@@ -281,6 +281,16 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// --- Reject jobs whose declared input files don't exist ---
+	// Bad paths must never reach the queue: a queued job with missing inputs
+	// would trigger a model load, get dispatched, fail, and (before
+	// isClientError) trip the inference circuit breaker, starving every
+	// other job in the same model's queue. Reject at the door instead.
+	if err := a.scheduler.ValidateJobInputs(req.Params); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+
 	// --- Dedup check ---
 	var forceNew bool
 	{
@@ -1506,6 +1516,13 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 	modelID := llmModelID(req.Model)
 	if _, ok := a.config.Models[modelID]; !ok {
 		writeError(w, 404, fmt.Sprintf("LLM not registered: %s (register via POST /v1/llm/models)", req.Model))
+		return
+	}
+
+	// Reject if any declared input files don't exist (no-op for typical
+	// chat payloads; safety net for tool-using flows that reference files).
+	if err := a.scheduler.ValidateJobInputs(json.RawMessage(body)); err != nil {
+		writeError(w, 400, err.Error())
 		return
 	}
 
