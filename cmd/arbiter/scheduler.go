@@ -1328,20 +1328,37 @@ func (s *Scheduler) ValidateJobInputs(payload json.RawMessage) error {
 }
 
 // isClientError returns true when an inference error string indicates a
-// fatal client-side problem (bad input, missing file) rather than a model
-// fault. These should NOT count toward the inference circuit breaker — the
-// model is fine, the caller submitted bad data. Penalising the model would
-// pause it for 15 minutes and starve every other queued job.
+// fatal client-side problem (bad input, missing/unreadable file, broken
+// dependency from a previous pipeline stage) rather than a model fault.
+// These should NOT count toward the inference circuit breaker — the model
+// is fine, the caller submitted bad data. Penalising the model would pause
+// it for 15 minutes and starve every other queued job.
+//
+// Watched errno values:
+//   2  ENOENT  — no such file or directory
+//   5  EIO     — I/O error (often stale NFS/CIFS handle)
+//   13 EACCES  — permission denied
+//   22 EINVAL  — invalid argument (broken symlink on CIFS, bad path syntax)
+//   116 ESTALE — stale file handle (NFS specific)
+//
+// All of these mean "the bytes the worker wanted to read aren't reachable"
+// — never a model bug, always upstream of the worker.
 func isClientError(s string) bool {
 	low := strings.ToLower(s)
 	switch {
-	case strings.Contains(low, "no such file or directory"):
-		return true
-	case strings.Contains(low, "[errno 2]"):
-		return true
-	case strings.Contains(low, "filenotfounderror"):
-		return true
-	case strings.Contains(low, "input file(s) missing"):
+	case strings.Contains(low, "no such file or directory"),
+		strings.Contains(low, "filenotfounderror"),
+		strings.Contains(low, "input file(s) missing"),
+		strings.Contains(low, "stale file handle"),
+		strings.Contains(low, "permission denied"),
+		strings.Contains(low, "i/o error"),
+		strings.Contains(low, "invalid argument") && strings.Contains(low, "/mnt/") ||
+			strings.Contains(low, "invalid argument") && strings.Contains(low, "/output/"),
+		strings.Contains(low, "[errno 2]"),
+		strings.Contains(low, "[errno 5]"),
+		strings.Contains(low, "[errno 13]"),
+		strings.Contains(low, "[errno 22]"),
+		strings.Contains(low, "[errno 116]"):
 		return true
 	}
 	return false
