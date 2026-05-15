@@ -21,6 +21,7 @@ _ADAPTERS = [
     "tts_design",
     "latentsync",
     "sadtalker",
+    "echomimic",
     "sonic",
     "ltx2",
     "ltx2_encode",
