@@ -13,6 +13,7 @@ _log = logging.getLogger(__name__)
 _ADAPTERS = [
     "birefnet",
     "flux",
+    "flux2",
     "moondream",
     "whisper_large",
     "tts_custom",
