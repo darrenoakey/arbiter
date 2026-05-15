@@ -36,8 +36,8 @@ type Config struct {
 
 // JobTypeToModel maps job type strings to model IDs.
 var JobTypeToModel = map[string]string{
-	"image-generate":         "flux-schnell",
-	"image-edit":             "flux-schnell",
+	"image-generate":         "flux2",
+	"image-edit":             "flux2",
 	"background-remove":      "birefnet",
 	"caption":                "moondream",
 	"query":                  "moondream",
