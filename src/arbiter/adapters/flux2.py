@@ -1,11 +1,11 @@
-"""FLUX.2-klein-4B unified generation + editing adapter.
+"""FLUX.2-klein-9B unified generation + editing adapter.
 
-black-forest-labs/FLUX.2-klein-4B (Apache-2.0, ungated): step-distilled
-(4 steps, guidance 1.0) 4B transformer with an integrated Mistral/Qwen3
-text encoder. A SINGLE Flux2KleinPipeline handles both text-to-image and
-image editing (image-to-image / reference editing) — pass ``image=`` to
-edit. The larger klein-9B is gated (FLUX non-commercial license); swap
-FLUX2_HF_ID to it once the license is accepted for higher quality.
+black-forest-labs/FLUX.2-klein-9B (FLUX non-commercial license, gated —
+access accepted for this account): step-distilled (4 steps, guidance 1.0)
+9B transformer with an integrated ~8B Qwen3 text encoder. A SINGLE
+Flux2KleinPipeline handles both text-to-image and image editing
+(image-to-image / reference editing) — pass ``image=`` to edit. The
+smaller ungated klein-4B is the fallback if 9B access is ever revoked.
 
 Runs in the isolated ``venvs/flux2`` environment (torch 2.12 / git
 diffusers / transformers 5.x) via a custom ``worker_cmd`` in the model
@@ -25,7 +25,7 @@ from arbiter.adapters.registry import register
 
 log = logging.getLogger(__name__)
 
-FLUX2_HF_ID = "black-forest-labs/FLUX.2-klein-4B"
+FLUX2_HF_ID = "black-forest-labs/FLUX.2-klein-9B"
 DEFAULT_STEPS = 4      # klein is step-distilled
 GUIDANCE_SCALE = 1.0   # klein recommended guidance
 
