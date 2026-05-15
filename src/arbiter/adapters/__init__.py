@@ -22,6 +22,7 @@ _ADAPTERS = [
     "latentsync",
     "sadtalker",
     "echomimic",
+    "wan_s2v",
     "sonic",
     "ltx2",
     "ltx2_encode",
