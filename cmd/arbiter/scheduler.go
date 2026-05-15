@@ -50,6 +50,12 @@ type Scheduler struct {
 	// other job) for the entire stream duration.
 	streamMu       sync.Mutex
 	streamHandoffs map[string]*streamHandoff
+	// Rate-limit for the "scheduler ticked but dispatched nothing while queue
+	// is non-empty" diagnostic log. Without rate-limiting we'd emit it every
+	// 100ms tick and drown the log; without the log itself we have no way to
+	// see why a queue with thousands of jobs isn't draining.
+	lastIdleLogMu sync.Mutex
+	lastIdleLog   time.Time
 }
 
 type streamHandoff struct {
@@ -377,7 +383,7 @@ func (s *Scheduler) getFullModels() map[string]bool {
 		// bounces back to "queued" — and meanwhile other models with ready
 		// work and loaded instances are starved.
 		if !s.mgr.ModelHasAnyCapacity(modelID) {
-			slog.Debug("scheduler.full: no instance with capacity",
+			slog.Info("scheduler.full: no instance with capacity",
 				"model", modelID,
 				"max_concurrent", cfg.MaxConcurrent, "max_instances", *cfg.MaxInstances)
 			full[modelID] = true
@@ -390,7 +396,7 @@ func (s *Scheduler) getFullModels() map[string]bool {
 		// effective weight grows linearly with wait time, no thresholds.
 		budget := 1.0 + ages[modelID]*pressureAgeRate
 		if cp+*cfg.PressureIndex > budget+1e-9 {
-			slog.Debug("scheduler.full: model would exceed pressure budget",
+			slog.Info("scheduler.full: model would exceed pressure budget",
 				"model", modelID, "current_pressure", cp,
 				"model_pressure_index", *cfg.PressureIndex,
 				"sum", cp+*cfg.PressureIndex,
@@ -873,6 +879,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 			continue
 		}
 		if job == nil {
+			s.logIdleSkipIfBacklogged(full)
 			continue
 		}
 		slog.Info("scheduler.picked_job",
@@ -906,7 +913,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 		s.pressureMu.Lock()
 		s.currentPressure += pressure
 		s.pressureMu.Unlock()
-		slog.Debug("pressure reserved", "model", job.ModelID, "pressure", pressure, "total", s.currentPressure)
+		slog.Info("pressure reserved", "model", job.ModelID, "pressure", pressure, "total", s.currentPressure)
 
 		go func(j *Job, inst *Instance, pressure float64) {
 			s.dispatchJobToInstance(j, inst, pressure)
@@ -916,6 +923,52 @@ func (s *Scheduler) Run(ctx context.Context) {
 		// Preload next instance in background
 		s.tryPreload()
 	}
+}
+
+// logIdleSkipIfBacklogged emits a diagnostic when the scheduler ticks,
+// PickNextJob returns nil, but there is queued work for at least one model.
+// That combination means every model with backlog was filtered out (paused,
+// at capacity, or over the pressure budget) — historically silent, which
+// made "queue not draining" impossible to diagnose from the log alone.
+// Rate-limited to once per 5s so the 100ms tick doesn't flood the log.
+func (s *Scheduler) logIdleSkipIfBacklogged(full map[string]bool) {
+	pending := s.pendingJobsByModel()
+	totalPending := 0
+	for _, n := range pending {
+		totalPending += n
+	}
+	if totalPending == 0 {
+		return
+	}
+
+	s.lastIdleLogMu.Lock()
+	if time.Since(s.lastIdleLog) < 5*time.Second {
+		s.lastIdleLogMu.Unlock()
+		return
+	}
+	s.lastIdleLog = time.Now()
+	s.lastIdleLogMu.Unlock()
+
+	s.pressureMu.Lock()
+	cp := s.currentPressure
+	s.pressureMu.Unlock()
+
+	fullList := make([]string, 0, len(full))
+	for m := range full {
+		fullList = append(fullList, m)
+	}
+	pendingFull := make(map[string]int)
+	for m, n := range pending {
+		if n > 0 && full[m] {
+			pendingFull[m] = n
+		}
+	}
+	slog.Info("scheduler.idle_skip: backlog present but no job dispatched",
+		"total_pending", totalPending,
+		"pending_by_model", pending,
+		"full_models", fullList,
+		"pending_in_full_models", pendingFull,
+		"current_pressure", cp)
 }
 
 // RunScheduledWatchdog requeues jobs stuck in "scheduled" long enough that

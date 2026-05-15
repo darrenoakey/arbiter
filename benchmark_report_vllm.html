@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>LLM Backend Benchmark</title>
+<style>
+body { font: 14px -apple-system, sans-serif; margin: 24px; color: #222; }
+h1 { font-size: 22px; }
+h2 { margin-top: 28px; font-size: 17px; }
+table { border-collapse: collapse; margin: 8px 0 16px; }
+th, td { border: 1px solid #ddd; padding: 5px 9px; text-align: right; }
+th { background: #f4f4f4; }
+td.label, th.label { text-align: left; }
+.headline { background: #fff7d6; padding: 10px 14px; border-left: 4px solid #d4a017; margin: 14px 0; }
+.bad { color: #b00; }
+.muted { color: #888; font-size: 12px; }
+</style></head><body>
+<h1>LLM Backend Benchmark</h1>
+<p class="muted">Generated 2026-04-30 23:51:58. Concurrency sweep: [1, 2, 4, 8, 16]. Prompt sizes: ['small', 'medium'].</p>
+
+<div id="root"></div>
+<script>
+const data = [{"model_id": "llm:gemma4-26b-vllm", "name": "gemma4-26b-vllm", "backend": "vllm", "cold_load_s": 164.15, "warm_load_s": 0.01, "memory": {"vram_gb": 70.63671875, "rss_gb": 70.63671875}, "cells": [{"model": "gemma4-26b-vllm", "prompt": "small", "n": 1, "reasoning": false, "throughput_tps": 25.92, "p50_s": 0.998, "p95_s": 0.998, "wall_s": 1.003, "ok": 1, "valid": 1, "total": 1, "completion_tokens": 26, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 2, "reasoning": false, "throughput_tps": 19.06, "p50_s": 2.728, "p95_s": 2.728, "wall_s": 2.729, "ok": 2, "valid": 2, "total": 2, "completion_tokens": 52, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 4, "reasoning": false, "throughput_tps": 107.87, "p50_s": 0.982, "p95_s": 0.982, "wall_s": 0.983, "ok": 4, "valid": 4, "total": 4, "completion_tokens": 106, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 8, "reasoning": false, "throughput_tps": 206.33, "p50_s": 1.007, "p95_s": 1.007, "wall_s": 1.008, "ok": 8, "valid": 8, "total": 8, "completion_tokens": 208, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 16, "reasoning": false, "throughput_tps": 162.37, "p50_s": 2.559, "p95_s": 2.561, "wall_s": 2.562, "ok": 16, "valid": 16, "total": 16, "completion_tokens": 416, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 1, "reasoning": false, "throughput_tps": 18.46, "p50_s": 1.462, "p95_s": 1.462, "wall_s": 1.462, "ok": 1, "valid": 1, "total": 1, "completion_tokens": 27, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 2, "reasoning": false, "throughput_tps": 52.05, "p50_s": 1.344, "p95_s": 1.344, "wall_s": 1.345, "ok": 2, "valid": 2, "total": 2, "completion_tokens": 70, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 4, "reasoning": false, "throughput_tps": 88.18, "p50_s": 1.188, "p95_s": 1.382, "wall_s": 1.383, "ok": 4, "valid": 4, "total": 4, "completion_tokens": 122, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 8, "reasoning": false, "throughput_tps": 179.84, "p50_s": 1.298, "p95_s": 1.3, "wall_s": 1.301, "ok": 8, "valid": 8, "total": 8, "completion_tokens": 234, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 16, "reasoning": false, "throughput_tps": 393.75, "p50_s": 1.2, "p95_s": 1.202, "wall_s": 1.204, "ok": 16, "valid": 16, "total": 16, "completion_tokens": 474, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 1, "reasoning": true, "throughput_tps": 30.26, "p50_s": 4.23, "p95_s": 4.23, "wall_s": 4.23, "ok": 1, "valid": 1, "total": 1, "completion_tokens": 128, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 2, "reasoning": true, "throughput_tps": 70.33, "p50_s": 3.64, "p95_s": 3.64, "wall_s": 3.64, "ok": 2, "valid": 2, "total": 2, "completion_tokens": 256, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 4, "reasoning": true, "throughput_tps": 139.0, "p50_s": 3.678, "p95_s": 3.683, "wall_s": 3.683, "ok": 4, "valid": 4, "total": 4, "completion_tokens": 512, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 8, "reasoning": true, "throughput_tps": 267.7, "p50_s": 3.823, "p95_s": 3.824, "wall_s": 3.825, "ok": 8, "valid": 8, "total": 8, "completion_tokens": 1024, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 16, "reasoning": true, "throughput_tps": 493.77, "p50_s": 4.14, "p95_s": 4.147, "wall_s": 4.148, "ok": 16, "valid": 16, "total": 16, "completion_tokens": 2048, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 1, "reasoning": true, "throughput_tps": 32.96, "p50_s": 7.768, "p95_s": 7.768, "wall_s": 7.768, "ok": 1, "valid": 1, "total": 1, "completion_tokens": 256, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 2, "reasoning": true, "throughput_tps": 66.76, "p50_s": 7.668, "p95_s": 7.669, "wall_s": 7.669, "ok": 2, "valid": 2, "total": 2, "completion_tokens": 512, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 4, "reasoning": true, "throughput_tps": 116.23, "p50_s": 8.809, "p95_s": 8.809, "wall_s": 8.81, "ok": 4, "valid": 4, "total": 4, "completion_tokens": 1024, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 8, "reasoning": true, "throughput_tps": 227.32, "p50_s": 9.005, "p95_s": 9.006, "wall_s": 9.009, "ok": 8, "valid": 8, "total": 8, "completion_tokens": 2048, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 16, "reasoning": true, "throughput_tps": 392.42, "p50_s": 10.432, "p95_s": 10.435, "wall_s": 10.438, "ok": 16, "valid": 16, "total": 16, "completion_tokens": 4096, "had_reasoning_count": 0}], "recommended_max_concurrent": 16, "notes": ["server-reported cold load_ms=164147"]}];
+const root = document.getElementById("root");
+
+function tbl(headers, rows) {
+  let h = "<table><tr>" + headers.map(x => `<th class="label">${x}</th>`).join("") + "</tr>";
+  for (const r of rows) {
+    h += "<tr>" + r.map((v,i) => `<td class="${i===0?'label':''}">${v}</td>`).join("") + "</tr>";
+  }
+  return h + "</table>";
+}
+
+// Headline comparison
+let html = "<div class='headline'><b>Headline</b><br>";
+for (const m of data) {
+  html += `<b>${m.name}</b> [${m.backend}] — cold load ${m.cold_load_s}s, recommended max_concurrent = <b>${m.recommended_max_concurrent}</b><br>`;
+}
+html += "</div>";
+
+// Per-model details
+for (const m of data) {
+  html += `<h2>${m.name} — ${m.backend}</h2>`;
+  html += `<p>Cold load: <b>${m.cold_load_s}s</b>, warm load: ${m.warm_load_s}s. VRAM after load: ${(m.memory && m.memory.vram_gb) || '?'} GB, RSS: ${(m.memory && m.memory.rss_gb) || '?'} GB.</p>`;
+  html += `<p>Recommended max_concurrent: <b>${m.recommended_max_concurrent}</b></p>`;
+  // honors-reasoning-toggle finding
+  const onCells = m.cells.filter(c => c.reasoning);
+  const offCells = m.cells.filter(c => !c.reasoning);
+  const onHadAny = onCells.some(c => c.had_reasoning_count > 0);
+  const offHadAny = offCells.some(c => c.had_reasoning_count > 0);
+  let toggleNote = "";
+  if (onHadAny && !offHadAny) toggleNote = "✓ honors enable_thinking toggle (reasoning ON → reasoning_content present, OFF → empty)";
+  else if (!onHadAny && !offHadAny) toggleNote = "model never produced reasoning_content (reasoning may be disabled at model level)";
+  else if (onHadAny && offHadAny) toggleNote = "reasoning_content present even with enable_thinking=False — backend ignores the toggle";
+  else toggleNote = "reasoning_content empty even with enable_thinking=True — model not producing thinking output";
+  html += `<p class="muted"><b>Reasoning toggle:</b> ${toggleNote}</p>`;
+
+  // throughput / latency table per (reasoning, prompt size)
+  for (const reasoning of [true, false]) {
+    const tag = reasoning ? "ON" : "OFF";
+    html += `<h3>Reasoning: ${tag}</h3>`;
+    const sizes = [...new Set(m.cells.filter(c=>c.reasoning===reasoning).map(c => c.prompt))];
+    for (const s of sizes) {
+      html += `<h4>Prompt: ${s}</h4>`;
+      const rows = m.cells.filter(c => c.prompt === s && c.reasoning === reasoning)
+                          .sort((a,b)=>a.n-b.n).map(c => [
+        c.n,
+        c.throughput_tps,
+        c.p50_s,
+        c.p95_s,
+        c.wall_s,
+        `${c.valid}/${c.total}`,
+        c.completion_tokens,
+        `${c.had_reasoning_count}/${c.total}`,
+      ]);
+      html += tbl(["N","throughput tok/s","p50 s","p95 s","wall s","valid/total","tokens","reasoning/total"], rows);
+    }
+  }
+}
+
+// Side-by-side (medium prompt, reasoning OFF — production-typical)
+if (data.length >= 2) {
+  html += "<h2>Side-by-side throughput (medium prompt, reasoning OFF)</h2>";
+  const a = data[0], b = data[1];
+  const ns = [...new Set(a.cells.filter(c=>c.prompt==='medium' && !c.reasoning).map(c=>c.n))].sort((x,y)=>x-y);
+  const rows = ns.map(n => {
+    const ca = a.cells.find(c => c.prompt==='medium' && c.n===n && !c.reasoning) || {throughput_tps:'-', p95_s:'-'};
+    const cb = b.cells.find(c => c.prompt==='medium' && c.n===n && !c.reasoning) || {throughput_tps:'-', p95_s:'-'};
+    return [n, ca.throughput_tps, cb.throughput_tps, ca.p95_s, cb.p95_s];
+  });
+  html += tbl(["N", a.name+" tok/s", b.name+" tok/s", a.name+" p95 s", b.name+" p95 s"], rows);
+}
+
+root.innerHTML = html;
+</script></body></html>

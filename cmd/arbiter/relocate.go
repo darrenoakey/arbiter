@@ -41,6 +41,16 @@ func relocateJobOutput(cfg *Config, jobID, localDir string) string {
 	if share == "" {
 		return localDir
 	}
+	// Same-path no-op: when output_dir is itself under share_mount the worker
+	// already wrote the final file in the share location. Falling through to
+	// rename/copy+RemoveAll deletes the just-written file (CIFS rename A→A is
+	// not POSIX-clean, copyTree(A,A) opens dst with O_TRUNC and wipes it,
+	// then RemoveAll(localDir) deletes the dir).
+	if absLocal, errLocal := filepath.Abs(localDir); errLocal == nil {
+		if absShare, errShare := filepath.Abs(share); errShare == nil && absLocal == absShare {
+			return share
+		}
+	}
 	info, err := os.Stat(localDir)
 	if err != nil || !info.IsDir() {
 		return localDir

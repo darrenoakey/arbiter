@@ -832,16 +832,18 @@ func (m *InstanceManager) PickInstance(modelID string) *Instance {
 	// must not get more piled on — they would all unblock simultaneously
 	// once the load finishes and overwhelm the worker. So every branch
 	// below checks HasCapacity().
+	//
+	// For multi-instance models (max_instances > 1) the pool of Instance
+	// objects is fixed at startup by setupInstances, so falling through to
+	// cold-start a stopped sibling can never exceed max_instances. That is
+	// exactly the horizontal-scale behaviour the config asks for: when #0
+	// is saturated, light up #1.
 
 	// 1. Loaded with capacity (least busy first)
 	var bestLoaded *Instance
-	anyOnPath := false // a loaded or loading instance exists, even if full
 	for _, id := range ids {
 		inst := m.instances[id]
 		state := inst.State()
-		if state == "loaded" || state == "loading" {
-			anyOnPath = true
-		}
 		if state == "loaded" && inst.HasCapacity() {
 			if bestLoaded == nil || inst.ActiveJobs() < bestLoaded.ActiveJobs() {
 				bestLoaded = inst
@@ -852,19 +854,14 @@ func (m *InstanceManager) PickInstance(modelID string) *Instance {
 		return bestLoaded
 	}
 
-	// 2. Loading with capacity (job will wait for load to complete)
+	// 2. Loading with capacity (job will wait for load to complete).
+	// Preferred over cold-starting a sibling because the load is already
+	// in flight — adding another cold start just wastes VRAM/time.
 	for _, id := range ids {
 		inst := m.instances[id]
 		if inst.State() == "loading" && inst.HasCapacity() {
 			return inst
 		}
-	}
-
-	// If a loaded/loading instance exists but all are at capacity, refuse
-	// to dispatch — wait for a slot to free up rather than cold-starting
-	// a redundant instance or piling more onto a wedged one.
-	if anyOnPath {
-		return nil
 	}
 
 	// 3. Unloaded or stopped (needs cold start). HasCapacity is trivially

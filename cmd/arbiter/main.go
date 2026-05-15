@@ -69,8 +69,18 @@ func main() {
 		slog.Warn("could not set oom_score_adj", "error", err)
 	}
 
-	// Structured logging to stderr
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	// Structured logging to stderr. Level is overridable via ARBITER_LOG_LEVEL
+	// (debug|info|warn|error) so we can flip to debug at runtime without rebuilding.
+	logLevel := slog.LevelInfo
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ARBITER_LOG_LEVEL"))) {
+	case "debug":
+		logLevel = slog.LevelDebug
+	case "warn", "warning":
+		logLevel = slog.LevelWarn
+	case "error":
+		logLevel = slog.LevelError
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
 
 	// Kill any leftover worker subprocesses from a prior arbiter lifetime.
 	// If this arbiter was hard-killed, its workers survive as init-children

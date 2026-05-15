@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import os
 import threading
 from pathlib import Path
 
@@ -174,7 +175,22 @@ class ZImageTurboAdapter(ModelAdapter):
 
         output_dir.mkdir(parents=True, exist_ok=True)
         out_path = output_dir / "result.png"
-        result_image.save(str(out_path), format="PNG")
+        # fsync data + dir so the bytes are durable on the share mount
+        # before we return. Arbiter's queue-priority eviction may SIGKILL
+        # the worker ~1s after we return; without explicit fsync, the
+        # CIFS write cache (cache=strict) can be dropped.
+        with open(out_path, "wb") as out_fh:
+            result_image.save(out_fh, format="PNG")
+            out_fh.flush()
+            os.fsync(out_fh.fileno())
+        try:
+            dir_fd = os.open(str(output_dir), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
 
         return {
             "format": "png",

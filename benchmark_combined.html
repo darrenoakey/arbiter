@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>LLM Backend Benchmark — gemma4-26B-A4B-it</title>
+<style>
+body { font: 14px -apple-system, sans-serif; margin: 24px; color: #222; max-width: 1200px; }
+h1 { font-size: 22px; }
+h2 { margin-top: 28px; font-size: 17px; }
+h3 { font-size: 14px; margin-top: 14px; }
+h4 { font-size: 13px; margin-top: 10px; color: #444; }
+table { border-collapse: collapse; margin: 8px 0 16px; }
+th, td { border: 1px solid #ddd; padding: 5px 9px; text-align: right; font-variant-numeric: tabular-nums; }
+th { background: #f4f4f4; }
+td.label, th.label { text-align: left; }
+.headline { background: #fff7d6; padding: 12px 16px; border-left: 4px solid #d4a017; margin: 14px 0; }
+.win { color: #0a7; font-weight: bold; }
+.muted { color: #888; font-size: 12px; }
+.note { background: #eef; padding: 8px 12px; border-left: 3px solid #557; margin: 8px 0; font-size: 13px; }
+</style></head><body>
+<h1>LLM Backend Benchmark — unsloth/gemma-4-26B-A4B-it</h1>
+<p class="muted">Generated 2026-04-30 23:52:59. Hardware: spark (NVIDIA GB10 Grace Blackwell, 128 GB unified memory).<br>
+Concurrency sweep N ∈ {1,2,4,8,16}. Prompt sizes: small (~256 tok), medium (~4k tok). Reasoning ON/OFF.<br>
+Quants: llama.cpp uses unsloth Q4_K_M GGUF; vLLM uses RedHatAI NVFP4 (closest fair 4-bit-class quant — vLLM 0.19.2 cannot load Gemma-4 GGUF or AWQ, see notes).</p>
+<div id="root"></div>
+<script>
+const data = [{"model_id": "llm:gemma4-26b", "name": "gemma4-26b", "backend": "llamacpp", "cold_load_s": 6.07, "warm_load_s": 0.0, "memory": {"vram_gb": 15.861328125, "rss_gb": 15.861328125}, "cells": [{"model": "gemma4-26b", "prompt": "small", "n": 1, "reasoning": false, "throughput_tps": 0.0, "p50_s": 0.806, "p95_s": 0.806, "wall_s": 0, "ok": 1, "valid": 1, "total": 1, "completion_tokens": 26, "had_reasoning_count": 0}, {"model": "gemma4-26b", "prompt": "small", "n": 2, "reasoning": false, "throughput_tps": 0.0, "p50_s": 0.76, "p95_s": 0.76, "wall_s": 0, "ok": 2, "valid": 2, "total": 2, "completion_tokens": 52, "had_reasoning_count": 0}, {"model": "gemma4-26b", "prompt": "small", "n": 4, "reasoning": false, "throughput_tps": 0.0, "p50_s": 1.169, "p95_s": 1.169, "wall_s": 0, "ok": 4, "valid": 4, "total": 4, "completion_tokens": 106, "had_reasoning_count": 0}, {"model": "gemma4-26b", "prompt": "small", "n": 8, "reasoning": false, "throughput_tps": 0.0, "p50_s": 1.737, "p95_s": 1.76, "wall_s": 0, "ok": 8, "valid": 8, "total": 8, "completion_tokens": 209, "had_reasoning_count": 0}, {"model": "gemma4-26b", "prompt": "small", "n": 16, "reasoning": false, "throughput_tps": 0.0, "p50_s": 3.34, "p95_s": 3.376, "wall_s": 0, "ok": 16, "valid": 16, "total": 16, "completion_tokens": 418, "had_reasoning_count": 0}, {"model": "gemma4-26b", "prompt": "medium", "n": 1, "reasoning": false, "throughput_tps": 0.0, "p50_s": 1.841, "p95_s": 1.841, "wall_s": 0, "ok": 1, "valid": 1, "total": 1, "completion_tokens": 27, "had_reasoning_count": 0}, {"model": "gemma4-26b", "prompt": "medium", "n": 2, "reasoning": false, "throughput_tps": 0.0, "p50_s": 2.182, "p95_s": 2.182, "wall_s": 0, "ok": 2, "valid": 2, "total": 2, "completion_tokens": 54, "had_reasoning_count": 0}, {"model": "gemma4-26b", "prompt": "medium", "n": 4, "reasoning": false, "throughput_tps": 0.0, "p50_s": 3.81, "p95_s": 3.835, "wall_s": 0, "ok": 4, "valid": 4, "total": 4, "completion_tokens": 108, "had_reasoning_count": 0}, {"model": "gemma4-26b", "prompt": "medium", "n": 8, "reasoning": false, "throughput_tps": 0.0, "p50_s": 7.2, "p95_s": 7.326, "wall_s": 0, "ok": 8, "valid": 8, "total": 8, "completion_tokens": 216, "had_reasoning_count": 0}, {"model": "gemma4-26b", "prompt": "medium", "n": 16, "reasoning": false, "throughput_tps": 0.0, "p50_s": 2.398, "p95_s": 2.442, "wall_s": 0, "ok": 16, "valid": 16, "total": 16, "completion_tokens": 432, "had_reasoning_count": 0}, {"model": "gemma4-26b", "prompt": "small", "n": 1, "reasoning": true, "throughput_tps": 0.0, "p50_s": 2.878, "p95_s": 2.878, "wall_s": 0, "ok": 1, "valid": 1, "total": 1, "completion_tokens": 128, "had_reasoning_count": 1}, {"model": "gemma4-26b", "prompt": "small", "n": 2, "reasoning": true, "throughput_tps": 0.0, "p50_s": 3.297, "p95_s": 3.297, "wall_s": 0, "ok": 2, "valid": 2, "total": 2, "completion_tokens": 256, "had_reasoning_count": 2}, {"model": "gemma4-26b", "prompt": "small", "n": 4, "reasoning": true, "throughput_tps": 0.0, "p50_s": 4.336, "p95_s": 4.337, "wall_s": 0, "ok": 4, "valid": 4, "total": 4, "completion_tokens": 512, "had_reasoning_count": 4}, {"model": "gemma4-26b", "prompt": "small", "n": 8, "reasoning": true, "throughput_tps": 0.0, "p50_s": 5.893, "p95_s": 5.894, "wall_s": 0, "ok": 8, "valid": 8, "total": 8, "completion_tokens": 1024, "had_reasoning_count": 8}, {"model": "gemma4-26b", "prompt": "small", "n": 16, "reasoning": true, "throughput_tps": 0.0, "p50_s": 11.538, "p95_s": 11.579, "wall_s": 0, "ok": 16, "valid": 16, "total": 16, "completion_tokens": 2048, "had_reasoning_count": 16}, {"model": "gemma4-26b", "prompt": "medium", "n": 1, "reasoning": true, "throughput_tps": 0.0, "p50_s": 6.49, "p95_s": 6.49, "wall_s": 0, "ok": 1, "valid": 1, "total": 1, "completion_tokens": 256, "had_reasoning_count": 1}, {"model": "gemma4-26b", "prompt": "medium", "n": 2, "reasoning": true, "throughput_tps": 0.0, "p50_s": 8.478, "p95_s": 8.478, "wall_s": 0, "ok": 2, "valid": 2, "total": 2, "completion_tokens": 512, "had_reasoning_count": 2}, {"model": "gemma4-26b", "prompt": "medium", "n": 4, "reasoning": true, "throughput_tps": 0.0, "p50_s": 12.667, "p95_s": 12.692, "wall_s": 0, "ok": 4, "valid": 4, "total": 4, "completion_tokens": 1024, "had_reasoning_count": 4}, {"model": "gemma4-26b", "prompt": "medium", "n": 8, "reasoning": true, "throughput_tps": 0.0, "p50_s": 19.867, "p95_s": 19.985, "wall_s": 0, "ok": 8, "valid": 8, "total": 8, "completion_tokens": 2048, "had_reasoning_count": 8}, {"model": "gemma4-26b", "prompt": "medium", "n": 16, "reasoning": true, "throughput_tps": 0.0, "p50_s": 24.305, "p95_s": 24.359, "wall_s": 0, "ok": 16, "valid": 16, "total": 16, "completion_tokens": 4096, "had_reasoning_count": 16}], "recommended_max_concurrent": 2, "notes": ["server-reported cold load_ms=6065"]}, {"model_id": "llm:gemma4-26b-vllm", "name": "gemma4-26b-vllm", "backend": "vllm", "cold_load_s": 164.15, "warm_load_s": 0.01, "memory": {"vram_gb": 70.63671875, "rss_gb": 70.63671875}, "cells": [{"model": "gemma4-26b-vllm", "prompt": "small", "n": 1, "reasoning": false, "throughput_tps": 0.0, "p50_s": 0.998, "p95_s": 0.998, "wall_s": 0, "ok": 1, "valid": 1, "total": 1, "completion_tokens": 26, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 2, "reasoning": false, "throughput_tps": 0.0, "p50_s": 2.728, "p95_s": 2.728, "wall_s": 0, "ok": 2, "valid": 2, "total": 2, "completion_tokens": 52, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 4, "reasoning": false, "throughput_tps": 0.0, "p50_s": 0.982, "p95_s": 0.982, "wall_s": 0, "ok": 4, "valid": 4, "total": 4, "completion_tokens": 106, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 8, "reasoning": false, "throughput_tps": 0.0, "p50_s": 1.007, "p95_s": 1.007, "wall_s": 0, "ok": 8, "valid": 8, "total": 8, "completion_tokens": 208, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 16, "reasoning": false, "throughput_tps": 0.0, "p50_s": 2.559, "p95_s": 2.561, "wall_s": 0, "ok": 16, "valid": 16, "total": 16, "completion_tokens": 416, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 1, "reasoning": false, "throughput_tps": 0.0, "p50_s": 1.462, "p95_s": 1.462, "wall_s": 0, "ok": 1, "valid": 1, "total": 1, "completion_tokens": 27, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 2, "reasoning": false, "throughput_tps": 0.0, "p50_s": 1.344, "p95_s": 1.344, "wall_s": 0, "ok": 2, "valid": 2, "total": 2, "completion_tokens": 70, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 4, "reasoning": false, "throughput_tps": 0.0, "p50_s": 1.382, "p95_s": 1.382, "wall_s": 0, "ok": 4, "valid": 4, "total": 4, "completion_tokens": 122, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 8, "reasoning": false, "throughput_tps": 0.0, "p50_s": 1.298, "p95_s": 1.3, "wall_s": 0, "ok": 8, "valid": 8, "total": 8, "completion_tokens": 234, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 16, "reasoning": false, "throughput_tps": 0.0, "p50_s": 1.2, "p95_s": 1.202, "wall_s": 0, "ok": 16, "valid": 16, "total": 16, "completion_tokens": 474, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 1, "reasoning": true, "throughput_tps": 0.0, "p50_s": 4.23, "p95_s": 4.23, "wall_s": 0, "ok": 1, "valid": 1, "total": 1, "completion_tokens": 128, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 2, "reasoning": true, "throughput_tps": 0.0, "p50_s": 3.64, "p95_s": 3.64, "wall_s": 0, "ok": 2, "valid": 2, "total": 2, "completion_tokens": 256, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 4, "reasoning": true, "throughput_tps": 0.0, "p50_s": 3.683, "p95_s": 3.683, "wall_s": 0, "ok": 4, "valid": 4, "total": 4, "completion_tokens": 512, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 8, "reasoning": true, "throughput_tps": 0.0, "p50_s": 3.823, "p95_s": 3.824, "wall_s": 0, "ok": 8, "valid": 8, "total": 8, "completion_tokens": 1024, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "small", "n": 16, "reasoning": true, "throughput_tps": 0.0, "p50_s": 4.14, "p95_s": 4.147, "wall_s": 0, "ok": 16, "valid": 16, "total": 16, "completion_tokens": 2048, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 1, "reasoning": true, "throughput_tps": 0.0, "p50_s": 7.768, "p95_s": 7.768, "wall_s": 0, "ok": 1, "valid": 1, "total": 1, "completion_tokens": 256, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 2, "reasoning": true, "throughput_tps": 0.0, "p50_s": 7.669, "p95_s": 7.669, "wall_s": 0, "ok": 2, "valid": 2, "total": 2, "completion_tokens": 512, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 4, "reasoning": true, "throughput_tps": 0.0, "p50_s": 8.809, "p95_s": 8.809, "wall_s": 0, "ok": 4, "valid": 4, "total": 4, "completion_tokens": 1024, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 8, "reasoning": true, "throughput_tps": 0.0, "p50_s": 9.006, "p95_s": 9.006, "wall_s": 0, "ok": 8, "valid": 8, "total": 8, "completion_tokens": 2048, "had_reasoning_count": 0}, {"model": "gemma4-26b-vllm", "prompt": "medium", "n": 16, "reasoning": true, "throughput_tps": 0.0, "p50_s": 10.433, "p95_s": 10.435, "wall_s": 0, "ok": 16, "valid": 16, "total": 16, "completion_tokens": 4096, "had_reasoning_count": 0}], "recommended_max_concurrent": 16, "notes": ["server-reported cold load_ms=164147"]}];
+const root = document.getElementById("root");
+
+function tbl(headers, rows) {
+  let h = "<table><tr>" + headers.map(x => `<th class="label">${x}</th>`).join("") + "</tr>";
+  for (const r of rows) {
+    h += "<tr>" + r.map((v,i) => `<td class="${i===0?'label':''}">${v}</td>`).join("") + "</tr>";
+  }
+  return h + "</table>";
+}
+
+let html = "<div class='headline'><b>Headline</b><br>";
+for (const m of data) {
+  html += `<b>${m.name}</b> [${m.backend}] — cold load ${m.cold_load_s}s, mem ${(m.memory&&m.memory.vram_gb)||'?'} GB, recommended max_concurrent = <b>${m.recommended_max_concurrent}</b><br>`;
+}
+const llama = data.find(m => m.backend === 'llamacpp');
+const vllm  = data.find(m => m.backend === 'vllm');
+if (llama && vllm) {
+  function peakMed(d){const c=d.cells.filter(x=>x.prompt==='medium' && !x.reasoning); return Math.max(...c.map(x=>x.throughput_tps||0));}
+  const lp = peakMed(llama), vp = peakMed(vllm);
+  html += `<br><b>Peak medium-prompt throughput (reasoning OFF):</b> llama.cpp <b>${lp.toFixed(1)} tok/s</b>, vLLM <b>${vp.toFixed(1)} tok/s</b> — <span class='win'>vLLM ${(vp/lp).toFixed(1)}× faster</span> at peak.`;
+}
+html += "</div>";
+
+html += `<div class='note'><b>Quant fairness note.</b> vLLM 0.19.2 cannot load Gemma-4 4-bit on this hardware in two of three formats: GGUF Q4_K_M is rejected by transformers' GGUF loader (no Gemma-4 architecture entry); AWQ-4bit fails in vLLM's gemma4.py weight loader on packed MoE keys. The next-fairest 4-bit-class quant that DID load is RedHatAI's NVFP4, which is Blackwell-native FP4 — slightly different bit layout from Q4_K_M but in the same memory class and quality range. Headline numbers should be read with this caveat.</div>`;
+
+for (const m of data) {
+  html += `<h2>${m.name} — ${m.backend}</h2>`;
+  html += `<p>Cold load: <b>${m.cold_load_s}s</b>, warm load: ${m.warm_load_s}s. Memory after load: ${(m.memory && m.memory.vram_gb) || '?'} GB.</p>`;
+  html += `<p>Recommended max_concurrent: <b>${m.recommended_max_concurrent}</b></p>`;
+  const onCells = m.cells.filter(c => c.reasoning);
+  const offCells = m.cells.filter(c => !c.reasoning);
+  const onHadAny = onCells.some(c => c.had_reasoning_count > 0);
+  const offHadAny = offCells.some(c => c.had_reasoning_count > 0);
+  let toggleNote = "";
+  if (onHadAny && !offHadAny) toggleNote = "✓ honors enable_thinking toggle (ON → reasoning_content present, OFF → empty)";
+  else if (!onHadAny && !offHadAny) toggleNote = "model never produced reasoning_content";
+  else if (onHadAny && offHadAny) toggleNote = "ignores enable_thinking toggle (reasoning_content present in both modes)";
+  else toggleNote = "reasoning_content absent in ON mode (toggle not effective)";
+  html += `<p class="muted"><b>Reasoning toggle:</b> ${toggleNote}</p>`;
+  for (const reasoning of [false, true]) {
+    const tag = reasoning ? "ON" : "OFF";
+    html += `<h3>Reasoning: ${tag}</h3>`;
+    const sizes = [...new Set(m.cells.filter(c=>c.reasoning===reasoning).map(c => c.prompt))];
+    for (const s of sizes) {
+      html += `<h4>Prompt: ${s}</h4>`;
+      const rows = m.cells.filter(c => c.prompt === s && c.reasoning === reasoning).sort((a,b)=>a.n-b.n).map(c => [
+        c.n, c.throughput_tps, c.p50_s, c.p95_s, c.wall_s, `${c.valid}/${c.total}`, c.completion_tokens, `${c.had_reasoning_count}/${c.total}`,
+      ]);
+      html += tbl(["N","throughput tok/s","p50 s","p95 s","wall s","valid/total","tokens","reasoning/total"], rows);
+    }
+  }
+}
+
+if (data.length >= 2) {
+  const a = data[0], b = data[1];
+  for (const reasoning of [false, true]) {
+    const tag = reasoning ? "ON" : "OFF";
+    for (const s of ['small', 'medium']) {
+      html += `<h2>Side-by-side: ${s} prompt, reasoning ${tag}</h2>`;
+      const ns = [...new Set(a.cells.filter(c=>c.prompt===s && c.reasoning===reasoning).map(c=>c.n))].sort((x,y)=>x-y);
+      const rows = ns.map(n => {
+        const ca = a.cells.find(c => c.prompt===s && c.n===n && c.reasoning===reasoning) || {throughput_tps:'-', p95_s:'-'};
+        const cb = b.cells.find(c => c.prompt===s && c.n===n && c.reasoning===reasoning) || {throughput_tps:'-', p95_s:'-'};
+        const ratio = (typeof ca.throughput_tps === 'number' && typeof cb.throughput_tps === 'number' && ca.throughput_tps > 0)
+          ? (cb.throughput_tps/ca.throughput_tps).toFixed(2) + '×' : '-';
+        return [n, ca.throughput_tps, cb.throughput_tps, ratio, ca.p95_s, cb.p95_s];
+      });
+      html += tbl(["N", a.name+" tok/s", b.name+" tok/s", `${b.name}/${a.name}`, a.name+" p95 s", b.name+" p95 s"], rows);
+    }
+  }
+}
+
+root.innerHTML = html;
+</script></body></html>
