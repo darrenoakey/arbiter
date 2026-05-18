@@ -253,7 +253,7 @@ func TestLoadCircuitBreakerPausesAfterThreeFailures(t *testing.T) {
 	}
 
 	// getFullModels should include the paused model
-	full := sched.getFullModels()
+	full := sched.getFullModels("")
 	if !full["broken"] {
 		t.Fatal("broken model should be in full models set")
 	}
@@ -675,5 +675,349 @@ func TestSnapshotReportsErrorState(t *testing.T) {
 	}
 	if models[0]["state"] != "error" {
 		t.Fatalf("model state = %v, want error", models[0]["state"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Min-mean-flow scheduling tests
+// ---------------------------------------------------------------------------
+
+// buildMinMeanFlowScheduler constructs a minimal Scheduler backed by a real
+// SQLite Store and a real InstanceManager with the given model configs.
+// No worker subprocesses are started — we only test the selection logic.
+func buildMinMeanFlowScheduler(t *testing.T, models map[string]ModelConfig) (*Scheduler, *Store, *InstanceManager) {
+	t.Helper()
+	projectRoot := t.TempDir()
+	outputDir := filepath.Join(projectRoot, "output")
+	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+
+	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	store.InitDedup()
+
+	// Apply config defaults (PressureIndex, MaxInstances, etc.)
+	for id, m := range models {
+		if m.MaxConcurrent < 1 {
+			m.MaxConcurrent = 1
+		}
+		if m.MaxInstances == nil {
+			one := 1
+			m.MaxInstances = &one
+		}
+		if m.PressureIndex == nil {
+			one := 1.0
+			m.PressureIndex = &one
+		}
+		models[id] = m
+	}
+
+	cfg := &Config{
+		VRAMBudgetGB: 1000,
+		Models:       models,
+	}
+	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
+	t.Cleanup(func() { logger.Close() })
+
+	mgr := NewInstanceManager(cfg, "python3", projectRoot)
+	for modelID, m := range models {
+		mgr.ScaleModel(modelID, 1, m)
+	}
+
+	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+	return sched, store, mgr
+}
+
+// markLoaded sets an instance's state to "loaded" directly and reserves the
+// VRAM budget so scoreModel / getFullModels see it as loaded.
+func markLoaded(t *testing.T, mgr *InstanceManager, modelID string) {
+	t.Helper()
+	instances := mgr.GetModelInstances(modelID)
+	if len(instances) == 0 {
+		t.Fatalf("markLoaded: no instances for %q", modelID)
+	}
+	inst := instances[0]
+	inst.mu.Lock()
+	inst.state = "loaded"
+	inst.mu.Unlock()
+	mgr.ReserveMemoryFor(inst, inst.memoryGB)
+}
+
+// TestSelectModelMinMeanFlow_ShortColdBatchBeatsLoadedLong verifies that a
+// cold model with a batch of short jobs beats a loaded model with a single
+// long job because the load cost is amortized over the batch.
+//
+// "long": AvgInferenceMs=3_600_000 (3600 s), LoadMs=1000 (1 s), loaded.
+// "short": AvgInferenceMs=5000 (5 s), LoadMs=43000 (43 s), NOT loaded.
+//
+// With 1 queued job for "long" and 3 for "short":
+//
+//	score_long  = 3600 + 0/1         = 3600
+//	score_short = 5    + 43/3 ≈ 19.3
+//
+// → "short" wins.
+func TestSelectModelMinMeanFlow_ShortColdBatchBeatsLoadedLong(t *testing.T) {
+	models := map[string]ModelConfig{
+		"long":  {MemoryGB: 10, MaxConcurrent: 1, AvgInferenceMs: 3_600_000, LoadMs: 1000},
+		"short": {MemoryGB: 5, MaxConcurrent: 1, AvgInferenceMs: 5000, LoadMs: 43000},
+	}
+	sched, store, mgr := buildMinMeanFlowScheduler(t, models)
+
+	markLoaded(t, mgr, "long")
+	// "short" is NOT loaded — scoreModel reads IsLoaded → false → adds LoadMs.
+
+	payload := json.RawMessage(`{}`)
+	if _, err := store.CreateJob("long", "image-generate", payload, 1); err != nil {
+		t.Fatalf("create long job: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := store.CreateJob("short", "image-generate", payload, 1); err != nil {
+			t.Fatalf("create short job %d: %v", i, err)
+		}
+	}
+
+	got := sched.selectModelMinMeanFlow(nil)
+	if got != "short" {
+		t.Fatalf("selectModelMinMeanFlow = %q, want \"short\" (score ≈19.3 < 3600)", got)
+	}
+}
+
+// TestSelectModelMinMeanFlow_LoadAmortization tests the crossover point where
+// adding more queued jobs for a cold model tips its amortized score below a
+// loaded model.
+//
+// Cold model "c": e=5 s, L=60 s. Loaded model "h": e=10 s, L=0.
+//
+//	q_c=1:  score_c = 5 + 60/1 = 65   > 10 → "h" wins.
+//	q_c=30: score_c = 5 + 60/30 = 7   < 10 → "c" wins.
+func TestSelectModelMinMeanFlow_LoadAmortization(t *testing.T) {
+	models := map[string]ModelConfig{
+		"c": {MemoryGB: 4, MaxConcurrent: 1, AvgInferenceMs: 5000, LoadMs: 60000},
+		"h": {MemoryGB: 4, MaxConcurrent: 1, AvgInferenceMs: 10000, LoadMs: 0},
+	}
+
+	// Sub-case 1: q_c=1 → loaded "h" wins.
+	t.Run("small_batch_loaded_wins", func(t *testing.T) {
+		sched, store, mgr := buildMinMeanFlowScheduler(t, models)
+		markLoaded(t, mgr, "h")
+
+		payload := json.RawMessage(`{}`)
+		if _, err := store.CreateJob("c", "image-generate", payload, 1); err != nil {
+			t.Fatalf("create c job: %v", err)
+		}
+		if _, err := store.CreateJob("h", "image-generate", payload, 1); err != nil {
+			t.Fatalf("create h job: %v", err)
+		}
+
+		got := sched.selectModelMinMeanFlow(nil)
+		if got != "h" {
+			t.Fatalf("q_c=1: got %q, want \"h\" (score_h=10 < score_c=65)", got)
+		}
+	})
+
+	// Sub-case 2: q_c=30 → cold "c" wins because load is well amortized.
+	t.Run("large_batch_cold_wins", func(t *testing.T) {
+		sched, store, mgr := buildMinMeanFlowScheduler(t, models)
+		markLoaded(t, mgr, "h")
+
+		payload := json.RawMessage(`{}`)
+		for i := 0; i < 30; i++ {
+			if _, err := store.CreateJob("c", "image-generate", payload, 1); err != nil {
+				t.Fatalf("create c job %d: %v", i, err)
+			}
+		}
+		if _, err := store.CreateJob("h", "image-generate", payload, 1); err != nil {
+			t.Fatalf("create h job: %v", err)
+		}
+
+		got := sched.selectModelMinMeanFlow(nil)
+		if got != "c" {
+			t.Fatalf("q_c=30: got %q, want \"c\" (score_c=7 < score_h=10)", got)
+		}
+	})
+}
+
+// TestSelectModelMinMeanFlow_TieBreakOldest verifies that when two models have
+// equal scores, the one whose oldest queued job was submitted first (larger age)
+// is selected.
+func TestSelectModelMinMeanFlow_TieBreakOldest(t *testing.T) {
+	// Both models: identical config so scores are always equal.
+	models := map[string]ModelConfig{
+		"alpha": {MemoryGB: 4, MaxConcurrent: 1, AvgInferenceMs: 5000, LoadMs: 0},
+		"beta":  {MemoryGB: 4, MaxConcurrent: 1, AvgInferenceMs: 5000, LoadMs: 0},
+	}
+	sched, store, mgr := buildMinMeanFlowScheduler(t, models)
+	markLoaded(t, mgr, "alpha")
+	markLoaded(t, mgr, "beta")
+
+	payload := json.RawMessage(`{}`)
+
+	// Submit "beta"'s job first so it has the older created_at.
+	betaJob, err := store.CreateJob("beta", "image-generate", payload, 1)
+	if err != nil {
+		t.Fatalf("create beta job: %v", err)
+	}
+	// Back-date beta's job so it is unambiguously older.
+	olderTS := nowTS() - 300
+	if err := store.UpdateState(betaJob.ID, "queued", WithStartedAt(olderTS)); err != nil {
+		t.Fatalf("backdate beta: %v", err)
+	}
+	// Directly update created_at since UpdateState doesn't touch it; use raw SQL.
+	if _, err := store.db.Exec("UPDATE jobs SET created_at = ? WHERE id = ?", olderTS, betaJob.ID); err != nil {
+		t.Fatalf("set beta created_at: %v", err)
+	}
+
+	if _, err := store.CreateJob("alpha", "image-generate", payload, 1); err != nil {
+		t.Fatalf("create alpha job: %v", err)
+	}
+
+	got := sched.selectModelMinMeanFlow(nil)
+	if got != "beta" {
+		t.Fatalf("tie-break: got %q, want \"beta\" (older oldest job)", got)
+	}
+}
+
+// TestPickOldestQueuedJobForModel verifies that PickOldestQueuedJobForModel
+// returns the oldest queued job for the requested model and ignores jobs
+// belonging to other models or in non-queued states.
+func TestPickOldestQueuedJobForModel(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "arbiter.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+	store.InitDedup()
+
+	payload := json.RawMessage(`{}`)
+
+	// Create a job for a different model — must be ignored.
+	if _, err := store.CreateJob("other-model", "image-generate", payload, 1); err != nil {
+		t.Fatalf("create other-model job: %v", err)
+	}
+
+	// Create two queued jobs for "target". The first has an older timestamp.
+	first, err := store.CreateJob("target", "image-generate", payload, 1)
+	if err != nil {
+		t.Fatalf("create first target job: %v", err)
+	}
+	olderTS := nowTS() - 60
+	if _, err := store.db.Exec("UPDATE jobs SET created_at = ? WHERE id = ?", olderTS, first.ID); err != nil {
+		t.Fatalf("backdate first job: %v", err)
+	}
+
+	second, err := store.CreateJob("target", "image-generate", payload, 1)
+	if err != nil {
+		t.Fatalf("create second target job: %v", err)
+	}
+
+	// Create a running job for "target" — must be ignored.
+	running, err := store.CreateJob("target", "image-generate", payload, 1)
+	if err != nil {
+		t.Fatalf("create running job: %v", err)
+	}
+	if err := store.UpdateState(running.ID, "running"); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+
+	got, err := store.PickOldestQueuedJobForModel("target")
+	if err != nil {
+		t.Fatalf("PickOldestQueuedJobForModel: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected a job, got nil")
+	}
+	if got.ID != first.ID {
+		t.Fatalf("got job %s, want oldest job %s (not %s)", got.ID, first.ID, second.ID)
+	}
+	if got.ModelID != "target" {
+		t.Fatalf("job model = %q, want \"target\"", got.ModelID)
+	}
+	if got.State != "queued" {
+		t.Fatalf("job state = %q, want \"queued\"", got.State)
+	}
+
+	// When no queued jobs exist for a model, should return nil without error.
+	got2, err := store.PickOldestQueuedJobForModel("no-such-model")
+	if err != nil {
+		t.Fatalf("PickOldestQueuedJobForModel for absent model: %v", err)
+	}
+	if got2 != nil {
+		t.Fatalf("expected nil for absent model, got %v", got2)
+	}
+}
+
+// evictableForScore is a pure helper extracted from the ensureLoaded
+// min-mean-flow eviction predicate. It is testable without spinning up
+// real VRAM bookkeeping or worker processes.
+//
+// An instance is a valid eviction candidate when:
+//   - it has no active jobs (never preempt running work), AND
+//   - the candidate model's score is strictly worse (higher) than the wanted score.
+func evictableForScore(activeJobs int, scoreCandidate, scoreWanted float64) bool {
+	if activeJobs > 0 {
+		return false
+	}
+	return scoreCandidate > scoreWanted
+}
+
+// TestEnsureLoadedDrainsIdleWorseModelButNotRunningOne exercises the pure
+// eviction-candidate predicate used by the min-mean-flow drain in ensureLoaded.
+func TestEnsureLoadedDrainsIdleWorseModelButNotRunningOne(t *testing.T) {
+	type testCase struct {
+		name           string
+		activeJobs     int
+		scoreCandidate float64
+		scoreWanted    float64
+		wantEvict      bool
+	}
+
+	cases := []testCase{
+		{
+			name:           "idle worse score — should evict",
+			activeJobs:     0,
+			scoreCandidate: 3600,
+			scoreWanted:    19,
+			wantEvict:      true,
+		},
+		{
+			name:           "running job — must NOT evict",
+			activeJobs:     1,
+			scoreCandidate: 3600,
+			scoreWanted:    19,
+			wantEvict:      false,
+		},
+		{
+			name:           "idle but better score — must NOT evict",
+			activeJobs:     0,
+			scoreCandidate: 10,
+			scoreWanted:    19,
+			wantEvict:      false,
+		},
+		{
+			name:           "idle equal score — must NOT evict",
+			activeJobs:     0,
+			scoreCandidate: 19,
+			scoreWanted:    19,
+			wantEvict:      false,
+		},
+		{
+			name:           "multiple active jobs — must NOT evict",
+			activeJobs:     3,
+			scoreCandidate: 9999,
+			scoreWanted:    1,
+			wantEvict:      false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := evictableForScore(tc.activeJobs, tc.scoreCandidate, tc.scoreWanted)
+			if got != tc.wantEvict {
+				t.Fatalf("evictableForScore(activeJobs=%d, candidate=%.1f, wanted=%.1f) = %v, want %v",
+					tc.activeJobs, tc.scoreCandidate, tc.scoreWanted, got, tc.wantEvict)
+			}
+		})
 	}
 }

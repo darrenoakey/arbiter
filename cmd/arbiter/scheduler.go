@@ -177,6 +177,86 @@ func (s *Scheduler) computePriority(modelID string) float64 {
 	return p
 }
 
+// scoreModel computes the min-mean-flow score for a model: the expected wait
+// for a new job to complete, accounting for model load time amortized over the
+// queued batch.
+//
+//	score = e_m + L_m / max(q_m, 1)
+//
+// where e_m is avg inference seconds (floored at 1s for unknown/zero),
+// L_m is load time in seconds (0 if already loaded), and q_m is queued count.
+// Lower score = schedule first.
+func (s *Scheduler) scoreModel(modelID string) float64 {
+	cfg, ok := s.config.Models[modelID]
+	if !ok {
+		return 1e9
+	}
+	e := cfg.AvgInferenceMs / 1000.0
+	if e <= 0 {
+		e = 1.0
+	}
+	var loadSec float64
+	if !s.mgr.IsLoaded(modelID) {
+		loadSec = cfg.LoadMs / 1000.0
+	}
+	counts, err := s.store.CountByState(modelID)
+	queuedCount := 1
+	if err == nil {
+		if q := counts["queued"]; q > 0 {
+			queuedCount = q
+		}
+	}
+	return e + loadSec/float64(queuedCount)
+}
+
+// selectModelMinMeanFlow returns the model ID with the minimum scoreModel score
+// among models that have queued jobs and are not excluded. On a tie (within
+// 1e-9) the model whose oldest queued job was submitted earliest (largest age)
+// wins. Returns "" if no eligible model exists.
+func (s *Scheduler) selectModelMinMeanFlow(exclude map[string]bool) string {
+	ages, _ := s.store.OldestQueuedAgeByModel()
+
+	bestModel := ""
+	bestScore := 0.0
+	bestAge := 0.0
+
+	for modelID := range s.config.Models {
+		if exclude[modelID] {
+			continue
+		}
+		counts, err := s.store.CountByState(modelID)
+		if err != nil {
+			continue
+		}
+		if counts["queued"] == 0 {
+			continue
+		}
+		score := s.scoreModel(modelID)
+		age := ages[modelID]
+
+		if bestModel == "" {
+			bestModel = modelID
+			bestScore = score
+			bestAge = age
+			continue
+		}
+
+		if score < bestScore-1e-9 {
+			bestModel = modelID
+			bestScore = score
+			bestAge = age
+		} else if score <= bestScore+1e-9 {
+			// Tie: prefer the model with the older oldest queued job (larger age).
+			if age > bestAge {
+				bestModel = modelID
+				bestScore = score
+				bestAge = age
+			}
+		}
+	}
+	return bestModel
+}
+
 func (s *Scheduler) rescoreModel(modelID string) {
 	p := s.computePriority(modelID)
 	s.store.UpdatePriority(modelID, p)
@@ -339,8 +419,12 @@ func (s *Scheduler) IsModelLoadPaused(modelID string) (bool, time.Time) {
 // blocked job's budget grows linearly with wait time until it fits.
 const pressureAgeRate = 0.01
 
-// getFullModels returns model IDs that are at total capacity or would exceed the pressure budget.
-func (s *Scheduler) getFullModels() map[string]bool {
+// getFullModels returns model IDs that are at total capacity or would exceed
+// the pressure budget. bestModel is the model with the minimum mean-flow score
+// (pre-computed by the caller); it is never excluded by the pressure-budget
+// check so that the best-latency model always gets at least one dispatch slot.
+// Pass "" to skip the pressure-bypass logic.
+func (s *Scheduler) getFullModels(bestModel string) map[string]bool {
 	full := make(map[string]bool)
 	now := time.Now()
 	s.cooldownMu.Lock()
@@ -396,6 +480,16 @@ func (s *Scheduler) getFullModels() map[string]bool {
 		// effective weight grows linearly with wait time, no thresholds.
 		budget := 1.0 + ages[modelID]*pressureAgeRate
 		if cp+*cfg.PressureIndex > budget+1e-9 {
+			// Never exclude the globally-best model from dispatch: if it won
+			// on latency it must get a slot even when pressure is high.
+			if modelID == bestModel {
+				slog.Info("scheduler.pressure_bypass: best-scoring model allowed past budget",
+					"model", modelID, "current_pressure", cp,
+					"model_pressure_index", *cfg.PressureIndex,
+					"sum", cp+*cfg.PressureIndex,
+					"aged_budget", budget, "score", s.scoreModel(modelID))
+				continue
+			}
 			slog.Info("scheduler.full: model would exceed pressure budget",
 				"model", modelID, "current_pressure", cp,
 				"model_pressure_index", *cfg.PressureIndex,
@@ -407,41 +501,61 @@ func (s *Scheduler) getFullModels() map[string]bool {
 	return full
 }
 
+// waitForInProgressLoad blocks until another goroutine's in-flight load for
+// inst resolves. Returns nil once loaded, an error if the load failed or timed
+// out. Used both by callers that observe state in loading/starting and by the
+// loser of the loadInFlight claim race. Failing here (rather than attempting
+// our own load) is deliberate: a second concurrent Load() would spawn a second
+// subprocess holding GPU memory in parallel, and counting it as a load failure
+// trips the dispatcher's load circuit-breaker after 3 attempts.
+func (s *Scheduler) waitForInProgressLoad(inst *Instance) error {
+	slog.Info("ensureLoaded.wait_for_in_progress_load", "instance", inst.InstanceID)
+	deadline := time.Now().Add(10 * time.Minute)
+	for time.Now().Before(deadline) {
+		s2 := inst.State()
+		if s2 == "loaded" {
+			slog.Info("ensureLoaded.in_progress_load_completed", "instance", inst.InstanceID)
+			return nil
+		}
+		// A terminal state only means failure once the load owner has released
+		// its claim. Otherwise we may be observing the brief window between the
+		// CAS win and Spawn() flipping state to "starting".
+		if (s2 == "stopped" || s2 == "error" || s2 == "unloaded") && !inst.loadInFlight.Load() {
+			slog.Warn("ensureLoaded.in_progress_load_failed",
+				"instance", inst.InstanceID, "final_state", s2)
+			return fmt.Errorf("instance %s in-progress load ended in state=%s", inst.InstanceID, s2)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("instance %s still loading after 10min", inst.InstanceID)
+}
+
 // ensureLoaded makes sure an instance is loaded within the VRAM budget.
-// Strategy: try reserve, evict idle if needed, retry.
+// Strategy: claim the load so two concurrent callers (the dispatch path and
+// the background tryPreload goroutine racing on the same instance) can't both
+// spawn a subprocess / double-reserve VRAM; then try reserve, evict idle if
+// needed, retry. The loser of the claim waits for the winner's load.
 func (s *Scheduler) ensureLoaded(inst *Instance) error {
 	state := inst.State()
 	if state == "loaded" {
 		return nil
 	}
-
-	if state == "loading" {
-		// Another caller (preload, prior dispatch) already kicked off the load.
-		// Wait for it to finish rather than failing — failing here counts as a
-		// load failure for the dispatcher, which after 3 attempts trips the
-		// load circuit-breaker and pauses the model for 30s+. That's how we
-		// ended up never getting concurrent dispatch on vLLM: the first job
-		// triggers load, the 2nd-Nth jobs picked while still loading all
-		// "fail", scheduler gives up, queue stalls.
-		slog.Info("ensureLoaded.wait_for_in_progress_load", "instance", inst.InstanceID)
-		deadline := time.Now().Add(10 * time.Minute)
-		for time.Now().Before(deadline) {
-			s2 := inst.State()
-			if s2 == "loaded" {
-				slog.Info("ensureLoaded.in_progress_load_completed", "instance", inst.InstanceID)
-				return nil
-			}
-			if s2 == "stopped" || s2 == "error" || s2 == "unloaded" {
-				slog.Warn("ensureLoaded.in_progress_load_failed",
-					"instance", inst.InstanceID, "final_state", s2)
-				return fmt.Errorf("instance %s in-progress load ended in state=%s", inst.InstanceID, s2)
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-		return fmt.Errorf("instance %s still loading after 10min", inst.InstanceID)
+	if state == "loading" || state == "starting" {
+		return s.waitForInProgressLoad(inst)
+	}
+	if state != "stopped" && state != "unloaded" && state != "error" {
+		// Transient (e.g. "unloading") — treat like an in-progress transition
+		// rather than racing a load against it.
+		return s.waitForInProgressLoad(inst)
 	}
 
-	if state == "stopped" || state == "unloaded" || state == "error" {
+	// state is stopped/unloaded/error: exactly one goroutine performs the load.
+	if !inst.loadInFlight.CompareAndSwap(false, true) {
+		return s.waitForInProgressLoad(inst)
+	}
+	defer inst.loadInFlight.Store(false)
+
+	{
 		needed := inst.memoryGB
 		freeGB := s.mgr.FreeGB()
 
@@ -454,6 +568,54 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 
 		// Try reserve
 		if !s.mgr.ReserveMemoryFor(inst, needed) {
+			// Min-mean-flow eviction: before falling back to the queue-aware
+			// evictor, try to drain any loaded idle instance that belongs to a
+			// model with a WORSE (higher) score than the one we're loading.
+			// Running jobs are protected by the ActiveJobs() == 0 guard so we
+			// never preempt in-flight work.
+			wantedScore := s.scoreModel(inst.ModelID)
+			for candidateModelID := range s.config.Models {
+				if candidateModelID == inst.ModelID {
+					continue
+				}
+				if s.mgr.FreeGB() >= needed {
+					break
+				}
+				if s.scoreModel(candidateModelID) <= wantedScore {
+					continue
+				}
+				for _, inst2 := range s.mgr.GetModelInstances(candidateModelID) {
+					if s.mgr.FreeGB() >= needed {
+						break
+					}
+					if inst2.State() != "loaded" {
+						continue
+					}
+					if inst2.ActiveJobs() > 0 {
+						continue
+					}
+					slog.Info("ensureLoaded: draining idle worse-scoring model",
+						"evicting_model", candidateModelID,
+						"evicting_instance", inst2.InstanceID,
+						"for_model", inst.ModelID,
+						"candidate_score", s.scoreModel(candidateModelID),
+						"wanted_score", wantedScore)
+					if err := inst2.Unload(); err != nil {
+						slog.Warn("ensureLoaded: drain unload failed",
+							"instance", inst2.InstanceID, "error", err)
+						continue
+					}
+					s.mgr.ReleaseMemoryFor(inst2)
+					s.logger.Log("model.evict_done", map[string]any{
+						"model_id":    candidateModelID,
+						"instance_id": inst2.InstanceID,
+						"reason":      "min_mean_flow_drain",
+						"freed_gb":    inst2.memoryGB,
+					})
+					s.rescoreModel(candidateModelID)
+				}
+			}
+
 			// Evict idle models. Use the queue-aware evictor so that a model
 			// which still has queued/running work is preserved over a model
 			// with nothing waiting for it.
@@ -871,12 +1033,37 @@ func (s *Scheduler) Run(ctx context.Context) {
 			s.rescoreAll()
 		}
 
+		// Select the model with the minimum mean-flow score (SPT + amortized
+		// load cost) across all models with queued work. This selection is done
+		// BEFORE getFullModels so that we can pass the winner to getFullModels,
+		// which exempts it from the pressure-budget exclusion. Computing it
+		// first (without the full-model set) avoids a second DB-query round-trip
+		// inside getFullModels and keeps the hot path at the same query count as
+		// the original FCFS implementation.
+		bestModel := s.selectModelMinMeanFlow(nil)
+
 		// Pick and dispatch one job at a time
-		full := s.getFullModels()
-		job, err := s.store.PickNextJob(full)
-		if err != nil {
-			slog.Warn("scheduler.pick_next_job error", "error", err)
-			continue
+		full := s.getFullModels(bestModel)
+
+		// Fall back to FCFS PickNextJob if the best model was excluded by some
+		// hard constraint (cooldown, circuit-breaker, capacity) or if no model
+		// was selected. The full set has bestModel exempted from the pressure
+		// check, but it can still be excluded by the hard constraints above.
+		var job *Job
+		var err error
+		if bestModel != "" && !full[bestModel] {
+			job, err = s.store.PickOldestQueuedJobForModel(bestModel)
+			if err != nil {
+				slog.Warn("scheduler.pick_for_model error", "model", bestModel, "error", err)
+				continue
+			}
+		}
+		if job == nil {
+			job, err = s.store.PickNextJob(full)
+			if err != nil {
+				slog.Warn("scheduler.pick_next_job error", "error", err)
+				continue
+			}
 		}
 		if job == nil {
 			s.logIdleSkipIfBacklogged(full)
@@ -1486,11 +1673,12 @@ func classifyStatError(path string, err error) string {
 // it for 15 minutes and starve every other queued job.
 //
 // Watched errno values:
-//   2  ENOENT  — no such file or directory
-//   5  EIO     — I/O error (often stale NFS/CIFS handle)
-//   13 EACCES  — permission denied
-//   22 EINVAL  — invalid argument (broken symlink on CIFS, bad path syntax)
-//   116 ESTALE — stale file handle (NFS specific)
+//
+//	2  ENOENT  — no such file or directory
+//	5  EIO     — I/O error (often stale NFS/CIFS handle)
+//	13 EACCES  — permission denied
+//	22 EINVAL  — invalid argument (broken symlink on CIFS, bad path syntax)
+//	116 ESTALE — stale file handle (NFS specific)
 //
 // All of these mean "the bytes the worker wanted to read aren't reachable"
 // — never a model bug, always upstream of the worker.

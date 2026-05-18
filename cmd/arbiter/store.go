@@ -315,10 +315,10 @@ func (s *Store) UpdateState(jobID, state string, opts ...func(*stateUpdate)) err
 }
 
 type stateUpdate struct {
-	startedAt  *float64
-	finishedAt *float64
-	result     *json.RawMessage
-	error      string
+	startedAt      *float64
+	finishedAt     *float64
+	result         *json.RawMessage
+	error          string
 	clearStartedAt bool
 }
 
@@ -401,6 +401,24 @@ func (s *Store) OldestQueuedAgeByModel() (map[string]float64, error) {
 		out[modelID] = age
 	}
 	return out, rows.Err()
+}
+
+// PickOldestQueuedJobForModel returns the oldest queued job for the given model,
+// ignoring all other models and non-queued states. Returns (nil, nil) when no
+// matching row exists.
+func (s *Store) PickOldestQueuedJobForModel(modelID string) (*Job, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	row := s.db.QueryRow(
+		"SELECT * FROM jobs WHERE state = 'queued' AND model_id = ? ORDER BY created_at ASC LIMIT 1",
+		modelID,
+	)
+	j, err := s.scanJob(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return j, err
 }
 
 func (s *Store) CountActive(modelID string) (int, error) {

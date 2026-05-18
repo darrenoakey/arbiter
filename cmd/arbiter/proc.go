@@ -27,9 +27,18 @@ type Instance struct {
 	mu         sync.Mutex
 	state      string // "stopped", "starting", "loading", "loaded", "unloading", "error"
 	activeJobs int32  // atomic
-	lastActive time.Time
-	memoryGB   float64
-	vramHeld   bool // true while this instance's memoryGB is counted in InstanceManager.usedGB
+	// loadInFlight is a try-lock for the ensureLoaded reserve+Load critical
+	// section. It is deliberately separate from `state`: Spawn() early-returns
+	// when state is anything other than stopped/error, so pre-setting state to
+	// "loading" as a claim would make Spawn a no-op and break loading entirely.
+	// Exactly one goroutine wins the CAS, performs the load, and clears it; any
+	// concurrent ensureLoaded caller (the dispatch path racing the background
+	// tryPreload goroutine for the same instance) observes it and waits instead
+	// of spawning a second subprocess / double-reserving VRAM.
+	loadInFlight atomic.Bool
+	lastActive   time.Time
+	memoryGB     float64
+	vramHeld     bool // true while this instance's memoryGB is counted in InstanceManager.usedGB
 
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -1050,11 +1059,37 @@ func (m *InstanceManager) ReserveMemory(gb float64) bool {
 // ReserveMemoryFor reserves VRAM and tags the instance so the reservation can
 // be matched back to it during reconciliation or death-path cleanup. Use this
 // for any reservation tied to an instance lifetime.
+// ReserveMemoryFor reserves gb of VRAM budget on behalf of inst. It is
+// idempotent per instance and race-safe: if inst already holds a reservation
+// (vramHeld), it returns true WITHOUT double-counting. Two goroutines can race
+// into ensureLoaded for the same instance (the dispatch path and the
+// background tryPreload goroutine both see state=="stopped" before either has
+// flipped it to "loading"); without this guard both call ReserveMemory(gb),
+// usedGB is inflated by one memoryGB, and because vramHeld is a single bool the
+// matching ReleaseMemoryFor only frees it once — a permanent budget leak that
+// AuditVRAMConsistency flags as drift and that eventually wedges the queue.
+// ReleaseMemoryFor was already idempotent the same way; this restores symmetry.
 func (m *InstanceManager) ReserveMemoryFor(inst *Instance, gb float64) bool {
+	inst.mu.Lock()
+	if inst.vramHeld {
+		inst.mu.Unlock()
+		return true
+	}
+	inst.mu.Unlock()
+
 	if !m.ReserveMemory(gb) {
 		return false
 	}
+
 	inst.mu.Lock()
+	if inst.vramHeld {
+		// Lost the race: another goroutine reserved for this instance between
+		// our check and now. Give back the extra reservation we just took so
+		// usedGB stays consistent, and report success — it IS reserved.
+		inst.mu.Unlock()
+		m.ReleaseMemory(gb)
+		return true
+	}
 	inst.vramHeld = true
 	inst.mu.Unlock()
 	return true
@@ -1315,7 +1350,7 @@ func (m *InstanceManager) EvictForGB(needed float64) error {
 			slog.Error("eviction unload failed", "instance", c.inst.InstanceID, "error", err)
 			continue
 		}
-				freed += m.ReleaseMemoryFor(c.inst)
+		freed += m.ReleaseMemoryFor(c.inst)
 		// Update loadedCount for remaining candidates of the same model
 		for i := range ordered {
 			if ordered[i].inst.ModelID == c.inst.ModelID {
@@ -1401,7 +1436,7 @@ func (m *InstanceManager) EvictForGBWithQueueInfo(needed float64, queuedJobs map
 				"instance", c.inst.InstanceID, "error", err)
 			continue
 		}
-				freed += m.ReleaseMemoryFor(c.inst)
+		freed += m.ReleaseMemoryFor(c.inst)
 	}
 
 	if freed < needed {
@@ -1644,7 +1679,7 @@ func (m *InstanceManager) EvictForReservation(needed float64, keepAliveSecs map[
 			slog.Error("reservation eviction failed", "instance", c.inst.InstanceID, "error", err)
 			continue
 		}
-				freed += m.ReleaseMemoryFor(c.inst)
+		freed += m.ReleaseMemoryFor(c.inst)
 	}
 
 	if freed < needed {
