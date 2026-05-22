@@ -60,6 +60,26 @@ type Scheduler struct {
 	// see why a queue with thousands of jobs isn't draining.
 	lastIdleLogMu sync.Mutex
 	lastIdleLog   time.Time
+	// inFlight is the authoritative registry of jobs currently owned by a live
+	// dispatch goroutine. It is the single source of truth for the activeJobs
+	// slot + pressure reservation each dispatch holds. Two problems this fixes:
+	//   1. Double-dispatch: the scheduled-watchdog used to requeue a job whose
+	//      dispatch was still loading its model (denoise loads take minutes,
+	//      the watchdog fires at 15s), so the same job got picked and dispatched
+	//      repeatedly. Each duplicate registered the same req_id and stranded
+	//      the earlier goroutine, which never ran its defer → leaked activeJobs
+	//      and pressure forever (instance pinned loaded, real jobs blocked).
+	//   2. Divergence: /v1/ps (in-memory activeJobs + currentPressure) could
+	//      silently drift from /v1/jobs (the store) with no reconciler. The
+	//      registry lets RunInFlightReconciler detect a stranded entry (store
+	//      says terminal but we still hold the reservation) and heal it.
+	inFlightMu sync.Mutex
+	inFlight   map[string]inFlightJob
+}
+
+type inFlightJob struct {
+	inst     *Instance
+	pressure float64
 }
 
 type streamHandoff struct {
@@ -101,7 +121,71 @@ func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *Event
 		loadFailureCooldownLevel: make(map[string]int),
 		loadAttempts:             make(map[string]int),
 		streamHandoffs:           make(map[string]*streamHandoff),
+		inFlight:                 make(map[string]inFlightJob),
 	}
+}
+
+// markInFlight records a dispatch and reserves its activeJobs slot + pressure.
+// Returns false if the job already has a live dispatch — the double-dispatch
+// guard. Increment of activeJobs + currentPressure is paired here so the only
+// way to reserve is through the registry.
+func (s *Scheduler) markInFlight(jobID string, inst *Instance, pressure float64) bool {
+	s.inFlightMu.Lock()
+	if _, exists := s.inFlight[jobID]; exists {
+		s.inFlightMu.Unlock()
+		return false
+	}
+	s.inFlight[jobID] = inFlightJob{inst: inst, pressure: pressure}
+	s.inFlightMu.Unlock()
+
+	atomic.AddInt32(&inst.activeJobs, 1)
+	s.pressureMu.Lock()
+	s.currentPressure += pressure
+	s.pressureMu.Unlock()
+	return true
+}
+
+// releaseInFlight removes a dispatch from the registry and releases its
+// pressure reservation. Idempotent: returns (inst, true) only on the FIRST
+// release for a job, so the dispatch defer and the reconciler can both call it
+// without double-releasing. The caller performs the matching activeJobs
+// decrement (ReleaseAndCheck) only when ok is true.
+func (s *Scheduler) releaseInFlight(jobID string) (*Instance, bool) {
+	s.inFlightMu.Lock()
+	entry, exists := s.inFlight[jobID]
+	if !exists {
+		s.inFlightMu.Unlock()
+		return nil, false
+	}
+	delete(s.inFlight, jobID)
+	s.inFlightMu.Unlock()
+
+	s.pressureMu.Lock()
+	s.currentPressure -= entry.pressure
+	if s.currentPressure < 0 {
+		s.currentPressure = 0
+	}
+	s.pressureMu.Unlock()
+	return entry.inst, true
+}
+
+// isInFlight reports whether a job currently has a live dispatch goroutine.
+func (s *Scheduler) isInFlight(jobID string) bool {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	_, ok := s.inFlight[jobID]
+	return ok
+}
+
+// inFlightIDs returns a snapshot of the currently-dispatched job IDs.
+func (s *Scheduler) inFlightIDs() []string {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	out := make([]string, 0, len(s.inFlight))
+	for id := range s.inFlight {
+		out = append(out, id)
+	}
+	return out
 }
 
 // RegisterStreamHandoff is called by the streaming-chat API handler before it
@@ -774,14 +858,14 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 			s.logger.Log("job.panic", map[string]any{"job_id": job.ID, "model_id": job.ModelID, "panic": fmt.Sprintf("%v", r)})
 			s.store.UpdateState(job.ID, "failed", WithError(fmt.Sprintf("internal panic: %v", r)))
 		}
-		s.pressureMu.Lock()
-		s.currentPressure -= pressure
-		if s.currentPressure < 0 {
-			s.currentPressure = 0
+		// Release the activeJobs slot + pressure through the in-flight registry.
+		// Idempotent: if the reconciler already healed this dispatch (store went
+		// terminal while this goroutine was stranded), releaseInFlight returns
+		// ok=false and we skip the decrement so the counters can't go negative.
+		if _, ok := s.releaseInFlight(job.ID); ok {
+			s.mgr.ReleaseAndCheck(inst)
+			s.rescoreModel(job.ModelID)
 		}
-		s.pressureMu.Unlock()
-		s.mgr.ReleaseAndCheck(inst)
-		s.rescoreModel(job.ModelID)
 	}()
 
 	slog.Info("dispatching job", "job_id", job.ID, "model", job.ModelID, "instance", inst.InstanceID)
@@ -1162,6 +1246,18 @@ func (s *Scheduler) Run(ctx context.Context) {
 		slog.Info("scheduler.picked_job",
 			"job_id", job.ID, "model", job.ModelID, "type", job.JobType, "priority", job.Priority)
 
+		// Double-dispatch guard. If a live dispatch goroutine already owns this
+		// job — e.g. the scheduled-watchdog requeued it while its instance was
+		// still loading (denoise model loads take minutes; the watchdog fires
+		// at 15s) — do NOT dispatch it again. Re-marking it scheduled keeps
+		// PickNextJob from returning it while the existing dispatch finishes.
+		// Re-dispatching is exactly what stranded duplicate goroutines and
+		// leaked activeJobs + pressure.
+		if s.isInFlight(job.ID) {
+			s.store.UpdateState(job.ID, "scheduled", WithStartedAt(nowTS()))
+			continue
+		}
+
 		// Mark scheduled so it won't be re-picked. Stamp the dispatch time so a
 		// watchdog can recover orphaned scheduled jobs if the dispatch path wedges.
 		s.store.UpdateState(job.ID, "scheduled", WithStartedAt(nowTS()))
@@ -1182,14 +1278,16 @@ func (s *Scheduler) Run(ctx context.Context) {
 			"active_jobs_before", inst.ActiveJobs())
 		slog.Info("picked instance for job", "job", job.ID, "model", job.ModelID,
 			"instance", inst.InstanceID, "state", inst.State(), "active_jobs", inst.ActiveJobs())
-		// Reserve the slot immediately so PickInstance won't return it again
-		atomic.AddInt32(&inst.activeJobs, 1)
 
-		// Reserve pressure immediately (main loop is single-threaded for dispatch decisions)
+		// Reserve the slot + pressure through the in-flight registry (single
+		// source of truth). markInFlight returns false only if the job is
+		// somehow already in-flight — leave it scheduled rather than reserving
+		// a second time.
 		pressure := *s.config.Models[job.ModelID].PressureIndex
-		s.pressureMu.Lock()
-		s.currentPressure += pressure
-		s.pressureMu.Unlock()
+		if !s.markInFlight(job.ID, inst, pressure) {
+			s.store.UpdateState(job.ID, "scheduled", WithStartedAt(nowTS()))
+			continue
+		}
 		slog.Info("pressure reserved", "model", job.ModelID, "pressure", pressure, "total", s.currentPressure)
 
 		go func(j *Job, inst *Instance, pressure float64) {
@@ -1266,16 +1364,89 @@ func (s *Scheduler) RunScheduledWatchdog(ctx context.Context) {
 		case <-ticker.C:
 		}
 
-		recovered, err := s.store.RecoverStuckScheduled(staleSec)
+		stuck, err := s.store.ListStuckScheduled(staleSec)
 		if err != nil {
-			slog.Warn("scheduled watchdog: failed to recover stuck jobs", "error", err)
+			slog.Warn("scheduled watchdog: failed to list stuck jobs", "error", err)
 			continue
 		}
+		recovered := 0
+		for _, jobID := range stuck {
+			// Skip jobs whose dispatch goroutine is still alive. A slow model
+			// load (minutes for denoise) legitimately keeps a job 'scheduled';
+			// requeuing it would cause the double-dispatch that leaks
+			// activeJobs + pressure. Only genuinely orphaned scheduled jobs
+			// (no live dispatch — e.g. survived a restart) get requeued.
+			if s.isInFlight(jobID) {
+				continue
+			}
+			if err := s.store.UpdateState(jobID, "queued"); err != nil {
+				slog.Warn("scheduled watchdog: requeue failed", "job", jobID, "error", err)
+				continue
+			}
+			recovered++
+		}
 		if recovered > 0 {
-			slog.Warn("scheduled watchdog: requeued stuck scheduled jobs", "count", recovered)
+			slog.Warn("scheduled watchdog: requeued orphaned scheduled jobs", "count", recovered)
 			s.Wake()
 		}
 	}
+}
+
+// RunInFlightReconciler keeps the in-memory reservation accounting (instance
+// activeJobs + currentPressure, surfaced by /v1/ps) consistent with the store
+// (/v1/jobs). It is the safety net for the class of bug where the two views
+// silently diverge: if a job is still in the in-flight registry but the store
+// says it reached a terminal state, the dispatch goroutine stranded (e.g.
+// blocked in InferRaw after a duplicate response consumed its channel) and
+// will never run its defer. Left alone, that leaked activeJobs pins the model
+// loaded forever and the leaked pressure starves real work. Here we detect it,
+// release the reservation idempotently, and log the divergence.
+func (s *Scheduler) RunInFlightReconciler(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		s.reconcileInFlight()
+	}
+}
+
+// reconcileInFlight is one pass of the reconciler: for every job still holding
+// an in-flight reservation, if the store says it already reached a terminal
+// state the dispatch goroutine stranded — release the leaked reservation
+// idempotently and log the divergence. Returns the number of jobs healed.
+func (s *Scheduler) reconcileInFlight() int {
+	healed := 0
+	for _, jobID := range s.inFlightIDs() {
+		job, err := s.store.GetJob(jobID)
+		if err != nil || job == nil {
+			continue
+		}
+		switch job.State {
+		case "completed", "failed", "cancelled":
+			inst, ok := s.releaseInFlight(jobID)
+			if !ok {
+				continue // already released by the dispatch defer
+			}
+			slog.Warn("reconciler: healed stranded in-flight job — reservation leaked",
+				"job", jobID, "model", job.ModelID, "store_state", job.State,
+				"instance", inst.InstanceID)
+			s.logger.Log("scheduler.inflight_reconciled", map[string]any{
+				"job_id":      jobID,
+				"model_id":    job.ModelID,
+				"store_state": job.State,
+				"instance_id": inst.InstanceID,
+			})
+			s.mgr.ReleaseAndCheck(inst)
+			s.rescoreModel(job.ModelID)
+			healed++
+		}
+	}
+	return healed
 }
 
 // RunKeepalive evicts idle models past their keep_alive_seconds.

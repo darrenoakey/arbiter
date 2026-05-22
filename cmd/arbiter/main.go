@@ -184,6 +184,7 @@ func main() {
 	// Start background goroutines
 	go sched.Run(ctx)
 	go sched.RunScheduledWatchdog(ctx)
+	go sched.RunInFlightReconciler(ctx)
 	go sched.RunKeepalive(ctx)
 	go sched.RunJobWatchdog(ctx)
 	go sched.RunModelHealthWatchdog(ctx)

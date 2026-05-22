@@ -265,6 +265,132 @@ func TestLoadCircuitBreakerPausesAfterThreeFailures(t *testing.T) {
 	// After the pause expires, it should not be paused.
 }
 
+// TestInFlightGuardAndIdempotentRelease verifies the double-dispatch guard and
+// idempotent release: a job already in-flight cannot reserve a second slot +
+// pressure (the bug that leaked activeJobs/pressure when the scheduled-watchdog
+// re-dispatched a job mid-load), and releasing twice is a no-op.
+func TestInFlightGuardAndIdempotentRelease(t *testing.T) {
+	sched, _, mgr := buildMinMeanFlowScheduler(t, map[string]ModelConfig{
+		"m": {MemoryGB: 1, AvgInferenceMs: 1000, MaxConcurrent: 2, MaxInstances: intPtr(1)},
+	})
+	inst := mgr.GetModelInstances("m")[0]
+
+	if !sched.markInFlight("job1", inst, 1.0) {
+		t.Fatal("first markInFlight should succeed")
+	}
+	if got := inst.ActiveJobs(); got != 1 {
+		t.Fatalf("activeJobs=%d after dispatch, want 1", got)
+	}
+	if sched.currentPressure != 1.0 {
+		t.Fatalf("currentPressure=%v, want 1.0", sched.currentPressure)
+	}
+
+	// Double-dispatch guard: the same job must not reserve again.
+	if sched.markInFlight("job1", inst, 1.0) {
+		t.Fatal("second markInFlight for the same job must return false")
+	}
+	if got := inst.ActiveJobs(); got != 1 {
+		t.Fatalf("activeJobs=%d after blocked re-dispatch, want 1 (no leak)", got)
+	}
+	if sched.currentPressure != 1.0 {
+		t.Fatalf("currentPressure=%v after blocked re-dispatch, want 1.0 (no leak)", sched.currentPressure)
+	}
+
+	// Release once frees the pressure; a second release is a no-op.
+	if _, ok := sched.releaseInFlight("job1"); !ok {
+		t.Fatal("first releaseInFlight should return ok=true")
+	}
+	if sched.currentPressure != 0 {
+		t.Fatalf("currentPressure=%v after release, want 0", sched.currentPressure)
+	}
+	if _, ok := sched.releaseInFlight("job1"); ok {
+		t.Fatal("second releaseInFlight must be a no-op (idempotent)")
+	}
+}
+
+// TestReconcilerHealsStrandedInFlight verifies the safety net: when a dispatch
+// strands (store reaches a terminal state but the reservation is still held),
+// the reconciler releases the leaked activeJobs + pressure so the instance is
+// no longer pinned. This is what keeps /v1/ps from permanently diverging from
+// /v1/jobs.
+func TestReconcilerHealsStrandedInFlight(t *testing.T) {
+	sched, store, mgr := buildMinMeanFlowScheduler(t, map[string]ModelConfig{
+		"m": {MemoryGB: 1, AvgInferenceMs: 1000, MaxConcurrent: 2, MaxInstances: intPtr(1)},
+	})
+	inst := mgr.GetModelInstances("m")[0]
+	job, err := store.CreateJob("m", "x", json.RawMessage(`{}`), 1)
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	// Dispatch reserved the slot, then stranded — store goes terminal while the
+	// reservation is still held (the defer never ran).
+	if !sched.markInFlight(job.ID, inst, 1.0) {
+		t.Fatal("markInFlight failed")
+	}
+	store.UpdateState(job.ID, "completed", WithFinishedAt(nowTS()))
+
+	if n := sched.reconcileInFlight(); n != 1 {
+		t.Fatalf("reconcileInFlight healed %d, want 1", n)
+	}
+	if sched.isInFlight(job.ID) {
+		t.Fatal("stranded job should be released after reconcile")
+	}
+	if sched.currentPressure != 0 {
+		t.Fatalf("currentPressure=%v after heal, want 0", sched.currentPressure)
+	}
+	if got := inst.ActiveJobs(); got != 0 {
+		t.Fatalf("activeJobs=%d after heal, want 0 (instance no longer pinned)", got)
+	}
+	if n := sched.reconcileInFlight(); n != 0 {
+		t.Fatalf("second reconcile healed %d, want 0 (idempotent)", n)
+	}
+}
+
+// TestScheduledWatchdogSkipsInFlightJobs verifies the watchdog only requeues
+// genuinely orphaned scheduled jobs, never one whose dispatch goroutine is
+// still alive (a slow load) — requeuing the latter is what caused the
+// double-dispatch leak.
+func TestScheduledWatchdogSkipsInFlightJobs(t *testing.T) {
+	sched, store, mgr := buildMinMeanFlowScheduler(t, map[string]ModelConfig{
+		"m": {MemoryGB: 1, AvgInferenceMs: 1000, MaxConcurrent: 2, MaxInstances: intPtr(1)},
+	})
+	inst := mgr.GetModelInstances("m")[0]
+
+	live, _ := store.CreateJob("m", "x", json.RawMessage(`{}`), 1)
+	orphan, _ := store.CreateJob("m", "x", json.RawMessage(`{}`), 1)
+	old := nowTS() - 60
+	store.UpdateState(live.ID, "scheduled", WithStartedAt(old))
+	store.UpdateState(orphan.ID, "scheduled", WithStartedAt(old))
+	// live has an active dispatch goroutine (e.g. its model is still loading).
+	sched.markInFlight(live.ID, inst, 1.0)
+
+	stuck, err := store.ListStuckScheduled(15)
+	if err != nil {
+		t.Fatalf("ListStuckScheduled: %v", err)
+	}
+	if len(stuck) != 2 {
+		t.Fatalf("ListStuckScheduled returned %d jobs, want 2", len(stuck))
+	}
+
+	// Apply the watchdog's filter: requeue only jobs NOT in-flight.
+	for _, id := range stuck {
+		if sched.isInFlight(id) {
+			continue
+		}
+		store.UpdateState(id, "queued")
+	}
+
+	o, _ := store.GetJob(orphan.ID)
+	if o.State != "queued" {
+		t.Fatalf("orphaned scheduled job should be requeued, got %s", o.State)
+	}
+	l, _ := store.GetJob(live.ID)
+	if l.State != "scheduled" {
+		t.Fatalf("in-flight job must stay scheduled (not requeued), got %s", l.State)
+	}
+}
+
 // TestConflictGroupExclusionAndPriority verifies the conflict-group gate:
 // same-group members are mutually exclusive and ordered by group_priority
 // (all higher-priority work drains first), while a model in no group runs

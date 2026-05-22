@@ -460,6 +460,35 @@ func (s *Store) RecoverFromCrash() (int, error) {
 	return int(n), nil
 }
 
+// ListStuckScheduled returns the IDs of jobs stuck in 'scheduled' longer than
+// olderThanSec. The caller decides which to requeue — in particular it skips
+// jobs whose dispatch goroutine is still alive (in the scheduler's in-flight
+// registry), because a legitimately slow load (denoise models take minutes)
+// keeps a job 'scheduled' without being orphaned. Requeuing those caused
+// double-dispatch and leaked reservations.
+func (s *Store) ListStuckScheduled(olderThanSec float64) ([]string, error) {
+	cutoff := nowTS() - olderThanSec
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(
+		"SELECT id FROM jobs WHERE state = 'scheduled' AND started_at IS NOT NULL AND started_at < ?",
+		cutoff,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 func (s *Store) RecoverStuckScheduled(olderThanSec float64) (int, error) {
 	cutoff := nowTS() - olderThanSec
 	s.mu.Lock()
