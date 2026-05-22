@@ -22,6 +22,17 @@ type ModelConfig struct {
 	WorkerCmd      []string          `json:"worker_cmd,omitempty"`
 	AdapterParams  map[string]string `json:"adapter_params,omitempty"`
 	PressureIndex  *float64          `json:"pressure_index"` // 0..1 memory bandwidth fraction; sum across in-flight jobs must stay ≤ 1.0. Omitted/nil defaults to 1.0 (serialize). Explicit 0 means "no pressure" — runs alongside anything.
+	// ConflictGroup names a hard mutual-exclusion set. Models sharing a
+	// ConflictGroup never run at the same time (independent of pressure); models
+	// in different/no groups are unconstrained by each other. GroupPriority
+	// orders members within the group — a lower value runs first, and a member
+	// is held while any higher-priority (lower-value) member of its group still
+	// has pending work. Example: ltx2-denoise1 (group "ltx_denoise", prio 0) and
+	// ltx2-denoise2 (group "ltx_denoise", prio 1) — all denoise1 drains before
+	// any denoise2, and the two never co-load, while image-gen/encode run freely
+	// alongside either.
+	ConflictGroup string `json:"conflict_group,omitempty"`
+	GroupPriority int    `json:"group_priority,omitempty"`
 }
 
 type Config struct {
@@ -36,32 +47,32 @@ type Config struct {
 
 // JobTypeToModel maps job type strings to model IDs.
 var JobTypeToModel = map[string]string{
-	"image-generate":         "flux2",
-	"image-edit":             "flux2",
-	"background-remove":      "birefnet",
-	"caption":                "moondream",
-	"query":                  "moondream",
-	"detect":                 "moondream",
-	"point":                  "moondream",
-	"transcribe":             "whisper-large",
-	"tts-custom":             "tts-custom",
-	"tts-clone":              "tts-clone",
-	"tts-design":             "tts-design",
-	"talking-head":           "sonic",
-	"talking-head-sadtalker": "sadtalker",
-	"lipsync":                "latentsync",
-	"video-generate":         "ltx2",
-	"video-encode":           "ltx2-encode",
-	"video-denoise1":         "ltx2-denoise1",
-	"video-denoise2":         "ltx2-denoise2",
-	"face-restore":             "face-restore",
-	"face-restore-codeformer":  "face-restore-codeformer",
-	"face-embed":               "insightface",
-	"aesthetic-score":        "aesthetic-scorer",
-	"tts-voxtral":            "tts-voxtral",
-	"lora-train":             "lora-train",
-	"composite":              "composite",
-	"embed-text":             "embed-text",
+	"image-generate":          "flux2",
+	"image-edit":              "flux2",
+	"background-remove":       "birefnet",
+	"caption":                 "moondream",
+	"query":                   "moondream",
+	"detect":                  "moondream",
+	"point":                   "moondream",
+	"transcribe":              "whisper-large",
+	"tts-custom":              "tts-custom",
+	"tts-clone":               "tts-clone",
+	"tts-design":              "tts-design",
+	"talking-head":            "sonic",
+	"talking-head-sadtalker":  "sadtalker",
+	"lipsync":                 "latentsync",
+	"video-generate":          "ltx2",
+	"video-encode":            "ltx2-encode",
+	"video-denoise1":          "ltx2-denoise1",
+	"video-denoise2":          "ltx2-denoise2",
+	"face-restore":            "face-restore",
+	"face-restore-codeformer": "face-restore-codeformer",
+	"face-embed":              "insightface",
+	"aesthetic-score":         "aesthetic-scorer",
+	"tts-voxtral":             "tts-voxtral",
+	"lora-train":              "lora-train",
+	"composite":               "composite",
+	"embed-text":              "embed-text",
 }
 
 func LoadConfig(projectRoot string) (*Config, error) {

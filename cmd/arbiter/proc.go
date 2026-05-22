@@ -952,6 +952,17 @@ func (m *InstanceManager) TotalActiveJobs() int {
 	return total
 }
 
+// ModelActiveJobs returns the number of in-flight jobs across all instances of
+// one model. Used by the conflict-group gate to enforce mutual exclusion.
+func (m *InstanceManager) ModelActiveJobs(modelID string) int {
+	insts := m.GetModelInstances(modelID)
+	total := 0
+	for _, inst := range insts {
+		total += inst.ActiveJobs()
+	}
+	return total
+}
+
 // BudgetGB returns the total VRAM budget.
 func (m *InstanceManager) BudgetGB() float64 {
 	m.mu.RLock()

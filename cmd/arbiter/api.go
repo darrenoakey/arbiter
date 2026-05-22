@@ -68,6 +68,8 @@ type modelConfigRequest struct {
 	AdapterParams  *map[string]string `json:"adapter_params"`
 	PressureIndex  *float64           `json:"pressure_index"`
 	MaxRuntimeSec  *int               `json:"max_runtime_seconds"`
+	ConflictGroup  *string            `json:"conflict_group"`
+	GroupPriority  *int               `json:"group_priority"`
 	ReloadWorkers  bool               `json:"reload_workers"`
 }
 
@@ -893,6 +895,12 @@ func applyModelConfigRequest(cfg ModelConfig, req modelConfigRequest) ModelConfi
 	if req.MaxRuntimeSec != nil {
 		cfg.MaxRuntimeSec = *req.MaxRuntimeSec
 	}
+	if req.ConflictGroup != nil {
+		cfg.ConflictGroup = *req.ConflictGroup
+	}
+	if req.GroupPriority != nil {
+		cfg.GroupPriority = *req.GroupPriority
+	}
 	return cfg
 }
 
@@ -1048,7 +1056,8 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 	} else if scaleResult == nil && req.MaxConcurrent == nil && req.MemoryGB == nil &&
 		req.KeepAliveSec == nil && req.AvgInferenceMs == nil && req.LoadMs == nil &&
 		req.WorkerCmd == nil && req.AdapterParams == nil && req.AutoDownload == nil &&
-		req.ModelPath == nil && req.Group == nil && req.MaxInstances == nil {
+		req.ModelPath == nil && req.Group == nil && req.MaxInstances == nil &&
+		req.ConflictGroup == nil && req.GroupPriority == nil {
 		result["message"] = "no changes"
 	}
 	writeJSON(w, 200, result)

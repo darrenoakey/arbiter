@@ -436,6 +436,34 @@ func (s *Scheduler) IsModelLoadPaused(modelID string) (bool, time.Time) {
 // blocked job's budget grows linearly with wait time until it fits.
 const pressureAgeRate = 0.01
 
+// conflictGroupHolds reports whether modelID (which declares a non-empty
+// ConflictGroup) must be held this tick by a same-group constraint:
+//   - a different member of the group currently has active (in-flight) jobs —
+//     mutual exclusion, two members never run at once; or
+//   - a higher-priority member (strictly lower GroupPriority) still has pending
+//     work (queued/scheduled/running), so lower-priority members wait until it
+//     fully drains.
+func (s *Scheduler) conflictGroupHolds(modelID string, cfg ModelConfig) bool {
+	for otherID, otherCfg := range s.config.Models {
+		if otherID == modelID || otherCfg.ConflictGroup != cfg.ConflictGroup {
+			continue
+		}
+		// Mutual exclusion: a different group member is actively running.
+		if s.mgr.ModelActiveJobs(otherID) > 0 {
+			return true
+		}
+		// Priority: a higher-priority member still has pending work.
+		if otherCfg.GroupPriority < cfg.GroupPriority {
+			if counts, err := s.store.CountByState(otherID); err == nil {
+				if counts["queued"]+counts["scheduled"]+counts["running"] > 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // getFullModels returns model IDs that are at total capacity or would exceed
 // the pressure budget. bestModel is the model with the minimum mean-flow score
 // (pre-computed by the caller); it is never excluded by the pressure-budget
@@ -473,6 +501,20 @@ func (s *Scheduler) getFullModels(bestModel string) map[string]bool {
 		}
 		// Check inference circuit-breaker
 		if paused, _ := s.IsModelPaused(modelID); paused {
+			full[modelID] = true
+			continue
+		}
+		// Conflict-group mutual exclusion + intra-group priority. HARD
+		// constraint — never bypassable (unlike the pressure budget). Models
+		// sharing a ConflictGroup never run simultaneously; within a group a
+		// lower GroupPriority runs first, so a member is held while any
+		// higher-priority member still has pending work. This keeps ltx
+		// denoise1 and denoise2 off the GPU at the same time (and drains all
+		// denoise1 before any denoise2) while image-gen / encode, which are in
+		// no group, run freely alongside either.
+		if cfg.ConflictGroup != "" && s.conflictGroupHolds(modelID, cfg) {
+			slog.Info("scheduler.full: conflict-group hold",
+				"model", modelID, "group", cfg.ConflictGroup, "priority", cfg.GroupPriority)
 			full[modelID] = true
 			continue
 		}

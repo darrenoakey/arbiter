@@ -265,6 +265,81 @@ func TestLoadCircuitBreakerPausesAfterThreeFailures(t *testing.T) {
 	// After the pause expires, it should not be paused.
 }
 
+// TestConflictGroupExclusionAndPriority verifies the conflict-group gate:
+// same-group members are mutually exclusive and ordered by group_priority
+// (all higher-priority work drains first), while a model in no group runs
+// freely alongside any of them.
+func TestConflictGroupExclusionAndPriority(t *testing.T) {
+	projectRoot := t.TempDir()
+	outputDir := filepath.Join(projectRoot, "output")
+	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+
+	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+	store.InitDedup()
+
+	pi := 0.5
+	const grp = "ltx_denoise"
+	cfg := &Config{
+		VRAMBudgetGB: 1000,
+		Models: map[string]ModelConfig{
+			"denoise1": {MemoryGB: 10, MaxConcurrent: 2, MaxInstances: intPtr(1), PressureIndex: &pi, ConflictGroup: grp, GroupPriority: 0},
+			"denoise2": {MemoryGB: 10, MaxConcurrent: 2, MaxInstances: intPtr(1), PressureIndex: &pi, ConflictGroup: grp, GroupPriority: 1},
+			"flux2":    {MemoryGB: 10, MaxConcurrent: 1, MaxInstances: intPtr(1), PressureIndex: &pi},
+		},
+	}
+	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
+	defer logger.Close()
+	mgr := NewInstanceManager(cfg, "python3", projectRoot)
+	for id, m := range cfg.Models {
+		mgr.ScaleModel(id, 1, m)
+	}
+	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+
+	mustJob := func(model string) {
+		if _, err := store.CreateJob(model, "x", json.RawMessage(`{}`), 1); err != nil {
+			t.Fatalf("create job %s: %v", model, err)
+		}
+	}
+
+	// Case 1: all three have queued work, nothing running. denoise1 (priority 0)
+	// outranks denoise2 (priority 1), so denoise2 is held; flux2 (no group) runs.
+	mustJob("denoise1")
+	mustJob("denoise2")
+	mustJob("flux2")
+	full := sched.getFullModels("")
+	if full["denoise1"] {
+		t.Fatal("denoise1 (highest priority) must not be held")
+	}
+	if !full["denoise2"] {
+		t.Fatal("denoise2 must be held while denoise1 has pending work")
+	}
+	if full["flux2"] {
+		t.Fatal("flux2 (no group) must never be held by the denoise group")
+	}
+
+	// The hold is a hard constraint — not bypassable for the best-scoring model.
+	full = sched.getFullModels("denoise2")
+	if !full["denoise2"] {
+		t.Fatal("conflict-group hold must not be bypassed for the best-scoring model")
+	}
+
+	// Case 2: denoise1 is now actively running. denoise2 stays held by mutual
+	// exclusion; flux2 still runs alongside it.
+	markLoaded(t, mgr, "denoise1")
+	atomic.AddInt32(&mgr.GetModelInstances("denoise1")[0].activeJobs, 1)
+	full = sched.getFullModels("")
+	if !full["denoise2"] {
+		t.Fatal("denoise2 must be held (mutual exclusion) while denoise1 is running")
+	}
+	if full["flux2"] {
+		t.Fatal("flux2 must still run alongside a running denoise1")
+	}
+}
+
 // TestDrainModeBlocksNewDispatch verifies the graceful-drain contract: while
 // draining the scheduler starts no new jobs (a queued job stays queued and no
 // instance becomes active), and resuming restarts dispatch. This is the
