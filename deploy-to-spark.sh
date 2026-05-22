@@ -42,6 +42,36 @@ echo "    $(md5 -q arbiter-linux-arm64 2>/dev/null || md5sum arbiter-linux-arm64
 echo "    $(md5 -q llm-worker-linux-arm64 2>/dev/null || md5sum llm-worker-linux-arm64 | awk '{print $1}') llm-worker"
 echo "    $(md5 -q vllm-chat-worker-linux-arm64 2>/dev/null || md5sum vllm-chat-worker-linux-arm64 | awk '{print $1}') vllm-chat-worker"
 
+# Graceful drain: ask the running arbiter to stop starting NEW jobs and let
+# in-flight work finish before we bounce it, so a redeploy never kills a
+# running job (e.g. a 10-min ltx2 denoise). Tolerant of an older binary that
+# lacks /v1/drain. Bounded wait; override with DEPLOY_FORCE=1 to skip, or
+# DEPLOY_DRAIN_TIMEOUT to change the ceiling (default 1800s).
+ARBITER_URL="http://10.0.0.254:8400"
+DEPLOY_DRAIN_TIMEOUT="${DEPLOY_DRAIN_TIMEOUT:-1800}"
+if [ "${DEPLOY_FORCE:-0}" = "1" ]; then
+    echo "==> DEPLOY_FORCE=1 — skipping graceful drain (may kill in-flight jobs)"
+elif curl -s --max-time 5 -X POST "$ARBITER_URL/v1/drain" >/dev/null 2>&1; then
+    echo "==> Draining arbiter (no new jobs; waiting for in-flight to finish, max ${DEPLOY_DRAIN_TIMEOUT}s)..."
+    drain_deadline=$(( $(date +%s) + DEPLOY_DRAIN_TIMEOUT ))
+    while :; do
+        active=$(curl -s --max-time 5 "$ARBITER_URL/v1/ps" 2>/dev/null \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin).get("active_jobs",0))' 2>/dev/null || echo 0)
+        if [ "${active:-0}" = "0" ]; then
+            echo "    drained — 0 in-flight jobs"
+            break
+        fi
+        if [ "$(date +%s)" -ge "$drain_deadline" ]; then
+            echo "    WARNING: still ${active} in-flight after ${DEPLOY_DRAIN_TIMEOUT}s — proceeding anyway"
+            break
+        fi
+        echo "    ${active} job(s) still in flight; waiting..."
+        sleep 10
+    done
+else
+    echo "==> No /v1/drain on running arbiter (older binary) — proceeding without drain"
+fi
+
 echo "==> Stopping arbiter on spark..."
 ssh "$SPARK" "/home/darren/local/auto/run stop arbiter" 2>&1 | tail -1 || true
 

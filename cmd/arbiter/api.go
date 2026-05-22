@@ -21,7 +21,7 @@ import (
 
 // portCacheEntry is one row of the per-instance worker-port cache.
 type portCacheEntry struct {
-	port    int
+	port     int
 	loadedAt time.Time
 }
 
@@ -39,6 +39,18 @@ type API struct {
 
 	// Cached /v1/ps response — updated every second by background goroutine
 	psCache atomic.Value // json.RawMessage
+
+	// requestShutdown triggers a graceful process shutdown. Set by main once
+	// the HTTP server exists. Invoked by the drain monitor when shutdown_when_idle
+	// was requested and the last in-flight job has finished.
+	requestShutdown   func()
+	drainShutdownOnce sync.Once
+}
+
+// SetShutdownFunc wires the graceful-shutdown callback used by drain
+// (shutdown_when_idle). Called once from main after the HTTP server is built.
+func (a *API) SetShutdownFunc(fn func()) {
+	a.requestShutdown = fn
 }
 
 type modelConfigRequest struct {
@@ -125,6 +137,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/llm/models", a.listLLMs)
 	mux.HandleFunc("DELETE /v1/llm/models/{name}", a.deregisterLLM)
 	mux.HandleFunc("POST /v1/chat/completions", a.chatCompletion)
+	mux.HandleFunc("POST /v1/drain", a.drain)
 	mux.HandleFunc("POST /v1/admin/models/unload_all", a.adminUnloadAll)
 	mux.HandleFunc("POST /v1/admin/models/preload", a.adminPreload)
 	mux.HandleFunc("GET /v1/health", a.health)
@@ -150,6 +163,11 @@ func (a *API) updatePSCache() {
 
 	// Add GPU utilization
 	snap["gpu_utilization_pct"] = GetGPUUtilization()
+
+	// Drain state + total in-flight jobs — so a deploy can poll for
+	// "draining && active_jobs == 0" to know it is safe to bounce.
+	snap["draining"] = a.scheduler.IsDraining()
+	snap["active_jobs"] = a.mgr.TotalActiveJobs()
 
 	// Add queue counts
 	counts, _ := a.store.CountByState("")
@@ -1701,6 +1719,77 @@ func proxyStreamFromInstance(w http.ResponseWriter, r *http.Request, inst *Insta
 // Admin endpoints let the operator unload all models (clean baseline) and
 // preload a single model without running a job (fair load-time measurement).
 
+// drain implements POST /v1/drain — graceful, job-safe wind-down.
+//
+//	{}                          → enter drain mode: start no new jobs, let
+//	                              in-flight jobs finish, keep queued work for
+//	                              after a restart. Never kills a running job.
+//	{"shutdown_when_idle":true} → also exit the process gracefully once the
+//	                              last in-flight job completes (one-shot safe
+//	                              shutdown for redeploys).
+//	{"resume":true}             → leave drain mode, resume normal dispatch.
+//
+// Poll GET /v1/ps for {"draining":true,"active_jobs":0} to know it is safe to
+// bounce.
+func (a *API) drain(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Resume           bool `json:"resume"`
+		ShutdownWhenIdle bool `json:"shutdown_when_idle"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req) // body is optional
+	}
+
+	if req.Resume {
+		a.scheduler.SetDraining(false)
+		a.logger.Log("scheduler.drain", map[string]any{"draining": false})
+		writeJSON(w, 200, map[string]any{"draining": false})
+		return
+	}
+
+	a.scheduler.SetDraining(true)
+	active := a.mgr.TotalActiveJobs()
+	a.logger.Log("scheduler.drain", map[string]any{
+		"draining": true, "active_jobs": active, "shutdown_when_idle": req.ShutdownWhenIdle,
+	})
+
+	if req.ShutdownWhenIdle {
+		a.startDrainShutdownMonitor()
+	}
+
+	writeJSON(w, 200, map[string]any{
+		"draining":           true,
+		"active_jobs":        active,
+		"shutdown_when_idle": req.ShutdownWhenIdle,
+		"message":            "no new jobs will start; in-flight jobs will finish. poll GET /v1/ps for draining && active_jobs==0",
+	})
+}
+
+// startDrainShutdownMonitor launches (at most once) a goroutine that waits for
+// all in-flight jobs to finish, then triggers a graceful process shutdown.
+// Aborts if drain mode is resumed before idle.
+func (a *API) startDrainShutdownMonitor() {
+	a.drainShutdownOnce.Do(func() {
+		go func() {
+			for {
+				time.Sleep(2 * time.Second)
+				if !a.scheduler.IsDraining() {
+					slog.Info("drain resumed before idle — cancelling shutdown monitor")
+					return
+				}
+				if a.mgr.TotalActiveJobs() == 0 {
+					slog.Info("drain complete — no in-flight jobs, shutting down")
+					a.logger.Log("scheduler.drain_shutdown", map[string]any{})
+					if a.requestShutdown != nil {
+						a.requestShutdown()
+					}
+					return
+				}
+			}
+		}()
+	})
+}
+
 func (a *API) adminUnloadAll(w http.ResponseWriter, r *http.Request) {
 	totalKilled := 0
 	models := make([]string, 0, len(a.config.Models))
@@ -1774,9 +1863,9 @@ func (a *API) adminPreload(w http.ResponseWriter, r *http.Request) {
 	loadMs := time.Since(start).Milliseconds()
 	a.logger.Log("admin.preload", map[string]any{"model_id": body.ModelID, "load_ms": loadMs})
 	writeJSON(w, 200, map[string]any{
-		"model_id":    body.ModelID,
-		"instance_id": inst.InstanceID,
-		"load_ms":     loadMs,
+		"model_id":       body.ModelID,
+		"instance_id":    inst.InstanceID,
+		"load_ms":        loadMs,
 		"already_loaded": loadMs < 100, // heuristic — sub-100ms means it was already up
 	})
 }

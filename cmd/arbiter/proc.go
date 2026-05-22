@@ -935,6 +935,23 @@ func (m *InstanceManager) ReclaimableIdleGB(excludeModelID string) float64 {
 	return total
 }
 
+// TotalActiveJobs returns the number of in-flight jobs across every instance.
+// Used by drain/graceful-shutdown to decide when it is safe to bounce.
+func (m *InstanceManager) TotalActiveJobs() int {
+	m.mu.RLock()
+	insts := make([]*Instance, 0, len(m.instances))
+	for _, inst := range m.instances {
+		insts = append(insts, inst)
+	}
+	m.mu.RUnlock()
+
+	total := 0
+	for _, inst := range insts {
+		total += inst.ActiveJobs()
+	}
+	return total
+}
+
 // BudgetGB returns the total VRAM budget.
 func (m *InstanceManager) BudgetGB() float64 {
 	m.mu.RLock()

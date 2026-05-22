@@ -234,16 +234,23 @@ func main() {
 	})
 	slog.Info("arbiter started", "addr", addr, "vram_budget_gb", cfg.VRAMBudgetGB)
 
+	// Graceful shutdown trigger shared by the signal handler and the drain
+	// monitor (POST /v1/drain {"shutdown_when_idle":true}).
+	gracefulShutdown := func() {
+		slog.Info("shutting down...")
+		sched.MarkShuttingDown()
+		cancel()
+		srv.Shutdown(context.Background())
+	}
+	api.SetShutdownFunc(gracefulShutdown)
+
 	// Handle shutdown signals
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
 		<-sigCh
-		slog.Info("shutting down...")
-		sched.MarkShuttingDown()
-		cancel()
-		srv.Shutdown(context.Background())
+		gracefulShutdown()
 	}()
 
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {

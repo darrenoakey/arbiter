@@ -14,14 +14,18 @@ import (
 )
 
 type Scheduler struct {
-	config          *Config
-	store           *Store
-	mgr             *InstanceManager
-	logger          *EventLogger
-	outputDir       string
-	inboxDir        string // if set, input files are deleted after job completion/failure
-	wake            chan struct{}
-	shuttingDown    atomic.Bool
+	config       *Config
+	store        *Store
+	mgr          *InstanceManager
+	logger       *EventLogger
+	outputDir    string
+	inboxDir     string // if set, input files are deleted after job completion/failure
+	wake         chan struct{}
+	shuttingDown atomic.Bool
+	// draining: when set, the scheduler stops starting NEW jobs (queued jobs
+	// stay queued, in-flight jobs run to completion). Used for graceful
+	// shutdown / safe redeploy so a bounce never kills a running job.
+	draining        atomic.Bool
 	cooldownMu      sync.Mutex
 	cooldownUntil   map[string]time.Time // model -> skip until this time (load failures)
 	pressureMu      sync.Mutex
@@ -150,6 +154,19 @@ func (s *Scheduler) Wake() {
 
 func (s *Scheduler) MarkShuttingDown() {
 	s.shuttingDown.Store(true)
+}
+
+// SetDraining toggles drain mode. While draining, the scheduler dispatches no
+// new jobs; in-flight work finishes and queued work waits. Resuming (false)
+// returns to normal dispatch.
+func (s *Scheduler) SetDraining(on bool) {
+	s.draining.Store(on)
+	slog.Info("scheduler drain mode changed", "draining", on)
+}
+
+// IsDraining reports whether drain mode is active.
+func (s *Scheduler) IsDraining() bool {
+	return s.draining.Load()
 }
 
 func (s *Scheduler) shouldRequeueForShutdown(err error, resp *WorkerResponse) bool {
@@ -1048,6 +1065,13 @@ func (s *Scheduler) Run(ctx context.Context) {
 			return
 		case <-s.wake:
 		case <-ticker.C:
+		}
+
+		// Drain mode: start no new work. In-flight jobs finish on their own
+		// goroutines; queued jobs stay queued for after the restart. We skip
+		// eviction too — no need to churn VRAM while winding down.
+		if s.draining.Load() {
+			continue
 		}
 
 		// Real queued work outranks warm residency. If there is backlog for any

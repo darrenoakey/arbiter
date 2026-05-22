@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -262,6 +263,85 @@ func TestLoadCircuitBreakerPausesAfterThreeFailures(t *testing.T) {
 	sched.RecordLoadSuccess("broken")
 	// CB pause is time-based, not reset by success — but count+level are reset.
 	// After the pause expires, it should not be paused.
+}
+
+// TestDrainModeBlocksNewDispatch verifies the graceful-drain contract: while
+// draining the scheduler starts no new jobs (a queued job stays queued and no
+// instance becomes active), and resuming restarts dispatch. This is the
+// primitive a safe redeploy relies on — bounce only once nothing is in flight.
+func TestDrainModeBlocksNewDispatch(t *testing.T) {
+	projectRoot := t.TempDir()
+	workerPath := filepath.Join(projectRoot, "idle_worker.py")
+	writeIdleWorker(t, workerPath)
+	outputDir := filepath.Join(projectRoot, "output")
+	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+	os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755)
+
+	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+	store.InitDedup()
+
+	pi := 1.0
+	cfg := &Config{
+		VRAMBudgetGB: 100,
+		Models: map[string]ModelConfig{
+			"m": {MemoryGB: 1, MaxConcurrent: 1, MaxInstances: intPtr(1), PressureIndex: &pi},
+		},
+	}
+	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
+	defer logger.Close()
+	mgr := NewInstanceManager(cfg, "python3", projectRoot)
+	mgr.ScaleModel("m", 1, cfg.Models["m"])
+	// Point the instance at the idle worker so load succeeds without a real model.
+	mgr.GetModelInstances("m")[0].workerCmd = []string{"python3", workerPath}
+	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+
+	sched.SetDraining(true)
+	if !sched.IsDraining() {
+		t.Fatal("IsDraining() = false after SetDraining(true)")
+	}
+
+	job, err := store.CreateJob("m", "embed-text", json.RawMessage(`{}`), 1)
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sched.Run(ctx)
+
+	// While draining, the job must NOT be dispatched.
+	time.Sleep(500 * time.Millisecond)
+	after, _ := store.GetJob(job.ID)
+	if after.State != "queued" {
+		t.Fatalf("draining: job state = %s, want queued (no dispatch)", after.State)
+	}
+	if got := mgr.TotalActiveJobs(); got != 0 {
+		t.Fatalf("draining: TotalActiveJobs() = %d, want 0", got)
+	}
+
+	// Resume → the job must now be picked up and leave the queue.
+	sched.SetDraining(false)
+	sched.Wake()
+	moved := false
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		after, _ = store.GetJob(job.ID)
+		if after.State != "queued" {
+			moved = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !moved {
+		t.Fatalf("after resume, job stayed queued — dispatch did not restart")
+	}
+
+	cancel()
+	mgr.GetModelInstances("m")[0].Kill()
 }
 
 // TestGetFullModelsGatesOnVRAMFeasibility verifies the hard VRAM gate: a model
