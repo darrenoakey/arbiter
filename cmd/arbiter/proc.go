@@ -907,6 +907,34 @@ func (m *InstanceManager) FreeGB() float64 {
 	return m.budgetGB - m.usedGB - m.reservedGB
 }
 
+// ReclaimableIdleGB returns the total VRAM (GB) currently held by loaded
+// instances that have no active jobs — i.e. memory the scheduler can free on
+// demand by evicting idle instances to make room for another model. Combined
+// with FreeGB this is the true upper bound on what a not-yet-loaded model
+// could be given without preempting in-flight work. Instances of
+// excludeModelID are skipped: the caller is deciding whether to load that
+// model and must not count its own idle residency toward "can it fit".
+func (m *InstanceManager) ReclaimableIdleGB(excludeModelID string) float64 {
+	m.mu.RLock()
+	insts := make([]*Instance, 0, len(m.instances))
+	for _, inst := range m.instances {
+		insts = append(insts, inst)
+	}
+	m.mu.RUnlock()
+
+	var total float64
+	for _, inst := range insts {
+		if inst.ModelID == excludeModelID {
+			continue
+		}
+		if inst.State() != "loaded" || inst.ActiveJobs() > 0 {
+			continue
+		}
+		total += inst.memoryGB
+	}
+	return total
+}
+
 // BudgetGB returns the total VRAM budget.
 func (m *InstanceManager) BudgetGB() float64 {
 	m.mu.RLock()

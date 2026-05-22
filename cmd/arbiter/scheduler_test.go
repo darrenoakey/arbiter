@@ -264,6 +264,72 @@ func TestLoadCircuitBreakerPausesAfterThreeFailures(t *testing.T) {
 	// After the pause expires, it should not be paused.
 }
 
+// TestGetFullModelsGatesOnVRAMFeasibility verifies the hard VRAM gate: a model
+// that isn't loaded and cannot fit in free VRAM + reclaimable-idle VRAM is
+// excluded from dispatch, so the scheduler never commits a job it can't load
+// (the "tries to load, fails on memory, requeues forever" churn). Crucially:
+//   - the gate fires even when the model is the best-scoring one (VRAM is a
+//     hard physical constraint, unlike the soft pressure budget);
+//   - the gate does NOT fire when the blocker is merely idle, because an idle
+//     instance is reclaimable — the scheduler can evict it on dispatch.
+func TestGetFullModelsGatesOnVRAMFeasibility(t *testing.T) {
+	projectRoot := t.TempDir()
+	outputDir := filepath.Join(projectRoot, "output")
+	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+
+	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+	store.InitDedup()
+
+	pi := 1.0
+	cfg := &Config{
+		VRAMBudgetGB: 100,
+		Models: map[string]ModelConfig{
+			// blocker holds 80GB — leaves only 20GB free while it runs.
+			"blocker": {MemoryGB: 80, MaxConcurrent: 1, MaxInstances: intPtr(1), PressureIndex: &pi},
+			// newcomer needs 40GB — cannot cold-load into 20GB free.
+			"newcomer": {MemoryGB: 40, MaxConcurrent: 1, MaxInstances: intPtr(1), PressureIndex: &pi},
+		},
+	}
+	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
+	defer logger.Close()
+	mgr := NewInstanceManager(cfg, "python3", projectRoot)
+	mgr.ScaleModel("blocker", 1, cfg.Models["blocker"])
+	mgr.ScaleModel("newcomer", 1, cfg.Models["newcomer"])
+	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+
+	// blocker is loaded AND actively running a job → its 80GB is pinned, not
+	// reclaimable. free = 100 - 80 = 20GB.
+	markLoaded(t, mgr, "blocker")
+	blockerInst := mgr.GetModelInstances("blocker")[0]
+	atomic.AddInt32(&blockerInst.activeJobs, 1)
+
+	full := sched.getFullModels("")
+	if !full["newcomer"] {
+		t.Fatalf("newcomer (40GB) must be VRAM-infeasible while blocker actively holds 80GB (free=%.0f, reclaimable=%.0f)",
+			mgr.FreeGB(), mgr.ReclaimableIdleGB("newcomer"))
+	}
+
+	// The gate is NOT bypassable for the best-scoring model — physical VRAM is
+	// hard, unlike the pressure budget.
+	full = sched.getFullModels("newcomer")
+	if !full["newcomer"] {
+		t.Fatal("VRAM infeasibility must not be bypassed even for the best-scoring model")
+	}
+
+	// blocker goes idle: its 80GB becomes reclaimable, so newcomer now fits —
+	// the scheduler can evict the idle blocker on dispatch.
+	atomic.AddInt32(&blockerInst.activeJobs, -1)
+	full = sched.getFullModels("")
+	if full["newcomer"] {
+		t.Fatalf("newcomer must fit once blocker is idle/reclaimable (free=%.0f, reclaimable=%.0f)",
+			mgr.FreeGB(), mgr.ReclaimableIdleGB("newcomer"))
+	}
+}
+
 func TestDispatchJobLeavesInsufficientMemoryQueued(t *testing.T) {
 	projectRoot := t.TempDir()
 	outputDir := filepath.Join(projectRoot, "output")

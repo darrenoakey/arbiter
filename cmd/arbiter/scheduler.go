@@ -473,6 +473,30 @@ func (s *Scheduler) getFullModels(bestModel string) map[string]bool {
 			full[modelID] = true
 			continue
 		}
+		// VRAM feasibility — a HARD physical constraint, never bypassable
+		// (unlike the pressure budget below, which the best-scoring model is
+		// allowed to exceed). If the model isn't already loaded it can only be
+		// dispatched when its weights fit in free VRAM plus whatever idle
+		// instances we could evict to make room. Without this gate the
+		// scheduler commits a job to a model that physically cannot load (e.g.
+		// gemma at 74.7GB while two ltx denoise stages hold the GPU), then
+		// ensureLoaded fails the reservation and requeues the job on a 30s
+		// cooldown — the "tries to load, fails on memory" churn — while the
+		// GPU does no useful new work. We decide feasibility up front so the
+		// only adapters we ever commit to loading are ones we can actually
+		// load. (A loaded model trivially fits: it passed the capacity check
+		// above, so its existing instance has a slot — no new load needed.)
+		if !s.mgr.IsLoaded(modelID) {
+			freeGB := s.mgr.FreeGB()
+			reclaimableGB := s.mgr.ReclaimableIdleGB(modelID)
+			if cfg.MemoryGB > freeGB+reclaimableGB+1e-9 {
+				slog.Info("scheduler.full: model won't fit in VRAM",
+					"model", modelID, "needed_gb", cfg.MemoryGB,
+					"free_gb", freeGB, "reclaimable_idle_gb", reclaimableGB)
+				full[modelID] = true
+				continue
+			}
+		}
 		// Age the budget by the oldest queued job's wait time. A model with
 		// queued work that's been sitting for a while gets more allowance,
 		// guaranteeing eventual dispatch even under sustained low-pressure
