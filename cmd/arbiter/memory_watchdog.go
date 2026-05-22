@@ -34,19 +34,19 @@ type MemoryWatchdog struct {
 }
 
 const (
-	driftRatio          = 1.5                                // actual must exceed configured by this much to count
-	driftConsecutive    = 2                                  // sustained over this many checks (so 60s at 30s cadence)
-	driftWritebackBuf   = 1.2                                // patched value = observed_max * 1.2
-	driftWritebackCap   = 0.8                                // never write a value larger than VRAMBudgetGB * cap
-	pressureThreshold   = 0.95                               // emit pressure event when total RAM > budget * threshold
-	pressureMinInterval = 30 * time.Second                   // throttle pressure events
+	driftRatio          = 1.5              // actual must exceed configured by this much to count
+	driftConsecutive    = 2                // sustained over this many checks (so 60s at 30s cadence)
+	driftWritebackBuf   = 1.2              // patched value = observed_max * 1.2
+	driftWritebackCap   = 0.8              // never write a value larger than VRAMBudgetGB * cap
+	pressureThreshold   = 0.95             // emit pressure event when total RAM > budget * threshold
+	pressureMinInterval = 30 * time.Second // throttle pressure events
 	// Downward shrink — reclaim over-reservation from instances that have
 	// stabilised well below their declared memory_gb (e.g. vLLM with
 	// gpu-memory-utilization=0.30 declared at 80GB but using 25GB).
-	shrinkRatio       = 0.6  // shrink only if observed < configured * this (i.e. >40% headroom wasted)
-	shrinkConsecutive = 4    // require 4 stable samples (~2 min at 30s cadence) before shrinking
-	shrinkSafetyBuf   = 1.3  // new memoryGB = observed * this (30% safety margin above peak observed)
-	shrinkMinFreedGB  = 2.0  // don't bother for tiny gains
+	shrinkRatio       = 0.6 // shrink only if observed < configured * this (i.e. >40% headroom wasted)
+	shrinkConsecutive = 4   // require 4 stable samples (~2 min at 30s cadence) before shrinking
+	shrinkSafetyBuf   = 1.3 // new memoryGB = observed * this (30% safety margin above peak observed)
+	shrinkMinFreedGB  = 2.0 // don't bother for tiny gains
 )
 
 // NewMemoryWatchdog constructs a watchdog. Caller starts it with Run.
@@ -106,10 +106,15 @@ func (w *MemoryWatchdog) checkDrift(s instanceMemSnapshot) {
 	if configured <= 0 {
 		return // no configured value to drift from
 	}
+	// memory_gb is the GPU-VRAM reservation, so drift is measured against
+	// actual GPU VRAM only. Host RSS is governed separately by
+	// checkSystemPressure. On unified-memory hardware (GB10) a vLLM worker's
+	// large host-side RSS used to leak into this figure via a max(), inflating
+	// the VRAM reservation far above the model's true GPU ceiling — e.g. gemma,
+	// hard-capped by --gpu-memory-utilization at ~43GB, got recorded at ~75GB
+	// (a ~62GB RSS+VRAM peak × 1.2), which then made it impossible to
+	// co-schedule with any other large model.
 	observed := s.TreeVRAMGB
-	if s.TreeRSSGB > observed {
-		observed = s.TreeRSSGB
-	}
 	w.driftMu.Lock()
 	defer w.driftMu.Unlock()
 
