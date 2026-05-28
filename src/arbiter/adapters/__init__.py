@@ -23,6 +23,7 @@ _ADAPTERS = [
     "sadtalker",
     "echomimic",
     "wan_s2v",
+    "wan_flf",
     "sonic",
     "ltx2",
     "ltx2_encode",
