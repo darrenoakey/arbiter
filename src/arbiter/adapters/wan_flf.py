@@ -65,13 +65,23 @@ class WanFlfAdapter(ModelAdapter):
             vae = AutoencoderKLWan.from_pretrained(
                 str(MODEL_DIR), subfolder="vae", torch_dtype=torch.float32,
             )
+            # Load with device_map="balanced": accelerate streams each shard
+            # straight to the GPU, so we never materialise a full CPU copy.
+            # A plain CPU-load-then-.to(cuda) doubles peak memory on the GB10's
+            # UNIFIED 128GB (full CPU copy + GPU copy) and NVRM-OOMs at ~77GB
+            # mid-move (observed crash-loop). "balanced" places the heavy
+            # components — transformer, transformer_2, text_encoder — all on
+            # cuda:0 (verified), giving full-speed resident inference.
             pipe = WanImageToVideoPipeline.from_pretrained(
                 str(MODEL_DIR), vae=vae, torch_dtype=torch.bfloat16,
+                device_map="balanced",
             )
-            # GB10 mmap->cuda is ~170MB/s; clone each tensor first (base helper).
-            self._pipe_to_cuda_cloned(pipe, device)
+            # device_map leaves the separately-loaded fp32 VAE on CPU; move it
+            # to the GPU so VAE-decode matches the cuda latents (otherwise:
+            # "Input type cuda vs weight cpu"). The fp32 VAE is small.
+            pipe.vae.to(device)
             self._pipe = pipe
-            log.info("wan-flf: model resident on %s", device)
+            log.info("wan-flf: model resident (balanced, vae->%s)", device)
         except Exception as e:
             self._pipe = None
             raise LoadError(f"Failed to load wan-flf: {e}") from e
