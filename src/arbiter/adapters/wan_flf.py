@@ -43,6 +43,12 @@ log = logging.getLogger(__name__)
 MODEL_DIR = Path("/mnt/arbiter-store/models/Wan2.2-I2V-A14B-Diffusers")
 NEG_PROMPT = ("blurry, low quality, distorted, deformed, extra limbs, extra "
              "fingers, watermark, text, jpeg artifacts, oversaturated, flickering")
+# WAN gen resolution cap. Blackwell has no flash-attn, so attention memory
+# scales with token count (W*H*frames); generating at full 1080p OOMs during
+# gen. We generate at this efficient area (~480p — WAN's native sweet spot,
+# proven to fit) then upscale to the requested dims in the ffmpeg-normalise
+# step. Keeps each chunk interchangeable with an LTX chunk at the target res.
+WAN_GEN_AREA = 832 * 480
 
 
 @register
@@ -80,8 +86,20 @@ class WanFlfAdapter(ModelAdapter):
             # to the GPU so VAE-decode matches the cuda latents (otherwise:
             # "Input type cuda vs weight cpu"). The fp32 VAE is small.
             pipe.vae.to(device)
+            # Blackwell has no flash-attn wheel, so attention falls back to
+            # SDPA which materialises the full attention matrix. For 81-frame
+            # video that is enormous and OOMs during gen. Slice attention and
+            # tile the VAE to cap peak activation memory (slower, but fits).
+            try:
+                pipe.enable_attention_slicing()
+            except Exception:
+                pass
+            try:
+                pipe.vae.enable_tiling()
+            except Exception:
+                pass
             self._pipe = pipe
-            log.info("wan-flf: model resident (balanced, vae->%s)", device)
+            log.info("wan-flf: model resident (balanced, vae->%s, sliced)", device)
         except Exception as e:
             self._pipe = None
             raise LoadError(f"Failed to load wan-flf: {e}") from e
@@ -118,8 +136,13 @@ class WanFlfAdapter(ModelAdapter):
         end_t = float(params.get("end_time", 0.0))
         target_dur = max(0.1, end_t - start_t) if end_t > start_t else num_frames / 16.0
 
-        img0 = img0.resize((width, height))
-        img1 = img1.resize((width, height))
+        # Generate at a memory-safe area (~480p), preserving aspect + /16
+        # alignment; the normalise step upscales to the requested width×height.
+        ar = max(0.1, width / height)
+        gen_h = max(16, int(round((WAN_GEN_AREA / ar) ** 0.5)) // 16 * 16)
+        gen_w = max(16, int(round((WAN_GEN_AREA * ar) ** 0.5)) // 16 * 16)
+        img0 = img0.resize((gen_w, gen_h))
+        img1 = img1.resize((gen_w, gen_h))
 
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -131,14 +154,14 @@ class WanFlfAdapter(ModelAdapter):
             from diffusers.utils import export_to_video
 
             self._check_cancel(cancel_flag)
-            log.info("wan-flf: %dx%d nf=%d steps=%d -> %.2fs@%dfps",
-                     width, height, num_frames, steps, target_dur, target_fps)
+            log.info("wan-flf: gen %dx%d nf=%d steps=%d -> upscale %dx%d %.2fs@%dfps",
+                     gen_w, gen_h, num_frames, steps, width, height, target_dur, target_fps)
             with self._gpu_lock:
                 self._check_cancel(cancel_flag)
                 gen = torch.Generator(device=self._device).manual_seed(seed)
                 frames = self._pipe(
                     image=img0, last_image=img1, prompt=prompt,
-                    negative_prompt=NEG_PROMPT, height=height, width=width,
+                    negative_prompt=NEG_PROMPT, height=gen_h, width=gen_w,
                     num_frames=num_frames, guidance_scale=guidance,
                     num_inference_steps=steps, generator=gen,
                 ).frames[0]
