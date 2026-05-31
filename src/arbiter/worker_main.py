@@ -48,6 +48,8 @@ def main():
     model_id = sys.argv[1]
     log.info("Worker starting for model: %s", model_id)
 
+    _apply_cuda_memory_cap()
+
     from arbiter.adapters import registry
     from arbiter.adapters.base import CancelledException
 
@@ -124,6 +126,43 @@ def main():
 
     executor.shutdown(wait=False)
     log.info("Worker shutting down")
+
+
+def _apply_cuda_memory_cap():
+    """Cap this worker's CUDA allocator to its declared footprint.
+
+    On the GB10 unified-memory host, GPU allocations bypass cgroup accounting,
+    so an adapter that overshoots its budget exhausts physical RAM and livelocks
+    the whole machine (no OOM-killer record, requires a physical reset). The Go
+    server passes the model's declared budget in ARBITER_MEMORY_GB; we set
+    torch.cuda.set_per_process_memory_fraction so an overshoot raises a catchable
+    ``CUDA out of memory`` and fails just this job instead of taking down the host.
+
+    A 15% pad over the declared reservation is allowed so legitimate slight
+    overshoot does not turn into a false OOM — the cap exists to stop the
+    catastrophic runaway, not to enforce the budget to the byte. The fraction is
+    hard-ceilinged at 0.92 so the host always keeps a reserve.
+    """
+    import os
+
+    mem_gb = os.environ.get("ARBITER_MEMORY_GB")
+    if not mem_gb:
+        return
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        total = torch.cuda.get_device_properties(0).total_memory
+        want = float(mem_gb) * (1024 ** 3) * 1.15
+        fraction = max(0.01, min(0.92, want / total))
+        torch.cuda.set_per_process_memory_fraction(fraction)
+        log.info(
+            "CUDA memory cap applied: declared=%.1f GB -> fraction %.3f (%.1f GB of %.1f GB)",
+            float(mem_gb), fraction, fraction * total / (1024 ** 3), total / (1024 ** 3),
+        )
+    except Exception:
+        log.exception("Failed to apply CUDA memory cap (continuing uncapped)")
 
 
 def _get_vram_bytes() -> int:

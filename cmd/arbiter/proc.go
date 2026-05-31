@@ -149,6 +149,17 @@ func (inst *Instance) Spawn() error {
 	}
 	cmd.Dir = inst.projectRoot
 	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1")
+	if inst.memoryGB > 0 {
+		// On GB10 unified memory, GPU allocations are NOT charged to the
+		// process's memory cgroup (verified: a MemoryMax=4G scope let a CUDA
+		// process allocate 8G unhindered). A runaway adapter therefore exhausts
+		// physical RAM while keeping a tiny RSS, so the kernel OOM killer can't
+		// identify it — the host livelocks and needs a physical reset. The only
+		// containment that works is a per-process CUDA cap inside the worker:
+		// worker_main applies torch.cuda.set_per_process_memory_fraction so an
+		// over-allocation raises a catchable CUDA OOM instead of wedging the box.
+		cmd.Env = append(cmd.Env, fmt.Sprintf("ARBITER_MEMORY_GB=%g", inst.memoryGB))
+	}
 	for _, e := range inst.workerEnv {
 		cmd.Env = append(cmd.Env, e)
 	}
