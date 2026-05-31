@@ -16,6 +16,12 @@ Arbiter is a unified GPU model server. It manages 11+ ML models on a single NVID
 - **`src/arbiter/adapters/`** — One file per model. Each wraps load/unload/infer.
 - **`src/arbiter/calibrate/`** — Measures VRAM, latency, concurrency per model.
 
+## Memory Containment (critical — do not regress)
+
+On the GB10 there is NO discrete VRAM: GPU memory IS the 119.5GB unified system pool, and **CUDA allocations are NOT charged to the process memory cgroup** (verified: a `MemoryMax=4G` scope let a CUDA process allocate 8GB unhindered). A runaway adapter therefore exhausts physical RAM while keeping a tiny RSS, so the kernel OOM killer can't find it — the host livelocks with no OOM log and needs a physical reset. systemd `MemoryMax`/slices/`systemd-oomd` CANNOT contain this; containment must happen in the application layer.
+
+The fix (commit `8429f62`): the Go server (`cmd/arbiter/proc.go`) passes `ARBITER_MEMORY_GB=<inst.memoryGB>` to every worker; `src/arbiter/worker_main.py` `_apply_cuda_memory_cap()` calls `torch.cuda.set_per_process_memory_fraction(declared*1.15/total, ceil 0.92)` at startup. An overshoot then raises a catchable `CUDA out of memory` (job fails, caller retries) instead of wedging the host. The cap derives from each model's declared `memory_gb` — so an inaccurate declaration produces an inaccurate cap. If a model legitimately CUDA-OOMs under its cap, raise its `memory_gb` in `local/config.json` (vllm/llm workers are separate binaries that self-bound via `--gpu-memory-utilization` and are unaffected). Host backstops (not in this repo): SBSA hardware watchdog (`RuntimeWatchdogSec=10s` → auto-reboot on livelock) and `vm.swappiness=10`.
+
 ## How to Run
 
 ```bash
