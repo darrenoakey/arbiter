@@ -28,6 +28,8 @@ _ADAPTERS = [
     "ltx2_encode",
     "ltx2_denoise1",
     "ltx2_denoise2",
+    "ltx2_dev_denoise1",
+    "ltx2_dev_denoise2",
     "face_restore",
     "face_restore_codeformer",
     "aesthetic_scorer",
