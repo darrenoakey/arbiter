@@ -106,21 +106,14 @@ class KokoroTTSAdapter(ModelAdapter):
         return letter if letter in _KNOWN_LANG_CODES else "a"
 
     # ----------------------------------------------------------------
-    # infer
-    # synthesize one line of text and write a 24 kHz mono result.wav
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    # synth one
+    # synthesize a single (text, voice, speed) → float32 mono samples @ 24 kHz
+    def _synth_one(self, text: str, voice_spec: str, speed: float,
+                   lang_override: str, cancel_flag: threading.Event):
         import numpy as np
-        import soundfile as sf
-        self._check_cancel(cancel_flag)
-
-        text = params["text"]
-        voice_spec = params.get("voice", "af_heart")
-        speed = float(params.get("speed", 1.0))
-        lang_code = self._lang_code_for(voice_spec, params.get("lang_code", ""))
-
+        lang_code = self._lang_code_for(voice_spec, lang_override)
         pipeline = self._pipeline_for(lang_code)
         voice = self._resolve_voice(pipeline, voice_spec)
-
         chunks: list = []
         for result in pipeline(text, voice=voice, speed=speed):
             self._check_cancel(cancel_flag)
@@ -132,18 +125,60 @@ class KokoroTTSAdapter(ModelAdapter):
             elif not isinstance(audio, np.ndarray):
                 audio = np.array(audio)
             chunks.append(audio.astype(np.float32))
-
         if not chunks:
             raise InferenceError(f"kokoro produced no audio for text: {text[:80]!r}")
-        wav = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+        return np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
 
+    # ----------------------------------------------------------------
+    # infer
+    # Two modes:
+    #   single: params{text, voice, speed} → one 24 kHz mono result.wav
+    #   batch:  params{items:[{text,voice,speed,lang_code?}], gap_seconds?}
+    #           → one concatenated result.wav + "item_samples" (per-item sample
+    #           counts) so the caller can slice it back into per-line WAVs.
+    #           Batching amortises the scheduler's per-job dispatch overhead,
+    #           which otherwise dwarfs kokoro's sub-second synthesis time.
+    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+        import numpy as np
+        import soundfile as sf
+        self._check_cancel(cancel_flag)
         sr = 24000
         out_path = output_dir / "result.wav"
+
+        items = params.get("items")
+        if items:
+            gap = float(params.get("gap_seconds", 0.0))
+            gap_samples = int(gap * sr)
+            silence = np.zeros(gap_samples, dtype=np.float32) if gap_samples > 0 else None
+            segments: list = []
+            item_samples: list[int] = []
+            for it in items:
+                self._check_cancel(cancel_flag)
+                wav = self._synth_one(
+                    it["text"], it.get("voice", "af_heart"),
+                    float(it.get("speed", 1.0)), it.get("lang_code", ""), cancel_flag,
+                )
+                item_samples.append(int(wav.shape[0]))
+                segments.append(wav)
+                if silence is not None:
+                    segments.append(silence)
+            full = np.concatenate(segments) if segments else np.zeros(0, dtype=np.float32)
+            sf.write(str(out_path), full, sr)
+            return {"format": "wav", "sample_rate": sr,
+                    "item_samples": item_samples, "gap_samples": gap_samples}
+
+        wav = self._synth_one(
+            params["text"], params.get("voice", "af_heart"),
+            float(params.get("speed", 1.0)), params.get("lang_code", ""), cancel_flag,
+        )
         sf.write(str(out_path), wav, sr)
         return {"format": "wav", "sample_rate": sr}
 
     def estimate_time(self, params: dict) -> float:
-        # Kokoro runs far faster than realtime on the GB10; a few hundred ms
-        # for typical lines. Scale gently with word count.
-        text = params.get("text", "")
-        return max(300, len(text.split()) * 20)
+        # Kokoro runs far faster than realtime on the GB10. Scale with total
+        # word count across all items.
+        items = params.get("items")
+        if items:
+            words = sum(len(str(it.get("text", "")).split()) for it in items)
+            return max(500, words * 20)
+        return max(300, len(params.get("text", "").split()) * 20)

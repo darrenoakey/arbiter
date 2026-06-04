@@ -199,10 +199,14 @@ class TTSDesignParams(BaseModel):
 
 
 class TTSKokoroParams(BaseModel):
-    text: str
+    # Single-line mode: text (+ voice/speed). Batch mode: items=[{text,voice,speed}]
+    # synthesized in one job and returned as one concatenated wav + item_samples.
+    text: str = ""
     voice: str = "af_heart"  # name or weighted blend "af_heart*0.6+am_michael*0.4"
     speed: float = 1.0
     lang_code: str = ""  # "" → derive from voice prefix (a/b/...)
+    items: Optional[list[dict]] = None
+    gap_seconds: float = 0.0
 
 
 class TalkingHeadParams(BaseModel):
