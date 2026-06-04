@@ -21,6 +21,7 @@ class JobType(str, Enum):
     TTS_CUSTOM = "tts-custom"
     TTS_CLONE = "tts-clone"
     TTS_DESIGN = "tts-design"
+    TTS_KOKORO = "tts-kokoro"
     TALKING_HEAD = "talking-head"
     TALKING_HEAD_SADTALKER = "talking-head-sadtalker"
     LIPSYNC = "lipsync"
@@ -44,6 +45,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "tts-custom": "tts-custom",
     "tts-clone": "tts-clone",
     "tts-design": "tts-design",
+    "tts-kokoro": "tts-kokoro",
     "talking-head": "sonic",
     "talking-head-sadtalker": "sadtalker",
     "lipsync": "latentsync",
@@ -196,6 +198,13 @@ class TTSDesignParams(BaseModel):
     temperature: float = 0.9
 
 
+class TTSKokoroParams(BaseModel):
+    text: str
+    voice: str = "af_heart"  # name or weighted blend "af_heart*0.6+am_michael*0.4"
+    speed: float = 1.0
+    lang_code: str = ""  # "" → derive from voice prefix (a/b/...)
+
+
 class TalkingHeadParams(BaseModel):
     image: Optional[str] = None
     image_file: Optional[str] = None
@@ -300,6 +309,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "tts-custom": TTSCustomParams,
     "tts-clone": TTSCloneParams,
     "tts-design": TTSDesignParams,
+    "tts-kokoro": TTSKokoroParams,
     "talking-head": TalkingHeadParams,
     "talking-head-sadtalker": TalkingHeadSadTalkerParams,
     "lipsync": LipsyncParams,

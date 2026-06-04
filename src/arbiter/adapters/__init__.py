@@ -19,6 +19,7 @@ _ADAPTERS = [
     "tts_custom",
     "tts_clone",
     "tts_design",
+    "kokoro_tts",
     "latentsync",
     "sadtalker",
     "echomimic",
