@@ -41,7 +41,12 @@ class KokoroTTSAdapter(ModelAdapter):
 
     def __init__(self):
         self._model = None
-        self._pipelines: dict = {}
+        # Per-thread KPipeline cache. With max_concurrent>1 the worker runs
+        # several infer() calls concurrently on this one adapter; a KPipeline's
+        # g2p (spaCy/misaki) is NOT thread-safe, so each worker thread gets its
+        # OWN pipeline. They all share the single KModel (one ~2 GB load), so
+        # GPU memory stays flat while CPU g2p parallelises safely.
+        self._local = threading.local()
 
     # ----------------------------------------------------------------
     # load
@@ -52,25 +57,31 @@ class KokoroTTSAdapter(ModelAdapter):
         dev = "cuda" if device == "cuda" and torch.cuda.is_available() else "cpu"
         self._model = KModel(repo_id=self._HF_REPO).to(dev).eval()
         self._device = dev
-        self._pipelines = {}
+        self._local = threading.local()
 
     def unload(self) -> None:
-        self._pipelines = {}
+        self._local = threading.local()
         del self._model
         self._model = None
         self._cleanup_gpu()
 
     # ----------------------------------------------------------------
     # pipeline for
-    # return (creating if needed) the KPipeline for one language code,
-    # sharing the single loaded KModel so we never load weights twice
+    # return (creating if needed) the calling thread's KPipeline for one
+    # language code. Pipelines are per-thread (g2p isn't thread-safe) but all
+    # share the single loaded KModel, so weights load once regardless of how
+    # many concurrent worker threads there are.
     def _pipeline_for(self, lang_code: str):
-        if lang_code not in self._pipelines:
+        pipelines = getattr(self._local, "pipelines", None)
+        if pipelines is None:
+            pipelines = {}
+            self._local.pipelines = pipelines
+        if lang_code not in pipelines:
             from kokoro import KPipeline
-            self._pipelines[lang_code] = KPipeline(
+            pipelines[lang_code] = KPipeline(
                 lang_code=lang_code, repo_id=self._HF_REPO, model=self._model,
             )
-        return self._pipelines[lang_code]
+        return pipelines[lang_code]
 
     # ----------------------------------------------------------------
     # resolve voice
