@@ -111,6 +111,11 @@ class KokoroTTSAdapter(ModelAdapter):
     def _synth_one(self, text: str, voice_spec: str, speed: float,
                    lang_override: str, cancel_flag: threading.Event):
         import numpy as np
+        # Empty / whitespace-only text is a valid script line (e.g. a blank
+        # narration beat) — emit a short silence rather than failing, so a
+        # single empty item can't sink (and infinitely retry) a whole batch.
+        if not text or not text.strip():
+            return np.zeros(int(0.2 * 24000), dtype=np.float32)
         lang_code = self._lang_code_for(voice_spec, lang_override)
         pipeline = self._pipeline_for(lang_code)
         voice = self._resolve_voice(pipeline, voice_spec)
