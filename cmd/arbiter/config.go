@@ -88,7 +88,17 @@ func LoadConfig(projectRoot string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		VRAMBudgetGB: 100,
+		// GB10 unified-memory safety ceiling. Each worker is hard-capped at
+		// declared_memory_gb * 1.15 (see worker_main._apply_cuda_memory_cap),
+		// eviction is synchronous (no transient co-residence), and the
+		// scheduler keeps sum(loaded declared) <= this budget. So worst-case
+		// real GPU usage is budget*1.15 + OS base (~6-8GB). The host has
+		// 119.5GB and CUDA allocations escape cgroup accounting, so exceeding
+		// it livelocks the machine with NO oom-kill (requires physical reset).
+		// 90*1.15 = 103.5 + 8 = ~111.5GB leaves ~8GB headroom. Do NOT raise
+		// above ~95 (95*1.15+8 = 117.3, the practical max) — 100/101 allowed
+		// the documented double livelock of 2026-06-04.
+		VRAMBudgetGB: 90,
 		Host:         "0.0.0.0",
 		Port:         8400,
 	}
