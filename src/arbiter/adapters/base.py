@@ -10,7 +10,10 @@ import time
 from abc import ABC, abstractmethod
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 _base_log = logging.getLogger(__name__)
 
@@ -103,6 +106,21 @@ class ModelAdapter(ABC):
             file_path = str(Path("output/refs") / file_path[4:])
         if file_path:
             p = Path(file_path)
+            # Reject DEFINITIVELY-bad inputs instantly — never burn the 10s
+            # CIFS-lag poll (or a model load + inference) on a file that can
+            # never be valid media. A macOS AppleDouble resource fork (._*) or
+            # a 0-byte file is junk that will fail no matter what; fail fast
+            # here as a client error (see isClientError in the Go scheduler) so
+            # the worker stays free and the model's circuit breaker is spared.
+            if p.name.startswith("._"):
+                raise InferenceError(
+                    f"bad input file (macOS resource fork '._', not real media): {p}"
+                )
+            try:
+                if p.is_file() and p.stat().st_size == 0:
+                    raise InferenceError(f"bad input file (empty, 0 bytes): {p}")
+            except OSError:
+                pass
             # The shared inbox is a CIFS mount; the client writes the file on
             # the Mac side then immediately submits the job, but spark's CIFS
             # attribute cache can lag briefly. Poll for up to 10s before
@@ -119,7 +137,6 @@ class ModelAdapter(ABC):
         # Fall back to base64
         b64_data = params.get(key) or params.get(f"{key}_url", "")
         if not b64_data:
-            from arbiter.adapters.base import InferenceError
             raise InferenceError(f"No {key} or {file_key} provided")
         if b64_data.startswith("data:"):
             _, b64_data = b64_data.split(",", 1)
@@ -129,14 +146,20 @@ class ModelAdapter(ABC):
     def _resolve_image(params: dict) -> "Image.Image":
         """Convenience: resolve image media and return a PIL Image."""
         from PIL import Image
-        from arbiter.adapters.base import ModelAdapter, InferenceError
         try:
             raw = ModelAdapter._resolve_media(params, "image")
-            return Image.open(io.BytesIO(raw)).convert("RGB")
+            img = Image.open(io.BytesIO(raw))
+            img.load()  # force decode now so a corrupt/truncated file fails here
+            return img.convert("RGB")
         except Exception as e:
             if isinstance(e, InferenceError):
                 raise
-            raise InferenceError(f"Failed to decode image: {e}")
+            # Present-but-undecodable (corrupt, truncated, or unsupported format
+            # like HEIC without the plugin) — a client/input problem, not a model
+            # fault. Phrase it so isClientError classifies it as such.
+            raise InferenceError(
+                f"bad input image (cannot decode — corrupt or unsupported format): {e}"
+            )
 
     @staticmethod
     def _cleanup_gpu():

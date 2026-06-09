@@ -1952,6 +1952,15 @@ func isClientError(s string) bool {
 		strings.Contains(low, "stale file handle"),
 		strings.Contains(low, "permission denied"),
 		strings.Contains(low, "i/o error"),
+		// bad/unparseable input media — the file is reachable but garbage:
+		// resource forks, empty files, corrupt/unsupported images. Failed
+		// instantly upfront by base.py; never a model fault.
+		strings.Contains(low, "bad input file"),
+		strings.Contains(low, "bad input image"),
+		strings.Contains(low, "resource fork"),
+		strings.Contains(low, "cannot identify image file"),
+		strings.Contains(low, "unidentifiedimageerror"),
+		strings.Contains(low, "cannot decode"),
 		strings.Contains(low, "invalid argument") && strings.Contains(low, "/mnt/") ||
 			strings.Contains(low, "invalid argument") && strings.Contains(low, "/output/"),
 		strings.Contains(low, "[errno 2]"),
