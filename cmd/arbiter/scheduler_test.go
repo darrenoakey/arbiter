@@ -1368,3 +1368,31 @@ func TestEnsureLoadedDrainsIdleWorseModelButNotRunningOne(t *testing.T) {
 		})
 	}
 }
+
+// TestIsClientErrorClassifiesBadInput verifies bad-input file errors (resource
+// forks, empty/undecodable images) are classified as client errors so they
+// don't trip the model's circuit breaker, while genuine model faults are not.
+func TestIsClientErrorClassifiesBadInput(t *testing.T) {
+	clientErrs := []string{
+		"InferenceError: bad input file (macOS resource fork '._', not real media): /mnt/arbiter-store/inbox/._x.jpg",
+		"InferenceError: bad input file (empty, 0 bytes): /mnt/arbiter-store/inbox/x.jpg",
+		"InferenceError: bad input image (cannot decode — corrupt or unsupported format): boom",
+		"PIL.UnidentifiedImageError: cannot identify image file <_io.BytesIO object>",
+		"job rejected: 1 input path(s) unreadable: /x: no such file or directory",
+	}
+	for _, e := range clientErrs {
+		if !isClientError(e) {
+			t.Errorf("expected isClientError=true for %q", e)
+		}
+	}
+	modelFaults := []string{
+		"CUDA out of memory. Tried to allocate 2.00 GiB",
+		"RuntimeError: shape mismatch at layer 7",
+		"model produced NaN logits",
+	}
+	for _, e := range modelFaults {
+		if isClientError(e) {
+			t.Errorf("expected isClientError=false (model fault) for %q", e)
+		}
+	}
+}

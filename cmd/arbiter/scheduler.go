@@ -1824,7 +1824,17 @@ func (s *Scheduler) ValidateJobInputs(payload json.RawMessage) error {
 	}
 	var failures []string
 	for _, p := range paths {
-		if _, err := os.Stat(p); err != nil {
+		// Reject definitively-bad inputs up front, at SUBMISSION — never queue
+		// a job (let alone load a model) for a file that can never be valid
+		// media. A macOS AppleDouble resource fork (._*) is junk by name; a
+		// 0-byte file has no content. Fail instantly with a client-error
+		// message (see isClientError) so the model's circuit breaker is spared.
+		if strings.HasPrefix(filepath.Base(p), "._") {
+			failures = append(failures, fmt.Sprintf("%s: bad input file (macOS resource fork '._', not real media)", p))
+			continue
+		}
+		info, err := os.Stat(p)
+		if err != nil {
 			// Build a precise reason. os.Stat returns *PathError whose
 			// inner err encodes the syscall errno (ENOENT, EINVAL, etc.).
 			// Surface the underlying error string verbatim so the caller
@@ -1832,6 +1842,10 @@ func (s *Scheduler) ValidateJobInputs(payload json.RawMessage) error {
 			// (broken symlink on CIFS — target was deleted)".
 			reason := classifyStatError(p, err)
 			failures = append(failures, fmt.Sprintf("%s: %s", p, reason))
+			continue
+		}
+		if info.Size() == 0 {
+			failures = append(failures, fmt.Sprintf("%s: bad input file (empty, 0 bytes)", p))
 		}
 	}
 	if len(failures) > 0 {
