@@ -10,7 +10,7 @@ host and `auto restart <name>`.
 |--------|---------|-----------|---------|
 | `gpu-mem-governor.sh` | spark `~/bin/` | `gpu-mem-governor` | Drops reclaimable page cache when MemFree is low — the NVIDIA driver won't evict clean cache to satisfy GPU allocations, so big model loads OOM with tens of GB "stuck" in cache. |
 | `blackbox.sh` | spark `~/bin/` | `blackbox` | 2-second flight recorder (MemAvailable, GPU power/util/temp, top-RSS) synced to disk every 30s. After any sudden death, `tail` the latest `/home/darren/local/blackbox/blackbox-*.log` FIRST — it distinguishes memory spike vs thermal climb vs instant power cut. |
-| `spark-watchdog.py` | mac mini `~/bin/` | `spark-watchdog` | Pings spark every 30s; after 3 minutes down it sends Wake-on-LAN magic packets (enP7s7, `30:c5:99:3e:50:64`) every 60s until spark answers. Turns "dead until someone presses the button" into "back in ~3 minutes". |
+| `spark-watchdog.py` | mac mini `~/bin/` | `spark-watchdog` | DOWN DETECTOR: pings spark every 30s; after 3 minutes down it logs the outage and sends WoL magic packets every 60s. NOTE: the DGX Spark does NOT support WoL (NVIDIA-confirmed, tested 2026-06-10) — the packets are kept only in case firmware ever adds it. Real remote revive = smart plug + UEFI "After Power Loss Behavior: Auto Boot" (the default). |
 
 Related layers (not in this directory):
 

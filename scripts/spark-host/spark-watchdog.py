@@ -11,9 +11,17 @@ this watchdog turns "dead until Darren walks over" into "back in ~3 minutes":
   ping spark every 30s -> 6 consecutive failures (3 min) -> send Wake-on-LAN
   magic packets every 60s until it answers again.
 
-WoL is armed on spark's enP7s7 (NetworkManager wake-on-lan=magic, verified
-`Wake-on: g`). Note WoL revives suspend/soft-off states; if the failure turns
-out to be a PSU hard-latch it may not fire — the logs here tell us which.
+VERDICT 2026-06-10 (controlled test + NVIDIA confirmation): the DGX Spark
+does NOT support Wake-on-LAN in any power state — NVIDIA support stated it
+flatly (forums thread 348168), there is no UEFI toggle, and the NIC's
+`Wake-on: g` is a red herring. Our test packets (verified clean sends) did
+not wake it from soft-off. This daemon therefore serves as the DOWN DETECTOR
+and evidence log; the magic packets stay because they cost nothing and would
+start working if firmware ever adds support. The actual remote revive is a
+smart plug: UEFI "After Power Loss Behavior" defaults to Auto Boot, so
+cutting and restoring AC boots the machine unattended (community-standard
+workflow; an energy-monitoring plug also doubles as a power-state indicator
+since the Spark has no power LED).
 """
 import socket
 import subprocess
@@ -40,13 +48,23 @@ def spark_alive() -> bool:
 
 
 def send_magic_packet() -> None:
+    # Broadcast destinations only. Unicast to the down host raises EHOSTDOWN
+    # on macOS (dead ARP entry) — and one raised sendto must never abort the
+    # rest, so every send is individually guarded.
     mac_bytes = bytes.fromhex(SPARK_MAC.replace(":", ""))
     packet = b"\xff" * 6 + mac_bytes * 16
+    sent = 0
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        for port in (9, 7):
-            s.sendto(packet, ("255.255.255.255", port))
-            s.sendto(packet, (SPARK_IP, port))
+        for dest in ("255.255.255.255", "10.0.0.255"):
+            for port in (9, 7):
+                try:
+                    s.sendto(packet, (dest, port))
+                    sent += 1
+                except OSError as e:
+                    log(f"WoL sendto {dest}:{port} failed: {e}")
+    if sent == 0:
+        raise OSError("all WoL sends failed")
 
 
 def main() -> None:
