@@ -135,7 +135,9 @@ Key per-model fields:
 
 ## Logs
 
-JSONL at `output/logs/arbiter-YYYY-MM-DD.jsonl`. Events: job lifecycle, model load/evict, memory snapshots.
+Two streams on spark, neither in the repo-local `output/` or `local_output/` dirs (those are stale):
+- **JSONL event log** (job lifecycle, model.scaled/auto_wake, vram): `$ARBITER_OUTPUT_DIR/logs/arbiter-YYYY-MM-DD.jsonl` — in production `/mnt/arbiter-store/output/logs/`.
+- **stdout/slog** (HTTP access lines incl. PATCH callers, scheduler decisions): managed by `auto` at `~/local/auto/output/logs/arbiter/YYYY/MM/` — find the live file via `ls -l /proc/$(pgrep -f arbiter-go)/fd/1`. An HTTP line with `remote=127.0.0.1` means the call was made on spark itself (e.g. through an ssh session).
 
 ## Reference Files
 
@@ -254,5 +256,7 @@ auto log arbiter           # View logs
 **PickInstance** must never return an instance that lacks capacity. Loading instances at capacity also count — piling jobs onto a not-yet-loaded worker just stacks them up to fire all at once when load completes.
 
 **VRAM bookkeeping.** `usedGB` must equal sum(`memoryGB` for instances where `vramHeld == true`) ± float-drift tolerance. If no instance holds VRAM, `usedGB` must be zero. `AuditVRAMConsistency(ctx)` enforces this on every load/unload — if it fires, dump every instance's state and root-cause the leaking path.
+
+**No silently dead models.** A model with queued work must always be able to make progress eventually. Scale-to-zero (`max_instances=0`) is a legitimate *temporary* operation, but the scheduler's auto-wake guard (`autoWakeParkedModels` in scheduler.go) scales any parked model with queued jobs back to 1 after `auto_wake_seconds` (default 300s; negative disables) and persists it — because the 2026-06-09 gemma4 outage proved an operator who parks a model and crashes leaves it dead forever (the 0 is persisted across restarts while jobs queue silently). Do not add code paths that can leave a model permanently unable to serve its queue.
 
 **Note on this CLAUDE.md.** Sections above describe the older Python architecture in `src/arbiter/`. The live system is the Go server in `cmd/arbiter/` (scheduler.go, proc.go, api.go, store.go). Treat the Python file paths as historical until that section is rewritten.
