@@ -101,9 +101,12 @@ func TestReconcileFromInstances_ToleratesFloatDrift(t *testing.T) {
 // clearing vramHeld. ReconcileFromInstances then summed the dead instance's
 // memoryGB into `expected`, hiding the phantom forever.
 //
-// The fix: markSubprocessExited always clears vramHeld, regardless of whether
-// the shutdown was deliberate. Reconcile then catches the orphan within one
-// watchdog tick.
+// The fix (strengthened 2026-06-10): markSubprocessExited always clears
+// vramHeld AND releases the reservation immediately — not merely leaving the
+// phantom for the 15s reconciler. The delayed-release window was itself a bug:
+// an eviction's challenger failed its reservation on the phantom GB, took the
+// 30s insufficient-memory cooldown, and the displaced model reloaded — the
+// swap-thrash livelock. usedGB must be correct the instant the process dies.
 func TestMarkSubprocessExited_ClearsVRAMOnDeliberateShutdown(t *testing.T) {
 	cfg := &Config{VRAMBudgetGB: 100, Models: map[string]ModelConfig{}}
 	mgr := NewInstanceManager(cfg, "python3", ".")
@@ -124,13 +127,13 @@ func TestMarkSubprocessExited_ClearsVRAMOnDeliberateShutdown(t *testing.T) {
 		t.Fatalf("deliberate shutdown should preserve state=stopped, got %q", inst.state)
 	}
 
-	// Reconcile within one watchdog tick reclaims the phantom.
-	freed := mgr.ReconcileFromInstances()
-	if freed < 80-0.01 || freed > 80+0.01 {
-		t.Fatalf("expected ~80GB reclaimed from dead instance, got %v", freed)
-	}
+	// The release is immediate — usedGB is already correct, no phantom left
+	// for the reconciler to find.
 	if mgr.usedGB > 0.01 {
-		t.Fatalf("usedGB should be ~0 after reconcile, got %v", mgr.usedGB)
+		t.Fatalf("usedGB should be ~0 immediately after subprocess exit, got %v", mgr.usedGB)
+	}
+	if freed := mgr.ReconcileFromInstances(); freed > 0.01 {
+		t.Fatalf("reconcile found %vGB to reclaim — release was not immediate", freed)
 	}
 }
 

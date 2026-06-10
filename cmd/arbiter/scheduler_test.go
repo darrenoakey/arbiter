@@ -787,7 +787,7 @@ func TestEvictForGBWithQueueInfoPrefersNoQueue(t *testing.T) {
 
 	// Need 25GB — model-b (no queue, 30GB) should be evicted first
 	// even though model-a (has queue, 20GB) is older (more idle)
-	freed, err := mgr.EvictForGBWithQueueInfo(25, queuedJobs)
+	freed, err := mgr.EvictForGBWithQueueInfo(25, queuedJobs, nil)
 	if err != nil {
 		t.Fatalf("eviction failed: %v", err)
 	}

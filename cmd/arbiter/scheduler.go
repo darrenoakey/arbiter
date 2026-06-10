@@ -369,6 +369,72 @@ func (s *Scheduler) selectModelMinMeanFlow(exclude map[string]bool) string {
 	return bestModel
 }
 
+// swapPatience returns the configured drain-before-swap factor: 0/unset means
+// the 2.0 default, negative disables the guard.
+const defaultSwapPatience = 2.0
+
+func (s *Scheduler) swapPatience() float64 {
+	p := s.config.SwapPatience
+	if p == 0 {
+		return defaultSwapPatience
+	}
+	return p
+}
+
+// canEvictForSwap reports whether instances of victimModel may be evicted to
+// make room for challengerModel. A victim with no pending work is always fair
+// game. A victim that still has queued/scheduled/running jobs is protected
+// until the challenger's oldest queued job has waited longer than the victim's
+// load cost × swap_patience — destroying a 7-minute load to run a 5-second job
+// and then paying the 7 minutes again is never worth it until the challenger
+// has genuinely been starved. Aging is the escape hatch: the challenger always
+// wins eventually, so this converts unbounded thrash into a bounded wait.
+func (s *Scheduler) canEvictForSwap(victimModelID, challengerModelID string) bool {
+	patience := s.swapPatience()
+	if patience < 0 {
+		return true // guard disabled
+	}
+	counts, err := s.store.CountByState(victimModelID)
+	if err != nil {
+		return true // can't see the queue — don't deadlock eviction on a store error
+	}
+	pending := counts["queued"] + counts["scheduled"] + counts["running"]
+	if pending == 0 {
+		return true
+	}
+	victimLoadSec := 60.0 // conservative floor when load_ms is unconfigured
+	if cfg, ok := s.config.Models[victimModelID]; ok && cfg.LoadMs > 0 {
+		victimLoadSec = cfg.LoadMs / 1000.0
+	}
+	threshold := victimLoadSec * patience
+	ages, err := s.store.OldestQueuedAgeByModel()
+	if err != nil {
+		return true
+	}
+	challengerWait := ages[challengerModelID]
+	if challengerWait > threshold {
+		return true
+	}
+	slog.Info("scheduler.swap_held",
+		"victim_model", victimModelID,
+		"victim_pending", pending,
+		"victim_load_sec", victimLoadSec,
+		"challenger_model", challengerModelID,
+		"challenger_wait_sec", challengerWait,
+		"threshold_sec", threshold,
+		"swap_patience", patience)
+	s.logger.Log("scheduler.swap_held", map[string]any{
+		"victim_model":        victimModelID,
+		"victim_pending":      pending,
+		"victim_load_sec":     victimLoadSec,
+		"challenger_model":    challengerModelID,
+		"challenger_wait_sec": challengerWait,
+		"threshold_sec":       threshold,
+		"swap_patience":       patience,
+	})
+	return false
+}
+
 func (s *Scheduler) rescoreModel(modelID string) {
 	p := s.computePriority(modelID)
 	s.store.UpdatePriority(modelID, p)
@@ -772,6 +838,9 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 					if inst2.ActiveJobs() > 0 {
 						continue
 					}
+					if !s.canEvictForSwap(candidateModelID, inst.ModelID) {
+						continue
+					}
 					slog.Info("ensureLoaded: draining idle worse-scoring model",
 						"evicting_model", candidateModelID,
 						"evicting_instance", inst2.InstanceID,
@@ -808,7 +877,10 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 					queuedJobs[modelID] = counts["queued"] + counts["scheduled"] + counts["running"]
 				}
 				slog.Info("ensureLoaded: evicting idle models", "instance", inst.InstanceID, "deficit_gb", deficit)
-				if _, err := s.mgr.EvictForGBWithQueueInfo(deficit, queuedJobs); err != nil {
+				allowQueued := func(victimModelID string) bool {
+					return s.canEvictForSwap(victimModelID, inst.ModelID)
+				}
+				if _, err := s.mgr.EvictForGBWithQueueInfo(deficit, queuedJobs, allowQueued); err != nil {
 					slog.Warn("ensureLoaded: queue-aware eviction insufficient",
 						"instance", inst.InstanceID, "error", err)
 				}
@@ -1852,7 +1924,9 @@ func (s *Scheduler) RunVRAMWatchdog(ctx context.Context) {
 			queuedJobs[modelID] = counts["queued"] + counts["scheduled"] + counts["running"]
 		}
 
-		freed, err := s.mgr.EvictForGBWithQueueInfo(overage, queuedJobs)
+		// nil allowQueued: memory-pressure relief must always be able to evict —
+		// the swap-patience guard only applies to model-for-model swaps.
+		freed, err := s.mgr.EvictForGBWithQueueInfo(overage, queuedJobs, nil)
 		if err != nil {
 			slog.Warn("vram watchdog: could not free enough memory",
 				"needed_gb", overage, "freed_gb", freed, "error", err)

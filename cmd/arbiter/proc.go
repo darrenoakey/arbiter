@@ -39,6 +39,12 @@ type Instance struct {
 	lastActive   time.Time
 	memoryGB     float64
 	vramHeld     bool // true while this instance's memoryGB is counted in InstanceManager.usedGB
+	// manager is set by InstanceManager.Register. markSubprocessExited needs it
+	// to decrement usedGB in the same breath that it clears vramHeld — clearing
+	// the flag alone strands the reservation until the 15s reconciler, and the
+	// challenger that triggered the eviction fails its reservation on phantom
+	// memory in the meantime (the 2026-06-10 swap-thrash livelock).
+	manager *InstanceManager
 
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -289,13 +295,29 @@ func (inst *Instance) markSubprocessExited() {
 		slog.Warn("readLoop exited, subprocess died", "instance", inst.InstanceID, "prior_state", inst.state)
 		inst.state = "error"
 	}
-	inst.vramHeld = false
+	// Release the VRAM reservation properly, not just the flag. Clearing
+	// vramHeld without decrementing usedGB leaves the budget inflated until the
+	// 15s reconciler — and because ReleaseMemoryFor keys its idempotency off
+	// vramHeld, the eviction path's paired ReleaseMemoryFor call then no-ops.
+	// Observed 2026-06-10: denoise2 evicted for gemma, gemma's reservation
+	// failed on the phantom 56GB, 30s cooldown, denoise2 reloaded — an 8-minute
+	// load wasted per cycle, forever (the same gemma job aged, won, and lost
+	// five times in a row without ever running).
+	heldGB := 0.0
+	if inst.vramHeld {
+		heldGB = inst.memoryGB
+		inst.vramHeld = false
+	}
+	manager := inst.manager
 	if inst.stdin != nil {
 		inst.stdin.Close()
 		inst.stdin = nil
 	}
 	inst.cmd = nil
 	inst.mu.Unlock()
+	if heldGB > 0 && manager != nil {
+		manager.ReleaseMemory(heldGB)
+	}
 }
 
 // sendAndReceive sends a command and waits for the response.
@@ -783,6 +805,7 @@ func NewInstanceManager(cfg *Config, pythonBin, projectRoot string) *InstanceMan
 func (m *InstanceManager) Register(inst *Instance) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	inst.manager = m
 	m.instances[inst.InstanceID] = inst
 	m.byModel[inst.ModelID] = append(m.byModel[inst.ModelID], inst.InstanceID)
 }
@@ -1435,7 +1458,13 @@ func (m *InstanceManager) EvictForGB(needed float64) error {
 // EvictForGBWithQueueInfo frees VRAM by unloading idle instances, preferring
 // models with no queued jobs before models with queued jobs.
 // Within each group, eviction is LRU (longest idle first).
-func (m *InstanceManager) EvictForGBWithQueueInfo(needed float64, queuedJobs map[string]int) (float64, error) {
+//
+// allowQueued, when non-nil, gates the has-queue tier: an instance whose model
+// still has queued work is only evicted if allowQueued(modelID) returns true.
+// This is how the scheduler's swap-patience guard prevents a cheap-job model
+// from destroying an expensive model's sunk load between every job. Pass nil
+// to allow all (memory-pressure relief must always be able to evict).
+func (m *InstanceManager) EvictForGBWithQueueInfo(needed float64, queuedJobs map[string]int, allowQueued func(modelID string) bool) (float64, error) {
 	m.mu.RLock()
 	type candidate struct {
 		inst     *Instance
@@ -1467,6 +1496,9 @@ func (m *InstanceManager) EvictForGBWithQueueInfo(needed float64, queuedJobs map
 		if c.queued == 0 {
 			noQueue = append(noQueue, c)
 		} else {
+			if allowQueued != nil && !allowQueued(c.inst.ModelID) {
+				continue // swap-patience guard: this model's queue outranks the challenger for now
+			}
 			hasQueue = append(hasQueue, c)
 		}
 	}
