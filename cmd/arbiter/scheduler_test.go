@@ -1396,3 +1396,116 @@ func TestIsClientErrorClassifiesBadInput(t *testing.T) {
 		}
 	}
 }
+
+// newAutoWakeHarness builds a scheduler whose "parked" model has
+// max_instances=0, mirroring the gemma4 outage of 2026-06-09: a model parked
+// to free VRAM, never restored, accepting jobs it can never run.
+func newAutoWakeHarness(t *testing.T, autoWakeSeconds int) (*Scheduler, *Config, *InstanceManager, *Store, string) {
+	t.Helper()
+	projectRoot := t.TempDir()
+	outputDir := filepath.Join(projectRoot, "output")
+	if err := os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755); err != nil {
+		t.Fatalf("mkdir output jobs: %v", err)
+	}
+	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	store.InitDedup()
+
+	cfg := &Config{
+		VRAMBudgetGB:    100,
+		AutoWakeSeconds: autoWakeSeconds,
+		Models: map[string]ModelConfig{
+			"parked": {MemoryGB: 1, MaxConcurrent: 1, MaxInstances: intPtr(0)},
+		},
+	}
+	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
+	t.Cleanup(func() { logger.Close() })
+	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 100}, "python3", projectRoot)
+	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+	return sched, cfg, mgr, store, projectRoot
+}
+
+func TestAutoWakeParkedModelWithBacklog(t *testing.T) {
+	sched, cfg, mgr, store, projectRoot := newAutoWakeHarness(t, 0)
+
+	if _, err := store.CreateJob("parked", "image-generate", json.RawMessage(`{}`), 1); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	// First pass only starts the grace clock — must not wake yet.
+	sched.autoWakeParkedModels()
+	if got := *cfg.Models["parked"].MaxInstances; got != 0 {
+		t.Fatalf("woke before grace elapsed: max_instances=%d", got)
+	}
+	if len(mgr.GetModelInstances("parked")) != 0 {
+		t.Fatal("instance created before grace elapsed")
+	}
+
+	// Age the starvation past the grace period and bypass the rate limiter.
+	sched.autoWakeMu.Lock()
+	sched.starvedSince["parked"] = time.Now().Add(-defaultAutoWakeGrace - time.Minute)
+	sched.lastAutoWakeCheck = time.Time{}
+	sched.autoWakeMu.Unlock()
+
+	sched.autoWakeParkedModels()
+
+	if got := *cfg.Models["parked"].MaxInstances; got != 1 {
+		t.Fatalf("expected auto-wake to set max_instances=1, got %d", got)
+	}
+	if n := len(mgr.GetModelInstances("parked")); n != 1 {
+		t.Fatalf("expected 1 instance slot after auto-wake, got %d", n)
+	}
+
+	// The wake must be persisted so a restart cannot resurrect the outage.
+	raw, err := os.ReadFile(filepath.Join(projectRoot, "local", "config.json"))
+	if err != nil {
+		t.Fatalf("read persisted config: %v", err)
+	}
+	var persisted map[string]any
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatalf("parse persisted config: %v", err)
+	}
+	entry := persisted["models"].(map[string]any)["parked"].(map[string]any)
+	if got := entry["max_instances"].(float64); got != 1 {
+		t.Fatalf("persisted max_instances = %v, want 1", got)
+	}
+}
+
+func TestAutoWakeIgnoresParkedModelWithEmptyQueue(t *testing.T) {
+	sched, cfg, mgr, _, _ := newAutoWakeHarness(t, 0)
+
+	// No queued jobs: even with the rate limiter bypassed across two passes,
+	// an intentionally-disabled idle model stays parked.
+	sched.autoWakeParkedModels()
+	sched.autoWakeMu.Lock()
+	sched.lastAutoWakeCheck = time.Time{}
+	sched.autoWakeMu.Unlock()
+	sched.autoWakeParkedModels()
+
+	if got := *cfg.Models["parked"].MaxInstances; got != 0 {
+		t.Fatalf("idle parked model was woken: max_instances=%d", got)
+	}
+	if len(mgr.GetModelInstances("parked")) != 0 {
+		t.Fatal("instance created for idle parked model")
+	}
+}
+
+func TestAutoWakeDisabledByNegativeConfig(t *testing.T) {
+	sched, cfg, _, store, _ := newAutoWakeHarness(t, -1)
+
+	if _, err := store.CreateJob("parked", "image-generate", json.RawMessage(`{}`), 1); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	sched.autoWakeMu.Lock()
+	sched.starvedSince["parked"] = time.Now().Add(-24 * time.Hour)
+	sched.autoWakeMu.Unlock()
+
+	sched.autoWakeParkedModels()
+
+	if got := *cfg.Models["parked"].MaxInstances; got != 0 {
+		t.Fatalf("guard ran despite auto_wake_seconds=-1: max_instances=%d", got)
+	}
+}

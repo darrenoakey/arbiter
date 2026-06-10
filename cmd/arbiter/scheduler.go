@@ -60,6 +60,16 @@ type Scheduler struct {
 	// see why a queue with thousands of jobs isn't draining.
 	lastIdleLogMu sync.Mutex
 	lastIdleLog   time.Time
+	// Auto-wake guard for parked models. A model scaled to max_instances=0
+	// still accepts submissions, so if whoever parked it (typically to free
+	// VRAM for a one-off big job) never restores it, its queue grows forever
+	// and the model is silently dead — across restarts, because the 0 is
+	// persisted (gemma4 outage, 2026-06-09: 186 queued jobs, dead overnight).
+	// starvedSince records when backlog was first seen for a parked model;
+	// once it has aged past the grace period the model is scaled back to 1.
+	autoWakeMu        sync.Mutex
+	starvedSince      map[string]time.Time
+	lastAutoWakeCheck time.Time
 	// inFlight is the authoritative registry of jobs currently owned by a live
 	// dispatch goroutine. It is the single source of truth for the activeJobs
 	// slot + pressure reservation each dispatch holds. Two problems this fixes:
@@ -122,6 +132,7 @@ func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *Event
 		loadAttempts:             make(map[string]int),
 		streamHandoffs:           make(map[string]*streamHandoff),
 		inFlight:                 make(map[string]inFlightJob),
+		starvedSince:             make(map[string]time.Time),
 	}
 }
 
@@ -1200,6 +1211,10 @@ func (s *Scheduler) Run(ctx context.Context) {
 			continue
 		}
 
+		// A parked model (max_instances=0) with queued work can never drain;
+		// scale it back up once the backlog outlives the grace period.
+		s.autoWakeParkedModels()
+
 		// Real queued work outranks warm residency. If there is backlog for any
 		// model, immediately evict loaded idle models that have zero pending
 		// work instead of waiting for keepalive expiry or explicit VRAM pressure.
@@ -1297,6 +1312,89 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 		// Preload next instance in background
 		s.tryPreload()
+	}
+}
+
+// autoWakeCheckInterval rate-limits the parked-model scan (it queries the
+// store per model) so the 100ms tick doesn't hammer SQLite.
+const autoWakeCheckInterval = 5 * time.Second
+
+// defaultAutoWakeGrace is how long a parked model may hold queued work before
+// the guard scales it back up, when config.auto_wake_seconds is unset.
+const defaultAutoWakeGrace = 300 * time.Second
+
+// autoWakeParkedModels scales any model that has had queued work but
+// max_instances=0 for longer than the grace period back to 1 instance, and
+// persists the change. This is the safety net for the "parked and forgotten"
+// outage: scale-to-zero is a legitimate temporary operation (free VRAM for a
+// big one-off job), but nothing used to force it back, so a crashed or
+// forgetful orchestrator left the model accepting jobs it could never run.
+// Demand-driven: a parked model with an empty queue stays parked. Waking only
+// creates a stopped instance slot — actual model load remains subject to the
+// scheduler's normal VRAM fitting, so this can never overcommit memory.
+func (s *Scheduler) autoWakeParkedModels() {
+	if s.config.AutoWakeSeconds < 0 {
+		return
+	}
+	grace := defaultAutoWakeGrace
+	if s.config.AutoWakeSeconds > 0 {
+		grace = time.Duration(s.config.AutoWakeSeconds) * time.Second
+	}
+
+	s.autoWakeMu.Lock()
+	defer s.autoWakeMu.Unlock()
+	now := time.Now()
+	if now.Sub(s.lastAutoWakeCheck) < autoWakeCheckInterval {
+		return
+	}
+	s.lastAutoWakeCheck = now
+
+	pending := s.pendingJobsByModel()
+
+	// Forget models that gained instances or drained their queue.
+	for id := range s.starvedSince {
+		cfg, ok := s.config.Models[id]
+		if !ok || pending[id] == 0 || cfg.MaxInstances == nil || *cfg.MaxInstances != 0 {
+			delete(s.starvedSince, id)
+		}
+	}
+
+	for id, n := range pending {
+		if n == 0 {
+			continue
+		}
+		cfg, ok := s.config.Models[id]
+		if !ok || cfg.MaxInstances == nil || *cfg.MaxInstances != 0 {
+			continue
+		}
+		first, seen := s.starvedSince[id]
+		if !seen {
+			s.starvedSince[id] = now
+			slog.Warn("scheduler.parked_model_has_backlog",
+				"model", id, "queued", n, "auto_wake_in", grace.String())
+			continue
+		}
+		if now.Sub(first) < grace {
+			continue
+		}
+
+		one := 1
+		cfg.MaxInstances = &one
+		s.config.Models[id] = cfg
+		scaleResult := s.mgr.ScaleModel(id, 1, cfg)
+		if err := PatchModelMaxInstances(s.mgr.projectRoot, id, 1); err != nil {
+			slog.Error("scheduler.auto_wake persist failed", "model", id, "error", err)
+		}
+		s.rescoreModel(id)
+		s.logger.Log("model.auto_wake", map[string]any{
+			"model_id":        id,
+			"queued_jobs":     n,
+			"starved_seconds": now.Sub(first).Seconds(),
+			"added":           scaleResult["added"],
+		})
+		slog.Warn("scheduler.auto_wake: parked model had backlog past grace — scaled back to 1",
+			"model", id, "queued", n, "starved", now.Sub(first).String())
+		delete(s.starvedSince, id)
 	}
 }
 

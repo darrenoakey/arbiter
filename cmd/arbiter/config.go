@@ -36,13 +36,20 @@ type ModelConfig struct {
 }
 
 type Config struct {
-	VRAMBudgetGB      float64                `json:"vram_budget_gb"`
-	SystemRAMBudgetGB float64                `json:"system_ram_budget_gb"` // 0 = disabled. On unified-memory hardware (GB10), this caps total tree-RSS across all worker process trees so CPU-side allocations can't push the GPU driver into NV_ERR_NO_MEMORY.
-	Host              string                 `json:"host"`
-	Port              int                    `json:"port"`
-	OutputDir         string                 `json:"output_dir"`
-	ShareMount        string                 `json:"share_mount"` // e.g. "/mnt/arbiter-store" — if set, monitored and remounted when unhealthy
-	Models            map[string]ModelConfig `json:"models"`
+	VRAMBudgetGB      float64 `json:"vram_budget_gb"`
+	SystemRAMBudgetGB float64 `json:"system_ram_budget_gb"` // 0 = disabled. On unified-memory hardware (GB10), this caps total tree-RSS across all worker process trees so CPU-side allocations can't push the GPU driver into NV_ERR_NO_MEMORY.
+	Host              string  `json:"host"`
+	Port              int     `json:"port"`
+	OutputDir         string  `json:"output_dir"`
+	ShareMount        string  `json:"share_mount"` // e.g. "/mnt/arbiter-store" — if set, monitored and remounted when unhealthy
+	// AutoWakeSeconds is the grace period before a model that has queued jobs
+	// but max_instances=0 is automatically scaled back to 1. A parked model
+	// still accepts job submissions, so an operator who scales to 0 (to free
+	// VRAM) and never restores it leaves the model silently dead with an
+	// ever-growing queue — and the 0 is persisted, so restarts don't recover
+	// it. 0 = default (300s); negative = guard disabled.
+	AutoWakeSeconds int                    `json:"auto_wake_seconds"`
+	Models          map[string]ModelConfig `json:"models"`
 }
 
 // JobTypeToModel maps job type strings to model IDs.
@@ -199,26 +206,38 @@ func SaveModelConfig(projectRoot, modelID string, cfg ModelConfig) error {
 	return writeConfigData(projectRoot, data)
 }
 
-// PatchModelMemoryGB updates only the memory_gb field for a model in
-// local/config.json, preserving every other key (including ones not in
-// ModelConfig). Used by the drift watchdog to write back observed high-water
-// marks without clobbering hand-edited fields.
-func PatchModelMemoryGB(projectRoot, modelID string, newMemoryGB float64) error {
+// patchModelField updates a single field for a model in local/config.json,
+// preserving every other key (including ones not in ModelConfig), so callers
+// never clobber hand-edited fields.
+func patchModelField(projectRoot, modelID, field string, value any) error {
 	data, err := loadMutableConfigData(projectRoot)
 	if err != nil {
 		return err
 	}
 	models, ok := data["models"].(map[string]any)
 	if !ok {
-		return fmt.Errorf("no models section in config")
+		models = make(map[string]any)
+		data["models"] = models
 	}
 	entry, ok := models[modelID].(map[string]any)
 	if !ok {
 		entry = make(map[string]any)
 		models[modelID] = entry
 	}
-	entry["memory_gb"] = newMemoryGB
+	entry[field] = value
 	return writeConfigData(projectRoot, data)
+}
+
+// PatchModelMemoryGB is used by the drift watchdog to write back observed
+// high-water marks.
+func PatchModelMemoryGB(projectRoot, modelID string, newMemoryGB float64) error {
+	return patchModelField(projectRoot, modelID, "memory_gb", newMemoryGB)
+}
+
+// PatchModelMaxInstances is used by the scheduler's auto-wake guard to undo a
+// persisted scale-to-zero.
+func PatchModelMaxInstances(projectRoot, modelID string, n int) error {
+	return patchModelField(projectRoot, modelID, "max_instances", n)
 }
 
 func DeleteModelConfig(projectRoot, modelID string) error {
