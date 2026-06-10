@@ -191,6 +191,7 @@ func main() {
 	go sched.RunVRAMWatchdog(ctx)
 	go sched.RunInboxWatchdog(ctx)
 	go NewMemoryWatchdog(cfg, mgr, eventLog, projectRoot).Run(ctx, 30*time.Second)
+	go NewEmergencyGuardian(cfg, mgr, eventLog).Run(ctx, 0)
 	if cfg.ShareMount != "" {
 		// Probe the mount root itself — contains inbox/ and output/ subdirs,
 		// so ReadDir always gets a real server round-trip.
