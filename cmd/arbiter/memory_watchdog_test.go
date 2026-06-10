@@ -50,7 +50,7 @@ func TestPatchModelMemoryGB_PreservesOtherFields(t *testing.T) {
 		"vram_budget_gb": 100.0,
 		"models": map[string]any{
 			"flux-schnell": map[string]any{
-				"memory_gb":     24.0,
+				"memory_gb":      24.0,
 				"max_concurrent": 1.0,
 				"adapter_params": map[string]any{"hand_edited": "yes"},
 			},

@@ -9,6 +9,9 @@
 # final 30s before any future death are on disk for the next boot to read.
 #
 # Read after an incident:  tail -200 /home/darren/local/blackbox/blackbox-<date>.log
+exec 9>/tmp/blackbox.lock
+flock -n 9 || { echo "2026-06-10T05:48:35+00:00 blackbox: another instance holds the lock — exiting"; exit 0; }
+
 OUT_DIR=/home/darren/local/blackbox
 INTERVAL=2
 SYNC_EVERY=15   # iterations between fsyncs (15 x 2s = 30s max data loss)

@@ -1,25 +1,27 @@
 // LLM worker for Arbiter — wraps llama-server as a subprocess.
 //
 // Speaks the Arbiter adapter protocol on stdin/stdout:
-//   {"cmd": "load", "device": "cuda"}       → start llama-server
-//   {"cmd": "infer", "req_id": "x", ...}    → proxy chat completion
-//   {"cmd": "get_port"}                      → return llama-server port
-//   {"cmd": "unload"}                        → stop llama-server
-//   {"cmd": "shutdown"}                      → exit
+//
+//	{"cmd": "load", "device": "cuda"}       → start llama-server
+//	{"cmd": "infer", "req_id": "x", ...}    → proxy chat completion
+//	{"cmd": "get_port"}                      → return llama-server port
+//	{"cmd": "unload"}                        → stop llama-server
+//	{"cmd": "shutdown"}                      → exit
 //
 // Environment:
-//   LLM_HF_REPO     — HuggingFace repo for GGUF model (e.g., "unsloth/qwen3.6-27b-GGUF")
-//   LLM_HF_FILE     — specific GGUF file in the repo (e.g., "qwen3.6-27b-Q8_0.gguf")
-//   LLM_MODEL_PATH  — local path to GGUF file (alternative to HF download)
-//   LLM_GPU_LAYERS  — number of GPU layers (-1 = all, default)
-//   LLM_CTX_SIZE    — context size (default: 8192)
-//   LLAMA_SERVER_BIN — path to llama-server binary
+//
+//	LLM_HF_REPO     — HuggingFace repo for GGUF model (e.g., "unsloth/qwen3.6-27b-GGUF")
+//	LLM_HF_FILE     — specific GGUF file in the repo (e.g., "qwen3.6-27b-Q8_0.gguf")
+//	LLM_MODEL_PATH  — local path to GGUF file (alternative to HF download)
+//	LLM_GPU_LAYERS  — number of GPU layers (-1 = all, default)
+//	LLM_CTX_SIZE    — context size (default: 8192)
+//	LLAMA_SERVER_BIN — path to llama-server binary
 package main
 
 import (
 	"bufio"
-	"context"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -51,11 +53,11 @@ type Response struct {
 }
 
 var (
-	llamaCmd      *exec.Cmd
-	llamaPort     int
-	cancelFlag    bool
-	cancelCtx     context.Context
-	cancelFunc    context.CancelFunc
+	llamaCmd   *exec.Cmd
+	llamaPort  int
+	cancelFlag bool
+	cancelCtx  context.Context
+	cancelFunc context.CancelFunc
 )
 
 func respond(r Response) {

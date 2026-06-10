@@ -7,15 +7,19 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 )
 
 // EmergencyGuardian is the arbiter's last line of defence against taking the
-// host down. It watches the kernel's MemAvailable — the ONE number that
-// unified-memory (UVM/CUDA) allocations cannot hide from, unlike cgroup
-// accounting and per-process RSS — and when it crosses the floor it
+// host down. It watches two kernel signals — MemAvailable (which
+// unified-memory/CUDA allocations cannot hide from, unlike cgroup accounting
+// and per-process RSS) and MemFree (because MemAvailable itself is blind to
+// the GB10 pathology where page cache the NVIDIA driver cannot use inflates
+// it; see emergencyDefaultMemFreeFloorGB) — and when either crosses its floor
+// it first drops page cache if there is real cache to reclaim, then
 // force-kills the worst-offending adapter instance, ACTIVE JOBS INCLUDED.
 //
 // This is deliberately different from every other watchdog in this file set:
@@ -46,15 +50,25 @@ import (
 // MemAvailable) and the kernel panic sysctls sit below this floor as host
 // backstops; the guardian fires first so the choice of casualty is informed.
 type EmergencyGuardian struct {
-	mgr     *InstanceManager
-	logger  *EventLogger
-	floorGB float64
+	mgr            *InstanceManager
+	logger         *EventLogger
+	floorGB        float64
+	memFreeFloorGB float64
 
 	// injectable for tests
-	readAvailableGB func() (float64, error)
-	killInstance    func(victim instanceMemSnapshot) bool
+	readMeminfo  func() (meminfoGB, error)
+	killInstance func(victim instanceMemSnapshot) bool
+	dropCaches   func() error
 
 	lastKill time.Time
+	lastDrop time.Time
+}
+
+// meminfoGB is the slice of /proc/meminfo the guardian needs, in GB.
+type meminfoGB struct {
+	AvailableGB float64
+	FreeGB      float64
+	CachedGB    float64
 }
 
 const (
@@ -66,6 +80,18 @@ const (
 	// Killing an instance holding less than this frees nothing meaningful;
 	// at that point the pressure is external and earlyoom owns the problem.
 	emergencyMinFootprintGB = 1.0
+	// MemFree co-trigger. MemAvailable is blind to the GB10 pathology where
+	// tens of GB of page cache inflate it while the NVIDIA driver cannot use
+	// that cache and reclaim stalls wedge the box (2026-06-10 03:58 host
+	// death: MemFree pinned at 8-12GB with 25-65GB Cached, MemAvailable
+	// healthy, guardian and earlyoom both silent). When MemFree itself is
+	// critically low the box is one allocation burst from livelock no matter
+	// what MemAvailable claims.
+	emergencyDefaultMemFreeFloorGB = 4.0
+	// With more reclaimable cache than this, dropping it is the benign remedy
+	// — try that before shooting a model (also covers a dead gpu-mem-governor).
+	emergencyCacheSlackGB = 16.0
+	emergencyDropCooldown = 60 * time.Second
 )
 
 func NewEmergencyGuardian(cfg *Config, mgr *InstanceManager, logger *EventLogger) *EmergencyGuardian {
@@ -73,11 +99,17 @@ func NewEmergencyGuardian(cfg *Config, mgr *InstanceManager, logger *EventLogger
 	if floor <= 0 {
 		floor = emergencyDefaultFloorGB
 	}
+	memFreeFloor := cfg.EmergencyMemFreeFloorGB
+	if memFreeFloor == 0 {
+		memFreeFloor = emergencyDefaultMemFreeFloorGB
+	} // negative disables the MemFree co-trigger
 	g := &EmergencyGuardian{
-		mgr:             mgr,
-		logger:          logger,
-		floorGB:         floor,
-		readAvailableGB: readMemAvailableGB,
+		mgr:            mgr,
+		logger:         logger,
+		floorGB:        floor,
+		memFreeFloorGB: memFreeFloor,
+		readMeminfo:    readMeminfoGB,
+		dropCaches:     sudoDropCaches,
 	}
 	g.killInstance = g.forceKill
 	return g
@@ -102,15 +134,46 @@ func (g *EmergencyGuardian) Run(ctx context.Context, interval time.Duration) {
 }
 
 func (g *EmergencyGuardian) tick() {
-	avail, err := g.readAvailableGB()
+	mi, err := g.readMeminfo()
 	if err != nil {
 		return // not on linux / proc unreadable — nothing we can do
 	}
-	if avail >= g.floorGB {
+	trigger := ""
+	if mi.AvailableGB < g.floorGB {
+		trigger = "mem_available"
+	}
+	if trigger == "" && g.memFreeFloorGB > 0 && mi.FreeGB < g.memFreeFloorGB {
+		// MemAvailable looks fine but MemFree is critical — the cache-inflated
+		// blind spot. If there is real cache to reclaim, drop it first: that is
+		// the benign remedy and also covers a dead gpu-mem-governor.
+		if mi.CachedGB > emergencyCacheSlackGB && time.Since(g.lastDrop) > emergencyDropCooldown {
+			g.lastDrop = time.Now()
+			dropErr := g.dropCaches()
+			recovered := false
+			if dropErr == nil {
+				if after, err2 := g.readMeminfo(); err2 == nil && after.FreeGB >= g.memFreeFloorGB {
+					recovered = true
+				}
+			}
+			g.logger.Log("system.emergency_cache_drop", map[string]any{
+				"mem_free_gb": mi.FreeGB,
+				"cached_gb":   mi.CachedGB,
+				"floor_gb":    g.memFreeFloorGB,
+				"drop_failed": dropErr != nil,
+				"recovered":   recovered,
+			})
+			if recovered {
+				return
+			}
+		}
+		trigger = "mem_free"
+	}
+	if trigger == "" {
 		return
 	}
-	slog.Error("emergency guardian: MemAvailable below floor",
-		"available_gb", avail, "floor_gb", g.floorGB)
+	slog.Error("emergency guardian: memory below floor",
+		"trigger", trigger, "available_gb", mi.AvailableGB, "mem_free_gb", mi.FreeGB,
+		"cached_gb", mi.CachedGB, "floor_gb", g.floorGB, "memfree_floor_gb", g.memFreeFloorGB)
 	if time.Since(g.lastKill) < emergencyKillCooldown {
 		return // let the previous kill's reclaim land before shooting again
 	}
@@ -121,7 +184,9 @@ func (g *EmergencyGuardian) tick() {
 		// Nothing of ours worth killing — pressure is external. earlyoom and
 		// the host sysctls are the remaining layers; make sure it's on record.
 		g.logger.Log("system.emergency_pressure_external", map[string]any{
-			"available_gb": avail,
+			"available_gb": mi.AvailableGB,
+			"mem_free_gb":  mi.FreeGB,
+			"trigger":      trigger,
 			"floor_gb":     g.floorGB,
 			"instances":    len(snaps),
 		})
@@ -137,7 +202,9 @@ func (g *EmergencyGuardian) tick() {
 			"tree_rss_gb":   victim.TreeRSSGB,
 			"tree_vram_gb":  victim.TreeVRAMGB,
 			"configured_gb": victim.ConfiguredGB,
-			"available_gb":  avail,
+			"available_gb":  mi.AvailableGB,
+			"mem_free_gb":   mi.FreeGB,
+			"trigger":       trigger,
 			"floor_gb":      g.floorGB,
 		})
 	}
@@ -247,37 +314,60 @@ func (m *InstanceManager) snapshotKillableInstances(pidVRAM map[int]int64) []ins
 	return out
 }
 
-// readMemAvailableGB reads the kernel's estimate of allocatable memory. On
-// the GB10 this is the ground truth that CUDA unified-memory allocations
-// deplete even though they are invisible to cgroups and worker RSS.
-func readMemAvailableGB() (float64, error) {
+// readMeminfoGB reads the guardian's slice of /proc/meminfo. MemAvailable is
+// the kernel's estimate of allocatable memory — the ground truth that CUDA
+// unified-memory allocations deplete even though they are invisible to
+// cgroups and worker RSS. MemFree and Cached are read alongside it because
+// MemAvailable counts reclaimable cache the NVIDIA driver cannot actually
+// use, so MemFree is the number that exposes the GB10 starvation pathology.
+func readMeminfoGB() (meminfoGB, error) {
 	f, err := os.Open("/proc/meminfo")
 	if err != nil {
-		return 0, err
+		return meminfoGB{}, err
 	}
 	defer f.Close()
-	return parseMemAvailableGB(f)
+	return parseMeminfoGB(f)
 }
 
-func parseMemAvailableGB(r io.Reader) (float64, error) {
+func parseMeminfoGB(r io.Reader) (meminfoGB, error) {
+	var mi meminfoGB
+	seenAvailable := false
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "MemAvailable:") {
-			continue
-		}
-		fields := strings.Fields(line)
+		fields := strings.Fields(scanner.Text())
 		if len(fields) < 2 {
-			return 0, fmt.Errorf("malformed MemAvailable line: %q", line)
+			continue
 		}
 		kb, err := strconv.ParseFloat(fields[1], 64)
 		if err != nil {
-			return 0, fmt.Errorf("parse MemAvailable: %w", err)
+			continue
 		}
-		return kb / (1024 * 1024), nil
+		gb := kb / (1024 * 1024)
+		switch fields[0] {
+		case "MemAvailable:":
+			mi.AvailableGB = gb
+			seenAvailable = true
+		case "MemFree:":
+			mi.FreeGB = gb
+		case "Cached:":
+			mi.CachedGB = gb
+		}
 	}
 	if err := scanner.Err(); err != nil {
-		return 0, err
+		return meminfoGB{}, err
 	}
-	return 0, fmt.Errorf("MemAvailable not found in meminfo")
+	if !seenAvailable {
+		return meminfoGB{}, fmt.Errorf("MemAvailable not found in meminfo")
+	}
+	return mi, nil
+}
+
+// sudoDropCaches drops clean page cache (not dentries/inodes), same remedy as
+// gpu-mem-governor.sh. Requires passwordless sudo; -n fails instead of
+// prompting if that ever changes.
+func sudoDropCaches() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, "sudo", "-n", "sh", "-c",
+		"sync; echo 1 > /proc/sys/vm/drop_caches").Run()
 }

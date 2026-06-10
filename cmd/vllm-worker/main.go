@@ -1,16 +1,18 @@
 // vLLM worker for Arbiter — wraps `vllm serve --omni` as a subprocess.
 //
 // Speaks the Arbiter adapter protocol on stdin/stdout:
-//   {"cmd": "load", "device": "cuda"}       → start vllm serve --omni
-//   {"cmd": "infer", "req_id": "x", ...}    → proxy to vllm API
-//   {"cmd": "unload"}                        → stop vllm serve
-//   {"cmd": "shutdown"}                      → exit
+//
+//	{"cmd": "load", "device": "cuda"}       → start vllm serve --omni
+//	{"cmd": "infer", "req_id": "x", ...}    → proxy to vllm API
+//	{"cmd": "unload"}                        → stop vllm serve
+//	{"cmd": "shutdown"}                      → exit
 //
 // Environment:
-//   VLLM_MODEL       — HuggingFace model ID (e.g., "mistralai/Voxtral-4B-TTS-2603")
-//   VLLM_MODE        — endpoint mode: "tts" or "chat" (default: "tts")
-//   VLLM_EXTRA_ARGS  — additional args for vllm serve (space-separated)
-//   VLLM_PYTHON      — python binary to use (default: python from arbiter .venv)
+//
+//	VLLM_MODEL       — HuggingFace model ID (e.g., "mistralai/Voxtral-4B-TTS-2603")
+//	VLLM_MODE        — endpoint mode: "tts" or "chat" (default: "tts")
+//	VLLM_EXTRA_ARGS  — additional args for vllm serve (space-separated)
+//	VLLM_PYTHON      — python binary to use (default: python from arbiter .venv)
 package main
 
 import (

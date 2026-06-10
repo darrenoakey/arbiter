@@ -5,19 +5,21 @@
 // venv (`~/src/arbiter/.venv-vllm`) so the two installs cannot conflict.
 //
 // Speaks the Arbiter adapter protocol on stdin/stdout:
-//   {"cmd": "load", "device": "cuda"}       → start vllm serve
-//   {"cmd": "infer", "req_id": "x", ...}    → proxy chat completion
-//   {"cmd": "get_port"}                      → return vllm server port
-//   {"cmd": "unload"}                        → stop vllm serve
-//   {"cmd": "shutdown"}                      → exit
+//
+//	{"cmd": "load", "device": "cuda"}       → start vllm serve
+//	{"cmd": "infer", "req_id": "x", ...}    → proxy chat completion
+//	{"cmd": "get_port"}                      → return vllm server port
+//	{"cmd": "unload"}                        → stop vllm serve
+//	{"cmd": "shutdown"}                      → exit
 //
 // Environment:
-//   VLLM_MODEL       — HuggingFace model ID or GGUF repo:file spec
-//                      (e.g., "Qwen/Qwen3.6-35B-A3B" or
-//                       "unsloth/Qwen3.6-35B-A3B-GGUF:Qwen3.6-35B-A3B-UD-Q4_K_S.gguf")
-//   VLLM_EXTRA_ARGS  — additional args for vllm serve (space-separated)
-//   VLLM_BIN         — path to vllm CLI (default: ~/src/arbiter/.venv-vllm/bin/vllm)
-//   VLLM_READY_TIMEOUT_SEC — how long to wait for health (default 900)
+//
+//	VLLM_MODEL       — HuggingFace model ID or GGUF repo:file spec
+//	                   (e.g., "Qwen/Qwen3.6-35B-A3B" or
+//	                    "unsloth/Qwen3.6-35B-A3B-GGUF:Qwen3.6-35B-A3B-UD-Q4_K_S.gguf")
+//	VLLM_EXTRA_ARGS  — additional args for vllm serve (space-separated)
+//	VLLM_BIN         — path to vllm CLI (default: ~/src/arbiter/.venv-vllm/bin/vllm)
+//	VLLM_READY_TIMEOUT_SEC — how long to wait for health (default 900)
 package main
 
 import (

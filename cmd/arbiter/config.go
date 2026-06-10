@@ -39,10 +39,19 @@ type Config struct {
 	VRAMBudgetGB      float64 `json:"vram_budget_gb"`
 	SystemRAMBudgetGB float64 `json:"system_ram_budget_gb"` // 0 = disabled. On unified-memory hardware (GB10), this caps total tree-RSS across all worker process trees so CPU-side allocations can't push the GPU driver into NV_ERR_NO_MEMORY.
 	EmergencyFloorGB  float64 `json:"emergency_floor_gb"`   // MemAvailable floor below which the EmergencyGuardian force-kills the worst-offending instance (active jobs included). 0 = default 8GB. Must stay above earlyoom's SIGTERM threshold (~6GB at -m 5) so the informed kill happens before the host backstop.
-	Host              string  `json:"host"`
-	Port              int     `json:"port"`
-	OutputDir         string  `json:"output_dir"`
-	ShareMount        string  `json:"share_mount"` // e.g. "/mnt/arbiter-store" — if set, monitored and remounted when unhealthy
+	// EmergencyMemFreeFloorGB is the MemFree co-trigger for the
+	// EmergencyGuardian. MemAvailable counts reclaimable page cache that the
+	// NVIDIA driver cannot use (2026-06-10 host death: MemFree 8-12GB with
+	// 25-65GB Cached while MemAvailable looked healthy and every
+	// MemAvailable-keyed layer stayed silent). Below this MemFree floor the
+	// guardian first drops page cache, and if MemFree stays under the floor it
+	// force-kills the worst-offending instance. 0 = default 4GB; negative
+	// disables the co-trigger.
+	EmergencyMemFreeFloorGB float64 `json:"emergency_memfree_floor_gb"`
+	Host                    string  `json:"host"`
+	Port                    int     `json:"port"`
+	OutputDir               string  `json:"output_dir"`
+	ShareMount              string  `json:"share_mount"` // e.g. "/mnt/arbiter-store" — if set, monitored and remounted when unhealthy
 	// AutoWakeSeconds is the grace period before a model that has queued jobs
 	// but max_instances=0 is automatically scaled back to 1. A parked model
 	// still accepts job submissions, so an operator who scales to 0 (to free

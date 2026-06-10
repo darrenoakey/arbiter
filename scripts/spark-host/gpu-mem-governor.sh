@@ -18,6 +18,10 @@
 # Helps every big model on the arbiter (ltx2, wan-flf, wan-s2v, flux2, gemma).
 # Managed by `auto` (restarts on crash, starts at login). Privileged drop runs
 # via passwordless sudo.
+# Single-instance guard: auto can race and spawn two copies at login; the
+# duplicate exits instead of double-dropping caches.
+exec 9>/tmp/gpu-mem-governor.lock
+flock -n 9 || { echo "2026-06-10T05:44:26+00:00 gpu-mem-governor: another instance holds the lock — exiting"; exit 0; }
 FLOOR_KB=$((12 * 1024 * 1024))     # act when MemFree < 12 GB
 MINCACHE_KB=$((24 * 1024 * 1024))  # ...and reclaimable Cached > 24 GB
 INTERVAL=6

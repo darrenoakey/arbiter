@@ -6,6 +6,11 @@ Source of truth for the machine-local scripts that keep the spark GB10 alive
 `auto` on their respective hosts. If you change one here, scp it to the right
 host and `auto restart <name>`.
 
+NOTE: `auto` can race at login and spawn TWO copies of a service (observed
+2026-06-10: duplicate governors and blackboxes, double cache drops in the
+journal). Both spark scripts therefore take an exclusive flock on a /tmp lock
+file and the duplicate exits immediately — keep that guard when editing.
+
 | Script | Runs on | auto name | Purpose |
 |--------|---------|-----------|---------|
 | `gpu-mem-governor.sh` | spark `~/bin/` | `gpu-mem-governor` | Drops reclaimable page cache when MemFree is low — the NVIDIA driver won't evict clean cache to satisfy GPU allocations, so big model loads OOM with tens of GB "stuck" in cache. |

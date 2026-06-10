@@ -6,25 +6,30 @@ import (
 	"time"
 )
 
-func TestParseMemAvailableGB(t *testing.T) {
+func TestParseMeminfoGB(t *testing.T) {
 	meminfo := `MemTotal:       125353216 kB
 MemFree:        70463488 kB
 MemAvailable:   73932800 kB
 Buffers:           12345 kB
 Cached:          2242560 kB
 `
-	got, err := parseMemAvailableGB(strings.NewReader(meminfo))
+	got, err := parseMeminfoGB(strings.NewReader(meminfo))
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
-	want := 73932800.0 / (1024 * 1024)
-	if got < want-0.01 || got > want+0.01 {
-		t.Fatalf("got %.3f GB, want %.3f GB", got, want)
+	check := func(name string, got, wantKB float64) {
+		want := wantKB / (1024 * 1024)
+		if got < want-0.01 || got > want+0.01 {
+			t.Fatalf("%s: got %.3f GB, want %.3f GB", name, got, want)
+		}
 	}
+	check("MemAvailable", got.AvailableGB, 73932800)
+	check("MemFree", got.FreeGB, 70463488)
+	check("Cached", got.CachedGB, 2242560)
 }
 
-func TestParseMemAvailableGBMissing(t *testing.T) {
-	if _, err := parseMemAvailableGB(strings.NewReader("MemTotal: 1 kB\n")); err == nil {
+func TestParseMeminfoGBMissingAvailable(t *testing.T) {
+	if _, err := parseMeminfoGB(strings.NewReader("MemTotal: 1 kB\n")); err == nil {
 		t.Fatal("expected error for meminfo without MemAvailable")
 	}
 }
@@ -88,8 +93,8 @@ func TestEmergencyGuardianTick(t *testing.T) {
 
 	g := NewEmergencyGuardian(cfg, mgr, logger)
 
-	avail := 50.0
-	g.readAvailableGB = func() (float64, error) { return avail, nil }
+	mem := meminfoGB{AvailableGB: 50, FreeGB: 40, CachedGB: 5}
+	g.readMeminfo = func() (meminfoGB, error) { return mem, nil }
 
 	var killed []string
 	g.killInstance = func(v instanceMemSnapshot) bool {
@@ -110,7 +115,7 @@ func TestEmergencyGuardianTick(t *testing.T) {
 
 	// 2. Below floor with NO loaded instances: external-pressure event path,
 	// no kill, and the cooldown timestamp advances (event throttle).
-	avail = 4.0
+	mem.AvailableGB = 4.0
 	g.tick()
 	if len(killed) != 0 {
 		t.Fatalf("kill fired with no instances: %v", killed)
@@ -131,5 +136,98 @@ func TestEmergencyGuardianTick(t *testing.T) {
 	g.tick()
 	if g.lastKill.Equal(prev.Add(-2 * emergencyKillCooldown)) {
 		t.Fatal("guardian did not act after cooldown expiry")
+	}
+}
+
+// TestEmergencyGuardianMemFreeCoTrigger covers the GB10 blind spot: MemFree
+// critical while page cache keeps MemAvailable looking healthy (the 2026-06-10
+// host death). The guardian must first try a cache drop, and only act further
+// if MemFree stays under the floor.
+func TestEmergencyGuardianMemFreeCoTrigger(t *testing.T) {
+	cfg := &Config{
+		EmergencyFloorGB:        8,
+		EmergencyMemFreeFloorGB: 4,
+		Models:                  map[string]ModelConfig{},
+	}
+	mgr := NewInstanceManager(cfg, "python3", t.TempDir())
+	logger := NewEventLogger(t.TempDir())
+	g := NewEmergencyGuardian(cfg, mgr, logger)
+
+	mem := meminfoGB{AvailableGB: 40, FreeGB: 2, CachedGB: 35}
+	g.readMeminfo = func() (meminfoGB, error) { return mem, nil }
+	drops := 0
+	g.dropCaches = func() error {
+		drops++
+		mem.FreeGB = 30 // the drop reclaims cache into MemFree
+		mem.CachedGB = 5
+		return nil
+	}
+	var killed []string
+	g.killInstance = func(v instanceMemSnapshot) bool {
+		killed = append(killed, v.InstanceID)
+		return true
+	}
+
+	// 1. MemFree critical + lots of cache: drop fires, recovers, nothing dies.
+	g.tick()
+	if drops != 1 {
+		t.Fatalf("expected exactly one cache drop, got %d", drops)
+	}
+	if len(killed) != 0 {
+		t.Fatal("kill fired even though the cache drop recovered MemFree")
+	}
+	if !g.lastKill.IsZero() {
+		t.Fatal("recovered drop must not consume the kill/event throttle")
+	}
+
+	// 2. MemFree critical with NO cache to drop: goes straight to the shed
+	// path (external-pressure event here since no instances exist).
+	mem = meminfoGB{AvailableGB: 40, FreeGB: 2, CachedGB: 3}
+	g.tick()
+	if drops != 1 {
+		t.Fatalf("drop attempted with no reclaimable cache: %d", drops)
+	}
+	if g.lastKill.IsZero() {
+		t.Fatal("expected the shed path (external-pressure event) to fire")
+	}
+
+	// 3. MemFree critical, cache present, but the drop does NOT recover:
+	// proceeds to the shed path after the drop.
+	g.lastKill = time.Time{}
+	g.lastDrop = time.Time{}
+	mem = meminfoGB{AvailableGB: 40, FreeGB: 2, CachedGB: 35}
+	g.dropCaches = func() error { drops++; return nil } // drop "succeeds" but frees nothing
+	g.tick()
+	if drops != 2 {
+		t.Fatalf("expected a second drop attempt, got %d", drops)
+	}
+	if g.lastKill.IsZero() {
+		t.Fatal("expected shed path when drop fails to recover MemFree")
+	}
+}
+
+func TestEmergencyGuardianMemFreeTriggerDisabled(t *testing.T) {
+	cfg := &Config{
+		EmergencyFloorGB:        8,
+		EmergencyMemFreeFloorGB: -1,
+		Models:                  map[string]ModelConfig{},
+	}
+	mgr := NewInstanceManager(cfg, "python3", t.TempDir())
+	logger := NewEventLogger(t.TempDir())
+	g := NewEmergencyGuardian(cfg, mgr, logger)
+
+	g.readMeminfo = func() (meminfoGB, error) {
+		return meminfoGB{AvailableGB: 40, FreeGB: 1, CachedGB: 35}, nil
+	}
+	dropped := false
+	g.dropCaches = func() error { dropped = true; return nil }
+	g.killInstance = func(v instanceMemSnapshot) bool { t.Fatal("kill must not fire"); return false }
+
+	g.tick()
+	if dropped {
+		t.Fatal("co-trigger ran despite emergency_memfree_floor_gb=-1")
+	}
+	if !g.lastKill.IsZero() {
+		t.Fatal("no event path should fire when co-trigger disabled and MemAvailable healthy")
 	}
 }
