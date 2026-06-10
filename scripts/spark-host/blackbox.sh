@@ -25,8 +25,8 @@ while true; do
     find "$OUT_DIR" -name "blackbox-*.log" -mtime +14 -delete 2>/dev/null
   fi
   mem=$(awk "/^MemAvailable:/{a=\$2} /^MemFree:/{fr=\$2} /^Cached:/{c=\$2} END{printf \"avail=%dM free=%dM cached=%dM\", a/1024, fr/1024, c/1024}" /proc/meminfo)
-  gpu=$(timeout 5 nvidia-smi --query-gpu=power.draw,utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>/dev/null | tr -d " " | awk -F, "{printf \"gpu_w=%s gpu_util=%s gpu_temp=%s\", \$1, \$2, \$3}")
-  [ -z "$gpu" ] && gpu="gpu_w=ERR gpu_util=ERR gpu_temp=ERR"
+  gpu=$(timeout 5 nvidia-smi --query-gpu=power.draw,utilization.gpu,temperature.gpu,temperature.gpu.tlimit,clocks.gr --format=csv,noheader,nounits 2>/dev/null | tr -d " " | awk -F, "{printf \"gpu_w=%s gpu_util=%s gpu_temp=%s headroom=%s clk=%s\", \$1, \$2, \$3, \$4, \$5}")
+  [ -z "$gpu" ] && gpu="gpu_w=ERR gpu_util=ERR gpu_temp=ERR headroom=ERR clk=ERR"
   load=$(cut -d" " -f1-3 /proc/loadavg)
   top3=$(ps -eo rss,comm --sort=-rss --no-headers | head -3 | awk "{printf \"%s:%dM \", \$2, \$1/1024}")
   echo "$(date -Is) $mem $gpu load=$load top=[$top3]" >> "$f"
