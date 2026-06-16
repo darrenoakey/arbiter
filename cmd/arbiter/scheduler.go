@@ -336,15 +336,18 @@ func (s *Scheduler) selectModelMinMeanFlow(exclude map[string]bool) string {
 		if exclude[modelID] {
 			continue
 		}
-		counts, err := s.store.CountByState(modelID)
-		if err != nil {
-			continue
-		}
-		if counts["queued"] == 0 {
+		// Only models with queued work are candidates. OldestQueuedAgeByModel
+		// already returns exactly the models that have ≥1 queued job (one row
+		// per model, WHERE state='queued'), so presence in `ages` is identical
+		// to queued>0 — and free. Calling CountByState(modelID) here instead
+		// made the scheduler GROUP BY state over every one of that model's rows
+		// (all completed history — 86k for gemma) every sweep, sorting them on
+		// disk and pinning a core. See ActivePendingByModel for the same fix.
+		age, hasQueued := ages[modelID]
+		if !hasQueued {
 			continue
 		}
 		score := s.scoreModel(modelID)
-		age := ages[modelID]
 
 		if bestModel == "" {
 			bestModel = modelID
@@ -447,13 +450,9 @@ func (s *Scheduler) rescoreAll() {
 }
 
 func (s *Scheduler) pendingJobsByModel() map[string]int {
-	pending := make(map[string]int, len(s.config.Models))
-	for modelID := range s.config.Models {
-		counts, err := s.store.CountByState(modelID)
-		if err != nil {
-			continue
-		}
-		pending[modelID] = counts["queued"] + counts["scheduled"] + counts["running"]
+	pending, err := s.store.ActivePendingByModel()
+	if err != nil {
+		return map[string]int{}
 	}
 	return pending
 }
@@ -674,7 +673,7 @@ func (s *Scheduler) getFullModels(bestModel string) map[string]bool {
 		// denoise1 before any denoise2) while image-gen / encode, which are in
 		// no group, run freely alongside either.
 		if cfg.ConflictGroup != "" && s.conflictGroupHolds(modelID, cfg) {
-			slog.Info("scheduler.full: conflict-group hold",
+			slog.Debug("scheduler.full: conflict-group hold",
 				"model", modelID, "group", cfg.ConflictGroup, "priority", cfg.GroupPriority)
 			full[modelID] = true
 			continue
@@ -687,7 +686,7 @@ func (s *Scheduler) getFullModels(bestModel string) map[string]bool {
 		// bounces back to "queued" — and meanwhile other models with ready
 		// work and loaded instances are starved.
 		if !s.mgr.ModelHasAnyCapacity(modelID) {
-			slog.Info("scheduler.full: no instance with capacity",
+			slog.Debug("scheduler.full: no instance with capacity",
 				"model", modelID,
 				"max_concurrent", cfg.MaxConcurrent, "max_instances", *cfg.MaxInstances)
 			full[modelID] = true
@@ -710,7 +709,7 @@ func (s *Scheduler) getFullModels(bestModel string) map[string]bool {
 			freeGB := s.mgr.FreeGB()
 			reclaimableGB := s.mgr.ReclaimableIdleGB(modelID)
 			if cfg.MemoryGB > freeGB+reclaimableGB+1e-9 {
-				slog.Info("scheduler.full: model won't fit in VRAM",
+				slog.Debug("scheduler.full: model won't fit in VRAM",
 					"model", modelID, "needed_gb", cfg.MemoryGB,
 					"free_gb", freeGB, "reclaimable_idle_gb", reclaimableGB)
 				full[modelID] = true
@@ -734,7 +733,7 @@ func (s *Scheduler) getFullModels(bestModel string) map[string]bool {
 					"aged_budget", budget, "score", s.scoreModel(modelID))
 				continue
 			}
-			slog.Info("scheduler.full: model would exceed pressure budget",
+			slog.Debug("scheduler.full: model would exceed pressure budget",
 				"model", modelID, "current_pressure", cp,
 				"model_pressure_index", *cfg.PressureIndex,
 				"sum", cp+*cfg.PressureIndex,

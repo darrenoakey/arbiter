@@ -40,6 +40,17 @@ type API struct {
 	// Cached /v1/ps response — updated every second by background goroutine
 	psCache atomic.Value // json.RawMessage
 
+	// Cached DB-derived /v1/ps aggregates. These scan all job history
+	// (O(rows), and rows only grow), so they are refreshed on a slow cadence
+	// rather than every tick — recomputing all-time averages 65 times a second
+	// (global + per-model) pinned a CPU core indefinitely.
+	statsMu       sync.Mutex
+	statsAt       time.Time
+	statsCounts   map[string]map[string]int // model_id -> state -> count
+	statsGlobalCt map[string]int            // state -> count (global)
+	statsModel    map[string]JobStats       // model_id -> completed stats
+	statsGlobal   JobStats                  // global completed stats
+
 	// requestShutdown triggers a graceful process shutdown. Set by main once
 	// the HTTP server exists. Invoked by the drain monitor when shutdown_when_idle
 	// was requested and the last in-flight job has finished.
@@ -160,6 +171,37 @@ func (a *API) RunPSCache(done <-chan struct{}) {
 	}
 }
 
+// psStatsInterval bounds how often the DB-derived /v1/ps aggregates (queue
+// counts + completed-job stats) are recomputed. They aggregate over all job
+// history, so per-second recomputation is pure waste; a status dashboard
+// polling every few seconds does not need fresher-than-this historical data.
+const psStatsInterval = 5 * time.Second
+
+// refreshStats recomputes the DB-derived /v1/ps aggregates if the cached copy
+// is older than psStatsInterval, in two grouped scans (one for counts, one for
+// completed stats) covering every model at once. On query error it keeps the
+// last good values rather than blanking the dashboard.
+func (a *API) refreshStats() {
+	a.statsMu.Lock()
+	defer a.statsMu.Unlock()
+	if !a.statsAt.IsZero() && time.Since(a.statsAt) < psStatsInterval {
+		return
+	}
+	perModelCounts, globalCounts, err := a.store.CountByStateGrouped()
+	if err != nil {
+		return
+	}
+	perModelStats, globalStats, err := a.store.CompletedJobStatsGrouped()
+	if err != nil {
+		return
+	}
+	a.statsCounts = perModelCounts
+	a.statsGlobalCt = globalCounts
+	a.statsModel = perModelStats
+	a.statsGlobal = globalStats
+	a.statsAt = time.Now()
+}
+
 func (a *API) updatePSCache() {
 	snap := a.mgr.Snapshot()
 
@@ -171,27 +213,33 @@ func (a *API) updatePSCache() {
 	snap["draining"] = a.scheduler.IsDraining()
 	snap["active_jobs"] = a.mgr.TotalActiveJobs()
 
-	// Add queue counts
-	counts, _ := a.store.CountByState("")
-	snap["queue"] = counts
-	completedJobs, avgTotalSeconds, avgExecSeconds, _ := a.store.CompletedJobStats("")
+	// Queue counts + completed-job stats come from the throttled cache (see
+	// refreshStats) so the per-second tick stays cheap.
+	a.refreshStats()
+	a.statsMu.Lock()
+	globalCounts := a.statsGlobalCt
+	globalStats := a.statsGlobal
+	perModelCounts := a.statsCounts
+	perModelStats := a.statsModel
+	a.statsMu.Unlock()
+
+	snap["queue"] = globalCounts
 	snap["job_stats"] = map[string]any{
-		"completed_jobs":        completedJobs,
-		"avg_total_seconds":     avgTotalSeconds,
-		"avg_execution_seconds": avgExecSeconds,
-		"avg_waiting_seconds":   math.Max(avgTotalSeconds-avgExecSeconds, 0),
+		"completed_jobs":        globalStats.Count,
+		"avg_total_seconds":     globalStats.AvgTotal,
+		"avg_execution_seconds": globalStats.AvgExec,
+		"avg_waiting_seconds":   math.Max(globalStats.AvgTotal-globalStats.AvgExec, 0),
 	}
 
 	if models, ok := snap["models"].([]map[string]any); ok {
 		for _, m := range models {
 			if id, ok := m["id"].(string); ok {
-				modelCounts, _ := a.store.CountByState(id)
-				m["queued_jobs"] = modelCounts["queued"]
-				completedJobs, avgTotalSeconds, avgExecSeconds, _ := a.store.CompletedJobStats(id)
-				m["completed_jobs"] = completedJobs
-				m["avg_total_seconds"] = avgTotalSeconds
-				m["avg_execution_seconds"] = avgExecSeconds
-				m["avg_waiting_seconds"] = math.Max(avgTotalSeconds-avgExecSeconds, 0)
+				m["queued_jobs"] = perModelCounts[id]["queued"]
+				st := perModelStats[id]
+				m["completed_jobs"] = st.Count
+				m["avg_total_seconds"] = st.AvgTotal
+				m["avg_execution_seconds"] = st.AvgExec
+				m["avg_waiting_seconds"] = math.Max(st.AvgTotal-st.AvgExec, 0)
 				if cfg, ok := a.config.Models[id]; ok {
 					m["max_instances"] = *cfg.MaxInstances
 					m["max_concurrent"] = cfg.MaxConcurrent

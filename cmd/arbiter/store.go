@@ -372,6 +372,38 @@ func (s *Store) CountByState(modelID string) (map[string]int, error) {
 	return counts, nil
 }
 
+// ActivePendingByModel returns, per model, the number of jobs in an active
+// state (queued + scheduled + running) in a SINGLE indexed scan over just the
+// active rows. The scheduler calls this every sweep; the old approach
+// (CountByState once per model) scanned the entire jobs table — all completed,
+// cancelled and failed history included — on every sweep, which pinned a core
+// as job history grew (gemma alone has 86k completed rows). Active rows are
+// few, so this is O(active jobs), not O(all history). Models with no active
+// jobs are simply absent from the map (callers read missing keys as 0).
+func (s *Store) ActivePendingByModel() (map[string]int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(
+		"SELECT model_id, COUNT(*) FROM jobs WHERE state IN ('queued','scheduled','running') GROUP BY model_id",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]int)
+	for rows.Next() {
+		var modelID string
+		var n int
+		if err := rows.Scan(&modelID, &n); err != nil {
+			return nil, err
+		}
+		out[modelID] = n
+	}
+	return out, rows.Err()
+}
+
 // OldestQueuedAgeByModel returns the wait time (seconds since created_at) of
 // the oldest currently-queued job per model. Models with no queued jobs are
 // absent from the map. Used by the scheduler to age the pressure budget so
@@ -613,6 +645,104 @@ WHERE state = 'completed' AND finished_at IS NOT NULL
 	var avgExec float64
 	err := s.db.QueryRow(query, args...).Scan(&count, &avgTotal, &avgExec)
 	return count, avgTotal, avgExec, err
+}
+
+// JobStats holds completed-job aggregates for a single model or the whole DB.
+type JobStats struct {
+	Count    int
+	AvgTotal float64
+	AvgExec  float64
+}
+
+// CountByStateGrouped returns job counts per (model, state) plus a global
+// per-state total, computed in ONE table scan. The /v1/ps cache used to call
+// CountByState once globally and once per model (an N+1 full scan every
+// second); this collapses that into a single GROUP BY.
+func (s *Store) CountByStateGrouped() (perModel map[string]map[string]int, global map[string]int, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query("SELECT model_id, state, COUNT(*) FROM jobs GROUP BY model_id, state")
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	perModel = make(map[string]map[string]int)
+	global = make(map[string]int)
+	for rows.Next() {
+		var modelID, state string
+		var count int
+		if err := rows.Scan(&modelID, &state, &count); err != nil {
+			return nil, nil, err
+		}
+		if perModel[modelID] == nil {
+			perModel[modelID] = make(map[string]int)
+		}
+		perModel[modelID][state] = count
+		global[state] += count
+	}
+	return perModel, global, rows.Err()
+}
+
+// CompletedJobStatsGrouped returns completed-job statistics per model plus a
+// global aggregate, in ONE scan of the completed-jobs index. Replaces the
+// per-model CompletedJobStats loop the /v1/ps cache used to run (a full scan
+// per model, every second). Averages are computed from per-model SUM/COUNT so
+// the global figure matches a single AVG over all completed jobs exactly.
+func (s *Store) CompletedJobStatsGrouped() (perModel map[string]JobStats, global JobStats, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`
+SELECT
+	model_id,
+	COUNT(*),
+	COALESCE(SUM(finished_at - created_at), 0),
+	SUM(CASE WHEN started_at IS NOT NULL THEN finished_at - started_at END),
+	COUNT(CASE WHEN started_at IS NOT NULL THEN 1 END)
+FROM jobs
+WHERE state = 'completed' AND finished_at IS NOT NULL
+GROUP BY model_id`)
+	if err != nil {
+		return nil, JobStats{}, err
+	}
+	defer rows.Close()
+
+	perModel = make(map[string]JobStats)
+	var gCount, gExecCount int
+	var gSumTotal, gSumExec float64
+	for rows.Next() {
+		var modelID string
+		var count, execCount int
+		var sumTotal float64
+		var sumExec sql.NullFloat64
+		if err := rows.Scan(&modelID, &count, &sumTotal, &sumExec, &execCount); err != nil {
+			return nil, JobStats{}, err
+		}
+		js := JobStats{Count: count}
+		if count > 0 {
+			js.AvgTotal = sumTotal / float64(count)
+		}
+		if execCount > 0 && sumExec.Valid {
+			js.AvgExec = sumExec.Float64 / float64(execCount)
+		}
+		perModel[modelID] = js
+		gCount += count
+		gExecCount += execCount
+		gSumTotal += sumTotal
+		if sumExec.Valid {
+			gSumExec += sumExec.Float64
+		}
+	}
+	if gCount > 0 {
+		global.Count = gCount
+		global.AvgTotal = gSumTotal / float64(gCount)
+	}
+	if gExecCount > 0 {
+		global.AvgExec = gSumExec / float64(gExecCount)
+	}
+	return perModel, global, rows.Err()
 }
 
 // GetRunningJobs returns all jobs currently in the "running" state with their model_id and started_at.
