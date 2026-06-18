@@ -59,6 +59,7 @@ type Response struct {
 
 var (
 	vllmCmd    *exec.Cmd
+	vllmDone   chan error
 	vllmPort   int
 	cancelFlag bool
 	stdoutMu   sync.Mutex
@@ -151,6 +152,10 @@ func startVLLM() error {
 	if err := vllmCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start vllm: %w", err)
 	}
+	vllmDone = make(chan error, 1)
+	go func(cmd *exec.Cmd, done chan<- error) {
+		done <- cmd.Wait()
+	}(vllmCmd, vllmDone)
 
 	readySec := 900
 	if v := os.Getenv("VLLM_READY_TIMEOUT_SEC"); v != "" {
@@ -169,8 +174,15 @@ func startVLLM() error {
 				return nil
 			}
 		}
-		if vllmCmd.ProcessState != nil {
+		select {
+		case err := <-vllmDone:
+			vllmCmd = nil
+			vllmDone = nil
+			if err != nil {
+				return fmt.Errorf("vllm exited prematurely: %w", err)
+			}
 			return fmt.Errorf("vllm exited prematurely")
+		default:
 		}
 		time.Sleep(2 * time.Second)
 	}
@@ -180,14 +192,19 @@ func startVLLM() error {
 func stopVLLM() {
 	if vllmCmd != nil && vllmCmd.Process != nil {
 		vllmCmd.Process.Signal(syscall.SIGTERM)
-		done := make(chan error, 1)
-		go func() { done <- vllmCmd.Wait() }()
+		done := vllmDone
+		if done == nil {
+			done = make(chan error, 1)
+			go func(cmd *exec.Cmd) { done <- cmd.Wait() }(vllmCmd)
+		}
 		select {
 		case <-done:
 		case <-time.After(30 * time.Second):
 			vllmCmd.Process.Kill()
+			<-done
 		}
 		vllmCmd = nil
+		vllmDone = nil
 		log.Printf("vllm stopped")
 	}
 }
