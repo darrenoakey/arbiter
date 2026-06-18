@@ -212,6 +212,7 @@ Sonic at 5GB is much lighter than the 15GB estimate.
 - **LTX-2**: `load()` is instant (~2ms) — only creates config objects. Heavy model loading happens inside `infer()` per-phase. Memory manager should budget 55GB for the full job duration.
 - **FLUX.1-schnell**: Needs `sentencepiece` package for tokenizer.
 - **BiRefNet**: Needs `kornia` package.
+- **vLLM chat worker**: `cmd/vllm-chat-worker` wraps `vllm serve`. When checking whether the child died during readiness polling, use a goroutine running `cmd.Wait()` and select on that channel; `exec.Cmd.ProcessState` stays nil for a zombie child until `Wait()` runs, which can leave Arbiter jobs stuck in `scheduled` with `active_jobs=1`.
 
 ## Key Dependencies
 
