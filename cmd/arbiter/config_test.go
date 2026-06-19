@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -53,5 +55,47 @@ func TestSaveAndDeleteModelConfig(t *testing.T) {
 	}
 	if _, ok := loaded.Models["demo-model"]; ok {
 		t.Fatalf("model still present after delete")
+	}
+}
+
+func TestSaveModelConfigConcurrentWritesRemainValid(t *testing.T) {
+	projectRoot := t.TempDir()
+	const n = 24
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+
+	for i := 0; i < n; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cfg := ModelConfig{
+				MemoryGB:       float64(10 + i),
+				MaxConcurrent:  1,
+				MaxInstances:   intPtr(1),
+				KeepAliveSec:   900,
+				AvgInferenceMs: 1500,
+				LoadMs:         2500,
+			}
+			errs <- SaveModelConfig(projectRoot, fmt.Sprintf("model-%02d", i), cfg)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("SaveModelConfig() error = %v", err)
+		}
+	}
+
+	loaded, err := LoadConfig(projectRoot)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("model-%02d", i)
+		if _, ok := loaded.Models[id]; !ok {
+			t.Fatalf("saved model %q missing after concurrent writes", id)
+		}
 	}
 }

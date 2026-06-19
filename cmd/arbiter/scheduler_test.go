@@ -1077,6 +1077,40 @@ func buildMinMeanFlowScheduler(t *testing.T, models map[string]ModelConfig) (*Sc
 	return sched, store, mgr
 }
 
+func TestGetFullModelsDefaultsNilPressureIndex(t *testing.T) {
+	projectRoot := t.TempDir()
+	outputDir := t.TempDir()
+	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	store.InitDedup()
+
+	cfg := &Config{
+		VRAMBudgetGB: 100,
+		Models: map[string]ModelConfig{
+			"live-registered": {
+				MemoryGB:       1,
+				AvgInferenceMs: 1000,
+				MaxConcurrent:  1,
+				MaxInstances:   intPtr(1),
+				PressureIndex:  nil,
+			},
+		},
+	}
+	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
+	t.Cleanup(func() { logger.Close() })
+	mgr := NewInstanceManager(cfg, "python3", projectRoot)
+	mgr.ScaleModel("live-registered", 1, cfg.Models["live-registered"])
+
+	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+	full := sched.getFullModels("")
+	if full["live-registered"] {
+		t.Fatalf("live-registered unexpectedly full with default pressure index")
+	}
+}
+
 // markLoaded sets an instance's state to "loaded" directly and reserves the
 // VRAM budget so scoreModel / getFullModels see it as loaded.
 func markLoaded(t *testing.T, mgr *InstanceManager, modelID string) {

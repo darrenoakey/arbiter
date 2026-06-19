@@ -654,6 +654,10 @@ func (s *Scheduler) getFullModels(bestModel string) map[string]bool {
 		if full[modelID] {
 			continue
 		}
+		pressureIndex := 1.0
+		if cfg.PressureIndex != nil {
+			pressureIndex = *cfg.PressureIndex
+		}
 		// Check load circuit-breaker
 		if paused, _ := s.IsModelLoadPaused(modelID); paused {
 			full[modelID] = true
@@ -722,21 +726,21 @@ func (s *Scheduler) getFullModels(bestModel string) map[string]bool {
 		// load. This is the multiplier-style aging the user asked for: a job's
 		// effective weight grows linearly with wait time, no thresholds.
 		budget := 1.0 + ages[modelID]*pressureAgeRate
-		if cp+*cfg.PressureIndex > budget+1e-9 {
+		if cp+pressureIndex > budget+1e-9 {
 			// Never exclude the globally-best model from dispatch: if it won
 			// on latency it must get a slot even when pressure is high.
 			if modelID == bestModel {
 				slog.Info("scheduler.pressure_bypass: best-scoring model allowed past budget",
 					"model", modelID, "current_pressure", cp,
-					"model_pressure_index", *cfg.PressureIndex,
-					"sum", cp+*cfg.PressureIndex,
+					"model_pressure_index", pressureIndex,
+					"sum", cp+pressureIndex,
 					"aged_budget", budget, "score", s.scoreModel(modelID))
 				continue
 			}
 			slog.Debug("scheduler.full: model would exceed pressure budget",
 				"model", modelID, "current_pressure", cp,
-				"model_pressure_index", *cfg.PressureIndex,
-				"sum", cp+*cfg.PressureIndex,
+				"model_pressure_index", pressureIndex,
+				"sum", cp+pressureIndex,
 				"aged_budget", budget, "wait_seconds", ages[modelID])
 			full[modelID] = true
 		}

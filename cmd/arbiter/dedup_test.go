@@ -164,3 +164,50 @@ func TestRecoverFromCrashRequeuesRunningAndScheduled(t *testing.T) {
 		t.Fatalf("follower after recovery = state %s error %q, want untouched following", followerAfter.State, followerAfter.Error)
 	}
 }
+
+func TestUpdateStateDoesNotResurrectTerminalJob(t *testing.T) {
+	store, _ := newTestStore(t)
+	payload := json.RawMessage(`{"prompt":"cancel race"}`)
+	job, _ := store.CreateJob("llm:test", "chat-completion", payload, 1)
+
+	if err := store.UpdateState(job.ID, "cancelled", WithFinishedAt(nowTS())); err != nil {
+		t.Fatalf("cancel job: %v", err)
+	}
+	if err := store.UpdateState(job.ID, "scheduled", WithStartedAt(nowTS())); err != nil {
+		t.Fatalf("late schedule update: %v", err)
+	}
+
+	after, _ := store.GetJob(job.ID)
+	if after.State != "cancelled" {
+		t.Fatalf("state resurrected to %s, want cancelled", after.State)
+	}
+	if after.FinishedAt == nil {
+		t.Fatalf("finished_at was cleared")
+	}
+}
+
+func TestRecoverFromCrashDoesNotRequeueFinishedActiveState(t *testing.T) {
+	store, _ := newTestStore(t)
+	payload := json.RawMessage(`{"prompt":"finished scheduled"}`)
+	job, _ := store.CreateJob("llm:test", "chat-completion", payload, 1)
+
+	finished := nowTS()
+	if err := store.UpdateState(job.ID, "scheduled", WithStartedAt(finished-10), WithFinishedAt(finished)); err != nil {
+		t.Fatalf("set inconsistent scheduled job: %v", err)
+	}
+
+	recovered, err := store.RecoverFromCrash()
+	if err != nil {
+		t.Fatalf("recover from crash: %v", err)
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered = %d, want 0", recovered)
+	}
+	after, _ := store.GetJob(job.ID)
+	if after.State != "failed" {
+		t.Fatalf("state = %s, want failed", after.State)
+	}
+	if after.FinishedAt == nil {
+		t.Fatalf("finished_at missing after recovery cleanup")
+	}
+}

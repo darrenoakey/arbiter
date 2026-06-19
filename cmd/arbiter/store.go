@@ -309,8 +309,11 @@ func (s *Store) UpdateState(jobID, state string, opts ...func(*stateUpdate)) err
 		sets += ", error = ?"
 		args = append(args, u.error)
 	}
-	args = append(args, jobID)
-	_, err := s.db.Exec("UPDATE jobs SET "+sets+" WHERE id = ?", args...)
+	args = append(args, jobID, state)
+	_, err := s.db.Exec(
+		"UPDATE jobs SET "+sets+" WHERE id = ? AND NOT (state IN ('completed','failed','cancelled') AND ? IN ('queued','scheduled','running','following'))",
+		args...,
+	)
 	return err
 }
 
@@ -482,8 +485,13 @@ func (s *Store) CancelJob(jobID string) (bool, error) {
 func (s *Store) RecoverFromCrash() (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, err := s.db.Exec(
+		"UPDATE jobs SET state = 'failed', error = COALESCE(NULLIF(error, ''), 'recovered non-terminal job with finished_at') WHERE state IN ('queued','scheduled','running','following') AND finished_at IS NOT NULL",
+	); err != nil {
+		return 0, err
+	}
 	res, err := s.db.Exec(
-		"UPDATE jobs SET state = 'queued', started_at = NULL WHERE state IN ('scheduled','running')",
+		"UPDATE jobs SET state = 'queued', started_at = NULL WHERE state IN ('scheduled','running') AND finished_at IS NULL",
 	)
 	if err != nil {
 		return 0, err

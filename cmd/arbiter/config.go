@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 )
 
 type ModelConfig struct {
@@ -70,6 +71,8 @@ type Config struct {
 	AutoWakeSeconds int                    `json:"auto_wake_seconds"`
 	Models          map[string]ModelConfig `json:"models"`
 }
+
+var mutableConfigMu sync.Mutex
 
 // JobTypeToModel maps job type strings to model IDs.
 var JobTypeToModel = map[string]string{
@@ -212,16 +215,38 @@ func loadMutableConfigData(projectRoot string) (map[string]any, error) {
 }
 
 func writeConfigData(projectRoot string, data map[string]any) error {
-	os.MkdirAll(filepath.Join(projectRoot, "local"), 0o755)
+	localDir := filepath.Join(projectRoot, "local")
+	if err := os.MkdirAll(localDir, 0o755); err != nil {
+		return fmt.Errorf("create local config dir: %w", err)
+	}
 	out, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
 	out = append(out, '\n')
-	return os.WriteFile(filepath.Join(projectRoot, "local", "config.json"), out, 0o644)
+	tmp, err := os.CreateTemp(localDir, ".config.*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp config: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(out); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp config: %w", err)
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp config: %w", err)
+	}
+	return os.Rename(tmpName, filepath.Join(localDir, "config.json"))
 }
 
 func SaveModelConfig(projectRoot, modelID string, cfg ModelConfig) error {
+	mutableConfigMu.Lock()
+	defer mutableConfigMu.Unlock()
 	data, err := loadMutableConfigData(projectRoot)
 	if err != nil {
 		return err
@@ -239,6 +264,8 @@ func SaveModelConfig(projectRoot, modelID string, cfg ModelConfig) error {
 // preserving every other key (including ones not in ModelConfig), so callers
 // never clobber hand-edited fields.
 func patchModelField(projectRoot, modelID, field string, value any) error {
+	mutableConfigMu.Lock()
+	defer mutableConfigMu.Unlock()
 	data, err := loadMutableConfigData(projectRoot)
 	if err != nil {
 		return err
@@ -270,6 +297,8 @@ func PatchModelMaxInstances(projectRoot, modelID string, n int) error {
 }
 
 func DeleteModelConfig(projectRoot, modelID string) error {
+	mutableConfigMu.Lock()
+	defer mutableConfigMu.Unlock()
 	data, err := loadMutableConfigData(projectRoot)
 	if err != nil {
 		return err
