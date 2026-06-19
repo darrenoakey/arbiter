@@ -132,6 +132,8 @@ Key per-model fields:
 - `keep_alive_seconds` — Keep loaded after last use (default 300)
 - `auto_download` — HuggingFace repo ID for auto-download
 - Runtime registration/update goes through the Go control plane: `POST /v1/models` can add a new configured model live, and `PATCH /v1/models/{id}` with `reload_workers=true` replaces only that model's workers so other adapters keep serving.
+- Live model registration persists through `SaveModelConfig` into `local/config.json`. Keep those writes serialized and atomic: concurrent registration can otherwise leave a truncated JSON file that crashes startup/reload. Runtime-created model configs may omit optional pointer fields such as `pressure_index`; scheduler code must default nil `PressureIndex` to `1.0` instead of dereferencing it.
+- Live model registration persists through `SaveModelConfig` into `local/config.json`. Keep those writes serialized and atomic: concurrent registration can otherwise leave a truncated JSON file that crashes startup/reload. Runtime-created model configs may omit optional pointer fields such as `pressure_index`; scheduler code must default nil `PressureIndex` to `1.0` instead of dereferencing it.
 
 ## Logs
 
@@ -257,6 +259,10 @@ auto log arbiter           # View logs
 **PickInstance** must never return an instance that lacks capacity. Loading instances at capacity also count — piling jobs onto a not-yet-loaded worker just stacks them up to fire all at once when load completes.
 
 **VRAM bookkeeping.** `usedGB` must equal sum(`memoryGB` for instances where `vramHeld == true`) ± float-drift tolerance. If no instance holds VRAM, `usedGB` must be zero. `AuditVRAMConsistency(ctx)` enforces this on every load/unload — if it fires, dump every instance's state and root-cause the leaking path.
+
+**Terminal jobs stay terminal.** `UpdateState` must not allow late scheduler/dispatch updates to move `completed`, `failed`, or `cancelled` jobs back to `queued`, `scheduled`, `running`, or `following`. Crash recovery must not requeue any active-state row that already has `finished_at`; mark it failed instead so active slots cannot be resurrected and stranded after cancellation races.
+
+**Terminal jobs stay terminal.** `UpdateState` must not allow late scheduler/dispatch updates to move `completed`, `failed`, or `cancelled` jobs back to `queued`, `scheduled`, `running`, or `following`. Crash recovery must not requeue any active-state row that already has `finished_at`; mark it failed instead so active slots cannot be resurrected and stranded after cancellation races.
 
 **No silently dead models.** A model with queued work must always be able to make progress eventually. Scale-to-zero (`max_instances=0`) is a legitimate *temporary* operation, but the scheduler's auto-wake guard (`autoWakeParkedModels` in scheduler.go) scales any parked model with queued jobs back to 1 after `auto_wake_seconds` (default 300s; negative disables) and persists it — because the 2026-06-09 gemma4 outage proved an operator who parks a model and crashes leaves it dead forever (the 0 is persisted across restarts while jobs queue silently). Do not add code paths that can leave a model permanently unable to serve its queue.
 
