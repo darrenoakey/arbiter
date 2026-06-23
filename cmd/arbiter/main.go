@@ -177,12 +177,21 @@ func main() {
 	// API
 	api := NewAPI(cfg, store, mgr, sched, eventLog, outputDir, projectRoot)
 
+	// Per-host liveness monitor (Phase 3): polls every remote host's
+	// /api/version, flips it absent on consecutive failures (firing the active-
+	// cancel hook so failover is fast), and exposes the reachability predicate
+	// PickInstanceForJob uses to skip dead hosts. No remote hosts → no-op.
+	hostMonitor := NewHostMonitor(cfg, mgr, eventLog, sched)
+	mgr.SetReachabilityFunc(hostMonitor.IsReachable)
+	api.SetHostMonitor(hostMonitor)
+
 	// Context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Start background goroutines
 	go sched.Run(ctx)
+	go hostMonitor.Run(ctx)
 	go sched.RunScheduledWatchdog(ctx)
 	go sched.RunInFlightReconciler(ctx)
 	go sched.RunKeepalive(ctx)

@@ -74,6 +74,27 @@ type Instance struct {
 	projectRoot string
 	workerCmd   []string // custom worker command (overrides python)
 	workerEnv   []string // extra env vars for worker
+
+	// placementReason records why the most recent job landed on this instance's
+	// host (preferred|spill|fallback). Set at dispatch by the scheduler; surfaced
+	// in /v1/ps so a 3am debugger can see where work is going and why. Advisory:
+	// it never gates scheduling.
+	reasonMu        sync.Mutex
+	placementReason string
+}
+
+// setPlacementReason records the reason the latest dispatch chose this instance.
+func (inst *Instance) setPlacementReason(reason string) {
+	inst.reasonMu.Lock()
+	inst.placementReason = reason
+	inst.reasonMu.Unlock()
+}
+
+// PlacementReason returns the latest dispatch's placement reason for /v1/ps.
+func (inst *Instance) PlacementReason() string {
+	inst.reasonMu.Lock()
+	defer inst.reasonMu.Unlock()
+	return inst.placementReason
 }
 
 // WorkerResponse is the JSON response from the Python worker.
@@ -107,6 +128,15 @@ func NewInstance(modelID, instanceID string, maxConcurrent int, memoryGB float64
 // instances hold ZERO audited VRAM on spark, so VRAM bookkeeping skips them.
 func (inst *Instance) isRemote() bool {
 	return inst.host != "" && inst.host != LocalHost
+}
+
+// hostOrLocal returns the instance's host id, defaulting empty to the local
+// host ("spark") for /v1/ps display.
+func (inst *Instance) hostOrLocal() string {
+	if inst.host == "" {
+		return LocalHost
+	}
+	return inst.host
 }
 
 func (inst *Instance) State() string {
@@ -829,6 +859,39 @@ type InstanceManager struct {
 	// local-CUDA ledger). Phase 1 only builds the registry from config; Phase 2
 	// polls each host and routes against it.
 	remoteHosts map[string]*remoteHostBudget
+	// reachable reports whether a host id is currently reachable. It is set by
+	// the HostMonitor (Phase 3) so PickInstanceForJob can skip a host whose
+	// liveness poll has confirmed it absent — without that, a job would be
+	// dispatched to a dead box and only fail over after the inference call timed
+	// out. nil means "assume everything reachable" (tests / no monitor running),
+	// preserving pre-Phase-3 behavior.
+	reachableMu sync.RWMutex
+	reachable   func(hostID string) bool
+}
+
+// SetReachabilityFunc installs the host-reachability predicate used by
+// PickInstanceForJob to skip confirmed-absent remote hosts. The HostMonitor
+// calls this once at startup. Safe to call before the monitor's first poll: it
+// starts every host reachable.
+func (m *InstanceManager) SetReachabilityFunc(f func(hostID string) bool) {
+	m.reachableMu.Lock()
+	m.reachable = f
+	m.reachableMu.Unlock()
+}
+
+// hostReachable consults the installed reachability predicate. Local hosts and
+// the absence of a predicate both report reachable=true.
+func (m *InstanceManager) hostReachable(hostID string) bool {
+	if m.config.HostIsLocal(hostID) {
+		return true
+	}
+	m.reachableMu.RLock()
+	f := m.reachable
+	m.reachableMu.RUnlock()
+	if f == nil {
+		return true
+	}
+	return f(hostID)
 }
 
 func NewInstanceManager(cfg *Config, pythonBin, projectRoot string) *InstanceManager {
@@ -890,6 +953,19 @@ func (m *InstanceManager) GetModelInstances(modelID string) []*Instance {
 	var out []*Instance
 	for _, id := range m.byModel[modelID] {
 		out = append(out, m.instances[id])
+	}
+	return out
+}
+
+// AllInstances returns every registered instance across all models. Used by the
+// host liveness monitor to fire Cancel() on the remote instances of a host that
+// just flipped absent.
+func (m *InstanceManager) AllInstances() []*Instance {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*Instance, 0, len(m.instances))
+	for _, inst := range m.instances {
+		out = append(out, inst)
 	}
 	return out
 }
@@ -1004,36 +1080,82 @@ func pickFromPool(pool []*Instance) *Instance {
 // Returns nil only when no eligible host has capacity right now (the scheduler
 // then requeues the job and retries on the next tick).
 func (m *InstanceManager) PickInstanceForJob(job *Job, remoteEnabled bool) *Instance {
+	inst, _ := m.PickInstanceForJobWithReason(job, remoteEnabled)
+	return inst
+}
+
+// placementReason classifies WHY a job landed on the host it did, for /v1/ps and
+// the model.placed event. The chain is walked most-preferred-first:
+//   - preferred: the head of the chain was chosen
+//   - spill:     a higher-preference host was unavailable (full/excluded/absent)
+//     so we fell to a later REMOTE host
+//   - fallback:  we fell all the way to the local host (spark) because no remote
+//     host in the chain was usable
+//   - absent:    (annotation) the head host is confirmed unreachable right now
+//   - excluded:  (annotation) the head host is in the job's excluded set
+//
+// The reason returned by PickInstanceForJobWithReason is the *chosen* host's
+// reason (preferred/spill/fallback). "absent"/"excluded" describe why earlier
+// hosts were skipped and surface as per-instance annotations in /v1/ps.
+const (
+	reasonPreferred = "preferred"
+	reasonSpill     = "spill"
+	reasonFallback  = "fallback"
+	reasonAbsent    = "absent"
+	reasonExcluded  = "excluded"
+)
+
+// PickInstanceForJobWithReason is PickInstanceForJob plus the placement_reason
+// classifying why the chosen host was picked. A confirmed-absent remote host is
+// SKIPPED here (its liveness poll flipped it absent) so a job is never dispatched
+// to a dead box only to time out — it spills immediately to the next placement,
+// with spark the guaranteed reachable final link.
+func (m *InstanceManager) PickInstanceForJobWithReason(job *Job, remoteEnabled bool) (*Instance, string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	mc, ok := m.config.Models[job.ModelID]
 	if !ok {
 		// Unknown model: fall back to the flat pool (back-compat).
-		return m.pickFromModelLocked(job.ModelID)
+		return m.pickFromModelLocked(job.ModelID), reasonPreferred
 	}
 	placements := mc.PlacementsOrDefault()
 
-	for _, host := range placements {
+	skippedHigher := false // a more-preferred host was passed over
+	for idx, host := range placements {
 		if job.HostExcluded(host) {
+			skippedHigher = true
 			continue
 		}
 		isLocal := m.config.HostIsLocal(host)
 		if !isLocal && !remoteEnabled {
+			skippedHigher = true
 			continue // kill-switch: skip remote hosts, spill to local
+		}
+		if !isLocal && !m.hostReachable(host) {
+			skippedHigher = true
+			continue // liveness poll confirmed this host absent — skip, don't dispatch into the dark
 		}
 		inst := m.instanceForHostLocked(job.ModelID, host)
 		if inst == nil {
+			skippedHigher = true
 			continue
 		}
 		if picked := pickFromPool([]*Instance{inst}); picked != nil {
 			// pickFromPool on a single-element pool returns that instance only
 			// when it has capacity / can cold-start; a returned errored
 			// instance (branch 4) is still a legit retry target on its host.
-			return picked
+			reason := reasonPreferred
+			if isLocal && (idx > 0 || skippedHigher) {
+				reason = reasonFallback
+			} else if skippedHigher {
+				reason = reasonSpill
+			}
+			return picked, reason
 		}
+		skippedHigher = true
 	}
-	return nil
+	return nil, ""
 }
 
 // pickFromModelLocked is the flat (host-agnostic) pick over all of a model's
@@ -2045,6 +2167,13 @@ func (m *InstanceManager) Snapshot() map[string]any {
 				"instance_id": inst.InstanceID,
 				"state":       iState,
 				"active_jobs": inst.ActiveJobs(),
+				"host":        inst.hostOrLocal(),
+			}
+			if pr := inst.PlacementReason(); pr != "" {
+				ie["placement_reason"] = pr
+			}
+			if inst.isRemote() {
+				ie["remote"] = true
 			}
 			if m.condemned[inst.InstanceID] {
 				ie["condemned"] = true
@@ -2075,7 +2204,16 @@ func (m *InstanceManager) Snapshot() map[string]any {
 			}
 		}
 
-		if len(g.instances) > 1 || condemnedCount > 0 {
+		// Any remote placement means the model spans hosts — always show the
+		// per-instance breakdown so the host + placement_reason are visible.
+		hasRemote := false
+		for _, inst := range g.instances {
+			if inst.isRemote() {
+				hasRemote = true
+				break
+			}
+		}
+		if len(g.instances) > 1 || condemnedCount > 0 || hasRemote {
 			entry["instances"] = instList
 			entry["loaded_instances"] = loadedCount
 			entry["total_instances"] = len(m.byModel[modelID])

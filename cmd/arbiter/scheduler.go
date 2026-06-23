@@ -271,6 +271,51 @@ func (s *Scheduler) tryFailover(job *Job, inst *Instance, cause error) bool {
 	return true
 }
 
+// DrainRemoteJobsForModel pins a model to spark by abandoning every in-flight
+// remote dispatch for it: it fires the per-backend Cancel() on each remote
+// instance that currently owns one of the model's jobs. Cancel makes the
+// in-flight Infer return INFRA, which the dispatch path routes through
+// tryFailover → running→queued + excluded_hosts → the scheduler re-picks down
+// the chain (and, with remote now disabled for the model, lands on spark).
+//
+// Per the no-cancel-on-slow invariant, this is a DELIBERATE operator action
+// (the kill-switch), distinct from cancelling a slow-but-alive request during
+// normal operation: the operator has decided this model must leave remote NOW.
+// Cancel leaves the detached upstream ollama call to drain harmlessly, so the
+// remote runner is not wedged. Returns the number of jobs drained.
+//
+// It works even when the remote host is unreachable: Cancel is a local channel
+// close, no network round-trip — so the kill-switch is instant regardless of LAN
+// state. New jobs are already pinned to spark the moment remote_enabled is
+// persisted (PickInstanceForJob honors it); this method handles only the jobs
+// already running remotely.
+func (s *Scheduler) DrainRemoteJobsForModel(modelID string) int {
+	s.inFlightMu.Lock()
+	type victim struct {
+		jobID string
+		inst  *Instance
+	}
+	var victims []victim
+	for jobID, entry := range s.inFlight {
+		if entry.inst != nil && entry.inst.isRemote() && entry.inst.ModelID == modelID {
+			victims = append(victims, victim{jobID, entry.inst})
+		}
+	}
+	s.inFlightMu.Unlock()
+
+	for _, v := range victims {
+		slog.Warn("kill-switch: draining in-flight remote job to spark",
+			"job", v.jobID, "model", modelID, "host", v.inst.host)
+		if v.inst.backend != nil {
+			v.inst.backend.Cancel()
+		}
+	}
+	if len(victims) > 0 {
+		s.Wake()
+	}
+	return len(victims)
+}
+
 // clearFailoverAttempts drops the per-job failover counter once the job reaches
 // a terminal state, so the map can't grow unbounded.
 func (s *Scheduler) clearFailoverAttempts(jobID string) {
@@ -1504,14 +1549,22 @@ func (s *Scheduler) Run(ctx context.Context) {
 		// by transparent failover), honors the per-model remote kill-switch, and
 		// never returns an instance lacking capacity. spark is always the
 		// reachable final link.
-		inst := s.mgr.PickInstanceForJob(job, s.config.Models[job.ModelID].RemoteEnabledOrDefault())
+		inst, placeReason := s.mgr.PickInstanceForJobWithReason(job, s.config.RemoteAllowedFor(job.ModelID))
 		if inst == nil {
 			slog.Info("scheduler.requeue: no instance available",
 				"job", job.ID, "model", job.ModelID,
-				"reason", "PickInstanceForJob returned nil — all eligible hosts at max_concurrent or excluded")
+				"reason", "PickInstanceForJob returned nil — all eligible hosts at max_concurrent, excluded, or absent")
 			s.store.UpdateState(job.ID, "queued")
 			continue
 		}
+		inst.setPlacementReason(placeReason)
+		s.logger.Log("model.placed", map[string]any{
+			"job_id":           job.ID,
+			"model_id":         job.ModelID,
+			"host":             inst.host,
+			"instance_id":      inst.InstanceID,
+			"placement_reason": placeReason,
+		})
 		slog.Info("scheduler.dispatch",
 			"job", job.ID, "model", job.ModelID,
 			"instance", inst.InstanceID, "instance_state", inst.State(),

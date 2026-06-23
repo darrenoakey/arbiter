@@ -1,0 +1,326 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"sync"
+	"time"
+)
+
+// HostMonitor runs one liveness poll per remote host and is the authoritative
+// source of "is this box reachable right now". It exists for ONE hard reason:
+// detection must be fast and active. A slept laptop's established TCP socket can
+// hang silently with no RST, so we cannot wait for the inference timeout to
+// discover a host is gone. The monitor polls a cheap endpoint ({addr}/api/version)
+// every few seconds and, on N CONSECUTIVE failures, flips the host absent AND
+// fires the per-backend Cancel() hook on every remote instance placed there — so
+// the Phase-2 transparent failover fires in seconds, not minutes.
+//
+// CRITICAL invariant (overrides any "cancel in-flight" wording): Cancel() is
+// ONLY ever fired for a host the poll has CONFIRMED dead. A slow-but-alive host
+// (poll still succeeding) is NEVER cancelled — aborting a live ollama request
+// wedges that model's runner (every later /api/chat hangs). So the cancel path
+// runs strictly inside the "consecutive failures crossed the threshold" branch.
+type HostMonitor struct {
+	mgr    *InstanceManager
+	logger *EventLogger
+	sched  *Scheduler
+
+	// pollInterval / failThreshold tune detection latency vs flap-resistance.
+	// At 4s × 3 a host is declared absent ~12s after it stops answering — fast
+	// enough that failover beats a human noticing, slow enough that a single
+	// dropped poll (GC pause on the Mac, a momentary Wi-Fi blip) doesn't trip it.
+	pollInterval  time.Duration
+	failThreshold int
+
+	mu     sync.RWMutex
+	states map[string]*hostState // host id -> liveness state
+
+	// httpClient is a dedicated client for the cheap version poll. It uses a
+	// short timeout and DisableKeepAlives so a flapped LAN route can't brick a
+	// pooled connection (the documented Go net/http EHOSTUNREACH wedge) — every
+	// poll is a fresh dial, exactly like RemoteHTTPBackend.
+	httpClient *http.Client
+}
+
+type hostState struct {
+	hostID       string
+	addr         string
+	reachable    bool
+	failStreak   int
+	lastChecked  time.Time
+	lastOK       time.Time
+	modelsLoaded []string // ollama-reported loaded model names (from /api/ps)
+}
+
+// NewHostMonitor builds a monitor over the remote hosts in cfg. Local (spark)
+// is never polled — it is the always-up coordinator. Remote hosts start as
+// reachable=true so a model isn't spuriously pinned-to-spark before the first
+// poll completes (the first poll corrects it within pollInterval if wrong).
+func NewHostMonitor(cfg *Config, mgr *InstanceManager, logger *EventLogger, sched *Scheduler) *HostMonitor {
+	states := make(map[string]*hostState)
+	for id, h := range cfg.Hosts {
+		if cfg.HostIsLocal(id) {
+			continue
+		}
+		states[id] = &hostState{hostID: id, addr: h.Addr, reachable: true}
+	}
+	return &HostMonitor{
+		mgr:           mgr,
+		logger:        logger,
+		sched:         sched,
+		pollInterval:  4 * time.Second,
+		failThreshold: 3,
+		states:        states,
+		httpClient: &http.Client{
+			Timeout: 3 * time.Second,
+			Transport: &http.Transport{
+				DisableKeepAlives:   true,
+				MaxIdleConns:        1,
+				IdleConnTimeout:     time.Second,
+				TLSHandshakeTimeout: 3 * time.Second,
+			},
+		},
+	}
+}
+
+// IsReachable reports whether a host id is currently reachable. Unknown ids and
+// the local host are always reachable (spark is the always-up final link). A
+// host with no monitor entry (e.g. tests that don't run the poll) is treated as
+// reachable so routing isn't blocked by a never-started monitor.
+func (hm *HostMonitor) IsReachable(hostID string) bool {
+	if hostID == "" || hostID == LocalHost {
+		return true
+	}
+	hm.mu.RLock()
+	defer hm.mu.RUnlock()
+	st, ok := hm.states[hostID]
+	if !ok {
+		return true
+	}
+	return st.reachable
+}
+
+// Run drives the per-host poll loop until ctx is cancelled. Hosts are polled
+// concurrently each tick so one slow/dead host's dial timeout never delays the
+// others' detection.
+func (hm *HostMonitor) Run(ctx context.Context) {
+	if len(hm.states) == 0 {
+		return // no remote hosts → nothing to poll
+	}
+	slog.Info("host liveness monitor started", "hosts", len(hm.states),
+		"interval", hm.pollInterval.String(), "fail_threshold", hm.failThreshold)
+	ticker := time.NewTicker(hm.pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("host liveness monitor stopped")
+			return
+		case <-ticker.C:
+			hm.pollAll(ctx)
+		}
+	}
+}
+
+// pollAll polls every monitored host concurrently and applies the result.
+func (hm *HostMonitor) pollAll(ctx context.Context) {
+	hm.mu.RLock()
+	type target struct{ id, addr string }
+	targets := make([]target, 0, len(hm.states))
+	for id, st := range hm.states {
+		targets = append(targets, target{id, st.addr})
+	}
+	hm.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	for _, t := range targets {
+		wg.Add(1)
+		go func(id, addr string) {
+			defer wg.Done()
+			ok := hm.pollOne(ctx, addr)
+			hm.applyResult(id, ok)
+		}(t.id, t.addr)
+	}
+	wg.Wait()
+}
+
+// pollOne hits {addr}/api/version. Reachable == a 2xx response. Anything else
+// (dial refused, no route, timeout, non-2xx) is a failure for streak counting.
+func (hm *HostMonitor) pollOne(ctx context.Context, addr string) bool {
+	reqCtx, cancel := context.WithTimeout(ctx, hm.httpClient.Timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, addr+"/api/version", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := hm.httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}
+
+// applyResult folds one poll outcome into the host's state, emitting
+// host.absent / host.recovered exactly once per transition and firing the
+// active-cancel hook on the absent transition.
+func (hm *HostMonitor) applyResult(hostID string, ok bool) {
+	hm.mu.Lock()
+	st := hm.states[hostID]
+	if st == nil {
+		hm.mu.Unlock()
+		return
+	}
+	st.lastChecked = time.Now()
+
+	var becameAbsent, recovered bool
+	if ok {
+		st.lastOK = time.Now()
+		if !st.reachable {
+			st.reachable = true
+			recovered = true
+		}
+		st.failStreak = 0
+	} else {
+		st.failStreak++
+		if st.reachable && st.failStreak >= hm.failThreshold {
+			st.reachable = false
+			becameAbsent = true
+		}
+	}
+	streak := st.failStreak
+	hm.mu.Unlock()
+
+	switch {
+	case becameAbsent:
+		slog.Warn("host liveness: host flipped ABSENT — cancelling in-flight remote work",
+			"host", hostID, "fail_streak", streak)
+		if hm.logger != nil {
+			hm.logger.Log("host.absent", map[string]any{
+				"host_id":     hostID,
+				"fail_streak": streak,
+			})
+		}
+		// Fire the Phase-2 active-cancel hook on EVERY remote instance placed on
+		// this host. This is the ONLY place Cancel() is driven, and it runs ONLY
+		// after a CONFIRMED-absence transition — never on a slow-but-alive host.
+		// Cancel() makes an in-flight Infer return INFRA (→ transparent failover)
+		// while leaving the detached upstream call to drain harmlessly.
+		hm.cancelHostInstances(hostID)
+		if hm.sched != nil {
+			hm.sched.Wake() // let the scheduler re-pick down the chain immediately
+		}
+	case recovered:
+		slog.Info("host liveness: host RECOVERED — eligible for placement again", "host", hostID)
+		if hm.logger != nil {
+			hm.logger.Log("host.recovered", map[string]any{"host_id": hostID})
+		}
+		if hm.sched != nil {
+			hm.sched.Wake() // a parked/queued model may now drain to this host
+		}
+	}
+}
+
+// cancelHostInstances fires Cancel() on every remote instance whose host just
+// flipped absent. It is idempotent (Cancel is epoch-based) and never touches a
+// local instance.
+func (hm *HostMonitor) cancelHostInstances(hostID string) {
+	for _, inst := range hm.mgr.AllInstances() {
+		if inst.host == hostID && inst.backend != nil && inst.backend.IsRemote() {
+			if err := inst.backend.Cancel(); err != nil {
+				slog.Warn("host liveness: cancel failed", "host", hostID,
+					"instance", inst.InstanceID, "error", err)
+			}
+			// A cancelled remote instance is no longer serving — flip its state so
+			// pickFromPool won't hand it new work until a recovery cold-warm.
+			inst.setState("error")
+		}
+	}
+}
+
+// RemoteHostsPanel builds the SEPARATE /v1/ps remote-hosts panel. It is advisory
+// and DELIBERATELY disjoint from the audited local VRAM ledger (usedGB /
+// AuditVRAMConsistency) — remote hosts hold ZERO bytes there. Each entry carries
+// the advisory used/budget (from remoteHostBudget), the liveness flag, and the
+// models the host's ollama reports loaded (live /api/ps). Never call this on the
+// hot path: it does a network round-trip per host.
+func (hm *HostMonitor) RemoteHostsPanel() []map[string]any {
+	hm.mu.RLock()
+	type snap struct {
+		id, addr     string
+		reachable    bool
+		failStreak   int
+		lastOK       time.Time
+		modelsLoaded []string
+	}
+	snaps := make([]snap, 0, len(hm.states))
+	for _, st := range hm.states {
+		snaps = append(snaps, snap{st.hostID, st.addr, st.reachable, st.failStreak, st.lastOK, nil})
+	}
+	hm.mu.RUnlock()
+
+	panel := make([]map[string]any, 0, len(snaps))
+	for _, s := range snaps {
+		entry := map[string]any{
+			"host_id":   s.id,
+			"addr":      s.addr,
+			"reachable": s.reachable,
+		}
+		if s.failStreak > 0 {
+			entry["fail_streak"] = s.failStreak
+		}
+		if !s.lastOK.IsZero() {
+			entry["last_ok_seconds_ago"] = time.Since(s.lastOK).Seconds()
+		}
+		if hb := hm.mgr.RemoteHostBudget(s.id); hb != nil {
+			entry["budget_gb"] = hb.budgetGB
+			entry["used_gb"] = hb.usedGB // advisory only — NOT spark's audited VRAM
+		}
+		// Live loaded-model list from the host's ollama, best-effort. Only attempt
+		// when reachable so a dead host doesn't add a dial-timeout to the request.
+		if s.reachable {
+			if loaded := hm.queryOllamaPS(s.addr); loaded != nil {
+				entry["models_loaded"] = loaded
+			}
+		}
+		panel = append(panel, entry)
+	}
+	return panel
+}
+
+// queryOllamaPS asks a host's ollama which models are currently loaded
+// (GET /api/ps). Best-effort: returns nil on any error so the panel still
+// renders. This is the remote analogue of spark's /v1/ps "loaded models", kept
+// SEPARATE from the audited local ledger.
+func (hm *HostMonitor) queryOllamaPS(addr string) []string {
+	req, err := http.NewRequest(http.MethodGet, addr+"/api/ps", nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := hm.httpClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil
+	}
+	var body struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(body.Models))
+	for _, m := range body.Models {
+		names = append(names, m.Name)
+	}
+	return names
+}

@@ -335,10 +335,12 @@ func TestChatCompletionStreamReservesInstanceWhileStreaming(t *testing.T) {
 
 	// Streaming chat now goes through the queue like everything else, so the
 	// scheduler must be running to dispatch the job and hand the picked
-	// instance back to the API handler via the stream-handoff registry.
+	// instance back to the API handler via the stream-handoff registry. It is
+	// started AFTER the model config map is populated below — sched.Run reads
+	// config.Models (rescoreAll) on a separate goroutine, so writing the map
+	// after launching it would be a concurrent map write (data race).
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go api.scheduler.Run(ctx)
 
 	upstreamDone := make(chan struct{})
 	upstreamRelease := make(chan struct{})
@@ -381,6 +383,10 @@ func TestChatCompletionStreamReservesInstanceWhileStreaming(t *testing.T) {
 		AdapterParams: map[string]string{"FAKE_STREAM_PORT": fmt.Sprintf("%d", streamPort)},
 	}
 	api.mgr.ScaleModel("llm:test-stream", 1, api.config.Models["llm:test-stream"])
+
+	// Config map is fully populated — now it's safe to start the scheduler
+	// goroutine that reads it.
+	go api.scheduler.Run(ctx)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte(`{"stream":true}`)))
 	rec := httptest.NewRecorder()

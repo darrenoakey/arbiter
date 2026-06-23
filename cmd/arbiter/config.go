@@ -128,6 +128,26 @@ type Config struct {
 	// absent/empty, arbiter behaves exactly as today: a single local host.
 	// Phase 1 only parses and stores this; cross-host routing is Phase 2.
 	Hosts map[string]HostConfig `json:"hosts,omitempty"`
+	// RemoteDisabled is the GLOBAL remote kill-switch. When true, NO model uses
+	// any remote placement — every job pins to spark regardless of per-model
+	// remote_enabled / placements. Flip it via PATCH /v1/remote {"enabled":false}
+	// for an instant, fleet-wide retreat to local (e.g. the whole LAN is flaky).
+	// Persisted so it survives restarts. Defaults to false (remote allowed).
+	RemoteDisabled bool `json:"remote_disabled,omitempty"`
+}
+
+// RemoteAllowedFor reports whether a given model may use remote placements right
+// now, folding the global kill-switch over the per-model flag. The global switch
+// dominates: if remote is globally disabled, no model goes remote.
+func (c *Config) RemoteAllowedFor(modelID string) bool {
+	if c.RemoteDisabled {
+		return false
+	}
+	mc, ok := c.Models[modelID]
+	if !ok {
+		return true
+	}
+	return mc.RemoteEnabledOrDefault()
 }
 
 var mutableConfigMu sync.Mutex
@@ -352,6 +372,33 @@ func PatchModelMemoryGB(projectRoot, modelID string, newMemoryGB float64) error 
 // persisted scale-to-zero.
 func PatchModelMaxInstances(projectRoot, modelID string, n int) error {
 	return patchModelField(projectRoot, modelID, "max_instances", n)
+}
+
+// PatchModelRemoteEnabled persists a per-model remote kill-switch flip. The
+// flag must survive restarts so an operator who pins a model to spark (because
+// a remote host is misbehaving) doesn't have it silently re-enabled on the next
+// bounce.
+func PatchModelRemoteEnabled(projectRoot, modelID string, enabled bool) error {
+	return patchModelField(projectRoot, modelID, "remote_enabled", enabled)
+}
+
+// PatchRemoteDisabled persists the GLOBAL remote kill-switch. It is a top-level
+// config field (not under models), so it gets written directly into the config
+// map, preserving every other key.
+func PatchRemoteDisabled(projectRoot string, disabled bool) error {
+	mutableConfigMu.Lock()
+	defer mutableConfigMu.Unlock()
+	data, err := loadMutableConfigData(projectRoot)
+	if err != nil {
+		return err
+	}
+	if disabled {
+		data["remote_disabled"] = true
+	} else {
+		// Keep the file clean: omit the flag entirely when remote is allowed.
+		delete(data, "remote_disabled")
+	}
+	return writeConfigData(projectRoot, data)
 }
 
 func DeleteModelConfig(projectRoot, modelID string) error {

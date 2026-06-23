@@ -36,6 +36,10 @@ type API struct {
 	outputDir   string
 	projectRoot string
 	startTime   time.Time
+	// hostMonitor is the Phase-3 per-host liveness monitor. /v1/ps consults it
+	// for the SEPARATE remote_hosts panel. nil when no remote hosts are
+	// configured (single-host arbiter) — the panel is simply omitted then.
+	hostMonitor *HostMonitor
 
 	// Cached /v1/ps response — updated every second by background goroutine
 	psCache atomic.Value // json.RawMessage
@@ -64,6 +68,12 @@ func (a *API) SetShutdownFunc(fn func()) {
 	a.requestShutdown = fn
 }
 
+// SetHostMonitor wires the Phase-3 liveness monitor so /v1/ps can render the
+// remote_hosts panel. Called once from main after the monitor is built.
+func (a *API) SetHostMonitor(hm *HostMonitor) {
+	a.hostMonitor = hm
+}
+
 type modelConfigRequest struct {
 	ModelID        string             `json:"model_id"`
 	MemoryGB       *float64           `json:"memory_gb"`
@@ -81,7 +91,12 @@ type modelConfigRequest struct {
 	MaxRuntimeSec  *int               `json:"max_runtime_seconds"`
 	ConflictGroup  *string            `json:"conflict_group"`
 	GroupPriority  *int               `json:"group_priority"`
-	ReloadWorkers  bool               `json:"reload_workers"`
+	// RemoteEnabled is the per-model remote kill-switch. PATCH with
+	// {"remote_enabled":false} pins the model to spark instantly — in ONE curl,
+	// working even if the remote host is unreachable. The handler also drains any
+	// in-flight remote job for the model back to spark.
+	RemoteEnabled *bool `json:"remote_enabled"`
+	ReloadWorkers bool  `json:"reload_workers"`
 }
 
 type llmRegisterRequest struct {
@@ -150,6 +165,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/llm/models", a.listLLMs)
 	mux.HandleFunc("DELETE /v1/llm/models/{name}", a.deregisterLLM)
 	mux.HandleFunc("POST /v1/chat/completions", a.chatCompletion)
+	mux.HandleFunc("PATCH /v1/remote", a.setGlobalRemote)
+	mux.HandleFunc("GET /v1/remote", a.getGlobalRemote)
 	mux.HandleFunc("POST /v1/drain", a.drain)
 	mux.HandleFunc("POST /v1/admin/models/unload_all", a.adminUnloadAll)
 	mux.HandleFunc("POST /v1/admin/models/preload", a.adminPreload)
@@ -245,6 +262,16 @@ func (a *API) updatePSCache() {
 					m["max_concurrent"] = cfg.MaxConcurrent
 				}
 			}
+		}
+	}
+
+	// SEPARATE remote-hosts panel — advisory used/budget, liveness, and the
+	// models each host's ollama reports loaded. Deliberately disjoint from the
+	// audited local VRAM numbers above: remote hosts hold ZERO bytes in spark's
+	// usedGB / AuditVRAMConsistency ledger.
+	if a.hostMonitor != nil {
+		if panel := a.hostMonitor.RemoteHostsPanel(); len(panel) > 0 {
+			snap["remote_hosts"] = panel
 		}
 	}
 
@@ -884,6 +911,10 @@ func serializeModelConfig(modelID string, cfg ModelConfig) map[string]any {
 		"adapter_params":      cfg.AdapterParams,
 		"pressure_index":      cfg.PressureIndex,
 		"max_runtime_seconds": cfg.MaxRuntimeSec,
+		"remote_enabled":      cfg.RemoteEnabledOrDefault(),
+	}
+	if len(cfg.Placements) > 0 {
+		resp["placements"] = cfg.Placements
 	}
 	if cfg.MaxInstances != nil {
 		resp["max_instances"] = *cfg.MaxInstances
@@ -948,6 +979,10 @@ func applyModelConfigRequest(cfg ModelConfig, req modelConfigRequest) ModelConfi
 	}
 	if req.GroupPriority != nil {
 		cfg.GroupPriority = *req.GroupPriority
+	}
+	if req.RemoteEnabled != nil {
+		v := *req.RemoteEnabled
+		cfg.RemoteEnabled = &v
 	}
 	return cfg
 }
@@ -1099,13 +1134,31 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 			"model_id": modelID, "old": current.MaxConcurrent, "new": updated.MaxConcurrent,
 		})
 	}
+	// Remote kill-switch: when remote_enabled flips to false, pin the model to
+	// spark. New jobs already route to spark (PickInstanceForJob honors the
+	// persisted flag above); drain any IN-FLIGHT remote job back to spark via the
+	// transparent-failover path. Instant, ONE curl, works even if the remote host
+	// is unreachable (Cancel is a local channel close, no network round-trip).
+	if req.RemoteEnabled != nil && !*req.RemoteEnabled {
+		drained := a.scheduler.DrainRemoteJobsForModel(modelID)
+		result["remote_enabled"] = false
+		result["drained_remote_jobs"] = drained
+		a.logger.Log("model.remote_disabled", map[string]any{
+			"model_id":            modelID,
+			"drained_remote_jobs": drained,
+		})
+	} else if req.RemoteEnabled != nil && *req.RemoteEnabled {
+		result["remote_enabled"] = true
+		a.logger.Log("model.remote_enabled", map[string]any{"model_id": modelID})
+		a.scheduler.Wake()
+	}
 	if !req.ReloadWorkers && (req.WorkerCmd != nil || req.AdapterParams != nil) {
 		result["message"] = "config updated; existing loaded workers keep running until this model is reloaded"
 	} else if scaleResult == nil && req.MaxConcurrent == nil && req.MemoryGB == nil &&
 		req.KeepAliveSec == nil && req.AvgInferenceMs == nil && req.LoadMs == nil &&
 		req.WorkerCmd == nil && req.AdapterParams == nil && req.AutoDownload == nil &&
 		req.ModelPath == nil && req.Group == nil && req.MaxInstances == nil &&
-		req.ConflictGroup == nil && req.GroupPriority == nil {
+		req.ConflictGroup == nil && req.GroupPriority == nil && req.RemoteEnabled == nil {
 		result["message"] = "no changes"
 	}
 	writeJSON(w, 200, result)
@@ -1891,6 +1944,52 @@ func replayRemoteStream(w http.ResponseWriter, inst *Instance, body []byte) erro
 //
 // Admin endpoints let the operator unload all models (clean baseline) and
 // preload a single model without running a job (fair load-time measurement).
+
+// getGlobalRemote reports the global remote kill-switch state.
+func (a *API) getGlobalRemote(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{"enabled": !a.config.RemoteDisabled})
+}
+
+// setGlobalRemote implements PATCH /v1/remote — the GLOBAL remote kill-switch.
+//
+//	{"enabled":false} → no model uses any remote placement; ALL jobs pin to
+//	                    spark, and every in-flight remote job is drained to spark.
+//	{"enabled":true}  → restore remote routing (per-model flags still apply).
+//
+// Instant, ONE curl, works even when remote hosts are unreachable: new routing
+// honors the flag immediately and the drain is a local channel-close per job.
+func (a *API) setGlobalRemote(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Enabled == nil {
+		writeError(w, 400, "body must be {\"enabled\":true|false}")
+		return
+	}
+	disabled := !*req.Enabled
+	a.config.RemoteDisabled = disabled
+	if err := PatchRemoteDisabled(a.projectRoot, disabled); err != nil {
+		writeError(w, 500, fmt.Sprintf("persist global remote flag: %s", err))
+		return
+	}
+
+	drained := 0
+	if disabled {
+		// Drain in-flight remote work across EVERY model to spark.
+		for modelID := range a.config.Models {
+			drained += a.scheduler.DrainRemoteJobsForModel(modelID)
+		}
+	}
+	a.scheduler.Wake()
+	a.logger.Log("remote.global_toggle", map[string]any{
+		"enabled":             *req.Enabled,
+		"drained_remote_jobs": drained,
+	})
+	writeJSON(w, 200, map[string]any{
+		"enabled":             *req.Enabled,
+		"drained_remote_jobs": drained,
+	})
+}
 
 // drain implements POST /v1/drain — graceful, job-safe wind-down.
 //
