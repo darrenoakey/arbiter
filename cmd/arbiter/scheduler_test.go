@@ -1222,6 +1222,58 @@ func markLoaded(t *testing.T, mgr *InstanceManager, modelID string) {
 	mgr.ReserveMemoryFor(inst, inst.memoryGB)
 }
 
+// A waiter that loses the loadInFlight race must NOT terminal-fail its job when
+// the owner's load failed purely because spark VRAM couldn't be reserved: it
+// must observe the lastLoadInsufficientMem marker and return an
+// insufficientMemoryError so the job requeues to wait for VRAM. Without this,
+// jobs racing onto a VRAM-starved model (e.g. gemma fallback while ltx2 holds
+// the GPU) fail spuriously after maxLoadAttempts.
+func TestWaitForInProgressLoadReturnsInsufficientMemOnVRAMFailure(t *testing.T) {
+	projectRoot := t.TempDir()
+	outputDir := filepath.Join(projectRoot, "output")
+	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+	store.InitDedup()
+	pi := 1.0
+	cfg := &Config{
+		VRAMBudgetGB: 100,
+		Models: map[string]ModelConfig{
+			"big": {MemoryGB: 90, MaxConcurrent: 1, MaxInstances: intPtr(1), PressureIndex: &pi},
+		},
+	}
+	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
+	defer logger.Close()
+	mgr := NewInstanceManager(cfg, "python3", projectRoot)
+	mgr.ScaleModel("big", 1, cfg.Models["big"])
+	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+	inst := mgr.GetModelInstances("big")[0]
+
+	// Simulate: owner finished a failed load, instance back to stopped, not in
+	// flight. VRAM-insufficiency marker set → waiter must get insufficientMemory.
+	inst.setState("stopped")
+	inst.loadInFlight.Store(false)
+	inst.lastLoadInsufficientMem.Store(true)
+	err = sched.waitForInProgressLoad(inst)
+	if _, ok := err.(insufficientMemoryError); !ok {
+		t.Fatalf("VRAM-insufficiency waiter must return insufficientMemoryError, got %T: %v", err, err)
+	}
+
+	// A genuine load failure (marker clear) must still return the generic error so
+	// it counts toward the load circuit-breaker / maxLoadAttempts.
+	inst.lastLoadInsufficientMem.Store(false)
+	err = sched.waitForInProgressLoad(inst)
+	if err == nil {
+		t.Fatal("genuine load failure must return a non-nil error")
+	}
+	if _, ok := err.(insufficientMemoryError); ok {
+		t.Fatalf("genuine load failure must NOT be insufficientMemoryError, got %v", err)
+	}
+}
+
 // TestSelectModelMinMeanFlow_ShortColdBatchBeatsLoadedLong verifies that a
 // cold model with a batch of short jobs beats a loaded model with a single
 // long job because the load cost is amortized over the batch.

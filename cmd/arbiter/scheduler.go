@@ -932,6 +932,17 @@ func (s *Scheduler) waitForInProgressLoad(inst *Instance) error {
 		if (s2 == "stopped" || s2 == "error" || s2 == "unloaded") && !inst.loadInFlight.Load() {
 			slog.Warn("ensureLoaded.in_progress_load_failed",
 				"instance", inst.InstanceID, "final_state", s2)
+			// If the owner's load failed purely because spark VRAM couldn't be
+			// reserved (not a worker crash), surface that as insufficientMemoryError
+			// so this waiter's job requeues to wait for VRAM rather than counting a
+			// load failure toward the maxLoadAttempts terminal-fail path.
+			if inst.lastLoadInsufficientMem.Load() {
+				return insufficientMemoryError{
+					instanceID: inst.InstanceID,
+					neededGB:   inst.memoryGB,
+					freeGB:     s.mgr.FreeGB(),
+				}
+			}
 			return fmt.Errorf("instance %s in-progress load ended in state=%s", inst.InstanceID, s2)
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -963,6 +974,8 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 		return s.waitForInProgressLoad(inst)
 	}
 	defer inst.loadInFlight.Store(false)
+	// Fresh attempt: clear any stale VRAM-insufficiency marker from a prior load.
+	inst.lastLoadInsufficientMem.Store(false)
 
 	{
 		needed := inst.memoryGB
@@ -1055,6 +1068,9 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 			if !s.mgr.ReserveMemoryFor(inst, needed) {
 				slog.Warn("ensureLoaded: can't reserve VRAM after eviction",
 					"instance", inst.InstanceID, "needed_gb", needed, "free_gb", s.mgr.FreeGB())
+				// Mark so a concurrent waiter (loser of the loadInFlight CAS) returns
+				// insufficientMemoryError too, and requeues instead of failing.
+				inst.lastLoadInsufficientMem.Store(true)
 				return insufficientMemoryError{
 					instanceID: inst.InstanceID,
 					neededGB:   needed,

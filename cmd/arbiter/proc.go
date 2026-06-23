@@ -48,7 +48,16 @@ type Instance struct {
 	// tryPreload goroutine for the same instance) observes it and waits instead
 	// of spawning a second subprocess / double-reserving VRAM.
 	loadInFlight atomic.Bool
-	lastActive   time.Time
+	// lastLoadInsufficientMem records that the most recent load attempt for this
+	// instance failed purely because spark VRAM couldn't be reserved (not a worker
+	// crash). A waiter that loses the loadInFlight race observes the resulting
+	// terminal state and uses this flag to return an insufficientMemoryError —
+	// which requeues the job to wait for VRAM rather than counting a load failure
+	// toward the maxLoadAttempts/circuit-breaker terminal-fail path. Without it,
+	// jobs racing onto a VRAM-starved model fail spuriously under transient
+	// contention (e.g. gemma fallback while ltx2 holds the GPU).
+	lastLoadInsufficientMem atomic.Bool
+	lastActive              time.Time
 	memoryGB     float64
 	vramHeld     bool // true while this instance's memoryGB is counted in InstanceManager.usedGB
 	// manager is set by InstanceManager.Register. markSubprocessExited needs it
