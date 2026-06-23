@@ -266,4 +266,28 @@ auto log arbiter           # View logs
 
 **No silently dead models.** A model with queued work must always be able to make progress eventually. Scale-to-zero (`max_instances=0`) is a legitimate *temporary* operation, but the scheduler's auto-wake guard (`autoWakeParkedModels` in scheduler.go) scales any parked model with queued jobs back to 1 after `auto_wake_seconds` (default 300s; negative disables) and persists it — because the 2026-06-09 gemma4 outage proved an operator who parks a model and crashes leaves it dead forever (the 0 is persisted across restarts while jobs queue silently). Do not add code paths that can leave a model permanently unable to serve its queue.
 
+## Multi-Host Model Offload (live since 2026-06-23)
+
+Arbiter can offload a model to a remote executor (Apple Silicon Mac running ollama/MLX) while staying the sole front door. spark remains the only queue/brain; clients always hit spark:8400. Config (top-level `hosts` map + per-model `placements`) lives in `local/config.json`:
+
+```json
+"hosts": { "boringstack": {"addr":"http://10.0.0.42:11434","kind":"mlx","budget_gb":96} },
+"models": { "llm:gemma4-26b": {
+  "placements": ["boringstack","darrens-mbp","spark"],
+  "remote_enabled": true,
+  "adapter_params": {"remote_model_tag": "gemma4-26b-32k"},
+  "max_concurrent": 1
+}}
+```
+
+- **One Instance per placement host** (`main.go setupInstances`): local (spark) = subprocess pool as today; each remote host = one `RemoteHTTPBackend` instance (`backend.go`) that POSTs to `{addr}/v1/chat/completions` (OpenAI-compatible ollama). `PickInstanceForJob` walks `placements` in order, skipping confirmed-absent or `excluded_hosts`, returning the first with capacity. spark is local + always reachable = guaranteed final fallback.
+- **Wiring requires a restart.** `setupInstances` + `HostMonitor` read `cfg.Hosts` only at startup. To add/change a `hosts` block or a model's `placements`, edit `local/config.json` on spark and **restart** arbiter (a PATCH cannot create a remote instance). The kill-switches and reachability operate live on already-created instances.
+- **Remote = ZERO audited VRAM (invariant).** Remote instances never touch `usedGB`/`AuditVRAMConsistency`. Their capacity is advisory in a SEPARATE `remoteHostBudget` and surfaced in the SEPARATE `/v1/ps` `remote_hosts` panel — never mixed into `vram_actual_gb`.
+- **Transparent mid-job failover.** On CONFIRMED remote absence (liveness poll `{addr}/api/version` 3×4s fails, or dial/conn-reset/EHOSTUNREACH) — NEVER on mere slowness — `tryFailover` requeues running→queued (allowed: no `finished_at`), appends the host to durable `excluded_hosts`, and the scheduler re-picks down the chain. The active-cancel hook (`backend.Cancel`) fires from the poll so failover is seconds, not the inference timeout. Idempotency: terminal-stays-terminal + in-flight ownership guarantee exactly one result even if the dead host responds late. `excluded_hosts` is append-only and NOT cleared on `host.recovered` (a recovered host won't re-absorb already-excluded jobs; spark catches them).
+- **Streaming = buffer-on-Mac / replay-from-spark.** For a remote `chat-completion-stream` job, arbiter buffers the FULL completion then emits SSE locally — so a mid-gen host loss yields 0 client bytes (no broken stream), failover is invisible. Local/spark instances keep the direct SSE proxy.
+- **Kill-switches (instant, one curl, work even if the host is down).** Per-model `PATCH /v1/models/{id} {"remote_enabled":false}` pins that model to spark + drains in-flight remote jobs; global `PATCH /v1/remote {"enabled":false}` does it fleet-wide. Both persist (`SaveModelConfig`/`PatchRemoteDisabled`).
+- **Remote-servable models are NOT gated by spark-local VRAM/load-CB.** `getFullModels` computes `remoteServable = RemoteAllowedFor(model) && ModelHasReachableRemoteCapacity(model)` and skips BOTH the local VRAM-feasibility gate AND the load circuit-breaker for such a model — otherwise spark GPU pressure (e.g. ltx2 holding 56GB) starves/freezes/fails a model that actually runs on a remote box. A VRAM-insufficiency load failure (incl. the `waitForInProgressLoad` race-loser path via `Instance.lastLoadInsufficientMem`) requeues, never counts toward `maxLoadAttempts`. When the remote is absent or kill-switched, both gates apply normally (job falls back to spark, which must fit).
+- **gemma fallback caveat:** spark gemma declares `memory_gb=90` and cannot load while ltx2 holds the GPU. With both Macs absent + spark ltx2-saturated, a gemma job legitimately QUEUES (not fails) until spark frees up. The intended fast fallback is a second Mac (darrens-mbp). gemma uses plain MLX `gemma4-26b-32k` (NO MTP — benchmarked slower at batch=1) and is a reasoning model: low `max_tokens` → empty `content` + `finish_reason:length`; pass generous `max_tokens` (≥256).
+- See memory [[multimachine-arbiter-project]] / [[multimachine-impl-spec]] / [[fleet-topology]] for the full design + per-phase history.
+
 **Note on this CLAUDE.md.** Sections above describe the older Python architecture in `src/arbiter/`. The live system is the Go server in `cmd/arbiter/` (scheduler.go, proc.go, api.go, store.go). Treat the Python file paths as historical until that section is rewritten.
