@@ -24,6 +24,18 @@ type Instance struct {
 	InstanceID    string
 	MaxConcurrent int
 
+	// host is the executor this instance runs on. Defaults to LocalHost
+	// ("spark") — the local CUDA backend, indistinguishable from pre-seam
+	// behavior. A non-local host marks the instance remote: it holds ZERO
+	// audited VRAM (skipped by Reserve/Release/AuditVRAMConsistency).
+	host string
+	// backend is the execution seam. For local instances it wraps these very
+	// methods (LocalProcBackend → Instance), so behavior is byte-identical;
+	// Phase 2 swaps in RemoteHTTPBackend for remote placements. Callers today
+	// still invoke the Instance methods directly — the field exists so the
+	// seam is in place and the scheduler can route through it in Phase 2.
+	backend Backend
+
 	mu         sync.Mutex
 	state      string // "stopped", "starting", "loading", "loaded", "unloading", "error"
 	activeJobs int32  // atomic
@@ -74,16 +86,27 @@ type WorkerResponse struct {
 }
 
 func NewInstance(modelID, instanceID string, maxConcurrent int, memoryGB float64, pythonBin, projectRoot string) *Instance {
-	return &Instance{
+	inst := &Instance{
 		ModelID:       modelID,
 		InstanceID:    instanceID,
 		MaxConcurrent: maxConcurrent,
+		host:          LocalHost,
 		state:         "stopped",
 		memoryGB:      memoryGB,
 		pending:       make(map[string]chan json.RawMessage),
 		pythonBin:     pythonBin,
 		projectRoot:   projectRoot,
 	}
+	// Default backend is the local subprocess path, wrapping these very
+	// methods so existing behavior is unchanged.
+	inst.backend = &LocalProcBackend{inst: inst}
+	return inst
+}
+
+// isRemote reports whether this instance runs on a remote executor. Remote
+// instances hold ZERO audited VRAM on spark, so VRAM bookkeeping skips them.
+func (inst *Instance) isRemote() bool {
+	return inst.host != "" && inst.host != LocalHost
 }
 
 func (inst *Instance) State() string {
@@ -787,9 +810,21 @@ type InstanceManager struct {
 	pythonBin    string
 	projectRoot  string
 	config       *Config // shared with the rest of the arbiter; mutated under m.mu
+	// remoteHosts is per-host advisory memory accounting for remote executors.
+	// It is intentionally SEPARATE from usedGB/budgetGB (spark's audited
+	// local-CUDA ledger). Phase 1 only builds the registry from config; Phase 2
+	// polls each host and routes against it.
+	remoteHosts map[string]*remoteHostBudget
 }
 
 func NewInstanceManager(cfg *Config, pythonBin, projectRoot string) *InstanceManager {
+	remoteHosts := make(map[string]*remoteHostBudget)
+	for id, h := range cfg.Hosts {
+		if cfg.HostIsLocal(id) {
+			continue // local CUDA host is the audited usedGB/budgetGB ledger
+		}
+		remoteHosts[id] = newRemoteHostBudget(id, h.Addr, h.BudgetGB)
+	}
 	return &InstanceManager{
 		instances:    make(map[string]*Instance),
 		byModel:      make(map[string][]string),
@@ -799,7 +834,17 @@ func NewInstanceManager(cfg *Config, pythonBin, projectRoot string) *InstanceMan
 		pythonBin:    pythonBin,
 		projectRoot:  projectRoot,
 		config:       cfg,
+		remoteHosts:  remoteHosts,
 	}
+}
+
+// RemoteHostBudget returns the advisory budget tracker for a remote host, or
+// nil if the id is unknown/local. Phase 2 dispatch uses this to gate remote
+// placement without ever touching the audited local VRAM ledger.
+func (m *InstanceManager) RemoteHostBudget(hostID string) *remoteHostBudget {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.remoteHosts[hostID]
 }
 
 func (m *InstanceManager) Register(inst *Instance) {
@@ -1160,6 +1205,14 @@ func (m *InstanceManager) ReserveMemory(gb float64) bool {
 // AuditVRAMConsistency flags as drift and that eventually wedges the queue.
 // ReleaseMemoryFor was already idempotent the same way; this restores symmetry.
 func (m *InstanceManager) ReserveMemoryFor(inst *Instance, gb float64) bool {
+	// Remote instances hold ZERO audited VRAM on spark — their memory lives on
+	// another box and is tracked separately (remoteHostBudget). Never touch
+	// usedGB or set vramHeld for them, so AuditVRAMConsistency stays
+	// local-CUDA-only. Report success: from the scheduler's view the "budget"
+	// for a remote instance is always available locally.
+	if inst.isRemote() {
+		return true
+	}
 	inst.mu.Lock()
 	if inst.vramHeld {
 		inst.mu.Unlock()
@@ -1199,6 +1252,11 @@ func (m *InstanceManager) ReleaseMemory(gb float64) {
 // idempotent: only the first call after a matching ReserveMemoryFor frees the
 // memory. Returns the GB freed (0 when no reservation was held).
 func (m *InstanceManager) ReleaseMemoryFor(inst *Instance) float64 {
+	// Remote instances never reserved audited VRAM (see ReserveMemoryFor), so
+	// there is nothing to release locally.
+	if inst.isRemote() {
+		return 0
+	}
 	inst.mu.Lock()
 	if !inst.vramHeld {
 		inst.mu.Unlock()
@@ -1266,6 +1324,9 @@ func (m *InstanceManager) ReconcileFromInstances() float64 {
 	defer m.mu.Unlock()
 	expected := 0.0
 	for _, inst := range m.instances {
+		if inst.isRemote() {
+			continue // remote instances never enter the audited local ledger
+		}
 		inst.mu.Lock()
 		if inst.vramHeld {
 			expected += inst.memoryGB
@@ -1298,6 +1359,9 @@ func (m *InstanceManager) AuditVRAMConsistency(ctx string) {
 	expected := 0.0
 	holders := 0
 	for _, inst := range m.instances {
+		if inst.isRemote() {
+			continue // remote instances hold zero audited VRAM on spark
+		}
 		inst.mu.Lock()
 		if inst.vramHeld {
 			expected += inst.memoryGB

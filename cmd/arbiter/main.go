@@ -287,6 +287,11 @@ func setupInstances(cfg *Config, mgr *InstanceManager, pythonBin, projectRoot st
 				modelCfg.MemoryGB,
 				pythonBin, projectRoot,
 			)
+			// Place the instance on its model's most-preferred host. With no
+			// placements this is LocalHost ("spark") — identical to today. A
+			// remote placement only sets the host field in Phase 1 (the shell
+			// exists, but routing/spawn to a remote backend is Phase 2).
+			inst.host = modelCfg.PlacementsOrDefault()[0]
 			if len(modelCfg.WorkerCmd) > 0 {
 				inst.workerCmd = modelCfg.WorkerCmd
 			}

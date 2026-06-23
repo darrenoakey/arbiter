@@ -34,6 +34,59 @@ type ModelConfig struct {
 	// alongside either.
 	ConflictGroup string `json:"conflict_group,omitempty"`
 	GroupPriority int    `json:"group_priority,omitempty"`
+	// Placements is the ordered list of host ids this model may run on, most
+	// preferred first. nil/empty means ["spark"] (local CUDA) — behaving
+	// exactly as before the multi-machine seam existed. Phase 1 only records
+	// the placement; routing across hosts arrives in Phase 2.
+	Placements []string `json:"placements,omitempty"`
+	// RemoteEnabled is a per-model kill switch for remote placement. nil means
+	// enabled (the default). When false, the model is pinned to local hosts
+	// regardless of its Placements. Phase 1 only stores the flag.
+	RemoteEnabled *bool `json:"remote_enabled,omitempty"`
+}
+
+// PlacementsOrDefault returns the model's ordered host placements, defaulting
+// to ["spark"] (the implicit local CUDA host) when none are configured. This
+// keeps every existing model — which has no placements — behaving exactly as
+// today.
+func (m ModelConfig) PlacementsOrDefault() []string {
+	if len(m.Placements) == 0 {
+		return []string{LocalHost}
+	}
+	return m.Placements
+}
+
+// RemoteEnabledOrDefault reports whether remote placement is permitted for this
+// model. Defaults to true (nil pointer).
+func (m ModelConfig) RemoteEnabledOrDefault() bool {
+	return m.RemoteEnabled == nil || *m.RemoteEnabled
+}
+
+// LocalHost is the implicit host id for spark's local CUDA backend. A model
+// with no placements runs here, and an instance with host == LocalHost is the
+// only kind that contributes to spark's audited VRAM ledger.
+const LocalHost = "spark"
+
+// HostConfig describes one executor in the fleet. The implicit host "spark"
+// (LocalHost) is always present and local even when absent from this map.
+type HostConfig struct {
+	Addr     string  `json:"addr"`      // host:port of the remote backend (ollama/mlx); empty for the local host
+	Kind     string  `json:"kind"`      // "cuda" (local spark) | "mlx" (remote Apple Silicon)
+	BudgetGB float64 `json:"budget_gb"` // advisory memory budget on that host; not part of spark's audited ledger
+}
+
+// IsLocal reports whether a host id refers to spark's local CUDA backend.
+func (c Config) HostIsLocal(hostID string) bool {
+	if hostID == "" || hostID == LocalHost {
+		return true
+	}
+	h, ok := c.Hosts[hostID]
+	if !ok {
+		// Unknown host id is treated as remote: it is not the local CUDA
+		// backend, so it must never touch the audited VRAM ledger.
+		return false
+	}
+	return h.Kind == "cuda" && h.Addr == ""
 }
 
 type Config struct {
@@ -70,6 +123,11 @@ type Config struct {
 	// it. 0 = default (300s); negative = guard disabled.
 	AutoWakeSeconds int                    `json:"auto_wake_seconds"`
 	Models          map[string]ModelConfig `json:"models"`
+	// Hosts is the fleet of executors keyed by host id. The implicit host
+	// "spark" (LocalHost) is always local CUDA and need not appear here. When
+	// absent/empty, arbiter behaves exactly as today: a single local host.
+	// Phase 1 only parses and stores this; cross-host routing is Phase 2.
+	Hosts map[string]HostConfig `json:"hosts,omitempty"`
 }
 
 var mutableConfigMu sync.Mutex
