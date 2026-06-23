@@ -996,6 +996,37 @@ func (m *InstanceManager) ModelHasAnyCapacity(modelID string) bool {
 	return false
 }
 
+// ModelHasReachableRemoteCapacity reports whether this model has at least one
+// REMOTE instance that is (a) on a reachable host and (b) able to accept a job
+// right now (loaded/loading with capacity, or unloaded/stopped → trivial warm).
+// A remote instance consumes ZERO spark VRAM, so when this is true the
+// scheduler's local-VRAM feasibility gate (getFullModels) must NOT mark the
+// model "full" just because spark's GPU is busy — the job will run on the remote
+// box. This is what lets gemma keep flowing to boringstack while ltx2 saturates
+// the local GPU, instead of queuing behind spark VRAM pressure.
+func (m *InstanceManager) ModelHasReachableRemoteCapacity(modelID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, id := range m.byModel[modelID] {
+		inst := m.instances[id]
+		if !inst.isRemote() {
+			continue
+		}
+		if !m.hostReachable(inst.host) {
+			continue
+		}
+		switch inst.State() {
+		case "loaded", "loading":
+			if inst.HasCapacity() {
+				return true
+			}
+		case "unloaded", "stopped", "error":
+			return true
+		}
+	}
+	return false
+}
+
 func (m *InstanceManager) PickInstance(modelID string) *Instance {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

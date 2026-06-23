@@ -853,7 +853,15 @@ func (s *Scheduler) getFullModels(bestModel string) map[string]bool {
 		// only adapters we ever commit to loading are ones we can actually
 		// load. (A loaded model trivially fits: it passed the capacity check
 		// above, so its existing instance has a slot — no new load needed.)
-		if !s.mgr.IsLoaded(modelID) {
+		// A remote placement consumes ZERO spark VRAM: if the model has a
+		// reachable remote instance with capacity, the job will dispatch there
+		// (PickInstanceForJob walks placements remote-first), so spark's local
+		// VRAM feasibility is irrelevant and must not gate it. Without this
+		// bypass, a remote-offloaded model (e.g. gemma on boringstack) gets
+		// starved behind local GPU pressure whenever spark is busy with CUDA
+		// work — exactly the contention the offload exists to avoid.
+		remoteServable := s.config.RemoteAllowedFor(modelID) && s.mgr.ModelHasReachableRemoteCapacity(modelID)
+		if !s.mgr.IsLoaded(modelID) && !remoteServable {
 			freeGB := s.mgr.FreeGB()
 			reclaimableGB := s.mgr.ReclaimableIdleGB(modelID)
 			if cfg.MemoryGB > freeGB+reclaimableGB+1e-9 {

@@ -611,6 +611,80 @@ func TestGetFullModelsGatesOnVRAMFeasibility(t *testing.T) {
 	}
 }
 
+// A remote-offloaded model must NOT be marked "full" by the local VRAM
+// feasibility gate when its remote host is reachable and has capacity — the job
+// runs on the remote box and consumes zero spark VRAM. Without the bypass, gemma
+// on boringstack would starve behind local CUDA pressure (the Phase-4 bug).
+func TestGetFullModelsBypassesVRAMForReachableRemote(t *testing.T) {
+	projectRoot := t.TempDir()
+	outputDir := filepath.Join(projectRoot, "output")
+	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+
+	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+	store.InitDedup()
+
+	pi := 1.0
+	cfg := &Config{
+		VRAMBudgetGB: 100,
+		Hosts: map[string]HostConfig{
+			"boringstack": {Addr: "http://10.255.255.1:11434", Kind: "mlx", BudgetGB: 96},
+		},
+		Models: map[string]ModelConfig{
+			// blocker holds 80GB → only 20GB free locally while it runs.
+			"blocker": {MemoryGB: 80, MaxConcurrent: 1, MaxInstances: intPtr(1), PressureIndex: &pi},
+			// gemma "needs" 90GB locally but is placed on boringstack first, spark
+			// last. It can never fit in 20GB free — but it must NOT be marked full
+			// because boringstack is reachable and serves it for zero spark VRAM.
+			"gemma": {
+				MemoryGB: 90, MaxConcurrent: 1, MaxInstances: intPtr(1),
+				PressureIndex: &pi,
+				Placements:    []string{"boringstack", "spark"},
+			},
+		},
+	}
+	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
+	defer logger.Close()
+	mgr := NewInstanceManager(cfg, "python3", projectRoot)
+	setupInstances(cfg, mgr, "python3", projectRoot)
+	// boringstack reachable.
+	mgr.SetReachabilityFunc(func(string) bool { return true })
+	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+
+	// blocker loaded + actively running → 80GB pinned, free = 20GB.
+	markLoaded(t, mgr, "blocker")
+	blockerInst := mgr.GetModelInstances("blocker")[0]
+	atomic.AddInt32(&blockerInst.activeJobs, 1)
+
+	full := sched.getFullModels("")
+	if full["gemma"] {
+		t.Fatalf("gemma must NOT be VRAM-full while boringstack is reachable (it offloads, 0 spark VRAM); free=%.0f", mgr.FreeGB())
+	}
+
+	// Make boringstack unreachable → no remote capacity → gemma is now gated by
+	// local VRAM (90GB can't fit in 20GB free), so it IS full.
+	mgr.SetReachabilityFunc(func(string) bool { return false })
+	full = sched.getFullModels("")
+	if !full["gemma"] {
+		t.Fatal("gemma must be VRAM-full once boringstack is unreachable (falls back to spark, which can't fit it)")
+	}
+
+	// Reachable again, but kill-switch disables remote for gemma → must be gated
+	// on local VRAM (pins to spark) and therefore full.
+	mgr.SetReachabilityFunc(func(string) bool { return true })
+	gemmaCfg := cfg.Models["gemma"]
+	disabled := false
+	gemmaCfg.RemoteEnabled = &disabled
+	cfg.Models["gemma"] = gemmaCfg
+	full = sched.getFullModels("")
+	if !full["gemma"] {
+		t.Fatal("gemma must be VRAM-full when remote is kill-switched off (pins to spark, can't fit)")
+	}
+}
+
 func TestDispatchJobLeavesInsufficientMemoryQueued(t *testing.T) {
 	projectRoot := t.TempDir()
 	outputDir := filepath.Join(projectRoot, "output")
