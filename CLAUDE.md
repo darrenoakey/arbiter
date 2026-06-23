@@ -174,6 +174,11 @@ The `ref:` prefix is resolved in `_resolve_media()` in `src/arbiter/adapters/bas
 ## Key Design Decisions
 
 - **Single process, ThreadPoolExecutor**: PyTorch releases GIL during CUDA ops. Threads share GPU memory efficiently.
+- **No Spark image generation.** `POST /v1/jobs` rejects `image-generate`,
+  `image-edit`, and explicit `z-image-turbo` model submissions. User-facing
+  image creation belongs to the mac mini `image-generation-service`, which uses
+  Codex; Arbiter may still run `background-remove` via BiRefNet for transparent
+  post-processing.
 - **SJF scheduling**: `priority = avg_inference_ms + (load_ms if not loaded else 0)`. Shortest jobs run first. Already-loaded models get natural priority.
 - **SQLite queue**: Persistent, crash-recoverable. On restart, incomplete jobs are re-queued.
 - **Dedup followers**: Duplicate requests are persisted as jobs with `state=following` and `error=following:<original_job_id>`. Startup recovery must requeue `scheduled`/`running` jobs, then reconcile followers so none remain attached to terminal or missing originals.
