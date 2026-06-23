@@ -115,6 +115,20 @@ func (inst *Instance) State() string {
 	return inst.state
 }
 
+// setState forces the instance lifecycle state. Used by RemoteHTTPBackend,
+// which has no subprocess to drive state transitions through Spawn/Load/Unload
+// the way the local path does — it must flip state directly so PickInstance /
+// ensureLoaded see "loaded"/"stopped" for a remote instance. Also stamps
+// lastActive on load so the keepalive timer starts from the warm.
+func (inst *Instance) setState(state string) {
+	inst.mu.Lock()
+	inst.state = state
+	if state == "loaded" {
+		inst.lastActive = time.Now()
+	}
+	inst.mu.Unlock()
+}
+
 func (inst *Instance) ActiveJobs() int {
 	return int(atomic.LoadInt32(&inst.activeJobs))
 }
@@ -914,25 +928,34 @@ func (m *InstanceManager) PickInstance(modelID string) *Instance {
 	if len(ids) == 0 {
 		return nil
 	}
+	pool := make([]*Instance, 0, len(ids))
+	for _, id := range ids {
+		pool = append(pool, m.instances[id])
+	}
+	return pickFromPool(pool)
+}
 
-	// MaxConcurrent applies regardless of lifecycle state. A loading
-	// instance that already has MaxConcurrent jobs reserved against it
-	// must not get more piled on — they would all unblock simultaneously
-	// once the load finishes and overwhelm the worker. So every branch
-	// below checks HasCapacity().
-	//
-	// For multi-instance models (max_instances > 1) the pool of Instance
-	// objects is fixed at startup by setupInstances, so falling through to
-	// cold-start a stopped sibling can never exceed max_instances. That is
-	// exactly the horizontal-scale behaviour the config asks for: when #0
-	// is saturated, light up #1.
+// pickFromPool selects the best instance among a candidate pool using the
+// capacity-aware preference order. Returns nil if the pool is empty.
+//
+// MaxConcurrent applies regardless of lifecycle state. A loading instance that
+// already has MaxConcurrent jobs reserved against it must not get more piled on
+// — they would all unblock simultaneously once the load finishes and overwhelm
+// the worker. So every branch below checks HasCapacity().
+//
+// For multi-instance models (max_instances > 1) the pool of Instance objects is
+// fixed at startup, so falling through to cold-start a stopped sibling can never
+// exceed max_instances. That is exactly the horizontal-scale behaviour the
+// config asks for: when #0 is saturated, light up #1.
+func pickFromPool(pool []*Instance) *Instance {
+	if len(pool) == 0 {
+		return nil
+	}
 
 	// 1. Loaded with capacity (least busy first)
 	var bestLoaded *Instance
-	for _, id := range ids {
-		inst := m.instances[id]
-		state := inst.State()
-		if state == "loaded" && inst.HasCapacity() {
+	for _, inst := range pool {
+		if inst.State() == "loaded" && inst.HasCapacity() {
 			if bestLoaded == nil || inst.ActiveJobs() < bestLoaded.ActiveJobs() {
 				bestLoaded = inst
 			}
@@ -945,8 +968,7 @@ func (m *InstanceManager) PickInstance(modelID string) *Instance {
 	// 2. Loading with capacity (job will wait for load to complete).
 	// Preferred over cold-starting a sibling because the load is already
 	// in flight — adding another cold start just wastes VRAM/time.
-	for _, id := range ids {
-		inst := m.instances[id]
+	for _, inst := range pool {
 		if inst.State() == "loading" && inst.HasCapacity() {
 			return inst
 		}
@@ -955,8 +977,7 @@ func (m *InstanceManager) PickInstance(modelID string) *Instance {
 	// 3. Unloaded or stopped (needs cold start). HasCapacity is trivially
 	// true for these (activeJobs == 0), but we still gate on it so the
 	// rule "no instance is ever picked while at capacity" holds uniformly.
-	for _, id := range ids {
-		inst := m.instances[id]
+	for _, inst := range pool {
 		s := inst.State()
 		if (s == "unloaded" || s == "stopped") && inst.HasCapacity() {
 			return inst
@@ -965,7 +986,80 @@ func (m *InstanceManager) PickInstance(modelID string) *Instance {
 
 	// 4. All errored — return first for retry. Only reachable when no
 	// instance is loaded, loading, unloaded, or stopped.
-	return m.instances[ids[0]]
+	return pool[0]
+}
+
+// PickInstanceForJob is the host-aware picker used by the dispatch path. It
+// walks the model's placement chain IN ORDER (most-preferred host first) and
+// returns the first host's instance that is (a) not in the job's excluded set,
+// and (b) pickable per pickFromPool (has capacity / can cold-start). Lower-
+// preference hosts stay unpicked while a higher one is available — so we never
+// duplicate a model across boxes, only spill when the preferred host has no
+// capacity or is excluded. spark (LocalHost) is always local + reachable and is
+// the guaranteed final link in every offloaded model's chain.
+//
+// remoteEnabled=false pins the model to LOCAL hosts only (the per-model
+// kill-switch): every remote host in the chain is skipped, leaving spark.
+//
+// Returns nil only when no eligible host has capacity right now (the scheduler
+// then requeues the job and retries on the next tick).
+func (m *InstanceManager) PickInstanceForJob(job *Job, remoteEnabled bool) *Instance {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	mc, ok := m.config.Models[job.ModelID]
+	if !ok {
+		// Unknown model: fall back to the flat pool (back-compat).
+		return m.pickFromModelLocked(job.ModelID)
+	}
+	placements := mc.PlacementsOrDefault()
+
+	for _, host := range placements {
+		if job.HostExcluded(host) {
+			continue
+		}
+		isLocal := m.config.HostIsLocal(host)
+		if !isLocal && !remoteEnabled {
+			continue // kill-switch: skip remote hosts, spill to local
+		}
+		inst := m.instanceForHostLocked(job.ModelID, host)
+		if inst == nil {
+			continue
+		}
+		if picked := pickFromPool([]*Instance{inst}); picked != nil {
+			// pickFromPool on a single-element pool returns that instance only
+			// when it has capacity / can cold-start; a returned errored
+			// instance (branch 4) is still a legit retry target on its host.
+			return picked
+		}
+	}
+	return nil
+}
+
+// pickFromModelLocked is the flat (host-agnostic) pick over all of a model's
+// instances. Caller holds m.mu.
+func (m *InstanceManager) pickFromModelLocked(modelID string) *Instance {
+	ids := m.byModel[modelID]
+	if len(ids) == 0 {
+		return nil
+	}
+	pool := make([]*Instance, 0, len(ids))
+	for _, id := range ids {
+		pool = append(pool, m.instances[id])
+	}
+	return pickFromPool(pool)
+}
+
+// instanceForHostLocked returns the model's instance placed on the given host,
+// or nil. Caller holds m.mu.
+func (m *InstanceManager) instanceForHostLocked(modelID, host string) *Instance {
+	for _, id := range m.byModel[modelID] {
+		inst := m.instances[id]
+		if inst.host == host || (m.config.HostIsLocal(host) && m.config.HostIsLocal(inst.host)) {
+			return inst
+		}
+	}
+	return nil
 }
 
 func (m *InstanceManager) IsLoaded(modelID string) bool {

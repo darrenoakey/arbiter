@@ -274,40 +274,74 @@ func main() {
 // setupInstances creates Instance objects for all configured models.
 func setupInstances(cfg *Config, mgr *InstanceManager, pythonBin, projectRoot string) {
 	for modelID, modelCfg := range cfg.Models {
-		n := *modelCfg.MaxInstances
 		mgr.EnsureModel(modelID)
-		for i := 0; i < n; i++ {
-			instanceID := modelID
-			if n > 1 {
-				instanceID = fmt.Sprintf("%s#%d", modelID, i)
-			}
-			inst := NewInstance(
-				modelID, instanceID,
-				modelCfg.MaxConcurrent,
-				modelCfg.MemoryGB,
-				pythonBin, projectRoot,
-			)
-			// Place the instance on its model's most-preferred host. With no
-			// placements this is LocalHost ("spark") — identical to today. A
-			// remote placement only sets the host field in Phase 1 (the shell
-			// exists, but routing/spawn to a remote backend is Phase 2).
-			inst.host = modelCfg.PlacementsOrDefault()[0]
-			if len(modelCfg.WorkerCmd) > 0 {
-				inst.workerCmd = modelCfg.WorkerCmd
-			}
-			if modelCfg.AdapterParams != nil {
-				for k, v := range modelCfg.AdapterParams {
-					inst.workerEnv = append(inst.workerEnv, k+"="+v)
+		placements := modelCfg.PlacementsOrDefault()
+
+		// One Instance per placement host. The LOCAL host (spark) gets the full
+		// local-subprocess pool (max_instances replicas) — identical to today.
+		// Each REMOTE host gets a single RemoteHTTPBackend instance: ollama
+		// serializes per model so there's no value in local replicas of a remote
+		// placement; MaxConcurrent still governs how many jobs queue against it.
+		for _, host := range placements {
+			if cfg.HostIsLocal(host) {
+				n := *modelCfg.MaxInstances
+				for i := 0; i < n; i++ {
+					instanceID := modelID
+					if n > 1 {
+						instanceID = fmt.Sprintf("%s#%d", modelID, i)
+					}
+					inst := NewInstance(
+						modelID, instanceID,
+						modelCfg.MaxConcurrent,
+						modelCfg.MemoryGB,
+						pythonBin, projectRoot,
+					)
+					inst.host = LocalHost
+					if len(modelCfg.WorkerCmd) > 0 {
+						inst.workerCmd = modelCfg.WorkerCmd
+					}
+					if modelCfg.AdapterParams != nil {
+						for k, v := range modelCfg.AdapterParams {
+							inst.workerEnv = append(inst.workerEnv, k+"="+v)
+						}
+					}
+					mgr.Register(inst)
 				}
+				if n > 1 {
+					slog.Info("registered multi-instance model",
+						"model", modelID, "instances", n, "memory_each_gb", modelCfg.MemoryGB)
+				}
+				continue
 			}
-			mgr.Register(inst)
-		}
-		if n > 1 {
-			slog.Info("registered multi-instance model",
-				"model", modelID,
-				"instances", n,
-				"memory_each_gb", modelCfg.MemoryGB,
+
+			// Remote placement: requires a host entry with an addr.
+			hc, ok := cfg.Hosts[host]
+			if !ok || hc.Addr == "" {
+				slog.Warn("skipping remote placement with no host addr",
+					"model", modelID, "host", host)
+				continue
+			}
+			modelTag := remoteModelTag(modelCfg, modelID)
+			inst := NewRemoteInstance(
+				modelID, fmt.Sprintf("%s@%s", modelID, host),
+				host, hc.Addr, modelTag,
+				modelCfg.MaxConcurrent, modelCfg.MemoryGB,
 			)
+			mgr.Register(inst)
+			slog.Info("registered remote model placement",
+				"model", modelID, "host", host, "addr", hc.Addr, "tag", modelTag)
 		}
 	}
+}
+
+// remoteModelTag resolves the ollama model tag to call on a remote host. The
+// model's "remote_model_tag" adapter param overrides; otherwise the arbiter
+// model id is used as-is.
+func remoteModelTag(mc ModelConfig, modelID string) string {
+	if mc.AdapterParams != nil {
+		if tag := mc.AdapterParams["remote_model_tag"]; tag != "" {
+			return tag
+		}
+	}
+	return modelID
 }

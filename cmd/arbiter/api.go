@@ -1718,10 +1718,18 @@ func (a *API) chatCompletionStream(w http.ResponseWriter, r *http.Request, model
 	handoff.doneCh <- streamErr
 }
 
-// proxyStreamFromInstance opens an HTTP stream against the worker's
-// llama-server / vLLM port and pipes SSE bytes through to the client. Returns
-// any transport-level error so the scheduler can mark the job appropriately.
+// proxyStreamFromInstance pipes a chat completion to the client as SSE. For a
+// LOCAL instance it proxies live SSE from the worker's llama-server/vLLM port.
+// For a REMOTE instance it uses the buffer-on-remote/replay-from-spark path:
+// the full completion is fetched over HTTP (non-streamed, on a detached
+// context), then replayed locally as SSE chunks. Returns any error so the
+// scheduler can mark the job appropriately — critically, a remote absence error
+// is returned BEFORE any client byte is written, so the scheduler can fail the
+// job over to the next box invisibly to the client.
 func proxyStreamFromInstance(w http.ResponseWriter, r *http.Request, inst *Instance, body []byte) error {
+	if inst.isRemote() {
+		return replayRemoteStream(w, inst, body)
+	}
 	port, err := inst.GetPort()
 	if err != nil {
 		writeError(w, 500, fmt.Sprintf("get worker port: %s", err))
@@ -1769,6 +1777,114 @@ func proxyStreamFromInstance(w http.ResponseWriter, r *http.Request, inst *Insta
 			return rerr
 		}
 	}
+}
+
+// replayRemoteStream implements the buffer-on-remote/replay-from-spark path. It
+// fetches the FULL completion from the remote backend (non-streamed, detached
+// context — a slow call drains, it is never cancelled by the client), then emits
+// it to the client as a valid OpenAI SSE stream from spark.
+//
+// Failover safety: the remote call is awaited BEFORE any byte is written to w.
+// If it errors (absence), we return the error without touching w, so the
+// scheduler's stream-handoff path can requeue to the next box and the client —
+// which has received nothing — sees no break. Only once we have the full,
+// successful completion do we start writing SSE.
+func replayRemoteStream(w http.ResponseWriter, inst *Instance, body []byte) error {
+	resp, err := inst.backend.InferRaw("stream-"+genID(), "chat-completion-stream", json.RawMessage(body), "")
+	if err != nil {
+		// No client bytes written yet → caller can fail this over transparently.
+		return err
+	}
+	if resp == nil || resp.Status != "ok" {
+		errMsg := "remote stream produced no result"
+		if resp != nil && resp.Error != "" {
+			errMsg = resp.Error
+		}
+		return fmt.Errorf("%s", errMsg)
+	}
+
+	// Pull the full OpenAI response out of the worker-shaped result.
+	var result struct {
+		Response json.RawMessage `json:"response"`
+	}
+	json.Unmarshal(resp.Result, &result)
+	full := result.Response
+	if len(full) == 0 {
+		full = resp.Result
+	}
+
+	var chatResp struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		Created int64  `json:"created"`
+		Model   string `json:"model"`
+		Choices []struct {
+			Message struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	json.Unmarshal(full, &chatResp)
+
+	content := ""
+	finish := "stop"
+	if len(chatResp.Choices) > 0 {
+		content = chatResp.Choices[0].Message.Content
+		if chatResp.Choices[0].FinishReason != "" {
+			finish = chatResp.Choices[0].FinishReason
+		}
+	}
+	id := chatResp.ID
+	if id == "" {
+		id = "chatcmpl-" + genID()
+	}
+	created := chatResp.Created
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+	model := chatResp.Model
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+
+	writeChunk := func(delta map[string]any, finishReason any) {
+		chunk := map[string]any{
+			"id":      id,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []map[string]any{{
+				"index":         0,
+				"delta":         delta,
+				"finish_reason": finishReason,
+			}},
+		}
+		data, _ := json.Marshal(chunk)
+		w.Write([]byte("data: "))
+		w.Write(data)
+		w.Write([]byte("\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	// Role chunk, then the content as a single delta, then the finish chunk and
+	// the SSE terminator — a valid OpenAI stream the client can consume normally.
+	writeChunk(map[string]any{"role": "assistant"}, nil)
+	if content != "" {
+		writeChunk(map[string]any{"content": content}, nil)
+	}
+	writeChunk(map[string]any{}, finish)
+	w.Write([]byte("data: [DONE]\n\n"))
+	if flusher != nil {
+		flusher.Flush()
+	}
+	return nil
 }
 
 // --- Admin ---

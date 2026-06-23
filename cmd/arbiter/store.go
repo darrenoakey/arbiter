@@ -30,6 +30,24 @@ type Job struct {
 	// os.Symlink(origDir, newDir) hack which left dangling pointers on CIFS
 	// when the orig dir became unreachable. Empty for normal jobs.
 	CanonicalJobID string `json:"canonical_job_id,omitempty"`
+	// ExcludedHosts is the set of host ids that must NOT be picked for this job.
+	// It is how transparent mid-job failover is made durable: when a remote
+	// executor disappears while running a job, the dead host is appended here,
+	// the job goes running→queued, and PickInstance walks the placement chain
+	// skipping every excluded host — so the next attempt lands on a different
+	// box. Persisted as a JSON array in the excluded_hosts column so it survives
+	// a crash/restart mid-failover. Empty/nil for the common case.
+	ExcludedHosts []string `json:"excluded_hosts,omitempty"`
+}
+
+// HostExcluded reports whether the given host id is in the job's excluded set.
+func (j *Job) HostExcluded(hostID string) bool {
+	for _, h := range j.ExcludedHosts {
+		if h == hostID {
+			return true
+		}
+	}
+	return false
 }
 
 const schema = `
@@ -45,7 +63,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at REAL NOT NULL,
     started_at REAL,
     finished_at REAL,
-    canonical_job_id TEXT
+    canonical_job_id TEXT,
+    excluded_hosts TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_priority ON jobs(priority) WHERE state = 'queued';
@@ -72,6 +91,19 @@ func migrateAddCanonicalJobID(db *sql.DB) {
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_jobs_canonical ON jobs(canonical_job_id) WHERE canonical_job_id IS NOT NULL`)
 }
 
+// migrateAddExcludedHosts adds the excluded_hosts column to databases that
+// pre-date transparent failover. Idempotent — a "duplicate column name" error
+// (column already present) is ignored.
+func migrateAddExcludedHosts(db *sql.DB) {
+	_, err := db.Exec(`ALTER TABLE jobs ADD COLUMN excluded_hosts TEXT`)
+	if err == nil || strings.Contains(err.Error(), "duplicate column") {
+		return
+	}
+	// Anything else is unexpected — scanJob falls back gracefully if the column
+	// is missing, so don't abort startup.
+	_ = err
+}
+
 type Store struct {
 	db *sql.DB
 	mu sync.RWMutex
@@ -87,6 +119,7 @@ func NewStore(dbPath string) (*Store, error) {
 	// canonical_job_id will fail if the column doesn't exist on a pre-
 	// existing jobs table that was created without it.
 	migrateAddCanonicalJobID(db)
+	migrateAddExcludedHosts(db)
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
@@ -129,13 +162,20 @@ func (s *Store) GetJob(id string) (*Job, error) {
 
 func (s *Store) scanJob(row *sql.Row) (*Job, error) {
 	var j Job
-	var payload, result, errStr, canonical sql.NullString
+	var payload, result, errStr, canonical, excluded sql.NullString
 	var startedAt, finishedAt sql.NullFloat64
 	err := row.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
-		&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt, &canonical)
+		&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt, &canonical, &excluded)
 	if err != nil {
 		return nil, err
 	}
+	fillJobNullable(&j, payload, result, errStr, canonical, excluded, startedAt, finishedAt)
+	return &j, nil
+}
+
+// fillJobNullable is the shared decode of the nullable job columns so scanJob
+// (QueryRow) and scanJobFromRows (Rows) stay in lockstep when columns change.
+func fillJobNullable(j *Job, payload, result, errStr, canonical, excluded sql.NullString, startedAt, finishedAt sql.NullFloat64) {
 	if payload.Valid {
 		j.Payload = json.RawMessage(payload.String)
 	}
@@ -155,7 +195,10 @@ func (s *Store) scanJob(row *sql.Row) (*Job, error) {
 	if canonical.Valid {
 		j.CanonicalJobID = canonical.String
 	}
-	return &j, nil
+	if excluded.Valid && excluded.String != "" {
+		// Stored as a JSON array; ignore malformed values (treat as none).
+		json.Unmarshal([]byte(excluded.String), &j.ExcludedHosts)
+	}
 }
 
 // SetCanonicalJobID marks a job as a dedup-cache-hit pointer to origID.
@@ -169,6 +212,38 @@ func (s *Store) SetCanonicalJobID(jobID, origID string) error {
 		origID, jobID,
 	)
 	return err
+}
+
+// AddExcludedHost durably appends a host id to a job's excluded set and returns
+// the updated list. This is the persistence half of transparent failover: a
+// remote executor that died mid-job is recorded here so PickInstance never
+// re-routes the requeued job back to the dead box, and so the exclusion
+// survives a crash mid-failover. Idempotent — re-adding an existing host is a
+// no-op. The read+write is done under the write lock so concurrent failovers on
+// the same job can't clobber each other.
+func (s *Store) AddExcludedHost(jobID, hostID string) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var existing sql.NullString
+	if err := s.db.QueryRow("SELECT excluded_hosts FROM jobs WHERE id = ?", jobID).Scan(&existing); err != nil {
+		return nil, err
+	}
+	var hosts []string
+	if existing.Valid && existing.String != "" {
+		json.Unmarshal([]byte(existing.String), &hosts)
+	}
+	for _, h := range hosts {
+		if h == hostID {
+			return hosts, nil // already excluded — no write
+		}
+	}
+	hosts = append(hosts, hostID)
+	encoded, _ := json.Marshal(hosts)
+	if _, err := s.db.Exec("UPDATE jobs SET excluded_hosts = ? WHERE id = ?", string(encoded), jobID); err != nil {
+		return nil, err
+	}
+	return hosts, nil
 }
 
 // CountCanonicalReferences returns how many jobs point at origID via
@@ -225,31 +300,13 @@ func (s *Store) ListJobs(state, modelID string, limit int) ([]*Job, error) {
 // list changes.
 func scanJobFromRows(rows *sql.Rows) (*Job, error) {
 	var j Job
-	var payload, result, errStr, canonical sql.NullString
+	var payload, result, errStr, canonical, excluded sql.NullString
 	var startedAt, finishedAt sql.NullFloat64
 	if err := rows.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
-		&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt, &canonical); err != nil {
+		&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt, &canonical, &excluded); err != nil {
 		return nil, err
 	}
-	if payload.Valid {
-		j.Payload = json.RawMessage(payload.String)
-	}
-	if result.Valid {
-		rm := json.RawMessage(result.String)
-		j.Result = &rm
-	}
-	if errStr.Valid {
-		j.Error = errStr.String
-	}
-	if startedAt.Valid {
-		j.StartedAt = &startedAt.Float64
-	}
-	if finishedAt.Valid {
-		j.FinishedAt = &finishedAt.Float64
-	}
-	if canonical.Valid {
-		j.CanonicalJobID = canonical.String
-	}
+	fillJobNullable(&j, payload, result, errStr, canonical, excluded, startedAt, finishedAt)
 	return &j, nil
 }
 
@@ -309,9 +366,17 @@ func (s *Store) UpdateState(jobID, state string, opts ...func(*stateUpdate)) err
 		sets += ", error = ?"
 		args = append(args, u.error)
 	}
-	args = append(args, jobID, state)
+	args = append(args, jobID)
+	// Terminal jobs are IMMUTABLE: once a row is completed/failed/cancelled, no
+	// UpdateState may change it — not to an active state (resurrection) and not
+	// to another terminal state (a late/duplicate result overwriting the first).
+	// This is the idempotency guard transparent failover relies on: a late
+	// upstream response from a dead host cannot overwrite the result the
+	// failover target already wrote, so exactly one result is recorded per job.
+	// Every legitimate terminal write in the codebase is a first transition from
+	// an active state, so blocking terminal→* loses nothing.
 	_, err := s.db.Exec(
-		"UPDATE jobs SET "+sets+" WHERE id = ? AND NOT (state IN ('completed','failed','cancelled') AND ? IN ('queued','scheduled','running','following'))",
+		"UPDATE jobs SET "+sets+" WHERE id = ? AND state NOT IN ('completed','failed','cancelled')",
 		args...,
 	)
 	return err
@@ -759,7 +824,7 @@ func (s *Store) GetRunningJobs() ([]*Job, error) {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(
-		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at, canonical_job_id FROM jobs WHERE state = 'running'",
+		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at, canonical_job_id, excluded_hosts FROM jobs WHERE state = 'running'",
 	)
 	if err != nil {
 		return nil, err
@@ -783,7 +848,7 @@ func (s *Store) GetActiveJobs() ([]*Job, error) {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(
-		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at, canonical_job_id FROM jobs WHERE state IN ('queued','scheduled','running','following')",
+		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at, canonical_job_id, excluded_hosts FROM jobs WHERE state IN ('queued','scheduled','running','following')",
 	)
 	if err != nil {
 		return nil, err

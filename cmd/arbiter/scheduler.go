@@ -85,6 +85,12 @@ type Scheduler struct {
 	//      says terminal but we still hold the reservation) and heal it.
 	inFlightMu sync.Mutex
 	inFlight   map[string]inFlightJob
+	// failoverAttempts counts how many times a job has been transparently failed
+	// over off a remote host (running→queued + excluded_hosts). Bounded by
+	// maxFailoverAttempts so a pathological flapping fleet can't loop a job
+	// forever; once exceeded the job fails terminal. Reset on terminal state.
+	failoverMu       sync.Mutex
+	failoverAttempts map[string]int
 }
 
 type inFlightJob struct {
@@ -98,6 +104,14 @@ type streamHandoff struct {
 }
 
 const maxLoadAttempts = 3
+
+// maxFailoverAttempts bounds transparent mid-job failover so a flapping fleet
+// can't loop a job forever. It is sized to the worst realistic chain length plus
+// slack: walking every placement once, with a little headroom for a host that
+// flaps back. Beyond it the job fails terminal. The progress guarantee still
+// holds because spark (always reachable) is the final link, so a healthy fleet
+// never approaches this cap.
+const maxFailoverAttempts = 8
 
 type insufficientMemoryError struct {
 	instanceID string
@@ -133,6 +147,7 @@ func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *Event
 		streamHandoffs:           make(map[string]*streamHandoff),
 		inFlight:                 make(map[string]inFlightJob),
 		starvedSince:             make(map[string]time.Time),
+		failoverAttempts:         make(map[string]int),
 	}
 }
 
@@ -178,6 +193,90 @@ func (s *Scheduler) releaseInFlight(jobID string) (*Instance, bool) {
 	}
 	s.pressureMu.Unlock()
 	return entry.inst, true
+}
+
+// tryFailover handles a CONFIRMED-absence (INFRA) error from a REMOTE instance
+// by transparently failing the job over to the next box, invisibly to the
+// client. It is the heart of the HARD requirement "mid-job host loss is never a
+// job failure".
+//
+// State transitions (terminal-stays-terminal still holds — the job has NO
+// finished_at, so running→queued is allowed):
+//  1. durably append the dead host to the job's excluded_hosts (survives crash);
+//  2. mark the job running→queued and CLEAR started_at so a watchdog doesn't
+//     mistake it for a stuck-scheduled job;
+//  3. wake the scheduler → PickInstanceForJob walks the chain, skips the
+//     excluded host, lands on the next placement (spark guaranteed last).
+//
+// The slot/in-flight ownership is released by the dispatch defer (idempotent),
+// and the remote instance held ZERO audited VRAM so there is nothing to
+// reconcile. IDEMPOTENCY: the requeue goes through UpdateState, which refuses to
+// move a terminal job — so a late upstream response that already completed the
+// job elsewhere can't resurrect it, and releaseInFlight ensures exactly one
+// dispatch owns the slot.
+//
+// Returns true when failover was applied (caller must NOT fail the job). Returns
+// false when the job should fail terminal: it's not remote/not INFRA, the
+// instance has no eligible failover target left, or the attempt cap is hit.
+func (s *Scheduler) tryFailover(job *Job, inst *Instance, cause error) bool {
+	if inst == nil || !inst.isRemote() {
+		return false
+	}
+	if !isRemoteAbsence(cause) {
+		return false // genuine job/model error → fail terminal
+	}
+
+	s.failoverMu.Lock()
+	s.failoverAttempts[job.ID]++
+	attempts := s.failoverAttempts[job.ID]
+	s.failoverMu.Unlock()
+
+	if attempts > maxFailoverAttempts {
+		slog.Error("failover attempt cap exceeded — failing job terminal",
+			"job", job.ID, "model", job.ModelID, "attempts", attempts)
+		return false
+	}
+
+	// Mark the host absent (advisory) so other scheduling decisions can avoid it
+	// until a Phase-3 liveness poll clears it. Never touches the audited ledger.
+	if hb := s.mgr.RemoteHostBudget(inst.host); hb != nil {
+		hb.SetUsedGB(0)
+	}
+	inst.setState("error") // a re-pick of this host will cold-warm again
+
+	excluded, err := s.store.AddExcludedHost(job.ID, inst.host)
+	if err != nil {
+		slog.Error("failover: could not persist excluded host — failing terminal",
+			"job", job.ID, "host", inst.host, "error", err)
+		return false
+	}
+
+	// running→queued (allowed: no finished_at). Clear started_at so the
+	// scheduled-watchdog timer restarts cleanly on the next dispatch.
+	s.store.UpdateState(job.ID, "queued", WithClearStartedAt())
+
+	s.logger.Log("job.failover", map[string]any{
+		"job_id":         job.ID,
+		"model_id":       job.ModelID,
+		"from_host":      inst.host,
+		"reason":         cause.Error(),
+		"attempt":        attempts,
+		"excluded_hosts": excluded,
+	})
+	slog.Warn("transparent failover: requeued job off absent host",
+		"job", job.ID, "model", job.ModelID, "from_host", inst.host,
+		"attempt", attempts, "excluded", excluded)
+
+	s.Wake()
+	return true
+}
+
+// clearFailoverAttempts drops the per-job failover counter once the job reaches
+// a terminal state, so the map can't grow unbounded.
+func (s *Scheduler) clearFailoverAttempts(jobID string) {
+	s.failoverMu.Lock()
+	delete(s.failoverAttempts, jobID)
+	s.failoverMu.Unlock()
 }
 
 // isInFlight reports whether a job currently has a live dispatch goroutine.
@@ -909,7 +1008,12 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 			"memory_gb":   inst.memoryGB,
 		})
 
-		if err := inst.Load("cuda"); err != nil {
+		// Route through the backend seam: LocalProcBackend.Load delegates to
+		// inst.Load (byte-identical to before), while a remote instance warms
+		// the ollama model over HTTP. A remote warm that hits CONFIRMED absence
+		// returns an INFRA error; ensureLoaded surfaces it and the dispatch path
+		// fails the load over to the next placement.
+		if err := inst.backend.Load("cuda"); err != nil {
 			s.mgr.ReleaseMemoryFor(inst)
 			slog.Error("ensureLoaded: load failed", "instance", inst.InstanceID, "error", err)
 			s.logger.Log("model.load_error", map[string]any{
@@ -966,6 +1070,13 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 			s.cooldownMu.Lock()
 			s.cooldownUntil[job.ModelID] = time.Now().Add(30 * time.Second)
 			s.cooldownMu.Unlock()
+			return
+		}
+
+		// A remote warm that hit CONFIRMED absence (host gone before it could
+		// even load) is transparent failover, not a job failure: exclude the
+		// host and requeue so the next placement picks it up.
+		if s.tryFailover(job, inst, err) {
 			return
 		}
 
@@ -1034,7 +1145,13 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 	// Kill the worker if inference exceeds max_runtime_seconds.
 	// This unblocks the goroutine (subprocess death → readLoop broadcasts → sendAndReceive returns).
 	// The DB-level watchdog (RunJobWatchdog) is a secondary check; this is the real fix.
-	if runtimeSec := s.config.Models[job.ModelID].MaxRuntimeSec; runtimeSec > 0 {
+	//
+	// NEVER for a remote instance: killing a slow-but-alive ollama request
+	// wedges that model's runner (every later /api/chat hangs). Remote failover
+	// is driven by CONFIRMED absence (dial errors / Phase-3 liveness poll firing
+	// Cancel), never by a runtime timeout. A slow remote call is allowed to
+	// drain on its detached context.
+	if runtimeSec := s.config.Models[job.ModelID].MaxRuntimeSec; runtimeSec > 0 && !inst.isRemote() {
 		killTimer := time.AfterFunc(time.Duration(runtimeSec)*time.Second, func() {
 			slog.Warn("inference timeout — killing worker",
 				"job", job.ID, "model", job.ModelID,
@@ -1051,8 +1168,22 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 	}
 
 	start := time.Now()
-	resp, err := inst.InferRaw(job.ID, job.JobType, job.Payload, jobDir)
+	// Route through the backend seam. Local instances delegate to inst.InferRaw
+	// (byte-identical); remote instances run the chat over HTTP on a DETACHED
+	// context and return the result in the local llm-worker's shape.
+	resp, err := inst.backend.InferRaw(job.ID, job.JobType, job.Payload, jobDir)
 	elapsed := time.Since(start).Seconds()
+
+	// Transparent mid-job failover: a CONFIRMED-absence error from a remote
+	// instance requeues the job (excluded_hosts + running→queued) instead of
+	// failing it. The client (waiting on poll/stream) sees no error — the next
+	// box answers. IDEMPOTENCY: a late upstream response can't resurrect the job
+	// because UpdateState refuses terminal→active and only one dispatch owns the
+	// slot.
+	if err != nil && s.tryFailover(job, inst, err) {
+		s.cleanupJobInbox(job)
+		return
+	}
 
 	if s.shouldRequeueForShutdown(err, resp) {
 		s.store.UpdateState(job.ID, "queued")
@@ -1083,8 +1214,13 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 			s.RecordFailure(job.ModelID)
 		}
 		s.cleanupJobInbox(job)
+		s.clearFailoverAttempts(job.ID)
 		return
 	}
+
+	// Job reached a terminal worker response (completed/cancelled/error) — the
+	// failover counter is no longer needed.
+	s.clearFailoverAttempts(job.ID)
 
 	if resp.Status == "cancelled" {
 		s.store.UpdateState(job.ID, "cancelled", WithFinishedAt(nowTS()))
@@ -1179,6 +1315,14 @@ func (s *Scheduler) dispatchStreamHandoff(job *Job, inst *Instance) {
 	case err := <-h.doneCh:
 		elapsed := time.Since(start).Seconds()
 		if err != nil {
+			// Transparent failover for a REMOTE buffered stream: if the remote
+			// call hit CONFIRMED absence, the handler had NOT written any client
+			// bytes yet (buffer-on-remote/replay-from-spark), so requeuing to the
+			// next box is invisible to the client. tryFailover requeues with
+			// excluded_hosts; the new dispatch creates a fresh stream handoff.
+			if s.tryFailover(job, inst, err) {
+				return
+			}
 			errMsg := fmt.Sprintf("stream error: %s", err)
 			s.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
 			s.logger.Log("job.failed", map[string]any{
@@ -1186,6 +1330,7 @@ func (s *Scheduler) dispatchStreamHandoff(job *Job, inst *Instance) {
 				"error": errMsg, "inference_seconds": elapsed,
 			})
 			s.RecordFailure(job.ModelID)
+			s.clearFailoverAttempts(job.ID)
 			return
 		}
 		s.store.UpdateState(job.ID, "completed", WithFinishedAt(nowTS()))
@@ -1194,6 +1339,7 @@ func (s *Scheduler) dispatchStreamHandoff(job *Job, inst *Instance) {
 			"inference_seconds": elapsed, "stream": true,
 		})
 		s.RecordSuccess(job.ModelID)
+		s.clearFailoverAttempts(job.ID)
 	case <-time.After(streamMax):
 		errMsg := fmt.Sprintf("stream exceeded %s", streamMax)
 		s.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
@@ -1353,12 +1499,16 @@ func (s *Scheduler) Run(ctx context.Context) {
 		s.store.UpdateState(job.ID, "scheduled", WithStartedAt(nowTS()))
 
 		// Pick instance NOW (synchronous) so concurrent goroutines
-		// don't race to pick the same instance
-		inst := s.mgr.PickInstance(job.ModelID)
+		// don't race to pick the same instance. Host-aware: walks the model's
+		// placement chain in order, skips hosts in the job's excluded set (set
+		// by transparent failover), honors the per-model remote kill-switch, and
+		// never returns an instance lacking capacity. spark is always the
+		// reachable final link.
+		inst := s.mgr.PickInstanceForJob(job, s.config.Models[job.ModelID].RemoteEnabledOrDefault())
 		if inst == nil {
 			slog.Info("scheduler.requeue: no instance available",
 				"job", job.ID, "model", job.ModelID,
-				"reason", "PickInstance returned nil — all instances at max_concurrent or none exist")
+				"reason", "PickInstanceForJob returned nil — all eligible hosts at max_concurrent or excluded")
 			s.store.UpdateState(job.ID, "queued")
 			continue
 		}
