@@ -802,8 +802,19 @@ func (s *Scheduler) getFullModels(bestModel string) map[string]bool {
 		if cfg.PressureIndex != nil {
 			pressureIndex = *cfg.PressureIndex
 		}
-		// Check load circuit-breaker
-		if paused, _ := s.IsModelLoadPaused(modelID); paused {
+		// A model is "remote-servable" right now if remote is allowed (kill-switch
+		// off) and it has a reachable remote instance with capacity. Such a model
+		// consumes ZERO spark VRAM and does not depend on a spark-local load, so
+		// the two SPARK-LOCAL gates below — the load circuit-breaker and the VRAM
+		// feasibility check — must not freeze it: a spark gemma load failure (e.g.
+		// 90GB won't fit while ltx2 holds the GPU) otherwise pauses gemma
+		// fleet-wide for minutes even though boringstack is healthy and could
+		// serve every queued job.
+		remoteServable := s.config.RemoteAllowedFor(modelID) && s.mgr.ModelHasReachableRemoteCapacity(modelID)
+		// Check load circuit-breaker (skip for remote-servable models: the breaker
+		// trips on spark-local load failures, which are irrelevant to a remote
+		// placement that needs no local load).
+		if paused, _ := s.IsModelLoadPaused(modelID); paused && !remoteServable {
 			full[modelID] = true
 			continue
 		}
@@ -860,7 +871,6 @@ func (s *Scheduler) getFullModels(bestModel string) map[string]bool {
 		// bypass, a remote-offloaded model (e.g. gemma on boringstack) gets
 		// starved behind local GPU pressure whenever spark is busy with CUDA
 		// work — exactly the contention the offload exists to avoid.
-		remoteServable := s.config.RemoteAllowedFor(modelID) && s.mgr.ModelHasReachableRemoteCapacity(modelID)
 		if !s.mgr.IsLoaded(modelID) && !remoteServable {
 			freeGB := s.mgr.FreeGB()
 			reclaimableGB := s.mgr.ReclaimableIdleGB(modelID)

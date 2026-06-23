@@ -683,6 +683,28 @@ func TestGetFullModelsBypassesVRAMForReachableRemote(t *testing.T) {
 	if !full["gemma"] {
 		t.Fatal("gemma must be VRAM-full when remote is kill-switched off (pins to spark, can't fit)")
 	}
+
+	// Re-enable remote, reachable. Now trip the LOAD circuit-breaker (simulating
+	// repeated spark-local gemma load failures). A remote-servable model must NOT
+	// be frozen by the spark-local breaker — boringstack can serve.
+	gemmaCfg.RemoteEnabled = nil // default true
+	cfg.Models["gemma"] = gemmaCfg
+	for i := 0; i < 5; i++ {
+		sched.RecordLoadFailure("gemma")
+	}
+	if paused, _ := sched.IsModelLoadPaused("gemma"); !paused {
+		t.Fatal("precondition: load circuit-breaker should be active after repeated failures")
+	}
+	full = sched.getFullModels("")
+	if full["gemma"] {
+		t.Fatal("gemma must NOT be full while load-CB is active but boringstack is reachable (remote needs no local load)")
+	}
+	// With boringstack unreachable, the load-CB pause applies normally.
+	mgr.SetReachabilityFunc(func(string) bool { return false })
+	full = sched.getFullModels("")
+	if !full["gemma"] {
+		t.Fatal("gemma must be full when load-CB is active AND no reachable remote (local-only, paused)")
+	}
 }
 
 func TestDispatchJobLeavesInsufficientMemoryQueued(t *testing.T) {
