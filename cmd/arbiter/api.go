@@ -337,6 +337,10 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, fmt.Sprintf("unknown job type: %s", req.Type))
 		return
 	}
+	if err := rejectSparkImageGeneration(req.Type, modelID); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
 	if _, ok := a.config.Models[modelID]; !ok {
 		writeError(w, 400, fmt.Sprintf("model not configured: %s", modelID))
 		return
@@ -490,6 +494,18 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		"model":             modelID,
 		"estimated_seconds": estimated / 1000,
 	})
+}
+
+func rejectSparkImageGeneration(jobType, modelID string) error {
+	if modelID == "z-image-turbo" {
+		return fmt.Errorf("z-image-turbo is permanently disabled on Spark; use the image server/Codex path")
+	}
+	switch jobType {
+	case "image-generate", "image-edit":
+		return fmt.Errorf("Spark image generation is permanently disabled; use the image server/Codex path")
+	default:
+		return nil
+	}
 }
 
 func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
