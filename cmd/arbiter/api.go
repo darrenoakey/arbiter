@@ -391,14 +391,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// --- Dedup check ---
-	var forceNew bool
-	{
-		var f struct {
-			Force bool `json:"force"`
-		}
-		json.Unmarshal(req.Params, &f)
-		forceNew = f.Force
-	}
+	forceNew := jobForceFlag(req.Params)
 	var dedupHash string
 	if !forceNew {
 		dedupHash = computeJobHash(req.Type, req.Params)

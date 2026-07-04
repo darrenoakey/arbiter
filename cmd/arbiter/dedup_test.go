@@ -124,6 +124,74 @@ func TestReconcileFollowingJobs(t *testing.T) {
 	}
 }
 
+// TestDedupRecoveredJobsCancelsPlainDuplicates verifies the base behaviour:
+// two content-identical queued jobs WITHOUT force → the later one is cancelled.
+func TestDedupRecoveredJobsCancelsPlainDuplicates(t *testing.T) {
+	store, _ := newTestStore(t)
+	payload := json.RawMessage(`{"prompt":"same"}`)
+
+	first, _ := store.CreateJob("z-image-turbo", "image-generate", payload, 1)
+	second, _ := store.CreateJob("z-image-turbo", "image-generate", payload, 1)
+
+	removed := store.DedupRecoveredJobs()
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+
+	firstAfter, _ := store.GetJob(first.ID)
+	if firstAfter.State != "queued" {
+		t.Fatalf("first job state = %s, want queued", firstAfter.State)
+	}
+	secondAfter, _ := store.GetJob(second.ID)
+	if secondAfter.State != "cancelled" || secondAfter.Error != "dedup: duplicate of "+first.ID {
+		t.Fatalf("second job = state %s error %q, want cancelled/dedup of %s",
+			secondAfter.State, secondAfter.Error, first.ID)
+	}
+}
+
+// TestDedupRecoveredJobsExemptsForceJobs mirrors the 2026-07-04 incident:
+// two content-identical queued jobs, BOTH force:true, the later one created
+// after the earlier. Recovery-time dedup must NOT cancel the later force job
+// (it deliberately opted out of dedup on the submit path), and must not treat
+// force jobs as canonical originals either.
+func TestDedupRecoveredJobsExemptsForceJobs(t *testing.T) {
+	store, _ := newTestStore(t)
+	forcePayload := json.RawMessage(`{"prompt":"denoise chunk","force":true}`)
+
+	// Earlier job (like 73a18713ca69 at 10:20) and later retry (like
+	// 1f6130b5c0ee at 12:50) — content-identical, both force:true.
+	earlier, _ := store.CreateJob("ltx2-dev-denoise", "video-generate", forcePayload, 1)
+	later, _ := store.CreateJob("ltx2-dev-denoise", "video-generate", forcePayload, 1)
+
+	// A plain (non-force) duplicate of the SAME content must still be cancelled,
+	// confirming the exemption is scoped to force jobs and the sweep still works.
+	plainPayload := json.RawMessage(`{"prompt":"denoise chunk"}`)
+	plainFirst, _ := store.CreateJob("ltx2-dev-denoise", "video-generate", plainPayload, 1)
+	plainDup, _ := store.CreateJob("ltx2-dev-denoise", "video-generate", plainPayload, 1)
+
+	store.DedupRecoveredJobs()
+
+	earlierAfter, _ := store.GetJob(earlier.ID)
+	if earlierAfter.State != "queued" {
+		t.Fatalf("earlier force job state = %s, want queued", earlierAfter.State)
+	}
+	laterAfter, _ := store.GetJob(later.ID)
+	if laterAfter.State != "queued" {
+		t.Fatalf("later force job state = %s (error %q), want queued — force jobs must survive recovery dedup",
+			laterAfter.State, laterAfter.Error)
+	}
+
+	plainFirstAfter, _ := store.GetJob(plainFirst.ID)
+	if plainFirstAfter.State != "queued" {
+		t.Fatalf("plain first job state = %s, want queued", plainFirstAfter.State)
+	}
+	plainDupAfter, _ := store.GetJob(plainDup.ID)
+	if plainDupAfter.State != "cancelled" || plainDupAfter.Error != "dedup: duplicate of "+plainFirst.ID {
+		t.Fatalf("plain duplicate = state %s error %q, want cancelled/dedup of %s",
+			plainDupAfter.State, plainDupAfter.Error, plainFirst.ID)
+	}
+}
+
 func TestRecoverFromCrashRequeuesRunningAndScheduled(t *testing.T) {
 	store, _ := newTestStore(t)
 	payload := json.RawMessage(`{"prompt":"recover"}`)

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"sort"
 	"strings"
@@ -17,6 +18,18 @@ import (
 // - Completed original → new job instantly completes with cached result
 // - In-flight original → new "follower" job waits for original
 // - Failed/cancelled original → treated as cache miss
+
+// jobForceFlag reports whether a job's params opted out of deduplication via
+// "force": true. This is the single accessor for the force flag; both the
+// submit path (api.go) and recovery-time dedup (DedupRecoveredJobs) use it so
+// the flag is read identically everywhere.
+func jobForceFlag(params json.RawMessage) bool {
+	var f struct {
+		Force bool `json:"force"`
+	}
+	json.Unmarshal(params, &f)
+	return f.Force
+}
 
 // computeJobHash produces a SHA256 hash of the job type + canonical params.
 // For *_file params, hashes file contents instead of the path.
@@ -345,6 +358,15 @@ func (s *Store) DedupRecoveredJobs() int {
 	now := nowTS()
 
 	for _, j := range jobs {
+		// Jobs submitted with force:true deliberately opted out of dedup on the
+		// submit path (api.go), so they must never be cancelled as a duplicate
+		// at recovery time either. Leave them queued and don't let them serve as
+		// the canonical "first" for others (they didn't register a dedup entry
+		// when submitted, so preserving that keeps recovery consistent with the
+		// live path).
+		if jobForceFlag(j.payload) {
+			continue
+		}
 		hash := computeJobHash(j.jobType, j.payload)
 		if firstID, exists := seen[hash]; exists {
 			// Duplicate — cancel it
@@ -354,6 +376,8 @@ func (s *Store) DedupRecoveredJobs() int {
 				now, "dedup: duplicate of "+firstID, j.id,
 			)
 			s.mu.Unlock()
+			slog.Info("dedup: cancelled recovered duplicate job",
+				"job_id", j.id, "duplicate_of", firstID, "job_type", j.jobType)
 			removed++
 		} else {
 			seen[hash] = j.id
