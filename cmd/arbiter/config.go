@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"time"
 )
 
 type ModelConfig struct {
@@ -134,6 +135,29 @@ type Config struct {
 	// for an instant, fleet-wide retreat to local (e.g. the whole LAN is flaky).
 	// Persisted so it survives restarts. Defaults to false (remote allowed).
 	RemoteDisabled bool `json:"remote_disabled,omitempty"`
+
+	// LLMCacheDisabled turns OFF the content-addressed chat-completion cache.
+	// The cache is ON by default: every identical chat call (any chat model)
+	// returns a stored JSON result without touching a model, and a nightly
+	// sweeper evicts entries not hit within the TTL. Set true only to disable.
+	LLMCacheDisabled bool `json:"llm_cache_disabled,omitempty"`
+	// LLMCacheTTLHours is the age (by mtime, refreshed on every hit) past which
+	// a cache entry is swept. 0 = default 32h. Negative is treated as default.
+	LLMCacheTTLHours float64 `json:"llm_cache_ttl_hours,omitempty"`
+}
+
+// LLMCacheEnabledOrDefault reports whether the chat-completion cache is on.
+// It is on unless explicitly disabled.
+func (c *Config) LLMCacheEnabledOrDefault() bool {
+	return !c.LLMCacheDisabled
+}
+
+// LLMCacheTTL is the sweep age for cache entries. Defaults to 32h.
+func (c *Config) LLMCacheTTL() time.Duration {
+	if c.LLMCacheTTLHours > 0 {
+		return time.Duration(c.LLMCacheTTLHours * float64(time.Hour))
+	}
+	return 32 * time.Hour
 }
 
 // RemoteAllowedFor reports whether a given model may use remote placements right

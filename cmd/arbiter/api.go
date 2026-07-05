@@ -60,6 +60,11 @@ type API struct {
 	// was requested and the last in-flight job has finished.
 	requestShutdown   func()
 	drainShutdownOnce sync.Once
+
+	// llmCache is the content-addressed on-disk cache for chat completions.
+	// Identical requests (any chat model) return the stored result without
+	// touching a model. nil when caching is disabled.
+	llmCache *LLMCache
 }
 
 // SetShutdownFunc wires the graceful-shutdown callback used by drain
@@ -134,7 +139,22 @@ func NewAPI(cfg *Config, store *Store, mgr *InstanceManager, sched *Scheduler, l
 		projectRoot: projectRoot,
 		startTime:   time.Now(),
 	}
+	if cfg.LLMCacheEnabledOrDefault() {
+		a.llmCache = NewLLMCache(
+			filepath.Join(projectRoot, "local", "llm-cache"),
+			cfg.LLMCacheTTL(),
+		)
+	}
 	return a
+}
+
+// StartLLMCacheSweeper launches the daily cache sweeper (with an immediate
+// startup sweep). No-op when caching is disabled. Called once from main.
+func (a *API) StartLLMCacheSweeper(stop <-chan struct{}) {
+	if a.llmCache == nil {
+		return
+	}
+	go a.llmCache.RunSweeper(stop)
 }
 
 func (a *API) Handler() http.Handler {
@@ -388,6 +408,27 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	if err := a.scheduler.ValidateJobInputs(req.Params); err != nil {
 		writeError(w, 400, err.Error())
 		return
+	}
+
+	// --- Content-addressed LLM cache check (async chat-completion path) ---
+	// For chat-completion jobs, an exactly-identical prior call returns a
+	// pre-completed job carrying the cached result WITHOUT touching a model.
+	// The result's mtime is bumped by Get() so the sweeper keeps it alive.
+	if a.llmCache != nil && (req.Type == "chat-completion" || req.Type == "chat-completion-stream") && !jobForceFlag(req.Params) {
+		if key, err := a.llmCache.Key(req.Params); err == nil {
+			if cached, ok := a.llmCache.Get(key); ok {
+				newJob, err := a.store.CreateJob(modelID, req.Type, req.Params, 0)
+				if err == nil {
+					a.store.UpdateState(newJob.ID, "completed", WithResult(cached), WithFinishedAt(nowTS()))
+					a.logger.Log("llm.cache_hit", map[string]any{"job_id": newJob.ID, "model": modelID, "async": true})
+					writeJSON(w, 200, map[string]any{
+						"job_id": newJob.ID, "status": "completed",
+						"model": modelID, "cached": true,
+					})
+					return
+				}
+			}
+		}
 	}
 
 	// --- Dedup check ---
@@ -1677,9 +1718,31 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// --- Content-addressed cache check (covers stream + non-stream) ---
+	// An exactly-identical prior call returns instantly without touching any
+	// model. The cache key strips the stream flag, so a streamed request replays
+	// the cached full completion as SSE. mtime is bumped on hit by Get().
+	cacheKey := ""
+	if a.llmCache != nil {
+		if k, err := a.llmCache.Key(body); err == nil {
+			cacheKey = k
+			if cached, ok := a.llmCache.Get(k); ok {
+				a.logger.Log("llm.cache_hit", map[string]any{"model": modelID, "stream": req.Stream})
+				if req.Stream {
+					replayCachedResultAsSSE(w, extractCachedResponse(cached))
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("X-Arbiter-Cache", "hit")
+					w.Write(extractCachedResponse(cached))
+				}
+				return
+			}
+		}
+	}
+
 	// Streaming: proxy directly to llama-server for SSE support
 	if req.Stream {
-		a.chatCompletionStream(w, r, modelID, body)
+		a.chatCompletionStreamCaching(w, r, modelID, body, cacheKey)
 		return
 	}
 
@@ -1710,11 +1773,16 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 			switch j.State {
 			case "completed":
 				if j.Result != nil {
+					// Write to cache on a successful, non-empty completion.
+					// storeChatResultIfCacheable refuses empty content, so we
+					// never cache blank replies.
+					a.storeChatResultIfCacheable(cacheKey, *j.Result)
 					var result map[string]any
 					json.Unmarshal(*j.Result, &result)
 					// Return the OpenAI response directly
 					if resp, ok := result["response"]; ok {
 						w.Header().Set("Content-Type", "application/json")
+						w.Header().Set("X-Arbiter-Cache", "miss")
 						if raw, ok := resp.(json.RawMessage); ok {
 							w.Write(raw)
 						} else {
@@ -1874,7 +1942,16 @@ func replayRemoteStream(w http.ResponseWriter, inst *Instance, body []byte) erro
 	if len(full) == 0 {
 		full = resp.Result
 	}
+	writeOpenAISSEFromResponse(w, full)
+	return nil
+}
 
+// writeOpenAISSEFromResponse emits a full OpenAI chat-completion JSON body as a
+// valid OpenAI SSE stream (role chunk, one content delta, finish chunk, [DONE]).
+// Shared by the remote-stream replay and the cache-hit stream replay so a
+// streamed request always gets the same shape whether the answer came from a
+// remote box or the on-disk cache.
+func writeOpenAISSEFromResponse(w http.ResponseWriter, full json.RawMessage) {
 	var chatResp struct {
 		ID      string `json:"id"`
 		Object  string `json:"object"`
@@ -1946,7 +2023,144 @@ func replayRemoteStream(w http.ResponseWriter, inst *Instance, body []byte) erro
 	if flusher != nil {
 		flusher.Flush()
 	}
-	return nil
+}
+
+// extractCachedResponse pulls the raw OpenAI response body out of a cached worker
+// result ({"format","response",...}). Falls back to the whole cached blob if it
+// has no "response" wrapper (defensive; all cached entries carry one).
+func extractCachedResponse(cached json.RawMessage) json.RawMessage {
+	var wrap struct {
+		Response json.RawMessage `json:"response"`
+	}
+	if err := json.Unmarshal(cached, &wrap); err == nil && len(wrap.Response) > 0 {
+		return wrap.Response
+	}
+	return cached
+}
+
+// replayCachedResultAsSSE replays a cached full completion to the client as an
+// OpenAI SSE stream and marks it a cache hit.
+func replayCachedResultAsSSE(w http.ResponseWriter, full json.RawMessage) {
+	w.Header().Set("X-Arbiter-Cache", "hit")
+	writeOpenAISSEFromResponse(w, full)
+}
+
+// chatResultHasContent reports whether a worker chat result carries non-empty
+// assistant content. Used to refuse caching blank/failed completions.
+func chatResultHasContent(result json.RawMessage) bool {
+	resp := extractCachedResponse(result)
+	var chatResp struct {
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				Reasoning string `json:"reasoning"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(resp, &chatResp); err != nil {
+		return false
+	}
+	if len(chatResp.Choices) == 0 {
+		return false
+	}
+	m := chatResp.Choices[0].Message
+	return m.Content != "" || m.Reasoning != ""
+}
+
+// storeChatResultIfCacheable writes a successful, non-empty chat result to the
+// cache. No-op when caching is off, the key is empty (unhashable request), or the
+// result has no content (never cache blanks/errors).
+func (a *API) storeChatResultIfCacheable(key string, result json.RawMessage) {
+	if a.llmCache == nil || key == "" {
+		return
+	}
+	if !chatResultHasContent(result) {
+		return
+	}
+	if err := a.llmCache.Put(key, result); err != nil {
+		slog.Warn("llmcache: put failed", "key", key, "error", err)
+	}
+}
+
+// chatCompletionStreamCaching wraps the streaming path with cache-write behavior.
+// A stream MISS is served by fetching the FULL completion once (as a non-stream
+// chat-completion job — reusing arbiter's scheduling), caching it, then replaying
+// it to the client as SSE. This makes streamed and non-streamed identical
+// requests share ONE cache entry (the stream flag is not part of the key). If
+// caching is disabled (empty key) it falls back to the live SSE proxy.
+func (a *API) chatCompletionStreamCaching(w http.ResponseWriter, r *http.Request, modelID string, body []byte, cacheKey string) {
+	if a.llmCache == nil || cacheKey == "" {
+		a.chatCompletionStream(w, r, modelID, body)
+		return
+	}
+
+	// Strip the stream flag and run as a normal (non-stream) job so we obtain the
+	// full completion to cache, then replay it as SSE.
+	nonStreamBody := stripStreamFlag(body)
+	priority := a.scheduler.computePriority(modelID)
+	job, err := a.store.CreateJob(modelID, "chat-completion", json.RawMessage(nonStreamBody), priority)
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("create job: %s", err))
+		return
+	}
+	a.scheduler.Wake()
+
+	timeout := time.After(15 * time.Minute)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-timeout:
+			writeError(w, 504, "chat completion timed out")
+			return
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			j, _ := a.store.GetJob(job.ID)
+			if j == nil {
+				continue
+			}
+			switch j.State {
+			case "completed":
+				if j.Result != nil {
+					a.storeChatResultIfCacheable(cacheKey, *j.Result)
+					replayCachedResultAsSSE2(w, extractCachedResponse(*j.Result))
+					return
+				}
+				writeError(w, 500, "no result")
+				return
+			case "failed":
+				writeError(w, 500, j.Error)
+				return
+			case "cancelled":
+				writeError(w, 499, "request cancelled")
+				return
+			}
+		}
+	}
+}
+
+// replayCachedResultAsSSE2 replays a freshly-computed (miss) completion as SSE
+// with a miss marker.
+func replayCachedResultAsSSE2(w http.ResponseWriter, full json.RawMessage) {
+	w.Header().Set("X-Arbiter-Cache", "miss")
+	writeOpenAISSEFromResponse(w, full)
+}
+
+// stripStreamFlag returns body with any "stream" field removed so a streamed
+// request can be executed as a normal non-streaming job. Falls back to the
+// original body if it is not a JSON object.
+func stripStreamFlag(body []byte) []byte {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	delete(m, "stream")
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // --- Admin ---

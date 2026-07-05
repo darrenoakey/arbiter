@@ -177,6 +177,11 @@ func main() {
 	// API
 	api := NewAPI(cfg, store, mgr, sched, eventLog, outputDir, projectRoot)
 
+	// Wire the content-addressed chat cache (owned by the API) into the
+	// scheduler so async chat-completion jobs populate the same cache the sync
+	// path reads, and start the daily sweeper (with an immediate startup sweep).
+	sched.SetLLMCache(api.llmCache)
+
 	// Per-host liveness monitor (Phase 3): polls every remote host's
 	// /api/version, flips it absent on consecutive failures (firing the active-
 	// cancel hook so failover is fast), and exposes the reachability predicate
@@ -201,6 +206,8 @@ func main() {
 	go sched.RunInboxWatchdog(ctx)
 	go NewMemoryWatchdog(cfg, mgr, eventLog, projectRoot).Run(ctx, 30*time.Second)
 	go NewEmergencyGuardian(cfg, mgr, eventLog).Run(ctx, 0)
+	// LLM chat cache sweeper: immediate startup sweep + daily thereafter.
+	api.StartLLMCacheSweeper(ctx.Done())
 	if cfg.ShareMount != "" {
 		// Probe the mount root itself — contains inbox/ and output/ subdirs,
 		// so ReadDir always gets a real server round-trip.

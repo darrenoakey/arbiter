@@ -14,12 +14,16 @@ import (
 )
 
 type Scheduler struct {
-	config       *Config
-	store        *Store
-	mgr          *InstanceManager
-	logger       *EventLogger
-	outputDir    string
-	inboxDir     string // if set, input files are deleted after job completion/failure
+	config    *Config
+	store     *Store
+	mgr       *InstanceManager
+	logger    *EventLogger
+	outputDir string
+	inboxDir  string // if set, input files are deleted after job completion/failure
+	// llmCache, when set, receives successful chat-completion results so the
+	// async /v1/jobs chat path populates the same content-addressed cache the
+	// sync /v1/chat/completions path uses. nil disables cache writes.
+	llmCache     *LLMCache
 	wake         chan struct{}
 	shuttingDown atomic.Bool
 	// draining: when set, the scheduler stops starting NEW jobs (queued jobs
@@ -148,6 +152,35 @@ func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *Event
 		inFlight:                 make(map[string]inFlightJob),
 		starvedSince:             make(map[string]time.Time),
 		failoverAttempts:         make(map[string]int),
+	}
+}
+
+// SetLLMCache wires the content-addressed chat cache so successful async
+// chat-completion jobs populate the same cache the sync path reads. Called once
+// from main after the API (which owns the cache) is built.
+func (s *Scheduler) SetLLMCache(c *LLMCache) {
+	s.llmCache = c
+}
+
+// cacheChatResult stores a successful chat-completion job's result in the
+// content-addressed cache, keyed on the job's request payload. No-op for
+// non-chat job types, when caching is off, or when the result has no content.
+func (s *Scheduler) cacheChatResult(job *Job, result json.RawMessage) {
+	if s.llmCache == nil {
+		return
+	}
+	if job.JobType != "chat-completion" && job.JobType != "chat-completion-stream" {
+		return
+	}
+	key, err := s.llmCache.Key(job.Payload)
+	if err != nil {
+		return
+	}
+	if !chatResultHasContent(result) {
+		return
+	}
+	if err := s.llmCache.Put(key, result); err != nil {
+		slog.Warn("llmcache: async put failed", "job", job.ID, "error", err)
 	}
 }
 
@@ -1327,6 +1360,7 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 			resp.Result = rewriteResultPaths(resp.Result, jobDir, newDir)
 		}
 		s.store.UpdateState(job.ID, "completed", WithResult(resp.Result), WithFinishedAt(nowTS()))
+		s.cacheChatResult(job, resp.Result)
 		rssEntry := map[string]any{
 			"job_id":            job.ID,
 			"model_id":          job.ModelID,
