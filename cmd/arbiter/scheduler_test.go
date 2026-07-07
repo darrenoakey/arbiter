@@ -1561,6 +1561,7 @@ func TestIsClientErrorClassifiesBadInput(t *testing.T) {
 		"InferenceError: bad input image (cannot decode — corrupt or unsupported format): boom",
 		"PIL.UnidentifiedImageError: cannot identify image file <_io.BytesIO object>",
 		"job rejected: 1 input path(s) unreadable: /x: no such file or directory",
+		"RuntimeError: No faces detected in any frame",
 	}
 	for _, e := range clientErrs {
 		if !isClientError(e) {

@@ -2421,6 +2421,7 @@ func isClientError(s string) bool {
 		strings.Contains(low, "cannot identify image file"),
 		strings.Contains(low, "unidentifiedimageerror"),
 		strings.Contains(low, "cannot decode"),
+		strings.Contains(low, "no faces detected"),
 		strings.Contains(low, "invalid argument") && strings.Contains(low, "/mnt/") ||
 			strings.Contains(low, "invalid argument") && strings.Contains(low, "/output/"),
 		strings.Contains(low, "[errno 2]"),
