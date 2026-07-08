@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-SPARK=darren@spark
+SPARK=${SPARK:-darren@10.0.0.254}
 REMOTE=/home/darren/src/arbiter
 
 cd "$(dirname "$0")"
