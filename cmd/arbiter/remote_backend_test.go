@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -284,6 +285,63 @@ func TestPickInstanceForJobHonorsExcludedHosts(t *testing.T) {
 	}
 }
 
+func TestPickInstanceForJobSpillsFromBusyLocalToRemote(t *testing.T) {
+	cfg := &Config{
+		VRAMBudgetGB: 100,
+		Hosts: map[string]HostConfig{
+			"boringstack": {Addr: "http://10.255.255.1:11434", Kind: "mlx", BudgetGB: 96},
+			"darrens-mbp": {Addr: "http://10.255.255.2:11434", Kind: "mlx", BudgetGB: 40},
+		},
+		Models: map[string]ModelConfig{
+			"ltx2-dev-denoise1": {
+				MemoryGB: 80, MaxConcurrent: 1, MaxInstances: intPtr(1),
+				PressureIndex: pi(),
+			},
+			"llm:gemma4-26b": {
+				MemoryGB: 10, MaxConcurrent: 1, MaxInstances: intPtr(1),
+				PressureIndex: pi(),
+				Placements:    []string{"spark", "boringstack", "darrens-mbp"},
+			},
+		},
+	}
+	mgr := NewInstanceManager(cfg, "python3", t.TempDir())
+	setupInstances(cfg, mgr, "python3", t.TempDir())
+	mgr.SetReachabilityFunc(func(string) bool { return true })
+
+	markLoaded(t, mgr, "ltx2-dev-denoise1")
+	blocker := mgr.GetModelInstances("ltx2-dev-denoise1")[0]
+	atomic.AddInt32(&blocker.activeJobs, 1)
+
+	job := &Job{ID: "j1", ModelID: "llm:gemma4-26b", State: "queued"}
+	got, reason := mgr.PickInstanceForJobWithReason(job, true)
+	if got == nil || got.host != "boringstack" {
+		t.Fatalf("spark-busy pick host=%v, want boringstack", hostOf(got))
+	}
+	if reason != reasonSpill {
+		t.Fatalf("spark-busy placement reason=%q, want %q", reason, reasonSpill)
+	}
+
+	atomic.AddInt32(&got.activeJobs, 1)
+	got.setState("loaded")
+	got2, reason2 := mgr.PickInstanceForJobWithReason(&Job{ID: "j2", ModelID: "llm:gemma4-26b", State: "queued"}, true)
+	if got2 == nil || got2.host != "darrens-mbp" {
+		t.Fatalf("boringstack-full pick host=%v, want darrens-mbp", hostOf(got2))
+	}
+	if reason2 != reasonSpill {
+		t.Fatalf("boringstack-full placement reason=%q, want %q", reason2, reasonSpill)
+	}
+
+	atomic.AddInt32(&got2.activeJobs, 1)
+	got2.setState("loaded")
+	got3, reason3 := mgr.PickInstanceForJobWithReason(&Job{ID: "j3", ModelID: "llm:gemma4-26b", State: "queued"}, true)
+	if got3 == nil || got3.host != "spark" {
+		t.Fatalf("all-remotes-full pick host=%v, want spark fallback", hostOf(got3))
+	}
+	if reason3 != reasonPreferred {
+		t.Fatalf("all-remotes-full placement reason=%q, want %q", reason3, reasonPreferred)
+	}
+}
+
 func hostOf(inst *Instance) string {
 	if inst == nil {
 		return "<nil>"
@@ -319,9 +377,9 @@ func TestLateResponseDoesNotResurrectTerminalJob(t *testing.T) {
 	// A LATE response from the originally-dispatched (dead) host tries to write a
 	// second result and/or move the job back to running. Both must be rejected.
 	loser := json.RawMessage(`{"format":"json","text":"LATE_LOSER"}`)
-	store.UpdateState(job.ID, "running")                                    // terminal→active: rejected
-	store.UpdateState(job.ID, "completed", WithResult(loser))               // overwrite attempt
-	store.UpdateState(job.ID, "queued", WithClearStartedAt())               // failover-requeue race
+	store.UpdateState(job.ID, "running")                      // terminal→active: rejected
+	store.UpdateState(job.ID, "completed", WithResult(loser)) // overwrite attempt
+	store.UpdateState(job.ID, "queued", WithClearStartedAt()) // failover-requeue race
 
 	final, _ := store.GetJob(job.ID)
 	if final.State != "completed" {

@@ -903,14 +903,14 @@ func TestEvictForGBWithQueueInfoPrefersNoQueue(t *testing.T) {
 func TestReadLoopCleansUpPIDOnSubprocessDeath(t *testing.T) {
 	projectRoot := t.TempDir()
 
-	// Worker that dies immediately on load
+	// Worker that loads successfully, then dies on the next command.
 	workerPath := filepath.Join(projectRoot, "die_on_load.py")
 	workerScript := `import json, sys
 for line in sys.stdin:
     msg = json.loads(line)
     if msg.get("cmd") == "load":
         print(json.dumps({"status": "ok", "req_id": msg.get("req_id", "_default")}), flush=True)
-        sys.stdout.flush()
+    elif msg.get("cmd") == "die":
         import os; os._exit(1)
 `
 	os.WriteFile(workerPath, []byte(workerScript), 0o755)
@@ -921,8 +921,9 @@ for line in sys.stdin:
 	if err := inst.Load("cuda"); err != nil {
 		t.Fatalf("load failed: %v", err)
 	}
+	_, _ = inst.sendAndReceive(map[string]any{"cmd": "die"})
 
-	// Wait for readLoop to detect the subprocess death (could race with Load returning)
+	// Wait for readLoop to detect the subprocess death.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if inst.State() == "error" {

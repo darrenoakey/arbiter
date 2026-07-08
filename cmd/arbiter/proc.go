@@ -58,8 +58,8 @@ type Instance struct {
 	// contention (e.g. gemma fallback while ltx2 holds the GPU).
 	lastLoadInsufficientMem atomic.Bool
 	lastActive              time.Time
-	memoryGB     float64
-	vramHeld     bool // true while this instance's memoryGB is counted in InstanceManager.usedGB
+	memoryGB                float64
+	vramHeld                bool // true while this instance's memoryGB is counted in InstanceManager.usedGB
 	// manager is set by InstanceManager.Register. markSubprocessExited needs it
 	// to decrement usedGB in the same breath that it clears vramHeld — clearing
 	// the flag alone strands the reservation until the 15s reconciler, and the
@@ -1000,6 +1000,10 @@ func (m *InstanceManager) ModelHasAnyCapacity(modelID string) bool {
 			}
 		case "unloaded", "stopped":
 			return true
+		case "error":
+			if inst.HasCapacity() {
+				return true
+			}
 		}
 	}
 	return false
@@ -1029,8 +1033,12 @@ func (m *InstanceManager) ModelHasReachableRemoteCapacity(modelID string) bool {
 			if inst.HasCapacity() {
 				return true
 			}
-		case "unloaded", "stopped", "error":
+		case "unloaded", "stopped":
 			return true
+		case "error":
+			if inst.HasCapacity() {
+				return true
+			}
 		}
 	}
 	return false
@@ -1100,9 +1108,15 @@ func pickFromPool(pool []*Instance) *Instance {
 		}
 	}
 
-	// 4. All errored — return first for retry. Only reachable when no
-	// instance is loaded, loading, unloaded, or stopped.
-	return pool[0]
+	// 4. Errored with capacity — retry only actual errored instances. A loaded
+	// instance at MaxConcurrent must not fall through and get overfilled.
+	for _, inst := range pool {
+		if inst.State() == "error" && inst.HasCapacity() {
+			return inst
+		}
+	}
+
+	return nil
 }
 
 // PickInstanceForJob is the host-aware picker used by the dispatch path. It
@@ -1181,6 +1195,14 @@ func (m *InstanceManager) PickInstanceForJobWithReason(job *Job, remoteEnabled b
 			skippedHigher = true
 			continue
 		}
+		if isLocal && m.localColdStartShouldSpillLocked(job, inst, remoteEnabled) {
+			skippedHigher = true
+			continue
+		}
+		if !m.instanceCanAcceptPlacementLocked(job.ModelID, inst) {
+			skippedHigher = true
+			continue
+		}
 		if picked := pickFromPool([]*Instance{inst}); picked != nil {
 			// pickFromPool on a single-element pool returns that instance only
 			// when it has capacity / can cold-start; a returned errored
@@ -1196,6 +1218,56 @@ func (m *InstanceManager) PickInstanceForJobWithReason(job *Job, remoteEnabled b
 		skippedHigher = true
 	}
 	return nil, ""
+}
+
+func (m *InstanceManager) localColdStartShouldSpillLocked(job *Job, inst *Instance, remoteEnabled bool) bool {
+	state := inst.State()
+	if state == "loaded" || state == "loading" {
+		return false
+	}
+	if !remoteEnabled || !m.localHostHasActiveJobsLocked(job.ModelID) {
+		return false
+	}
+	return m.jobHasPickableRemotePlacementLocked(job, remoteEnabled)
+}
+
+func (m *InstanceManager) localHostHasActiveJobsLocked(excludeModelID string) bool {
+	for _, inst := range m.instances {
+		if inst.isRemote() || inst.ModelID == excludeModelID {
+			continue
+		}
+		if inst.ActiveJobs() > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *InstanceManager) jobHasPickableRemotePlacementLocked(job *Job, remoteEnabled bool) bool {
+	if !remoteEnabled {
+		return false
+	}
+	mc, ok := m.config.Models[job.ModelID]
+	if !ok {
+		return false
+	}
+	for _, host := range mc.PlacementsOrDefault() {
+		if m.config.HostIsLocal(host) || job.HostExcluded(host) || !m.hostReachable(host) {
+			continue
+		}
+		inst := m.instanceForHostLocked(job.ModelID, host)
+		if inst != nil && pickFromPool([]*Instance{inst}) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *InstanceManager) instanceCanAcceptPlacementLocked(modelID string, inst *Instance) bool {
+	if inst.isRemote() || inst.State() == "loaded" || inst.State() == "loading" {
+		return true
+	}
+	return inst.memoryGB <= m.freeGBLocked()+m.reclaimableIdleGBLocked(modelID)+1e-9
 }
 
 // pickFromModelLocked is the flat (host-agnostic) pick over all of a model's
@@ -1239,7 +1311,7 @@ func (m *InstanceManager) IsLoaded(modelID string) bool {
 func (m *InstanceManager) FreeGB() float64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.budgetGB - m.usedGB - m.reservedGB
+	return m.freeGBLocked()
 }
 
 // ReclaimableIdleGB returns the total VRAM (GB) currently held by loaded
@@ -1251,14 +1323,17 @@ func (m *InstanceManager) FreeGB() float64 {
 // model and must not count its own idle residency toward "can it fit".
 func (m *InstanceManager) ReclaimableIdleGB(excludeModelID string) float64 {
 	m.mu.RLock()
-	insts := make([]*Instance, 0, len(m.instances))
-	for _, inst := range m.instances {
-		insts = append(insts, inst)
-	}
-	m.mu.RUnlock()
+	defer m.mu.RUnlock()
+	return m.reclaimableIdleGBLocked(excludeModelID)
+}
 
+func (m *InstanceManager) freeGBLocked() float64 {
+	return m.budgetGB - m.usedGB - m.reservedGB
+}
+
+func (m *InstanceManager) reclaimableIdleGBLocked(excludeModelID string) float64 {
 	var total float64
-	for _, inst := range insts {
+	for _, inst := range m.instances {
 		if inst.ModelID == excludeModelID {
 			continue
 		}
