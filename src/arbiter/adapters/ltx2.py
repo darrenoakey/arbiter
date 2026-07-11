@@ -11,23 +11,20 @@ Expected params dict:
     segments       : list[dict]   — [{description, start_time, end_time, start_image_b64, end_image_b64}, ...]
     audio_b64      : str          — base64-encoded audio file (mp3/wav/flac)
     resolution     : str          — "small" | "small-portrait" | "large" | "large-portrait"
-    fps            : int          — frame rate (default 24)
+    fps            : int          — native frame rate (25)
     seed           : int          — RNG seed (default 42)
     chunk_frames   : int          — frames per chunk (default 121)
 """
 from __future__ import annotations
 
 import base64
-import gc
 import io
 import logging
 import subprocess
 import sys
 import tempfile
 import threading
-import time
 from pathlib import Path
-from typing import Any
 
 from arbiter.adapters.base import (
     CancelledException,
@@ -35,6 +32,7 @@ from arbiter.adapters.base import (
     InferenceError,
     LoadError,
 )
+from arbiter.adapters.ltx2_clock import native_frame_rate
 from arbiter.adapters.registry import register
 
 log = logging.getLogger(__name__)
@@ -133,7 +131,9 @@ def _assemble_mp4(
 
 def _assemble_single_chunk_mp4(frames, audio_path, start_time, end_time, output_path, fps):
     """Assemble numpy frames + audio slice into an mp4."""
-    import subprocess, tempfile, os
+    import os
+    import subprocess
+    import tempfile
     tmp_vid = tempfile.mktemp(suffix=".mp4")
     h, w = frames.shape[1], frames.shape[2]
     proc = subprocess.Popen(
@@ -247,9 +247,6 @@ class LTX2Adapter(GroupAdapter):
           3. Run FastPipeline.generate_all_chunks (phases 1-7)
           4. Assemble .npy chunks into result.mp4
         """
-        import numpy as np
-        from PIL import Image
-
         if self._pipeline is None:
             raise InferenceError("LTX-2 pipeline not loaded — call load() first")
 
@@ -264,7 +261,10 @@ class LTX2Adapter(GroupAdapter):
         segments = params.get("segments", [])
         audio_b64 = params.get("audio_b64", "")
         resolution = params.get("resolution", "large")
-        fps = int(params.get("fps", 24))
+        try:
+            fps = native_frame_rate(params)
+        except ValueError as error:
+            raise InferenceError(str(error)) from error
         seed = int(params.get("seed", 42))
         chunk_frames = int(params.get("chunk_frames", 121))
 
@@ -400,8 +400,11 @@ class LTX2Adapter(GroupAdapter):
 
     def _infer_single_chunk(self, params, output_dir, cancel_flag):
         """Fast path: generate a single chunk with all models pre-loaded."""
-        import base64, numpy as np, tempfile, shutil
-        from pathlib import Path
+        import base64
+        import shutil
+        import tempfile
+
+        import numpy as np
         from PIL import Image
 
         seg = params["segments"][0]
@@ -474,7 +477,6 @@ class LTX2Adapter(GroupAdapter):
         frames = np.load(output_npy)
         result_path = output_dir / "result.mp4"
 
-        from ltx_pipelines.utils.media_io import decode_audio_from_file
         _assemble_single_chunk_mp4(frames, audio_path, start_time, end_time, str(result_path), fps)
 
         shutil.rmtree(tmp, ignore_errors=True)
@@ -494,10 +496,10 @@ class LTX2Adapter(GroupAdapter):
 
     def estimate_time(self, params: dict) -> float:
         """Rough estimate: ~800 ms per output frame."""
-        from constants import RESOLUTION_PRESETS
-
-        resolution = params.get("resolution", "large")
-        fps = int(params.get("fps", 24))
+        try:
+            fps = native_frame_rate(params)
+        except ValueError as error:
+            raise InferenceError(str(error)) from error
         chunk_frames = int(params.get("chunk_frames", 121))
         segments = params.get("segments", [])
 

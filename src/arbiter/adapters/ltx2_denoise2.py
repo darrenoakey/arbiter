@@ -35,6 +35,7 @@ from arbiter.adapters.base import (
     LoadError,
 )
 from arbiter.adapters.registry import register
+from arbiter.adapters.ltx2_clock import native_frame_rate
 
 log = logging.getLogger(__name__)
 
@@ -141,8 +142,6 @@ class LTX2Denoise2Adapter(GroupAdapter):
         self._cleanup_gpu()
 
     def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
-        import numpy as np
-
         if self._pipeline is None:
             raise InferenceError("denoise2 pipeline not loaded")
 
@@ -160,7 +159,10 @@ class LTX2Denoise2Adapter(GroupAdapter):
 
         start_time = float(params.get("start_time", 0.0))
         end_time = float(params.get("end_time", 0.0))
-        fps = int(params.get("fps", 24))
+        try:
+            fps = native_frame_rate(params)
+        except ValueError as error:
+            raise InferenceError(str(error)) from error
 
         output_dir.mkdir(parents=True, exist_ok=True)
         tmp_npy = str(output_dir / "frames.npy")

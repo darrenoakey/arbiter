@@ -185,7 +185,7 @@ class FaceRestoreCodeFormerAdapter(ModelAdapter):
         width = int(w_str)
         height = int(h_str)
         fr_num, fr_den = fps_str.split("/")
-        fps = float(fr_num) / float(fr_den) if float(fr_den) > 0 else 24.0
+        fps = float(fr_num) / float(fr_den) if float(fr_den) > 0 else 25.0
         frame_bytes = width * height * 3
 
         log.info(

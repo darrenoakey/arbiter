@@ -252,7 +252,7 @@ class VideoGenerateParams(BaseModel):
     segments: list[VideoSegmentParams]
     audio_b64: str  # base64-encoded audio file
     resolution: str = "large"
-    fps: int = 24
+    fps: int = 25
     seed: int = 42
     chunk_frames: int = 121
 

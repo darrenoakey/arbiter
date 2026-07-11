@@ -29,6 +29,7 @@ from arbiter.adapters.base import (
     LoadError,
 )
 from arbiter.adapters.registry import register
+from arbiter.adapters.ltx2_clock import lattice_frame_count, native_frame_rate
 
 log = logging.getLogger(__name__)
 
@@ -103,14 +104,19 @@ class LTX2EncodeAdapter(GroupAdapter):
 
         start_time = float(params.get("start_time", 0.0))
         end_time = float(params.get("end_time", 0.0))
-        fps = int(params.get("fps", 24))
+        try:
+            fps = native_frame_rate(params)
+        except ValueError as error:
+            raise InferenceError(str(error)) from error
         seed = int(params.get("seed", 42))
         chunk_index = int(params.get("chunk_index", 0))
 
-        num_frames = max(1, round((end_time - start_time) * fps))
-        if num_frames % 2 == 0:
-            num_frames += 1
-        start_frame = round(start_time * fps)
+        try:
+            num_frames = lattice_frame_count(params, fps, start_time, end_time)
+        except ValueError as error:
+            raise InferenceError(str(error)) from error
+        start_frame_value = params.get("start_frame")
+        start_frame = int(start_frame_value) if start_frame_value is not None else round(start_time * fps)
 
         chunk = {
             "index": chunk_index,
