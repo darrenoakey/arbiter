@@ -31,6 +31,72 @@ for line in sys.stdin:
 	}
 }
 
+// newRemotePlacementScheduler builds a scheduler over the remote-only /
+// mixed-placement config used by the placement regression tests.
+func newRemotePlacementScheduler(t *testing.T) (*Scheduler, *Store, *InstanceManager) {
+	t.Helper()
+	projectRoot := t.TempDir()
+	outputDir := filepath.Join(projectRoot, "output")
+	if err := os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755); err != nil {
+		t.Fatalf("mkdir output jobs: %v", err)
+	}
+	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	cfg := remotePlacementTestConfig()
+	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
+	t.Cleanup(func() { logger.Close() })
+	mgr := NewInstanceManager(cfg, "python3", projectRoot)
+	setupInstances(cfg, mgr, "python3", projectRoot)
+	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+	return sched, store, mgr
+}
+
+func TestRequeueNoInstanceSetsModelCooldown(t *testing.T) {
+	sched, store, _ := newRemotePlacementScheduler(t)
+
+	job, err := store.CreateJob("llm:remote-chat", "chat-completion", json.RawMessage(`{}`), 1)
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	store.UpdateState(job.ID, "scheduled", WithStartedAt(nowTS()))
+
+	sched.requeueNoInstance(job)
+
+	after, _ := store.GetJob(job.ID)
+	if after.State != "queued" {
+		t.Fatalf("job state = %s, want queued", after.State)
+	}
+	// The model must be on dispatch cooldown so the 100ms tick doesn't hot-loop
+	// re-picking the same unschedulable job (starving every other model).
+	full := sched.getFullModels("")
+	if !full["llm:remote-chat"] {
+		t.Fatal("model not on cooldown after no-instance requeue — scheduler would hot-loop")
+	}
+}
+
+func TestPreloadSkipsAbsentRemoteHost(t *testing.T) {
+	sched, store, mgr := newRemotePlacementScheduler(t)
+
+	// Every remote host is confirmed absent.
+	mgr.SetReachabilityFunc(func(string) bool { return false })
+
+	if _, err := store.CreateJob("llm:remote-chat", "chat-completion", json.RawMessage(`{}`), 1); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	sched.tryPreload()
+	time.Sleep(200 * time.Millisecond) // a buggy preload flips state async
+
+	for _, inst := range mgr.GetModelInstances("llm:remote-chat") {
+		if st := inst.State(); st != "stopped" {
+			t.Fatalf("instance %s state = %s after preload against absent host, want stopped", inst.InstanceID, st)
+		}
+	}
+}
+
 func TestDispatchJobPromotesFollowerWhenWorkerDies(t *testing.T) {
 	projectRoot := t.TempDir()
 	outputDir := filepath.Join(projectRoot, "output")

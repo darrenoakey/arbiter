@@ -1464,6 +1464,24 @@ func (s *Scheduler) dispatchStreamHandoff(job *Job, inst *Instance) {
 	}
 }
 
+// requeueNoInstance puts a picked job back on the queue when no instance can
+// host it (every placement absent, kill-switched, excluded, or at capacity) and
+// puts its model on a short dispatch cooldown. Without the cooldown the 100ms
+// tick re-picks this same oldest job forever — a ~10/sec hot loop that also
+// starves every other model queued behind the unschedulable one. The cooldown
+// marks the model "full" for a few seconds so the rest of the queue keeps
+// flowing while the blocking condition clears; a host recovery wakes the
+// scheduler explicitly, so added latency on recovery stays near zero.
+func (s *Scheduler) requeueNoInstance(job *Job) {
+	slog.Info("scheduler.requeue: no instance available",
+		"job", job.ID, "model", job.ModelID,
+		"reason", "PickInstanceForJob returned nil — all eligible hosts at max_concurrent, excluded, or absent")
+	s.store.UpdateState(job.ID, "queued")
+	s.cooldownMu.Lock()
+	s.cooldownUntil[job.ModelID] = time.Now().Add(3 * time.Second)
+	s.cooldownMu.Unlock()
+}
+
 // tryPreload speculatively loads the next needed instance in the background.
 // tryPreload speculatively loads every model that has queued work and fits
 // in remaining free VRAM. Spare GPU memory is wasted memory — if there's
@@ -1500,6 +1518,12 @@ func (s *Scheduler) tryPreload() {
 		}
 		inst := s.mgr.PickInstance(modelID)
 		if inst == nil {
+			continue
+		}
+		// PickInstance is host-blind; never speculatively warm an instance on a
+		// confirmed-absent host — the load fails instantly (connection refused)
+		// and the health watchdog then churns the instance error→reset forever.
+		if inst.isRemote() && !s.mgr.hostReachable(inst.host) {
 			continue
 		}
 		state := inst.State()
@@ -1619,10 +1643,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 		// reachable final link.
 		inst, placeReason := s.mgr.PickInstanceForJobWithReason(job, s.config.RemoteAllowedFor(job.ModelID))
 		if inst == nil {
-			slog.Info("scheduler.requeue: no instance available",
-				"job", job.ID, "model", job.ModelID,
-				"reason", "PickInstanceForJob returned nil — all eligible hosts at max_concurrent, excluded, or absent")
-			s.store.UpdateState(job.ID, "queued")
+			s.requeueNoInstance(job)
 			continue
 		}
 		inst.setPlacementReason(placeReason)

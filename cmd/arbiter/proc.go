@@ -2505,7 +2505,14 @@ func (m *InstanceManager) ScaleModel(modelID string, newCount int, cfg ModelConf
 	}
 
 	if newCount > currentCount {
-		// Scale up
+		// Scale up. A model whose placement chain has no local host gets no
+		// local pool — its capacity lives on the fleet placements. Creating a
+		// local worker here (e.g. the auto-wake guard un-parking a remote-only
+		// LLM) would spawn a Python adapter with no implementation for the
+		// model, which just crash-loops "Unknown model" against the registry.
+		if !m.config.HasLocalPlacement(cfg) {
+			return result
+		}
 		nextIdx := m.nextInstanceIndex(modelID)
 		for i := 0; i < newCount-currentCount; i++ {
 			idx := nextIdx + i

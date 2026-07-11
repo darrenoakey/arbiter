@@ -189,6 +189,26 @@ func TestReloadModelHealsMissingRemotePlacements(t *testing.T) {
 	}
 }
 
+func TestScaleModelCreatesNoLocalPoolForRemoteOnlyModel(t *testing.T) {
+	cfg := remotePlacementTestConfig()
+	mgr := NewInstanceManager(cfg, "python3", t.TempDir())
+	setupInstances(cfg, mgr, "python3", t.TempDir())
+
+	// The auto-wake guard un-parks a model by calling ScaleModel(1). For a
+	// remote-only model that must NOT create a local "#0" worker — there is
+	// no local adapter for it, so the worker would crash-loop.
+	mcfg := cfg.Models["llm:remote-chat"]
+	result := mgr.ScaleModel("llm:remote-chat", 1, mcfg)
+	if result["added"].(int) != 0 {
+		t.Fatalf("scale-up added %v local instances for a remote-only model, want 0", result["added"])
+	}
+	for _, inst := range mgr.GetModelInstances("llm:remote-chat") {
+		if !inst.isRemote() {
+			t.Fatalf("local instance %s exists for remote-only model", inst.InstanceID)
+		}
+	}
+}
+
 func TestHardKillModelRecreatesConfiguredSlots(t *testing.T) {
 	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 70}, "python3", t.TempDir())
 	cfg := ModelConfig{
