@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import gc
 import io
 import logging
@@ -16,6 +17,45 @@ if TYPE_CHECKING:
     from PIL import Image
 
 _base_log = logging.getLogger(__name__)
+
+
+class HeapTrimGuard:
+    """Return freed glibc heap pages while a unified-memory model loads."""
+
+    def __init__(self, interval_seconds: float = 0.25):
+        self._interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.trim_count = 0
+
+    def __enter__(self) -> "HeapTrimGuard":
+        trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+        if trim is None:
+            return self
+        trim.argtypes = [ctypes.c_size_t]
+        trim.restype = ctypes.c_int
+
+        def trim_loop() -> None:
+            while not self._stop.wait(self._interval_seconds):
+                trim(0)
+                self.trim_count += 1
+
+        self._thread = threading.Thread(
+            target=trim_loop,
+            name="arbiter-heap-trim",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self._interval_seconds * 4))
+        trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+        if trim is not None:
+            trim(0)
+            self.trim_count += 1
 
 
 class ModelState(str, Enum):

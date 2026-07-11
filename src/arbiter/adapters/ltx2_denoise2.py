@@ -31,6 +31,7 @@ from pathlib import Path
 from arbiter.adapters.base import (
     CancelledException,
     GroupAdapter,
+    HeapTrimGuard,
     InferenceError,
     LoadError,
 )
@@ -116,8 +117,9 @@ class LTX2Denoise2Adapter(GroupAdapter):
             # Pre-load stage-2 transformer + video decoder so they are cached
             # across chunks (key speedup — 40GB of weights stay resident).
             log.info("LTX2-denoise2: pre-loading stage-2 transformer + decoder")
-            self._pipeline._s2_transformer = self._pipeline.stage_2_ledger.transformer()
-            self._pipeline._s2_decoder = self._pipeline.stage_1_ledger.video_decoder()
+            with HeapTrimGuard():
+                self._pipeline._s2_transformer = self._pipeline.stage_2_ledger.transformer()
+                self._pipeline._s2_decoder = self._pipeline.stage_1_ledger.video_decoder()
             self._pipeline._s2_loaded = True
             log.info("LTX2-denoise2: models loaded")
         except Exception as e:

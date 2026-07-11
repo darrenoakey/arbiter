@@ -24,6 +24,7 @@ from pathlib import Path
 from arbiter.adapters.base import (
     CancelledException,
     GroupAdapter,
+    HeapTrimGuard,
     InferenceError,
     LoadError,
 )
@@ -64,7 +65,11 @@ class LTX2Denoise1Adapter(GroupAdapter):
         try:
             from video_fast_gpu import FastPipeline
             self._pipeline = FastPipeline()
-            self._pipeline._ensure_denoise1_models()
+            # Safetensors staging clones are short lived, but glibc otherwise
+            # retains their heap pages and creates a second checkpoint-sized
+            # allocation in GB10 unified memory during model load.
+            with HeapTrimGuard():
+                self._pipeline._ensure_denoise1_models()
             log.info("LTX2-denoise1: models loaded")
         except Exception as e:
             self._pipeline = None
