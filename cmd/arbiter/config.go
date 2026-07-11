@@ -76,6 +76,20 @@ type HostConfig struct {
 	BudgetGB float64 `json:"budget_gb"` // advisory memory budget on that host; not part of spark's audited ledger
 }
 
+// HasLocalPlacement reports whether the model's placement chain includes the
+// local host — i.e. whether a local "#N" subprocess pool should exist for it.
+// A remote-only model (e.g. an ollama-served LLM placed on fleet hosts) must
+// never get a local subprocess: there is no Python adapter for it, so a local
+// worker would just crash-loop.
+func (c Config) HasLocalPlacement(mc ModelConfig) bool {
+	for _, host := range mc.PlacementsOrDefault() {
+		if c.HostIsLocal(host) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsLocal reports whether a host id refers to spark's local CUDA backend.
 func (c Config) HostIsLocal(hostID string) bool {
 	if hostID == "" || hostID == LocalHost {

@@ -2473,13 +2473,28 @@ func (m *InstanceManager) retireInstanceLocked(modelID, instanceID string, resul
 		"state", state, "active_jobs", active)
 }
 
-// ScaleModel changes the number of instances for a model at runtime.
+// localInstanceIDsLocked returns the model's LOCAL ("#N" pool) instance ids.
+// Remote placement instances ("model@host") are registered per the placement
+// chain and must never be counted or retired by local pool scaling — a scale
+// or reload that consumed them would leave a remote-placed model with no
+// dispatchable instance until the next restart. Caller holds m.mu.
+func (m *InstanceManager) localInstanceIDsLocked(modelID string) []string {
+	ids := make([]string, 0, len(m.byModel[modelID]))
+	for _, id := range m.byModel[modelID] {
+		if inst := m.instances[id]; inst != nil && !inst.isRemote() {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// ScaleModel changes the number of LOCAL instances for a model at runtime.
 // Scale up: creates new stopped instances.
 // Scale down: removes idle instances immediately, condemns active ones.
+// Remote placement instances are untouched.
 func (m *InstanceManager) ScaleModel(modelID string, newCount int, cfg ModelConfig) map[string]any {
 	m.mu.Lock()
-	currentIDs := make([]string, len(m.byModel[modelID]))
-	copy(currentIDs, m.byModel[modelID])
+	currentIDs := m.localInstanceIDsLocked(modelID)
 	m.mu.Unlock()
 
 	currentCount := len(currentIDs)
@@ -2516,33 +2531,40 @@ func (m *InstanceManager) ScaleModel(modelID string, newCount int, cfg ModelConf
 	return result
 }
 
-// ReloadModel replaces a model's worker processes without touching other models.
-// New instances are registered first so only the target model is cycled.
+// ReloadModel replaces a model's LOCAL worker processes without touching other
+// models. New instances are registered first so only the target model is
+// cycled. Remote placement instances have no local subprocess to cycle; they
+// are left in place, but any MISSING remote placement (e.g. destroyed by an
+// earlier hard-kill) is re-registered so a reload heals the dispatch set.
 func (m *InstanceManager) ReloadModel(modelID string, targetCount int, cfg ModelConfig) map[string]any {
 	if targetCount < 0 {
 		targetCount = 0
 	}
 
 	m.mu.Lock()
-	currentIDs := make([]string, len(m.byModel[modelID]))
-	copy(currentIDs, m.byModel[modelID])
+	currentIDs := m.localInstanceIDsLocked(modelID)
 	m.mu.Unlock()
 
 	result := map[string]any{"added": 0, "removed": 0, "condemned": 0}
-	nextIdx := m.nextInstanceIndex(modelID)
-	for i := 0; i < targetCount; i++ {
-		instanceID := fmt.Sprintf("%s#%d", modelID, nextIdx+i)
-		inst := m.newInstance(modelID, instanceID, cfg)
-		m.Register(inst)
-		result["added"] = result["added"].(int) + 1
-		slog.Info("replacement instance added", "model", modelID, "instance", instanceID)
+	localWanted := m.config.HasLocalPlacement(cfg)
+	if localWanted {
+		nextIdx := m.nextInstanceIndex(modelID)
+		for i := 0; i < targetCount; i++ {
+			instanceID := fmt.Sprintf("%s#%d", modelID, nextIdx+i)
+			inst := m.newInstance(modelID, instanceID, cfg)
+			m.Register(inst)
+			result["added"] = result["added"].(int) + 1
+			slog.Info("replacement instance added", "model", modelID, "instance", instanceID)
+		}
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	for _, iid := range currentIDs {
 		m.retireInstanceLocked(modelID, iid, result)
 	}
+	m.mu.Unlock()
+
+	result["added"] = result["added"].(int) + m.registerMissingRemotePlacements(modelID, cfg)
 	return result
 }
 
@@ -2576,13 +2598,56 @@ func (m *InstanceManager) HardKillModel(modelID string, recreate bool, cfg *Mode
 		slog.Warn("instance hard killed", "model", modelID, "instance", iid, "state", state)
 	}
 
-	if recreate && cfg != nil && cfg.MaxInstances != nil && *cfg.MaxInstances > 0 {
+	if recreate && cfg != nil {
 		m.EnsureModel(modelID)
-		scaleResult := m.ScaleModel(modelID, *cfg.MaxInstances, *cfg)
-		result["recreated"] = scaleResult["added"]
+		recreated := 0
+		if m.config.HasLocalPlacement(*cfg) && cfg.MaxInstances != nil && *cfg.MaxInstances > 0 {
+			scaleResult := m.ScaleModel(modelID, *cfg.MaxInstances, *cfg)
+			recreated += scaleResult["added"].(int)
+		}
+		// Remote placements were destroyed above too. They are only ever
+		// registered from the placement chain (never by ScaleModel), so a
+		// hard-kill that skipped this would leave a remote-placed model with
+		// no dispatchable instance until the next arbiter restart — every
+		// queued job requeues forever ("PickInstanceForJob returned nil").
+		recreated += m.registerMissingRemotePlacements(modelID, *cfg)
+		result["recreated"] = recreated
 	}
 
 	return result
+}
+
+// registerMissingRemotePlacements registers a fresh remote instance for every
+// remote host in the model's placement chain that has no live instance,
+// mirroring setupInstances. Existing instances (any state) are left alone.
+// Returns the number of instances added.
+func (m *InstanceManager) registerMissingRemotePlacements(modelID string, cfg ModelConfig) int {
+	added := 0
+	for _, host := range cfg.PlacementsOrDefault() {
+		if m.config.HostIsLocal(host) {
+			continue
+		}
+		hc, ok := m.config.Hosts[host]
+		if !ok || hc.Addr == "" {
+			slog.Warn("skipping remote placement with no host addr",
+				"model", modelID, "host", host)
+			continue
+		}
+		instanceID := fmt.Sprintf("%s@%s", modelID, host)
+		m.mu.RLock()
+		_, exists := m.instances[instanceID]
+		m.mu.RUnlock()
+		if exists {
+			continue
+		}
+		inst := NewRemoteInstance(modelID, instanceID, host, hc.Addr,
+			remoteModelTag(cfg, modelID), cfg.MaxConcurrent, cfg.MemoryGB)
+		m.Register(inst)
+		added++
+		slog.Info("re-registered remote model placement",
+			"model", modelID, "host", host, "addr", hc.Addr)
+	}
+	return added
 }
 
 // ReleaseAndCheck decrements activeJobs and checks if the instance is condemned
