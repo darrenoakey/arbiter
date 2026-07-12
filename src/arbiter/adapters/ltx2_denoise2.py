@@ -17,6 +17,8 @@ Expected params dict:
     start_time    : float — chunk start in seconds
     end_time      : float — chunk end in seconds
     fps           : int   — output frame rate
+    width         : int   — exact requested output width after model-only padding
+    height        : int   — exact requested output height after model-only padding
 """
 from __future__ import annotations
 
@@ -41,6 +43,20 @@ from arbiter.adapters.ltx2_clock import native_frame_rate
 log = logging.getLogger(__name__)
 
 LTX2_SPARK_DIR = Path("/home/darren/src/ltx2-spark")
+
+
+def _crop_frames_to_target(frames, target_width: int, target_height: int):
+    """Center-crop model-padded frames back to the exact public dimensions."""
+    height, width = frames.shape[1:3]
+    if target_width <= 0 or target_height <= 0:
+        raise InferenceError("target video dimensions must be positive")
+    if target_width > width or target_height > height:
+        raise InferenceError(
+            f"target {target_width}x{target_height} exceeds decoded model frame {width}x{height}"
+        )
+    left = (width - target_width) // 2
+    top = (height - target_height) // 2
+    return frames[:, top:top + target_height, left:left + target_width, :]
 
 
 def _assemble_single_chunk_mp4(frames, audio_path, start_time, end_time, output_path, fps):
@@ -184,6 +200,11 @@ class LTX2Denoise2Adapter(GroupAdapter):
             with self._gpu_lock:
                 self._check_cancel(cancel_flag)
                 frames_np = self._pipeline.run_stage2_gpu(data, progress_fn=_progress)
+            frames_np = _crop_frames_to_target(
+                frames_np,
+                int(params.get("width", frames_np.shape[2])),
+                int(params.get("height", frames_np.shape[1])),
+            )
         except CancelledException:
             raise
         except Exception as e:
