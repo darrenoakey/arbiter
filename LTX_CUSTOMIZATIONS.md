@@ -160,6 +160,11 @@ objects, not a plain state dict).
 
 ## H. Other adapter-side orchestration to preserve
 
+- **Model-only spatial lattice:** the dev denoiser patches the 8x VAE latent in
+  2x2 blocks, so model dimensions must be divisible by 16. Beezle supplies
+  1920x1088 for a 1080p render; `ltx2_denoise2` center-crops the decoded frames
+  to the requested 1920x1080 before NVENC. Never expose 1088p or resize it back
+  to 1080p. 3840x2160 already satisfies the lattice and is unchanged.
 - **Odd frame count**: LTX-2 requires an odd `num_frames`; adapters do
   `if num_frames % 2 == 0: num_frames += 1`.
 - **Per-chunk seed**: `seed + chunk_index` — deterministic but varied per chunk.
