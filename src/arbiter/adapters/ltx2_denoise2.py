@@ -59,8 +59,33 @@ def _crop_frames_to_target(frames, target_width: int, target_height: int):
     return frames[:, top:top + target_height, left:left + target_width, :]
 
 
+def _mux_audio_slice(
+    video_path: str,
+    audio_path: str,
+    start_time: float,
+    video_duration: float,
+    output_path: str,
+) -> None:
+    """Mux an audio slice without allowing it to shorten the video stream."""
+    duration = format(video_duration, ".12g")
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", video_path,
+            "-ss", str(start_time), "-t", duration, "-i", audio_path,
+            "-filter:a", f"apad=whole_dur={duration},atrim=duration={duration}",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-map", "0:v", "-map", "1:a", "-t", duration,
+            str(output_path),
+        ],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        err = result.stderr.decode()[-500:]
+        raise InferenceError(f"ffmpeg mux failed: {err}")
+
+
 def _assemble_single_chunk_mp4(frames, audio_path, start_time, end_time, output_path, fps):
-    """Assemble numpy frames + audio slice into an mp4 via ffmpeg nvenc."""
+    """Assemble numpy frames + an exact-duration audio slice via ffmpeg nvenc."""
     import os
 
     tmp_vid = tempfile.mktemp(suffix=".mp4")
@@ -83,20 +108,20 @@ def _assemble_single_chunk_mp4(frames, audio_path, start_time, end_time, output_
         err = proc.stderr.read().decode()[-500:]
         raise InferenceError(f"ffmpeg nvenc failed: {err}")
 
-    duration = end_time - start_time
-    result = subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", tmp_vid,
-            "-ss", str(start_time), "-t", str(duration), "-i", audio_path,
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-map", "0:v", "-map", "1:a", "-shortest", str(output_path),
-        ],
-        capture_output=True,
-    )
-    os.unlink(tmp_vid)
-    if result.returncode != 0:
-        err = result.stderr.decode()[-500:]
-        raise InferenceError(f"ffmpeg mux failed: {err}")
+    # The decoded frame count is authoritative. The requested audio endpoint can
+    # be slightly beyond the source WAV due to sample-clock rounding, so pad the
+    # slice with silence instead of letting audio truncate the video.
+    video_duration = len(frames) / fps
+    try:
+        _mux_audio_slice(
+            video_path=tmp_vid,
+            audio_path=audio_path,
+            start_time=start_time,
+            video_duration=video_duration,
+            output_path=output_path,
+        )
+    finally:
+        os.unlink(tmp_vid)
 
 
 @register
