@@ -73,6 +73,18 @@ CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_completed_model ON jobs(state, model_id) WHERE state = 'completed';
 CREATE INDEX IF NOT EXISTS idx_jobs_completed_stats ON jobs(state, finished_at, started_at, created_at) WHERE state = 'completed' AND finished_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_jobs_canonical ON jobs(canonical_job_id) WHERE canonical_job_id IS NOT NULL;
+
+-- Persisted per-model rolling average of seconds-per-completed-action. This is
+-- the ONLY source of the ETA the dashboard shows: it survives daemon restarts
+-- (so ETAs stay meaningful across a bounce) and is fed exclusively by real
+-- completed-job execution timings via RecordActionDuration. avg_action_seconds
+-- is an exponential moving average (first sample seeds it, alpha thereafter).
+CREATE TABLE IF NOT EXISTS model_stats (
+    model_id TEXT PRIMARY KEY,
+    avg_action_seconds REAL NOT NULL,
+    samples INTEGER NOT NULL,
+    updated_at REAL NOT NULL
+);
 `
 
 // migrateAddCanonicalJobID adds the canonical_job_id column to existing
@@ -816,6 +828,97 @@ GROUP BY model_id`)
 		global.AvgExec = gSumExec / float64(gExecCount)
 	}
 	return perModel, global, rows.Err()
+}
+
+// actionEMAAlpha weights the newest completed-action duration when folding it
+// into a model's rolling average. 0.2 keeps the average stable against outliers
+// while still tracking genuine drift in a model's per-action cost over time.
+const actionEMAAlpha = 0.2
+
+// RecordActionDuration folds one completed action's real execution time into the
+// persisted per-model exponential moving average (model_stats). The first sample
+// for a model seeds the average outright; subsequent samples blend with
+// actionEMAAlpha. Non-positive durations are ignored (nothing to learn from a
+// zero/negative measurement). This is the sole writer of model_stats and is
+// called only from the scheduler's successful-completion paths, so the average
+// always reflects real timing data and never a mock/estimate.
+func (s *Store) RecordActionDuration(modelID string, seconds float64) error {
+	if modelID == "" || seconds <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var avg float64
+	var samples int
+	err := s.db.QueryRow(
+		"SELECT avg_action_seconds, samples FROM model_stats WHERE model_id = ?", modelID,
+	).Scan(&avg, &samples)
+	switch {
+	case err == sql.ErrNoRows:
+		avg = seconds
+		samples = 1
+	case err != nil:
+		return err
+	default:
+		avg = actionEMAAlpha*seconds + (1-actionEMAAlpha)*avg
+		samples++
+	}
+
+	_, err = s.db.Exec(
+		`INSERT INTO model_stats (model_id, avg_action_seconds, samples, updated_at)
+		 VALUES (?,?,?,?)
+		 ON CONFLICT(model_id) DO UPDATE SET
+		     avg_action_seconds = excluded.avg_action_seconds,
+		     samples            = excluded.samples,
+		     updated_at         = excluded.updated_at`,
+		modelID, avg, samples, nowTS(),
+	)
+	return err
+}
+
+// ModelActionAverages returns the persisted rolling average seconds-per-action
+// for every model that has recorded at least one completed action. Used by the
+// /v1/ps cache to compute each active model's ETA.
+func (s *Store) ModelActionAverages() (map[string]float64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query("SELECT model_id, avg_action_seconds FROM model_stats")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]float64)
+	for rows.Next() {
+		var modelID string
+		var avg float64
+		if err := rows.Scan(&modelID, &avg); err != nil {
+			return nil, err
+		}
+		out[modelID] = avg
+	}
+	return out, rows.Err()
+}
+
+// CompletedCountSince returns how many jobs for modelID reached the completed
+// state with finished_at at or after the given timestamp (float epoch seconds).
+// The dashboard uses this with a model's current load time to show "done since
+// the model was loaded" — a counter that intentionally resets each residency.
+func (s *Store) CompletedCountSince(modelID string, since float64) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var n int
+	err := s.db.QueryRow(
+		"SELECT COUNT(*) FROM jobs WHERE state = 'completed' AND model_id = ? AND finished_at IS NOT NULL AND finished_at >= ?",
+		modelID, since,
+	).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // GetRunningJobs returns all jobs currently in the "running" state with their model_id and started_at.
