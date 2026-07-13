@@ -54,6 +54,7 @@ type API struct {
 	statsGlobalCt map[string]int            // state -> count (global)
 	statsModel    map[string]JobStats       // model_id -> completed stats
 	statsGlobal   JobStats                  // global completed stats
+	statsAvg      map[string]float64        // model_id -> persisted rolling avg seconds/action
 
 	// requestShutdown triggers a graceful process shutdown. Set by main once
 	// the HTTP server exists. Invoked by the drain monitor when shutdown_when_idle
@@ -232,6 +233,11 @@ func (a *API) refreshStats() {
 	if err != nil {
 		return
 	}
+	// Persisted rolling averages (model_stats) feed the dashboard ETA. On query
+	// error keep the last good map rather than blanking ETAs.
+	if avg, err := a.store.ModelActionAverages(); err == nil {
+		a.statsAvg = avg
+	}
 	a.statsCounts = perModelCounts
 	a.statsGlobalCt = globalCounts
 	a.statsModel = perModelStats
@@ -258,6 +264,7 @@ func (a *API) updatePSCache() {
 	globalStats := a.statsGlobal
 	perModelCounts := a.statsCounts
 	perModelStats := a.statsModel
+	perModelAvg := a.statsAvg
 	a.statsMu.Unlock()
 
 	snap["queue"] = globalCounts
@@ -280,6 +287,42 @@ func (a *API) updatePSCache() {
 				if cfg, ok := a.config.Models[id]; ok {
 					m["max_instances"] = *cfg.MaxInstances
 					m["max_concurrent"] = cfg.MaxConcurrent
+				}
+
+				// In-progress panel: ONLY for models with active in-flight work.
+				// Idle or queued-only models get no in_progress block, so the
+				// dashboard renders their progress/ETA cells blank.
+				active, _ := m["active_jobs"].(int)
+				if active > 0 {
+					counts := perModelCounts[id]
+					outstanding := counts["queued"] + counts["scheduled"] + active
+
+					// Prefer the persisted rolling per-action average; fall back to
+					// the all-time execution average so an ETA appears immediately
+					// even before model_stats has accumulated a sample.
+					avg := perModelAvg[id]
+					if avg <= 0 {
+						avg = st.AvgExec
+					}
+
+					// "Done since load" and its running total reset each residency:
+					// loaded_at (from the manager snapshot) is the residency start.
+					doneSinceLoad := 0
+					var loadedAt float64
+					if la, ok := m["loaded_at"].(float64); ok && la > 0 {
+						loadedAt = la
+						if n, err := a.store.CompletedCountSince(id, la); err == nil {
+							doneSinceLoad = n
+						}
+					}
+
+					m["in_progress"] = map[string]any{
+						"done_since_load":    doneSinceLoad,
+						"total_since_load":   doneSinceLoad + outstanding,
+						"avg_action_seconds": avg,
+						"eta_seconds":        float64(outstanding) * avg,
+						"loaded_at":          loadedAt,
+					}
 				}
 			}
 		}

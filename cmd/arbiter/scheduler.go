@@ -1374,6 +1374,12 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 		}
 		s.logger.Log("job.completed", rssEntry)
 		s.RecordSuccess(job.ModelID)
+		// Feed the real execution time into the persisted per-model rolling
+		// average that drives the dashboard ETA. Only successful completions
+		// count — failures/cancellations aren't representative of action cost.
+		if err := s.store.RecordActionDuration(job.ModelID, elapsed); err != nil {
+			slog.Warn("failed to record action duration", "model", job.ModelID, "error", err)
+		}
 		s.cleanupJobInbox(job)
 	}
 
@@ -1452,6 +1458,9 @@ func (s *Scheduler) dispatchStreamHandoff(job *Job, inst *Instance) {
 			"inference_seconds": elapsed, "stream": true,
 		})
 		s.RecordSuccess(job.ModelID)
+		if err := s.store.RecordActionDuration(job.ModelID, elapsed); err != nil {
+			slog.Warn("failed to record action duration", "model", job.ModelID, "error", err)
+		}
 		s.clearFailoverAttempts(job.ID)
 	case <-time.After(streamMax):
 		errMsg := fmt.Sprintf("stream exceeded %s", streamMax)

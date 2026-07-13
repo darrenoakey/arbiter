@@ -58,8 +58,14 @@ type Instance struct {
 	// contention (e.g. gemma fallback while ltx2 holds the GPU).
 	lastLoadInsufficientMem atomic.Bool
 	lastActive              time.Time
-	memoryGB                float64
-	vramHeld                bool // true while this instance's memoryGB is counted in InstanceManager.usedGB
+	// loadedAt marks when the current residency (keep-alive session) began — set
+	// when the instance transitions into "loaded", cleared to zero on unload /
+	// subprocess exit. The dashboard uses it to count "actions done since this
+	// model was loaded", a progress numerator that intentionally resets whenever
+	// the model is reloaded.
+	loadedAt time.Time
+	memoryGB float64
+	vramHeld bool // true while this instance's memoryGB is counted in InstanceManager.usedGB
 	// manager is set by InstanceManager.Register. markSubprocessExited needs it
 	// to decrement usedGB in the same breath that it clears vramHeld — clearing
 	// the flag alone strands the reservation until the 15s reconciler, and the
@@ -164,8 +170,21 @@ func (inst *Instance) setState(state string) {
 	inst.state = state
 	if state == "loaded" {
 		inst.lastActive = time.Now()
+		if inst.loadedAt.IsZero() {
+			inst.loadedAt = inst.lastActive
+		}
+	} else if state == "stopped" || state == "unloading" || state == "error" {
+		inst.loadedAt = time.Time{}
 	}
 	inst.mu.Unlock()
+}
+
+// LoadedAt returns when the current residency began, or the zero time if the
+// instance is not currently loaded.
+func (inst *Instance) LoadedAt() time.Time {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	return inst.loadedAt
 }
 
 func (inst *Instance) ActiveJobs() int {
@@ -384,6 +403,7 @@ func (inst *Instance) markSubprocessExited() {
 		heldGB = inst.memoryGB
 		inst.vramHeld = false
 	}
+	inst.loadedAt = time.Time{} // residency ended
 	manager := inst.manager
 	if inst.stdin != nil {
 		inst.stdin.Close()
@@ -493,6 +513,7 @@ func (inst *Instance) Load(device string) error {
 	}
 	inst.state = "loaded"
 	inst.lastActive = time.Now() // start keepalive timer from load time
+	inst.loadedAt = inst.lastActive
 	inst.mu.Unlock()
 
 	slog.Info("model loaded", "instance", inst.InstanceID)
@@ -561,6 +582,7 @@ func (inst *Instance) Unload() error {
 
 	inst.mu.Lock()
 	inst.state = "unloading"
+	inst.loadedAt = time.Time{} // residency ended
 	stdin := inst.stdin
 	inst.mu.Unlock()
 	slog.Info("unloading model — initiating tree kill", "instance", inst.InstanceID)
@@ -613,6 +635,7 @@ func (inst *Instance) Kill() {
 		}
 	}
 	inst.state = "stopped"
+	inst.loadedAt = time.Time{} // residency ended
 	inst.stdin = nil
 	inst.cmd = nil
 	inst.mu.Unlock()
@@ -2252,6 +2275,26 @@ func (m *InstanceManager) Snapshot() map[string]any {
 			"state":       stateStr,
 			"memory_gb":   totalMem,
 			"active_jobs": totalActive,
+		}
+
+		// Earliest residency start among currently-loaded instances, as float
+		// epoch seconds. The /v1/ps cache uses it to count "actions done since the
+		// model was loaded". Omitted when nothing is loaded.
+		var earliestLoaded time.Time
+		for _, inst := range g.instances {
+			if inst.State() != "loaded" {
+				continue
+			}
+			la := inst.LoadedAt()
+			if la.IsZero() {
+				continue
+			}
+			if earliestLoaded.IsZero() || la.Before(earliestLoaded) {
+				earliestLoaded = la
+			}
+		}
+		if !earliestLoaded.IsZero() {
+			entry["loaded_at"] = float64(earliestLoaded.UnixNano()) / 1e9
 		}
 
 		if totalMem == 0 && len(g.instances) > 0 {
