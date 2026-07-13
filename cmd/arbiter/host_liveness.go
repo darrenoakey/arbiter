@@ -47,13 +47,12 @@ type HostMonitor struct {
 }
 
 type hostState struct {
-	hostID       string
-	addr         string
-	reachable    bool
-	failStreak   int
-	lastChecked  time.Time
-	lastOK       time.Time
-	modelsLoaded []string // ollama-reported loaded model names (from /api/ps)
+	hostID      string
+	addr        string
+	reachable   bool
+	failStreak  int
+	lastChecked time.Time
+	lastOK      time.Time
 }
 
 // NewHostMonitor builds a monitor over the remote hosts in cfg. Local (spark)
@@ -161,8 +160,14 @@ func (hm *HostMonitor) pollOne(ctx context.Context, addr string) bool {
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Debug("close host liveness response", "error", err)
+		}
+	}()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return false
+	}
 	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
@@ -252,15 +257,14 @@ func (hm *HostMonitor) cancelHostInstances(hostID string) {
 func (hm *HostMonitor) RemoteHostsPanel() []map[string]any {
 	hm.mu.RLock()
 	type snap struct {
-		id, addr     string
-		reachable    bool
-		failStreak   int
-		lastOK       time.Time
-		modelsLoaded []string
+		id, addr   string
+		reachable  bool
+		failStreak int
+		lastOK     time.Time
 	}
 	snaps := make([]snap, 0, len(hm.states))
 	for _, st := range hm.states {
-		snaps = append(snaps, snap{st.hostID, st.addr, st.reachable, st.failStreak, st.lastOK, nil})
+		snaps = append(snaps, snap{st.hostID, st.addr, st.reachable, st.failStreak, st.lastOK})
 	}
 	hm.mu.RUnlock()
 
@@ -306,7 +310,11 @@ func (hm *HostMonitor) queryOllamaPS(addr string) []string {
 	if err != nil {
 		return nil
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Debug("close ollama process response", "error", err)
+		}
+	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil
 	}

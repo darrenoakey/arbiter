@@ -1,9 +1,7 @@
 """Tests for job state transitions."""
 import time
 
-import pytest
 
-from arbiter.store import JobStore
 
 
 class TestJobLifecycle:

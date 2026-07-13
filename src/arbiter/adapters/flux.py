@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import importlib.util
 import io
 import logging
 import threading
@@ -143,13 +144,10 @@ class FluxSchnellAdapter(ModelAdapter):
 
         if transparent:
             # Defer to BiRefNet if available, otherwise skip
-            try:
-                from arbiter.adapters.birefnet import BiRefNetAdapter
+            if importlib.util.find_spec("arbiter.adapters.birefnet") is not None:
                 # Inline background removal is not supported here;
                 # the caller should chain a birefnet job instead.
                 log.warning("transparent=true requested but should be handled as a separate birefnet job")
-            except ImportError:
-                pass
 
         output_dir.mkdir(parents=True, exist_ok=True)
         out_path = output_dir / "result.png"

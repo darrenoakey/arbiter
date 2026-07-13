@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+func TestInboxOrphanGraceMatchesMaximumClientLease(t *testing.T) {
+	if inboxOrphanMinAge != 7*24*time.Hour {
+		t.Fatalf("inbox orphan grace = %s, want seven-day maximum client lease", inboxOrphanMinAge)
+	}
+}
+
 func writeIdleWorker(t *testing.T, path string) {
 	t.Helper()
 	script := `#!/usr/bin/env python3
@@ -61,7 +67,9 @@ func TestRequeueNoInstanceSetsModelCooldown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
-	store.UpdateState(job.ID, "scheduled", WithStartedAt(nowTS()))
+	if err := store.UpdateState(job.ID, "scheduled", WithStartedAt(nowTS())); err != nil {
+		t.Fatalf("schedule job: %v", err)
+	}
 
 	sched.requeueNoInstance(job)
 
@@ -69,11 +77,41 @@ func TestRequeueNoInstanceSetsModelCooldown(t *testing.T) {
 	if after.State != "queued" {
 		t.Fatalf("job state = %s, want queued", after.State)
 	}
+	if after.StartedAt != nil {
+		t.Fatalf("started_at = %v, want nil after no-instance requeue", after.StartedAt)
+	}
 	// The model must be on dispatch cooldown so the 100ms tick doesn't hot-loop
 	// re-picking the same unschedulable job (starving every other model).
 	full := sched.getFullModels("")
 	if !full["llm:remote-chat"] {
 		t.Fatal("model not on cooldown after no-instance requeue — scheduler would hot-loop")
+	}
+}
+
+func TestTryFailoverClearsStartedAt(t *testing.T) {
+	sched, store, mgr := newRemotePlacementScheduler(t)
+
+	job, err := store.CreateJob("llm:remote-chat", "chat-completion", json.RawMessage(`{}`), 1)
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := store.UpdateState(job.ID, "running", WithStartedAt(nowTS())); err != nil {
+		t.Fatalf("mark job running: %v", err)
+	}
+	inst := mgr.GetModelInstances("llm:remote-chat")[0]
+	if !sched.tryFailover(job, inst, context.Canceled) {
+		t.Fatal("tryFailover did not requeue confirmed remote absence")
+	}
+
+	after, err := store.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if after.State != "queued" {
+		t.Fatalf("job state = %s, want queued", after.State)
+	}
+	if after.StartedAt != nil {
+		t.Fatalf("started_at = %v, want nil after failover requeue", after.StartedAt)
 	}
 }
 
@@ -251,6 +289,9 @@ for line in sys.stdin:
 	if origAfter.State != "queued" || origAfter.Error != "" {
 		t.Fatalf("original after shutdown death = state %s error %q, want queued/cleared", origAfter.State, origAfter.Error)
 	}
+	if origAfter.StartedAt != nil {
+		t.Fatalf("original started_at = %v, want nil after shutdown requeue", origAfter.StartedAt)
+	}
 
 	for _, fid := range []string{followerA.ID, followerB.ID} {
 		follower, _ := store.GetJob(fid)
@@ -263,8 +304,12 @@ for line in sys.stdin:
 func TestLoadCircuitBreakerPausesAfterThreeFailures(t *testing.T) {
 	projectRoot := t.TempDir()
 	outputDir := filepath.Join(projectRoot, "output")
-	os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755)
-	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+	if err := os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755); err != nil {
+		t.Fatalf("create jobs dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755); err != nil {
+		t.Fatalf("create logs dir: %v", err)
+	}
 
 	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
 	if err != nil {
@@ -394,7 +439,9 @@ func TestReconcilerHealsStrandedInFlight(t *testing.T) {
 	if !sched.markInFlight(job.ID, inst, 1.0) {
 		t.Fatal("markInFlight failed")
 	}
-	store.UpdateState(job.ID, "completed", WithFinishedAt(nowTS()))
+	if err := store.UpdateState(job.ID, "completed", WithFinishedAt(nowTS())); err != nil {
+		t.Fatalf("complete job: %v", err)
+	}
 
 	if n := sched.reconcileInFlight(); n != 1 {
 		t.Fatalf("reconcileInFlight healed %d, want 1", n)
@@ -426,8 +473,12 @@ func TestScheduledWatchdogSkipsInFlightJobs(t *testing.T) {
 	live, _ := store.CreateJob("m", "x", json.RawMessage(`{}`), 1)
 	orphan, _ := store.CreateJob("m", "x", json.RawMessage(`{}`), 1)
 	old := nowTS() - 60
-	store.UpdateState(live.ID, "scheduled", WithStartedAt(old))
-	store.UpdateState(orphan.ID, "scheduled", WithStartedAt(old))
+	if err := store.UpdateState(live.ID, "scheduled", WithStartedAt(old)); err != nil {
+		t.Fatalf("schedule live job: %v", err)
+	}
+	if err := store.UpdateState(orphan.ID, "scheduled", WithStartedAt(old)); err != nil {
+		t.Fatalf("schedule orphan job: %v", err)
+	}
 	// live has an active dispatch goroutine (e.g. its model is still loading).
 	sched.markInFlight(live.ID, inst, 1.0)
 
@@ -439,21 +490,23 @@ func TestScheduledWatchdogSkipsInFlightJobs(t *testing.T) {
 		t.Fatalf("ListStuckScheduled returned %d jobs, want 2", len(stuck))
 	}
 
-	// Apply the watchdog's filter: requeue only jobs NOT in-flight.
-	for _, id := range stuck {
-		if sched.isInFlight(id) {
-			continue
-		}
-		store.UpdateState(id, "queued")
+	if recovered := sched.requeueStuckScheduled(15); recovered != 1 {
+		t.Fatalf("requeued stuck jobs = %d, want 1", recovered)
 	}
 
 	o, _ := store.GetJob(orphan.ID)
 	if o.State != "queued" {
 		t.Fatalf("orphaned scheduled job should be requeued, got %s", o.State)
 	}
+	if o.StartedAt != nil {
+		t.Fatalf("orphaned job started_at = %v, want nil after watchdog requeue", o.StartedAt)
+	}
 	l, _ := store.GetJob(live.ID)
 	if l.State != "scheduled" {
 		t.Fatalf("in-flight job must stay scheduled (not requeued), got %s", l.State)
+	}
+	if l.StartedAt == nil {
+		t.Fatal("in-flight job started_at cleared despite remaining scheduled")
 	}
 }
 
@@ -464,7 +517,9 @@ func TestScheduledWatchdogSkipsInFlightJobs(t *testing.T) {
 func TestConflictGroupExclusionAndPriority(t *testing.T) {
 	projectRoot := t.TempDir()
 	outputDir := filepath.Join(projectRoot, "output")
-	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+	if err := os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755); err != nil {
+		t.Fatalf("create logs dir: %v", err)
+	}
 
 	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
 	if err != nil {
@@ -541,8 +596,12 @@ func TestDrainModeBlocksNewDispatch(t *testing.T) {
 	workerPath := filepath.Join(projectRoot, "idle_worker.py")
 	writeIdleWorker(t, workerPath)
 	outputDir := filepath.Join(projectRoot, "output")
-	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
-	os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755)
+	if err := os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755); err != nil {
+		t.Fatalf("create logs dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755); err != nil {
+		t.Fatalf("create jobs dir: %v", err)
+	}
 
 	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
 	if err != nil {
@@ -622,7 +681,9 @@ func TestDrainModeBlocksNewDispatch(t *testing.T) {
 func TestGetFullModelsGatesOnVRAMFeasibility(t *testing.T) {
 	projectRoot := t.TempDir()
 	outputDir := filepath.Join(projectRoot, "output")
-	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+	if err := os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755); err != nil {
+		t.Fatalf("create logs dir: %v", err)
+	}
 
 	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
 	if err != nil {
@@ -684,7 +745,9 @@ func TestGetFullModelsGatesOnVRAMFeasibility(t *testing.T) {
 func TestGetFullModelsBypassesVRAMForReachableRemote(t *testing.T) {
 	projectRoot := t.TempDir()
 	outputDir := filepath.Join(projectRoot, "output")
-	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+	if err := os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755); err != nil {
+		t.Fatalf("create logs dir: %v", err)
+	}
 
 	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
 	if err != nil {
@@ -776,8 +839,12 @@ func TestGetFullModelsBypassesVRAMForReachableRemote(t *testing.T) {
 func TestDispatchJobLeavesInsufficientMemoryQueued(t *testing.T) {
 	projectRoot := t.TempDir()
 	outputDir := filepath.Join(projectRoot, "output")
-	os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755)
-	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+	if err := os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755); err != nil {
+		t.Fatalf("create jobs dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755); err != nil {
+		t.Fatalf("create logs dir: %v", err)
+	}
 
 	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
 	if err != nil {
@@ -814,6 +881,9 @@ func TestDispatchJobLeavesInsufficientMemoryQueued(t *testing.T) {
 
 	inst := mgr.GetModelInstances("big")[0]
 	for attempt := 0; attempt < maxLoadAttempts+2; attempt++ {
+		if err := store.UpdateState(job.ID, "scheduled", WithStartedAt(nowTS())); err != nil {
+			t.Fatalf("schedule job for attempt %d: %v", attempt, err)
+		}
 		atomic.AddInt32(&inst.activeJobs, 1)
 		sched.dispatchJobToInstance(job, inst, 1.0)
 		after, err := store.GetJob(job.ID)
@@ -823,6 +893,9 @@ func TestDispatchJobLeavesInsufficientMemoryQueued(t *testing.T) {
 		if after.State != "queued" || after.Error != "" {
 			t.Fatalf("attempt %d state=%s error=%q, want queued/no error", attempt, after.State, after.Error)
 		}
+		if after.StartedAt != nil {
+			t.Fatalf("attempt %d started_at=%v, want nil after memory requeue", attempt, after.StartedAt)
+		}
 	}
 
 	followerAfter, err := store.GetJob(follower.ID)
@@ -831,6 +904,56 @@ func TestDispatchJobLeavesInsufficientMemoryQueued(t *testing.T) {
 	}
 	if followerAfter.State != "following" || followerAfter.Error != "following:"+job.ID {
 		t.Fatalf("follower state=%s error=%q, want following original", followerAfter.State, followerAfter.Error)
+	}
+}
+
+func TestDispatchJobClearsStartedAtAfterLoadFailure(t *testing.T) {
+	projectRoot := t.TempDir()
+	outputDir := filepath.Join(projectRoot, "output")
+	if err := os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755); err != nil {
+		t.Fatalf("create jobs dir: %v", err)
+	}
+
+	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	cfg := &Config{
+		VRAMBudgetGB: 100,
+		Models: map[string]ModelConfig{
+			"broken": {
+				MemoryGB: 1, MaxConcurrent: 1, MaxInstances: intPtr(1),
+				WorkerCmd: []string{filepath.Join(projectRoot, "missing-worker")},
+			},
+		},
+	}
+	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
+	t.Cleanup(func() { logger.Close() })
+	mgr := NewInstanceManager(cfg, "python3", projectRoot)
+	mgr.ScaleModel("broken", 1, cfg.Models["broken"])
+	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+
+	job, err := store.CreateJob("broken", "image-generate", json.RawMessage(`{}`), 1)
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := store.UpdateState(job.ID, "scheduled", WithStartedAt(nowTS())); err != nil {
+		t.Fatalf("schedule job: %v", err)
+	}
+	inst := mgr.GetModelInstances("broken")[0]
+	atomic.AddInt32(&inst.activeJobs, 1)
+	sched.dispatchJobToInstance(job, inst, 1.0)
+
+	after, err := store.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if after.State != "queued" {
+		t.Fatalf("job state = %s, want queued", after.State)
+	}
+	if after.StartedAt != nil {
+		t.Fatalf("started_at = %v, want nil after load-failure requeue", after.StartedAt)
 	}
 }
 
@@ -979,7 +1102,9 @@ for line in sys.stdin:
     elif msg.get("cmd") == "die":
         import os; os._exit(1)
 `
-	os.WriteFile(workerPath, []byte(workerScript), 0o755)
+	if err := os.WriteFile(workerPath, []byte(workerScript), 0o755); err != nil {
+		t.Fatalf("write worker: %v", err)
+	}
 
 	inst := NewInstance("test", "test", 1, 1, "python3", projectRoot)
 	inst.workerCmd = []string{"python3", workerPath}
@@ -1021,8 +1146,12 @@ for line in sys.stdin:
 func TestWatchdogSkipsJobsWithZeroMaxRuntime(t *testing.T) {
 	projectRoot := t.TempDir()
 	outputDir := filepath.Join(projectRoot, "output")
-	os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755)
-	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+	if err := os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755); err != nil {
+		t.Fatalf("create jobs dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755); err != nil {
+		t.Fatalf("create logs dir: %v", err)
+	}
 
 	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
 	if err != nil {
@@ -1099,8 +1228,12 @@ func TestWatchdogSkipsJobsWithZeroMaxRuntime(t *testing.T) {
 func TestWatchdogKillsJobsExceedingMaxRuntime(t *testing.T) {
 	projectRoot := t.TempDir()
 	outputDir := filepath.Join(projectRoot, "output")
-	os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755)
-	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+	if err := os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755); err != nil {
+		t.Fatalf("create jobs dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755); err != nil {
+		t.Fatalf("create logs dir: %v", err)
+	}
 
 	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
 	if err != nil {
@@ -1158,7 +1291,9 @@ func TestWatchdogKillsJobsExceedingMaxRuntime(t *testing.T) {
 			continue
 		}
 		errMsg := "job timed out (test)"
-		store.UpdateState(j.ID, "failed", WithError(errMsg), WithFinishedAt(now))
+		if err := store.UpdateState(j.ID, "failed", WithError(errMsg), WithFinishedAt(now)); err != nil {
+			t.Fatalf("fail timed-out job: %v", err)
+		}
 	}
 
 	after, _ := store.GetJob(job.ID)
@@ -1199,7 +1334,9 @@ func buildMinMeanFlowScheduler(t *testing.T, models map[string]ModelConfig) (*Sc
 	t.Helper()
 	projectRoot := t.TempDir()
 	outputDir := filepath.Join(projectRoot, "output")
-	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+	if err := os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755); err != nil {
+		t.Fatalf("create logs dir: %v", err)
+	}
 
 	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
 	if err != nil {
@@ -1298,7 +1435,9 @@ func markLoaded(t *testing.T, mgr *InstanceManager, modelID string) {
 func TestWaitForInProgressLoadReturnsInsufficientMemOnVRAMFailure(t *testing.T) {
 	projectRoot := t.TempDir()
 	outputDir := filepath.Join(projectRoot, "output")
-	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
+	if err := os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755); err != nil {
+		t.Fatalf("create logs dir: %v", err)
+	}
 	store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
 	if err != nil {
 		t.Fatalf("new store: %v", err)

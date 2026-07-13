@@ -107,9 +107,12 @@ func main() {
 	if cfg.OutputDir != "" {
 		outputDir = cfg.OutputDir
 	}
-	os.MkdirAll(filepath.Join(outputDir, "jobs"), 0o755)
-	os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755)
-	os.MkdirAll(filepath.Join(outputDir, "refs"), 0o755)
+	for _, subdir := range []string{"jobs", "logs", "refs"} {
+		if err := os.MkdirAll(filepath.Join(outputDir, subdir), 0o755); err != nil {
+			slog.Error("create output directory", "subdir", subdir, "error", err)
+			os.Exit(1)
+		}
+	}
 
 	// Event logger
 	eventLog := NewEventLogger(filepath.Join(outputDir, "logs"))
@@ -258,7 +261,9 @@ func main() {
 		slog.Info("shutting down...")
 		sched.MarkShuttingDown()
 		cancel()
-		srv.Shutdown(context.Background())
+		if err := srv.Shutdown(context.Background()); err != nil {
+			slog.Error("graceful HTTP shutdown failed", "error", err)
+		}
 	}
 	api.SetShutdownFunc(gracefulShutdown)
 

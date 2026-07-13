@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 
 def print_report(results: dict):
@@ -36,7 +35,7 @@ def print_report(results: dict):
     print(f"\n RECOMMENDED max_concurrent: {rec}")
 
     if "config_entry" in results:
-        print(f"\n Config entry:")
+        print("\n Config entry:")
         print(f"   {json.dumps(results['config_entry'], indent=2)}")
 
     print(f"{'='*60}")

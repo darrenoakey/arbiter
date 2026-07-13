@@ -7,10 +7,10 @@ import threading
 import time
 from pathlib import Path
 
-log = logging.getLogger(__name__)
-
-from .base import ModelAdapter, LoadError, InferenceError
+from .base import ModelAdapter
 from .registry import register
+
+log = logging.getLogger(__name__)
 
 # Minimum cosine similarity between reference and output speaker embeddings.
 # Below this, the output voice drifted too far and we regenerate.

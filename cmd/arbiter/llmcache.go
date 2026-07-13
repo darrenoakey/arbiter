@@ -143,7 +143,9 @@ func (c *LLMCache) Get(key string) (json.RawMessage, bool) {
 		// Defensive: a truncated/garbage file (should be impossible with atomic
 		// writes) is a miss, and we drop it so it gets rewritten cleanly.
 		slog.Warn("llmcache: dropping invalid cache entry", "key", key)
-		os.Remove(p)
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			slog.Warn("llmcache: remove invalid entry failed", "key", key, "error", err)
+		}
 		return nil, false
 	}
 	now := time.Now()
@@ -175,16 +177,24 @@ func (c *LLMCache) Put(key string, result json.RawMessage) error {
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(result); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		if closeErr := tmp.Close(); closeErr != nil {
+			slog.Warn("llmcache: close failed temp", "path", tmpName, "error", closeErr)
+		}
+		if removeErr := os.Remove(tmpName); removeErr != nil && !os.IsNotExist(removeErr) {
+			slog.Warn("llmcache: remove failed temp", "path", tmpName, "error", removeErr)
+		}
 		return fmt.Errorf("llmcache: write temp: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+		if removeErr := os.Remove(tmpName); removeErr != nil && !os.IsNotExist(removeErr) {
+			slog.Warn("llmcache: remove unclosed temp", "path", tmpName, "error", removeErr)
+		}
 		return fmt.Errorf("llmcache: close temp: %w", err)
 	}
 	if err := os.Rename(tmpName, c.path(key)); err != nil {
-		os.Remove(tmpName)
+		if removeErr := os.Remove(tmpName); removeErr != nil && !os.IsNotExist(removeErr) {
+			slog.Warn("llmcache: remove unrenamed temp", "path", tmpName, "error", removeErr)
+		}
 		return fmt.Errorf("llmcache: rename: %w", err)
 	}
 	return nil

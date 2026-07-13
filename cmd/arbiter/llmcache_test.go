@@ -162,7 +162,9 @@ func TestLLMCacheSweeperDeletesOldKeepsFresh(t *testing.T) {
 		t.Fatalf("Put boundary: %v", err)
 	}
 	inside := time.Now().Add(-31 * time.Hour)
-	os.Chtimes(filepath.Join(dir, "boundary.json"), inside, inside)
+	if err := os.Chtimes(filepath.Join(dir, "boundary.json"), inside, inside); err != nil {
+		t.Fatalf("chtimes boundary: %v", err)
+	}
 
 	n, err := c.Sweep()
 	if err != nil {

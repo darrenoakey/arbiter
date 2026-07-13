@@ -66,7 +66,9 @@ func findFreePort() int {
 		return 18090
 	}
 	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
+	if err := l.Close(); err != nil {
+		log.Printf("close free-port listener: %v", err)
+	}
 	return port
 }
 
@@ -155,7 +157,9 @@ func startVLLM() error {
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(url)
 		if err == nil {
-			resp.Body.Close()
+			if err := resp.Body.Close(); err != nil {
+				log.Printf("close health response: %v", err)
+			}
 			if resp.StatusCode == 200 {
 				log.Printf("vllm ready on port %d", vllmPort)
 				return nil
@@ -171,13 +175,17 @@ func startVLLM() error {
 
 func stopVLLM() {
 	if vllmCmd != nil && vllmCmd.Process != nil {
-		vllmCmd.Process.Signal(syscall.SIGTERM)
+		if err := vllmCmd.Process.Signal(syscall.SIGTERM); err != nil {
+			log.Printf("signal vllm: %v", err)
+		}
 		done := make(chan error, 1)
 		go func() { done <- vllmCmd.Wait() }()
 		select {
 		case <-done:
 		case <-time.After(15 * time.Second):
-			vllmCmd.Process.Kill()
+			if err := vllmCmd.Process.Kill(); err != nil {
+				log.Printf("kill vllm: %v", err)
+			}
 		}
 		vllmCmd = nil
 		log.Printf("vllm stopped")
@@ -222,7 +230,11 @@ func proxyTTS(reqID string, params json.RawMessage, outputDir string) Response {
 	if err != nil {
 		return Response{Status: "error", ReqID: reqID, Error: fmt.Sprintf("vllm request failed: %s", err)}
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("close speech response: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != 200 {
 		errBody, _ := io.ReadAll(resp.Body)
@@ -235,9 +247,12 @@ func proxyTTS(reqID string, params json.RawMessage, outputDir string) Response {
 		return Response{Status: "error", ReqID: reqID, Error: fmt.Sprintf("create output: %s", err)}
 	}
 	n, err := io.Copy(f, resp.Body)
-	f.Close()
+	closeErr := f.Close()
 	if err != nil {
 		return Response{Status: "error", ReqID: reqID, Error: fmt.Sprintf("write output: %s", err)}
+	}
+	if closeErr != nil {
+		return Response{Status: "error", ReqID: reqID, Error: fmt.Sprintf("close output: %s", closeErr)}
 	}
 
 	log.Printf("TTS output: %s (%d bytes)", outPath, n)
@@ -257,7 +272,11 @@ func proxyChat(reqID string, params json.RawMessage) Response {
 	if err != nil {
 		return Response{Status: "error", ReqID: reqID, Error: fmt.Sprintf("proxy error: %s", err)}
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("close chat response: %v", err)
+		}
+	}()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -282,7 +301,9 @@ func proxyChat(reqID string, params json.RawMessage) Response {
 			TotalTokens      int `json:"total_tokens"`
 		} `json:"usage"`
 	}
-	json.Unmarshal(body, &chatResp)
+	if err := json.Unmarshal(body, &chatResp); err != nil {
+		return Response{Status: "error", ReqID: reqID, Error: fmt.Sprintf("decode vllm response: %s", err)}
+	}
 
 	resultMap := map[string]any{
 		"format":   "json",

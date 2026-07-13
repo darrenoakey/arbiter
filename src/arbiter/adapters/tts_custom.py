@@ -1,12 +1,10 @@
 """Qwen3-TTS CustomVoice adapter."""
 from __future__ import annotations
 
-import io
-import json
 import threading
 from pathlib import Path
 
-from .base import ModelAdapter, LoadError, InferenceError
+from .base import ModelAdapter
 from .registry import register
 
 

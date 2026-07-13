@@ -34,7 +34,11 @@ func reachableOllama(t *testing.T) bool {
 		t.Logf("local ollama not reachable (%v) — skipping real-remote test", err)
 		return false
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("close local ollama response: %v", err)
+		}
+	}()
 	if resp.StatusCode != 200 {
 		t.Logf("local ollama /api/tags returned %d — skipping", resp.StatusCode)
 		return false
@@ -44,7 +48,10 @@ func reachableOllama(t *testing.T) bool {
 			Name string `json:"name"`
 		} `json:"models"`
 	}
-	json.NewDecoder(resp.Body).Decode(&tags)
+	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
+		t.Logf("decode local ollama tags: %v", err)
+		return false
+	}
 	for _, m := range tags.Models {
 		if m.Name == localOllamaTag {
 			return true
@@ -65,7 +72,9 @@ func deadOllamaAddr(t *testing.T) string {
 		t.Fatalf("reserve dead port: %v", err)
 	}
 	addr := ln.Addr().String()
-	ln.Close() // nothing listens now → dial refused
+	if err := ln.Close(); err != nil { // nothing listens now → dial refused
+		t.Fatalf("close dead-port listener: %v", err)
+	}
 	return "http://" + addr
 }
 
@@ -166,7 +175,9 @@ func TestRemoteDispatchReturnsRealCompletion(t *testing.T) {
 		t.Fatalf("job state=%s error=%q, want completed", done.State, done.Error)
 	}
 	var result map[string]any
-	json.Unmarshal(*done.Result, &result)
+	if err := json.Unmarshal(*done.Result, &result); err != nil {
+		t.Fatalf("decode completed result: %v", err)
+	}
 	text, _ := result["text"].(string)
 	if text == "" {
 		t.Fatalf("completed job had empty text; result=%s", string(*done.Result))
@@ -229,7 +240,9 @@ func TestRemoteFailoverOnAbsenceCompletesElsewhere(t *testing.T) {
 		t.Fatalf("completed job has no finished_at")
 	}
 	var result map[string]any
-	json.Unmarshal(*done.Result, &result)
+	if err := json.Unmarshal(*done.Result, &result); err != nil {
+		t.Fatalf("decode completed result: %v", err)
+	}
 	if text, _ := result["text"].(string); text == "" {
 		t.Fatalf("failover completion had empty text; result=%s", string(*done.Result))
 	}
@@ -377,16 +390,24 @@ func TestLateResponseDoesNotResurrectTerminalJob(t *testing.T) {
 	// A LATE response from the originally-dispatched (dead) host tries to write a
 	// second result and/or move the job back to running. Both must be rejected.
 	loser := json.RawMessage(`{"format":"json","text":"LATE_LOSER"}`)
-	store.UpdateState(job.ID, "running")                      // terminal→active: rejected
-	store.UpdateState(job.ID, "completed", WithResult(loser)) // overwrite attempt
-	store.UpdateState(job.ID, "queued", WithClearStartedAt()) // failover-requeue race
+	if err := store.UpdateState(job.ID, "running"); err != nil { // terminal→active: rejected
+		t.Fatalf("attempt terminal-to-running update: %v", err)
+	}
+	if err := store.UpdateState(job.ID, "completed", WithResult(loser)); err != nil { // overwrite attempt
+		t.Fatalf("attempt terminal overwrite: %v", err)
+	}
+	if err := store.UpdateState(job.ID, "queued", WithClearStartedAt()); err != nil { // failover-requeue race
+		t.Fatalf("attempt terminal requeue: %v", err)
+	}
 
 	final, _ := store.GetJob(job.ID)
 	if final.State != "completed" {
 		t.Fatalf("terminal job moved to %s — terminal-stays-terminal violated", final.State)
 	}
 	var result map[string]any
-	json.Unmarshal(*final.Result, &result)
+	if err := json.Unmarshal(*final.Result, &result); err != nil {
+		t.Fatalf("decode final result: %v", err)
+	}
 	if result["text"] != "WINNER" {
 		t.Fatalf("result overwritten by late response: got %v, want WINNER", result["text"])
 	}

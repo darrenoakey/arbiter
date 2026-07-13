@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -345,7 +346,11 @@ func writeConfigData(projectRoot string, data map[string]any) error {
 		return fmt.Errorf("create temp config: %w", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() {
+		if err := os.Remove(tmpName); err != nil && !os.IsNotExist(err) {
+			slog.Warn("remove temporary config", "path", tmpName, "error", err)
+		}
+	}()
 	if _, err := tmp.Write(out); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("write temp config: %w", err)

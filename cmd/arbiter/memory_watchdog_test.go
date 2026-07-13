@@ -98,7 +98,9 @@ func TestMemoryWatchdog_DriftEmitsEventAndPatches(t *testing.T) {
 		},
 	}
 	raw, _ := json.MarshalIndent(configured, "", "  ")
-	os.WriteFile(filepath.Join(root, "local", "config.json"), raw, 0o644)
+	if err := os.WriteFile(filepath.Join(root, "local", "config.json"), raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
 
 	cfg := &Config{
 		VRAMBudgetGB: 100,
@@ -136,9 +138,14 @@ func TestMemoryWatchdog_DriftEmitsEventAndPatches(t *testing.T) {
 	}
 
 	// Config file should now have a larger memory_gb.
-	got, _ := os.ReadFile(filepath.Join(root, "local", "config.json"))
+	got, err := os.ReadFile(filepath.Join(root, "local", "config.json"))
+	if err != nil {
+		t.Fatalf("read updated config: %v", err)
+	}
 	var parsed map[string]any
-	json.Unmarshal(got, &parsed)
+	if err := json.Unmarshal(got, &parsed); err != nil {
+		t.Fatalf("decode updated config: %v", err)
+	}
 	model := parsed["models"].(map[string]any)["test-model"].(map[string]any)
 	newGB := model["memory_gb"].(float64)
 	if newGB <= 4.0 {
@@ -153,9 +160,15 @@ func TestMemoryWatchdog_DriftEmitsEventAndPatches(t *testing.T) {
 func TestMemoryWatchdog_DriftCappedByBudget(t *testing.T) {
 	root := t.TempDir()
 	logDir := filepath.Join(root, "logs")
-	os.MkdirAll(filepath.Join(root, "local"), 0o755)
-	os.MkdirAll(logDir, 0o755)
-	os.WriteFile(filepath.Join(root, "local", "config.json"), []byte(`{"models":{"m":{"memory_gb":4.0}}}`), 0o644)
+	if err := os.MkdirAll(filepath.Join(root, "local"), 0o755); err != nil {
+		t.Fatalf("create local dir: %v", err)
+	}
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("create log dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "local", "config.json"), []byte(`{"models":{"m":{"memory_gb":4.0}}}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
 
 	cfg := &Config{
 		VRAMBudgetGB: 100,
@@ -182,9 +195,15 @@ func TestMemoryWatchdog_DriftCappedByBudget(t *testing.T) {
 func TestMemoryWatchdog_NoDriftBelowThreshold(t *testing.T) {
 	root := t.TempDir()
 	logDir := filepath.Join(root, "logs")
-	os.MkdirAll(filepath.Join(root, "local"), 0o755)
-	os.MkdirAll(logDir, 0o755)
-	os.WriteFile(filepath.Join(root, "local", "config.json"), []byte(`{"models":{"m":{"memory_gb":4.0}}}`), 0o644)
+	if err := os.MkdirAll(filepath.Join(root, "local"), 0o755); err != nil {
+		t.Fatalf("create local dir: %v", err)
+	}
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("create log dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "local", "config.json"), []byte(`{"models":{"m":{"memory_gb":4.0}}}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
 
 	cfg := &Config{VRAMBudgetGB: 100, Models: map[string]ModelConfig{"m": {MemoryGB: 4}}}
 	mgr := NewInstanceManager(cfg, "python3", root)
@@ -204,7 +223,9 @@ func TestMemoryWatchdog_NoDriftBelowThreshold(t *testing.T) {
 func TestMemoryWatchdog_SystemPressureEventEmitted(t *testing.T) {
 	root := t.TempDir()
 	logDir := filepath.Join(root, "logs")
-	os.MkdirAll(logDir, 0o755)
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("create log dir: %v", err)
+	}
 
 	cfg := &Config{SystemRAMBudgetGB: 100, Models: map[string]ModelConfig{}}
 	mgr := NewInstanceManager(cfg, "python3", root)
@@ -221,7 +242,9 @@ func TestMemoryWatchdog_SystemPressureEventEmitted(t *testing.T) {
 func TestMemoryWatchdog_SystemPressureDisabledWhenBudgetZero(t *testing.T) {
 	root := t.TempDir()
 	logDir := filepath.Join(root, "logs")
-	os.MkdirAll(logDir, 0o755)
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("create log dir: %v", err)
+	}
 
 	cfg := &Config{SystemRAMBudgetGB: 0, Models: map[string]ModelConfig{}}
 	mgr := NewInstanceManager(cfg, "python3", root)

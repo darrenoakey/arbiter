@@ -153,7 +153,7 @@ def test_adapter(model_id: str, reserve_gb: float = 0, verbose: bool = False):
             return False
 
         # Test infer
-        print(f"\n  [INFER] Running inference...")
+        print("\n  [INFER] Running inference...")
         output_dir = Path(tempfile.mkdtemp(prefix=f"adapter-test-{model_id}-"))
         cancel_flag = threading.Event()
         params = {
@@ -182,7 +182,7 @@ def test_adapter(model_id: str, reserve_gb: float = 0, verbose: bool = False):
             return False
 
         # Verify output
-        print(f"\n  [VERIFY] Checking output...")
+        print("\n  [VERIFY] Checking output...")
         try:
             assert "format" in result, "Missing 'format' in result"
             assert "file" in result, "Missing 'file' in result"

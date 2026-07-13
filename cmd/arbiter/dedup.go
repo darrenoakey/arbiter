@@ -27,7 +27,9 @@ func jobForceFlag(params json.RawMessage) bool {
 	var f struct {
 		Force bool `json:"force"`
 	}
-	json.Unmarshal(params, &f)
+	if err := json.Unmarshal(params, &f); err != nil {
+		return false
+	}
 	return f.Force
 }
 
@@ -119,7 +121,11 @@ func hashFileContents(path string) string {
 	if err != nil {
 		return "" // file not accessible, use path as-is
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			slog.Warn("close dedup input", "path", path, "error", err)
+		}
+	}()
 
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
@@ -150,7 +156,9 @@ CREATE INDEX IF NOT EXISTS idx_dedup_created ON dedup_cache(created_at);
 func (s *Store) InitDedup() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.db.Exec(dedupSchema)
+	if _, err := s.db.Exec(dedupSchema); err != nil {
+		slog.Error("initialize dedup schema", "error", err)
+	}
 }
 
 // DedupLookup checks for an existing job with the same input hash.
@@ -174,10 +182,12 @@ func (s *Store) DedupLookup(hash string, ttlSeconds float64) (string, error) {
 func (s *Store) DedupRegister(hash, jobID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.db.Exec(
+	if _, err := s.db.Exec(
 		"INSERT OR REPLACE INTO dedup_cache (hash, job_id, created_at) VALUES (?, ?, ?)",
 		hash, jobID, nowTS(),
-	)
+	); err != nil {
+		slog.Error("register dedup entry", "job_id", jobID, "error", err)
+	}
 }
 
 // DedupCleanup removes entries older than ttlSeconds.
@@ -201,14 +211,20 @@ func (s *Store) GetFollowers(originalJobID string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			slog.Warn("close follower rows", "error", err)
+		}
+	}()
 	var ids []string
 	for rows.Next() {
 		var id string
-		rows.Scan(&id)
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
 		ids = append(ids, id)
 	}
-	return ids, nil
+	return ids, rows.Err()
 }
 
 // CreateFollowerJob creates a job in "following" state linked to the original.
@@ -252,15 +268,19 @@ func (s *Store) ResolveFollowers(originalJobID string, originalState string, res
 
 			s.mu.Lock()
 			if result != nil {
-				s.db.Exec(
+				if _, err := s.db.Exec(
 					"UPDATE jobs SET state = 'completed', result = ?, error = NULL, finished_at = ? WHERE id = ?",
 					string(*result), now, fid,
-				)
+				); err != nil {
+					slog.Error("resolve completed follower", "job_id", fid, "error", err)
+				}
 			} else {
-				s.db.Exec(
+				if _, err := s.db.Exec(
 					"UPDATE jobs SET state = 'completed', error = NULL, finished_at = ? WHERE id = ?",
 					now, fid,
-				)
+				); err != nil {
+					slog.Error("resolve follower without result", "job_id", fid, "error", err)
+				}
 			}
 			s.mu.Unlock()
 		}
@@ -269,15 +289,19 @@ func (s *Store) ResolveFollowers(originalJobID string, originalState string, res
 	if originalState != "completed" {
 		promotedID := followers[0]
 		s.mu.Lock()
-		s.db.Exec(
+		if _, err := s.db.Exec(
 			"UPDATE jobs SET state = 'queued', error = NULL, result = NULL, priority = 0, started_at = NULL, finished_at = NULL WHERE id = ?",
 			promotedID,
-		)
+		); err != nil {
+			slog.Error("promote dedup follower", "job_id", promotedID, "error", err)
+		}
 		for _, fid := range followers[1:] {
-			s.db.Exec(
+			if _, err := s.db.Exec(
 				"UPDATE jobs SET state = 'following', error = ?, result = NULL, started_at = NULL, finished_at = NULL WHERE id = ?",
 				"following:"+promotedID, fid,
-			)
+			); err != nil {
+				slog.Error("repoint dedup follower", "job_id", fid, "promoted_id", promotedID, "error", err)
+			}
 		}
 		s.mu.Unlock()
 
@@ -298,7 +322,11 @@ func (s *Store) ReconcileFollowingJobs(outputDir string) int {
 	if err != nil {
 		return 0
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			slog.Warn("close reconciliation rows", "error", err)
+		}
+	}()
 
 	var originalIDs []string
 	for rows.Next() {
@@ -337,7 +365,11 @@ func (s *Store) DedupRecoveredJobs() int {
 	if err != nil {
 		return 0
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			slog.Warn("close recovered job rows", "error", err)
+		}
+	}()
 
 	type queuedJob struct {
 		id      string
@@ -348,7 +380,10 @@ func (s *Store) DedupRecoveredJobs() int {
 	for rows.Next() {
 		var j queuedJob
 		var payload string
-		rows.Scan(&j.id, &j.jobType, &payload)
+		if err := rows.Scan(&j.id, &j.jobType, &payload); err != nil {
+			slog.Error("scan recovered job", "error", err)
+			continue
+		}
 		j.payload = json.RawMessage(payload)
 		jobs = append(jobs, j)
 	}
@@ -371,10 +406,12 @@ func (s *Store) DedupRecoveredJobs() int {
 		if firstID, exists := seen[hash]; exists {
 			// Duplicate — cancel it
 			s.mu.Lock()
-			s.db.Exec(
+			if _, err := s.db.Exec(
 				"UPDATE jobs SET state = 'cancelled', finished_at = ?, error = ? WHERE id = ?",
 				now, "dedup: duplicate of "+firstID, j.id,
-			)
+			); err != nil {
+				slog.Error("cancel recovered duplicate", "job_id", j.id, "error", err)
+			}
 			s.mu.Unlock()
 			slog.Info("dedup: cancelled recovered duplicate job",
 				"job_id", j.id, "duplicate_of", firstID, "job_type", j.jobType)

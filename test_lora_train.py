@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Test lora-train via arbiter API — submits a real job and polls for completion."""
-import json
 import sys
 import time
 
@@ -49,7 +48,7 @@ while True:
 
     if status == "completed":
         result = resp.json().get("result", {})
-        print(f"\nSUCCESS!")
+        print("\nSUCCESS!")
         print(f"  Train loss: {result.get('train_loss')}")
         print(f"  Runtime: {result.get('train_runtime_seconds')}s")
         print(f"  Adapter: {result.get('adapter_path')}")

@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .profiler import measure_vram, get_gpu_info
+from .profiler import get_gpu_info
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -129,7 +129,7 @@ def run_calibration(model_name: str, concurrency_levels: list[int], samples: int
 
         # Stop if latency is degrading badly (>3x single-request)
         if len(profiles) > 1 and profiles[-1]["avg_inference_time_ms"] > profiles[0]["avg_inference_time_ms"] * 3:
-            print(f"    Latency degraded >3x, stopping higher concurrency.")
+            print("    Latency degraded >3x, stopping higher concurrency.")
             break
 
     adapter.unload()

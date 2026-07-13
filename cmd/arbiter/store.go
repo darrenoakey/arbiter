@@ -100,7 +100,9 @@ func migrateAddCanonicalJobID(db *sql.DB) {
 		// scanJob falls back gracefully if the column is missing.
 		_ = err
 	}
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_jobs_canonical ON jobs(canonical_job_id) WHERE canonical_job_id IS NOT NULL`)
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_jobs_canonical ON jobs(canonical_job_id) WHERE canonical_job_id IS NOT NULL`); err != nil {
+		return
+	}
 }
 
 // migrateAddExcludedHosts adds the excluded_hosts column to databases that
@@ -209,7 +211,7 @@ func fillJobNullable(j *Job, payload, result, errStr, canonical, excluded sql.Nu
 	}
 	if excluded.Valid && excluded.String != "" {
 		// Stored as a JSON array; ignore malformed values (treat as none).
-		json.Unmarshal([]byte(excluded.String), &j.ExcludedHosts)
+		_ = json.Unmarshal([]byte(excluded.String), &j.ExcludedHosts)
 	}
 }
 
@@ -243,7 +245,9 @@ func (s *Store) AddExcludedHost(jobID, hostID string) ([]string, error) {
 	}
 	var hosts []string
 	if existing.Valid && existing.String != "" {
-		json.Unmarshal([]byte(existing.String), &hosts)
+		if err := json.Unmarshal([]byte(existing.String), &hosts); err != nil {
+			return nil, fmt.Errorf("decode excluded hosts for job %s: %w", jobID, err)
+		}
 	}
 	for _, h := range hosts {
 		if h == hostID {
@@ -293,7 +297,7 @@ func (s *Store) ListJobs(state, modelID string, limit int) ([]*Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var jobs []*Job
 	for rows.Next() {
@@ -303,7 +307,7 @@ func (s *Store) ListJobs(state, modelID string, limit int) ([]*Job, error) {
 		}
 		jobs = append(jobs, j)
 	}
-	return jobs, nil
+	return jobs, rows.Err()
 }
 
 // scanJobFromRows is the shared row-scan helper. Centralised so adding
@@ -440,16 +444,18 @@ func (s *Store) CountByState(modelID string) (map[string]int, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	counts := make(map[string]int)
 	for rows.Next() {
 		var state string
 		var count int
-		rows.Scan(&state, &count)
+		if err := rows.Scan(&state, &count); err != nil {
+			return nil, err
+		}
 		counts[state] = count
 	}
-	return counts, nil
+	return counts, rows.Err()
 }
 
 // ActivePendingByModel returns, per model, the number of jobs in an active
@@ -470,7 +476,7 @@ func (s *Store) ActivePendingByModel() (map[string]int, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make(map[string]int)
 	for rows.Next() {
@@ -497,7 +503,7 @@ func (s *Store) OldestQueuedAgeByModel() (map[string]float64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	now := nowTS()
 	out := make(map[string]float64)
 	for rows.Next() {
@@ -594,7 +600,7 @@ func (s *Store) ListStuckScheduled(olderThanSec float64) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var ids []string
 	for rows.Next() {
 		var id string
@@ -667,7 +673,7 @@ func (s *Store) FailActiveForModel(modelID, errMsg string) (int, error) {
 }
 
 func (s *Store) Close() {
-	s.db.Close()
+	_ = s.db.Close()
 }
 
 // GetJobs fetches multiple jobs by ID in a single query.
@@ -694,7 +700,7 @@ func (s *Store) GetJobs(ids []string) (map[string]*Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	result := make(map[string]*Job, len(ids))
 	for rows.Next() {
@@ -704,7 +710,7 @@ func (s *Store) GetJobs(ids []string) (map[string]*Job, error) {
 		}
 		result[j.ID] = j
 	}
-	return result, nil
+	return result, rows.Err()
 }
 
 func (s *Store) CompletedJobStats(modelID string) (int, float64, float64, error) {
@@ -751,7 +757,7 @@ func (s *Store) CountByStateGrouped() (perModel map[string]map[string]int, globa
 	if err != nil {
 		return nil, nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	perModel = make(map[string]map[string]int)
 	global = make(map[string]int)
@@ -792,7 +798,7 @@ GROUP BY model_id`)
 	if err != nil {
 		return nil, JobStats{}, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	perModel = make(map[string]JobStats)
 	var gCount, gExecCount int
@@ -888,7 +894,7 @@ func (s *Store) ModelActionAverages() (map[string]float64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make(map[string]float64)
 	for rows.Next() {
@@ -932,7 +938,7 @@ func (s *Store) GetRunningJobs() ([]*Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var jobs []*Job
 	for rows.Next() {
@@ -942,7 +948,7 @@ func (s *Store) GetRunningJobs() ([]*Job, error) {
 		}
 		jobs = append(jobs, j)
 	}
-	return jobs, nil
+	return jobs, rows.Err()
 }
 
 // GetActiveJobs returns all jobs in a non-terminal state (queued, scheduled, running, following).
@@ -956,7 +962,7 @@ func (s *Store) GetActiveJobs() ([]*Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var jobs []*Job
 	for rows.Next() {
@@ -966,5 +972,5 @@ func (s *Store) GetActiveJobs() ([]*Job, error) {
 		}
 		jobs = append(jobs, j)
 	}
-	return jobs, nil
+	return jobs, rows.Err()
 }

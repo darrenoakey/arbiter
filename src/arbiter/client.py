@@ -20,7 +20,6 @@ import base64
 import json
 import time
 from pathlib import Path
-from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 

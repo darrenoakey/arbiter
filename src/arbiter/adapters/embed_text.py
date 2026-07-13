@@ -24,7 +24,6 @@ _EMBEDDING_DIM = 768
 
 def _mean_pool(last_hidden_state, attention_mask):
     """Mean-pool the last hidden state weighted by the attention mask."""
-    import torch
 
     mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
     summed = (last_hidden_state * mask).sum(dim=1)
@@ -42,7 +41,6 @@ class EmbedTextAdapter(ModelAdapter):
         self._device = "cpu"
 
     def load(self, device: str = "cuda") -> None:
-        import torch
         from transformers import AutoModel, AutoTokenizer
 
         log.info("Loading %s on %s ...", _MODEL_REPOSITORY, device)

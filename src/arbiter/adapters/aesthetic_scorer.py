@@ -1,9 +1,7 @@
 """Aesthetic image scorer adapter — CLIP-based multi-dimensional aesthetic scoring."""
 from __future__ import annotations
 
-import base64
 import importlib.util
-import io
 import json
 import logging
 import math
@@ -82,7 +80,6 @@ class AestheticScorerAdapter(ModelAdapter):
 
     def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
         import torch
-        from PIL import Image
 
         self._check_cancel(cancel_flag)
 

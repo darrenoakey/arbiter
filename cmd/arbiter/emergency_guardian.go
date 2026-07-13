@@ -325,7 +325,11 @@ func readMeminfoGB() (meminfoGB, error) {
 	if err != nil {
 		return meminfoGB{}, err
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			slog.Debug("close meminfo", "error", err)
+		}
+	}()
 	return parseMeminfoGB(f)
 }
 

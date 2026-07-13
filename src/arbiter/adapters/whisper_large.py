@@ -1,7 +1,6 @@
 """Whisper large-v3 transcription adapter."""
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import tempfile
@@ -38,8 +37,7 @@ class WhisperLargeAdapter(ModelAdapter):
     def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
         self._check_cancel(cancel_flag)
 
-        # Decode base64 audio to a temp file
-        audio_b64 = params.get("audio", "")
+        # Decode audio to a temp file
         audio_format = params.get("format", "wav")
         language = params.get("language", None)
 

@@ -357,7 +357,11 @@ func (b *RemoteHTTPBackend) doChat(ctx context.Context, body []byte) ([]byte, er
 	if err != nil {
 		return nil, err // transport error (dial refused / no route / timeout)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Debug("close remote chat response", "host", b.host, "error", err)
+		}
+	}()
 	respBody, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
 		return nil, readErr
@@ -393,7 +397,9 @@ func mapChatBodyToResult(body []byte) json.RawMessage {
 			TotalTokens      int `json:"total_tokens"`
 		} `json:"usage"`
 	}
-	json.Unmarshal(body, &chatResp)
+	if err := json.Unmarshal(body, &chatResp); err != nil {
+		slog.Warn("decode remote chat response", "error", err)
+	}
 
 	result := map[string]any{
 		"format":   "json",
@@ -461,12 +467,18 @@ func (b *RemoteHTTPBackend) Unload() error {
 			"max_tokens": 1,
 			"keep_alive": 0,
 		})
-		b.doChat(ctx, payload) // best-effort; ignore result
+		if _, err := b.doChat(ctx, payload); err != nil {
+			slog.Debug("remote model unload request failed", "model", b.modelTag, "error", err)
+		}
 	}()
 	return nil
 }
 
-func (b *RemoteHTTPBackend) Kill()          { b.Unload() }
+func (b *RemoteHTTPBackend) Kill() {
+	if err := b.Unload(); err != nil {
+		slog.Debug("remote model kill failed", "model", b.modelTag, "error", err)
+	}
+}
 func (b *RemoteHTTPBackend) IsRemote() bool { return true }
 
 // remoteHostBudget is the per-host advisory memory accounting for a remote

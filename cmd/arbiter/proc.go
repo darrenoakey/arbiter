@@ -168,12 +168,13 @@ func (inst *Instance) State() string {
 func (inst *Instance) setState(state string) {
 	inst.mu.Lock()
 	inst.state = state
-	if state == "loaded" {
+	switch state {
+	case "loaded":
 		inst.lastActive = time.Now()
 		if inst.loadedAt.IsZero() {
 			inst.loadedAt = inst.lastActive
 		}
-	} else if state == "stopped" || state == "unloading" || state == "error" {
+	case "stopped", "unloading", "error":
 		inst.loadedAt = time.Time{}
 	}
 	inst.mu.Unlock()
@@ -261,9 +262,7 @@ func (inst *Instance) Spawn() error {
 		// over-allocation raises a catchable CUDA OOM instead of wedging the box.
 		cmd.Env = append(cmd.Env, fmt.Sprintf("ARBITER_MEMORY_GB=%g", inst.memoryGB))
 	}
-	for _, e := range inst.workerEnv {
-		cmd.Env = append(cmd.Env, e)
-	}
+	cmd.Env = append(cmd.Env, inst.workerEnv...)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -406,7 +405,9 @@ func (inst *Instance) markSubprocessExited() {
 	inst.loadedAt = time.Time{} // residency ended
 	manager := inst.manager
 	if inst.stdin != nil {
-		inst.stdin.Close()
+		if err := inst.stdin.Close(); err != nil {
+			slog.Debug("close worker stdin after exit", "instance", inst.InstanceID, "error", err)
+		}
 		inst.stdin = nil
 	}
 	inst.cmd = nil
@@ -468,7 +469,9 @@ func (inst *Instance) sendAndReceive(cmd map[string]any) (*WorkerResponse, error
 		}
 	}
 	var resp WorkerResponse
-	json.Unmarshal(raw, &resp)
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("decode worker response: %w", err)
+	}
 	return &resp, nil
 }
 
@@ -593,7 +596,9 @@ func (inst *Instance) Unload() error {
 	if stdin != nil {
 		go func() {
 			data, _ := json.Marshal(map[string]any{"cmd": "unload"})
-			stdin.Write(append(data, '\n'))
+			if _, err := stdin.Write(append(data, '\n')); err != nil {
+				slog.Debug("send unload hint", "instance", inst.InstanceID, "error", err)
+			}
 		}()
 	}
 
@@ -630,8 +635,12 @@ func (inst *Instance) Kill() {
 		// One graceful attempt — well-behaved workers will release CUDA cleanly.
 		if inst.stdin != nil {
 			data, _ := json.Marshal(map[string]any{"cmd": "shutdown"})
-			inst.stdin.Write(append(data, '\n'))
-			inst.stdin.Close()
+			if _, err := inst.stdin.Write(append(data, '\n')); err != nil {
+				slog.Debug("send worker shutdown", "instance", inst.InstanceID, "error", err)
+			}
+			if err := inst.stdin.Close(); err != nil {
+				slog.Debug("close worker stdin", "instance", inst.InstanceID, "error", err)
+			}
 		}
 	}
 	inst.state = "stopped"
@@ -665,7 +674,9 @@ func (inst *Instance) Kill() {
 	// happily spawned a SECOND worker (observed: two moondream processes both
 	// holding 17 GB). SIGKILL on a dead PID is harmless (ESRCH); SIGKILL on a
 	// live PID is what we need.
-	syscall.Kill(rootPid, syscall.SIGKILL)
+	if err := syscall.Kill(rootPid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+		slog.Warn("Kill: root SIGKILL failed", "instance", inst.InstanceID, "pid", rootPid, "error", err)
+	}
 
 	// Now verify-and-retry: walk the descendant tree, SIGKILL everything,
 	// and keep going until /proc shows none of them. 30 attempts × 500ms =
@@ -685,7 +696,9 @@ func (inst *Instance) Kill() {
 		slog.Warn("Kill: SIGKILL descendant tree",
 			"instance", inst.InstanceID, "root", rootPid, "attempt", attempt, "pids", descendants)
 		for _, pid := range descendants {
-			syscall.Kill(pid, syscall.SIGKILL)
+			if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+				slog.Warn("Kill: descendant SIGKILL failed", "instance", inst.InstanceID, "pid", pid, "error", err)
+			}
 		}
 		time.Sleep(500 * time.Millisecond)
 	}

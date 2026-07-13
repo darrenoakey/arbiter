@@ -1,9 +1,6 @@
 """Tests for config loading and validation."""
 import json
-import os
-from pathlib import Path
 
-import pytest
 
 from arbiter.config import ArbiterConfig, ModelConfig, load_config
 

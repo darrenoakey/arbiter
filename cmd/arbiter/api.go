@@ -19,15 +19,7 @@ import (
 	"time"
 )
 
-// portCacheEntry is one row of the per-instance worker-port cache.
-type portCacheEntry struct {
-	port     int
-	loadedAt time.Time
-}
-
 type API struct {
-	portCacheMu sync.Mutex
-	portCache   map[string]portCacheEntry // instance_id -> port
 	config      *Config
 	store       *Store
 	mgr         *InstanceManager
@@ -371,7 +363,10 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 			var pm struct {
 				Model string `json:"model"`
 			}
-			json.Unmarshal(req.Params, &pm)
+			if err := json.Unmarshal(req.Params, &pm); err != nil {
+				writeError(w, 400, "invalid job params")
+				return
+			}
 			if pm.Model != "" {
 				if _, exists := a.config.Models[pm.Model]; exists {
 					modelID = pm.Model
@@ -384,7 +379,10 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		var chatParams struct {
 			Model string `json:"model"`
 		}
-		json.Unmarshal(req.Params, &chatParams)
+		if err := json.Unmarshal(req.Params, &chatParams); err != nil {
+			writeError(w, 400, "invalid chat-completion params")
+			return
+		}
 		if chatParams.Model == "" {
 			writeError(w, 400, "chat-completion requires model in params")
 			return
@@ -462,7 +460,10 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 			if cached, ok := a.llmCache.Get(key); ok {
 				newJob, err := a.store.CreateJob(modelID, req.Type, req.Params, 0)
 				if err == nil {
-					a.store.UpdateState(newJob.ID, "completed", WithResult(cached), WithFinishedAt(nowTS()))
+					if err := a.store.UpdateState(newJob.ID, "completed", WithResult(cached), WithFinishedAt(nowTS())); err != nil {
+						writeError(w, 500, fmt.Sprintf("complete cached job: %s", err))
+						return
+					}
 					a.logger.Log("llm.cache_hit", map[string]any{"job_id": newJob.ID, "model": modelID, "async": true})
 					writeJSON(w, 200, map[string]any{
 						"job_id": newJob.ID, "status": "completed",
@@ -506,7 +507,10 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 								"job", newJob.ID, "orig", origID, "error", err)
 						}
 						if origJob.Result != nil {
-							a.store.UpdateState(newJob.ID, "completed", WithResult(*origJob.Result), WithFinishedAt(nowTS()))
+							if err := a.store.UpdateState(newJob.ID, "completed", WithResult(*origJob.Result), WithFinishedAt(nowTS())); err != nil {
+								writeError(w, 500, fmt.Sprintf("complete deduplicated job: %s", err))
+								return
+							}
 						}
 						a.logger.Log("job.dedup_hit", map[string]any{
 							"job_id": newJob.ID, "original_id": origID, "type": "cached",
@@ -579,7 +583,7 @@ func rejectSparkImageGeneration(jobType, modelID string) error {
 	}
 	switch jobType {
 	case "image-generate", "image-edit":
-		return fmt.Errorf("Spark image generation is permanently disabled; use the image server/Codex path")
+		return fmt.Errorf("spark image generation is permanently disabled; use the image server/Codex path")
 	default:
 		return nil
 	}
@@ -610,7 +614,10 @@ func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
 	}
 	if job.Result != nil {
 		var result map[string]any
-		json.Unmarshal(*job.Result, &result)
+		if err := json.Unmarshal(*job.Result, &result); err != nil {
+			writeError(w, 500, "stored job result is invalid")
+			return
+		}
 
 		// Inline result file as base64 if present
 		if job.State == "completed" && result != nil {
@@ -660,7 +667,9 @@ func (a *API) cancelJob(w http.ResponseWriter, r *http.Request) {
 
 	// If running, find the instance and send cancel signal
 	for _, inst := range a.mgr.GetModelInstances(job.ModelID) {
-		inst.Cancel()
+		if err := inst.Cancel(); err != nil {
+			slog.Warn("cancel running job instance", "job_id", jobID, "instance_id", inst.InstanceID, "error", err)
+		}
 	}
 	writeJSON(w, 200, map[string]any{"job_id": jobID, "status": "cancelling"})
 }
@@ -714,10 +723,13 @@ func (a *API) bulkStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		if j.State == "completed" && j.Result != nil {
 			var result map[string]any
-			json.Unmarshal(*j.Result, &result)
-			// Include result metadata but NOT file data (use GET /v1/jobs/{id} for that)
-			delete(result, "data")
-			entry["result"] = result
+			if err := json.Unmarshal(*j.Result, &result); err != nil {
+				slog.Warn("decode bulk job result", "job_id", j.ID, "error", err)
+			} else {
+				// Include result metadata but NOT file data (use GET /v1/jobs/{id} for that)
+				delete(result, "data")
+				entry["result"] = result
+			}
 		}
 		out[i] = entry
 	}
@@ -766,14 +778,18 @@ func (a *API) listJobs(w http.ResponseWriter, r *http.Request) {
 func (a *API) systemStatus(w http.ResponseWriter, r *http.Request) {
 	if cached := a.psCache.Load(); cached != nil {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(cached.([]byte))
+		if _, err := w.Write(cached.([]byte)); err != nil {
+			slog.Warn("write cached system status", "error", err)
+		}
 		return
 	}
 	// Fallback before first cache update
 	a.updatePSCache()
 	if cached := a.psCache.Load(); cached != nil {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(cached.([]byte))
+		if _, err := w.Write(cached.([]byte)); err != nil {
+			slog.Warn("write refreshed system status", "error", err)
+		}
 		return
 	}
 	writeJSON(w, 200, map[string]any{})
@@ -798,7 +814,11 @@ func (a *API) uploadRef(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, fmt.Sprintf("missing file field: %s", err))
 			return
 		}
-		defer f.Close()
+		defer func() {
+			if err := f.Close(); err != nil {
+				slog.Warn("close uploaded reference", "error", err)
+			}
+		}()
 		filename = header.Filename
 		data, err = io.ReadAll(f)
 		if err != nil {
@@ -857,7 +877,10 @@ func (a *API) deleteRef(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "ref not found")
 		return
 	}
-	os.Remove(path)
+	if err := os.Remove(path); err != nil {
+		writeError(w, 500, fmt.Sprintf("delete ref: %s", err))
+		return
+	}
 	slog.Info("ref deleted", "ref_id", refID)
 	writeJSON(w, 200, map[string]any{"ref_id": refID, "status": "deleted"})
 }
@@ -1160,7 +1183,7 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
 		return
 	}
-	current, ok := a.config.Models[modelID]
+	current := a.config.Models[modelID]
 
 	var req modelConfigRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1319,7 +1342,7 @@ func (a *API) hardKillModelWorkers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
 		return
 	}
-	cfg, ok := a.config.Models[modelID]
+	cfg := a.config.Models[modelID]
 
 	cancelledQueued, err := a.store.CancelQueuedForModel(modelID)
 	if err != nil {
@@ -1377,7 +1400,9 @@ func (a *API) killModelRunning(w http.ResponseWriter, r *http.Request) {
 	cancelledRunning := 0
 	for _, inst := range instances {
 		if inst.ActiveJobs() > 0 {
-			inst.Cancel()
+			if err := inst.Cancel(); err != nil {
+				slog.Warn("cancel model instance", "model_id", modelID, "instance_id", inst.InstanceID, "error", err)
+			}
 			cancelledRunning += inst.ActiveJobs()
 		}
 	}
@@ -1414,7 +1439,7 @@ func (a *API) removeModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
 		return
 	}
-	cfg, ok := a.config.Models[modelID]
+	cfg := a.config.Models[modelID]
 
 	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
 	counts, err := a.store.CountByState(modelID)
@@ -1507,12 +1532,6 @@ func vllmChatWorkerBin(projectRoot string) string {
 		return bin
 	}
 	return "vllm-chat-worker"
-}
-
-func estimateMemoryGB(totalParams int64) float64 {
-	// fp16: 2 bytes per param + 20% overhead, rounded up to nearest 5GB
-	gb := float64(totalParams) * 2.0 / (1024 * 1024 * 1024) * 1.2
-	return math.Ceil(gb/5) * 5
 }
 
 func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
@@ -1776,7 +1795,9 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 				} else {
 					w.Header().Set("Content-Type", "application/json")
 					w.Header().Set("X-Arbiter-Cache", "hit")
-					w.Write(extractCachedResponse(cached))
+					if _, err := w.Write(extractCachedResponse(cached)); err != nil {
+						slog.Warn("write cached chat completion", "error", err)
+					}
 				}
 				return
 			}
@@ -1821,15 +1842,22 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 					// never cache blank replies.
 					a.storeChatResultIfCacheable(cacheKey, *j.Result)
 					var result map[string]any
-					json.Unmarshal(*j.Result, &result)
+					if err := json.Unmarshal(*j.Result, &result); err != nil {
+						writeError(w, 500, "stored chat result is invalid")
+						return
+					}
 					// Return the OpenAI response directly
 					if resp, ok := result["response"]; ok {
 						w.Header().Set("Content-Type", "application/json")
 						w.Header().Set("X-Arbiter-Cache", "miss")
 						if raw, ok := resp.(json.RawMessage); ok {
-							w.Write(raw)
+							if _, err := w.Write(raw); err != nil {
+								slog.Warn("write chat completion", "error", err)
+							}
 						} else {
-							json.NewEncoder(w).Encode(resp)
+							if err := json.NewEncoder(w).Encode(resp); err != nil {
+								slog.Warn("encode chat completion", "error", err)
+							}
 						}
 						return
 					}
@@ -1876,12 +1904,16 @@ func (a *API) chatCompletionStream(w http.ResponseWriter, r *http.Request, model
 		// will time out; mark the job cancelled now so it doesn't sit as
 		// "running" forever once dispatched.
 		a.scheduler.UnregisterStreamHandoff(job.ID)
-		a.store.UpdateState(job.ID, "cancelled", WithFinishedAt(nowTS()))
+		if err := a.store.UpdateState(job.ID, "cancelled", WithFinishedAt(nowTS())); err != nil {
+			slog.Warn("cancel abandoned stream job", "job_id", job.ID, "error", err)
+		}
 		return
 	case <-time.After(15 * time.Minute):
 		a.scheduler.UnregisterStreamHandoff(job.ID)
-		a.store.UpdateState(job.ID, "failed",
-			WithError("queued >15min waiting for slot"), WithFinishedAt(nowTS()))
+		if err := a.store.UpdateState(job.ID, "failed",
+			WithError("queued >15min waiting for slot"), WithFinishedAt(nowTS())); err != nil {
+			slog.Warn("fail stream job after queue timeout", "job_id", job.ID, "error", err)
+		}
 		writeError(w, 504, "chat completion timed out waiting for slot")
 		return
 	}
@@ -1922,7 +1954,11 @@ func proxyStreamFromInstance(w http.ResponseWriter, r *http.Request, inst *Insta
 		writeError(w, 502, fmt.Sprintf("worker error: %s", err))
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Debug("close streamed worker response", "error", err)
+		}
+	}()
 
 	for k, vv := range resp.Header {
 		for _, v := range vv {
@@ -1940,7 +1976,9 @@ func proxyStreamFromInstance(w http.ResponseWriter, r *http.Request, inst *Insta
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
-			w.Write(buf[:n])
+			if _, err := w.Write(buf[:n]); err != nil {
+				return err
+			}
 			flusher.Flush()
 		}
 		if rerr != nil {
@@ -1980,7 +2018,9 @@ func replayRemoteStream(w http.ResponseWriter, inst *Instance, body []byte) erro
 	var result struct {
 		Response json.RawMessage `json:"response"`
 	}
-	json.Unmarshal(resp.Result, &result)
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return fmt.Errorf("decode remote stream result: %w", err)
+	}
 	full := result.Response
 	if len(full) == 0 {
 		full = resp.Result
@@ -2008,7 +2048,10 @@ func writeOpenAISSEFromResponse(w http.ResponseWriter, full json.RawMessage) {
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 	}
-	json.Unmarshal(full, &chatResp)
+	if err := json.Unmarshal(full, &chatResp); err != nil {
+		slog.Warn("decode OpenAI response for SSE replay", "error", err)
+		return
+	}
 
 	content := ""
 	finish := "stop"
@@ -2047,9 +2090,18 @@ func writeOpenAISSEFromResponse(w http.ResponseWriter, full json.RawMessage) {
 			}},
 		}
 		data, _ := json.Marshal(chunk)
-		w.Write([]byte("data: "))
-		w.Write(data)
-		w.Write([]byte("\n\n"))
+		if _, err := w.Write([]byte("data: ")); err != nil {
+			slog.Warn("write cached SSE prefix", "error", err)
+			return
+		}
+		if _, err := w.Write(data); err != nil {
+			slog.Warn("write cached SSE data", "error", err)
+			return
+		}
+		if _, err := w.Write([]byte("\n\n")); err != nil {
+			slog.Warn("write cached SSE delimiter", "error", err)
+			return
+		}
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -2062,7 +2114,9 @@ func writeOpenAISSEFromResponse(w http.ResponseWriter, full json.RawMessage) {
 		writeChunk(map[string]any{"content": content}, nil)
 	}
 	writeChunk(map[string]any{}, finish)
-	w.Write([]byte("data: [DONE]\n\n"))
+	if _, err := w.Write([]byte("data: [DONE]\n\n")); err != nil {
+		slog.Warn("write cached SSE terminator", "error", err)
+	}
 	if flusher != nil {
 		flusher.Flush()
 	}
@@ -2348,30 +2402,6 @@ func (a *API) adminUnloadAll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"killed_workers": totalKilled, "models_count": len(models)})
 }
 
-// cachedWorkerPort returns the worker's HTTP port, looking it up via the
-// stdin/stdout protocol on first access and caching subsequent lookups.
-// Concurrent benchmark requests would otherwise race on the protocol's
-// non-unique default reqID and corrupt each other's responses.
-func (a *API) cachedWorkerPort(inst *Instance) (int, error) {
-	a.portCacheMu.Lock()
-	if a.portCache == nil {
-		a.portCache = make(map[string]portCacheEntry)
-	}
-	if entry, ok := a.portCache[inst.InstanceID]; ok {
-		a.portCacheMu.Unlock()
-		return entry.port, nil
-	}
-	a.portCacheMu.Unlock()
-	port, err := inst.GetPort()
-	if err != nil {
-		return 0, err
-	}
-	a.portCacheMu.Lock()
-	a.portCache[inst.InstanceID] = portCacheEntry{port: port, loadedAt: time.Now()}
-	a.portCacheMu.Unlock()
-	return port, nil
-}
-
 // adminPreload loads a model without running a job. Returns load time and a
 // memory snapshot taken immediately after readiness — fair input for comparing
 // load cost across backends.
@@ -2426,10 +2456,6 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-var requestPool = sync.Pool{
-	New: func() any { return &responseWriter{} },
-}
-
 func withLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rw := &responseWriter{ResponseWriter: w, status: 200}
@@ -2446,7 +2472,9 @@ func withLogging(next http.Handler) http.Handler {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Warn("encode JSON response", "error", err)
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {

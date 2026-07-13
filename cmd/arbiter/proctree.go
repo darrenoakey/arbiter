@@ -82,7 +82,9 @@ func pidRSSAnonMB(pid int) float64 {
 	for _, line := range strings.Split(string(data), "\n") {
 		if strings.HasPrefix(line, "RssAnon:") {
 			var kb int64
-			fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(line, "RssAnon:")), "%d", &kb)
+			if _, err := fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(line, "RssAnon:")), "%d", &kb); err != nil {
+				return 0
+			}
 			return float64(kb) / 1024
 		}
 	}

@@ -1,9 +1,8 @@
 """Tests for SQLite job store."""
 import time
 
-import pytest
 
-from arbiter.store import JobStore, Job
+from arbiter.store import JobStore
 
 
 class TestJobStore:
@@ -107,7 +106,7 @@ class TestJobStore:
 
     def test_count_running(self, store):
         j1 = store.create_job("model-a", "t", {})
-        j2 = store.create_job("model-a", "t", {})
+        store.create_job("model-a", "t", {})
         store.update_state(j1.id, "running", started_at=time.time())
         assert store.count_running("model-a") == 1
 

@@ -9,7 +9,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import json
 import logging
 import shutil
-import threading
 import time
 from pathlib import Path
 
@@ -45,11 +44,6 @@ class LoraTrainAdapter(ModelAdapter):
         log.info("Pre-loading training libraries...")
         import unsloth.models._utils as _u
         _u.has_internet = lambda *a, **kw: False
-        import torch
-        from unsloth import FastLanguageModel
-        from unsloth.chat_templates import get_chat_template
-        from transformers import Trainer, TrainingArguments, DataCollatorForSeq2Seq
-        from datasets import Dataset
         self._device = device
         self._loaded = True
         log.info("Training libraries ready.")
@@ -223,7 +217,6 @@ class LoraTrainAdapter(ModelAdapter):
 
     def estimate_time(self, params):
         max_iters = params.get("max_iters", 0)
-        batch_size = params.get("batch_size", 4)
         if max_iters > 0:
             return max_iters * 500.0
         return 3600000.0

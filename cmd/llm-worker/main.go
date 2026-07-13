@@ -56,7 +56,6 @@ var (
 	llamaCmd   *exec.Cmd
 	llamaPort  int
 	cancelFlag bool
-	cancelCtx  context.Context
 	cancelFunc context.CancelFunc
 )
 
@@ -71,7 +70,9 @@ func findFreePort() int {
 		return 18080
 	}
 	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
+	if err := l.Close(); err != nil {
+		log.Printf("close free-port listener: %v", err)
+	}
 	return port
 }
 
@@ -165,7 +166,9 @@ func startLlamaServer() error {
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(url)
 		if err == nil {
-			resp.Body.Close()
+			if err := resp.Body.Close(); err != nil {
+				log.Printf("close health response: %v", err)
+			}
 			if resp.StatusCode == 200 {
 				log.Printf("llama-server ready on port %d", llamaPort)
 				return nil
@@ -182,13 +185,17 @@ func startLlamaServer() error {
 
 func stopLlamaServer() {
 	if llamaCmd != nil && llamaCmd.Process != nil {
-		llamaCmd.Process.Signal(syscall.SIGTERM)
+		if err := llamaCmd.Process.Signal(syscall.SIGTERM); err != nil {
+			log.Printf("signal llama-server: %v", err)
+		}
 		done := make(chan error, 1)
 		go func() { done <- llamaCmd.Wait() }()
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):
-			llamaCmd.Process.Kill()
+			if err := llamaCmd.Process.Kill(); err != nil {
+				log.Printf("kill llama-server: %v", err)
+			}
 		}
 		llamaCmd = nil
 		log.Printf("llama-server stopped")
@@ -235,7 +242,11 @@ func proxyChat(reqID string, params json.RawMessage) Response {
 	if err != nil {
 		return Response{Status: "error", ReqID: reqID, Error: fmt.Sprintf("proxy error: %s", err)}
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("close chat response: %v", err)
+		}
+	}()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -262,7 +273,9 @@ func proxyChat(reqID string, params json.RawMessage) Response {
 			TotalTokens      int `json:"total_tokens"`
 		} `json:"usage"`
 	}
-	json.Unmarshal(body, &chatResp)
+	if err := json.Unmarshal(body, &chatResp); err != nil {
+		return Response{Status: "error", ReqID: reqID, Error: fmt.Sprintf("decode llama-server response: %s", err)}
+	}
 
 	// Build result with both the full OpenAI response and extracted fields
 	result := map[string]any{

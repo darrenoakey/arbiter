@@ -19,7 +19,7 @@ type Scheduler struct {
 	mgr       *InstanceManager
 	logger    *EventLogger
 	outputDir string
-	inboxDir  string // if set, input files are deleted after job completion/failure
+	inboxDir  string // if set, orphaned input files are swept after the multi-stage grace period
 	// llmCache, when set, receives successful chat-completion results so the
 	// async /v1/jobs chat path populates the same content-addressed cache the
 	// sync /v1/chat/completions path uses. nil disables cache writes.
@@ -286,7 +286,10 @@ func (s *Scheduler) tryFailover(job *Job, inst *Instance, cause error) bool {
 
 	// running→queued (allowed: no finished_at). Clear started_at so the
 	// scheduled-watchdog timer restarts cleanly on the next dispatch.
-	s.store.UpdateState(job.ID, "queued", WithClearStartedAt())
+	if err := s.store.UpdateState(job.ID, "queued", WithClearStartedAt()); err != nil {
+		slog.Error("failover: could not requeue job", "job", job.ID, "error", err)
+		return false
+	}
 
 	s.logger.Log("job.failover", map[string]any{
 		"job_id":         job.ID,
@@ -340,7 +343,9 @@ func (s *Scheduler) DrainRemoteJobsForModel(modelID string) int {
 		slog.Warn("kill-switch: draining in-flight remote job to spark",
 			"job", v.jobID, "model", modelID, "host", v.inst.host)
 		if v.inst.backend != nil {
-			v.inst.backend.Cancel()
+			if err := v.inst.backend.Cancel(); err != nil {
+				slog.Warn("kill-switch: cancel remote backend failed", "job", v.jobID, "error", err)
+			}
 		}
 	}
 	if len(victims) > 0 {
@@ -617,13 +622,23 @@ func (s *Scheduler) canEvictForSwap(victimModelID, challengerModelID string) boo
 
 func (s *Scheduler) rescoreModel(modelID string) {
 	p := s.computePriority(modelID)
-	s.store.UpdatePriority(modelID, p)
+	if _, err := s.store.UpdatePriority(modelID, p); err != nil {
+		slog.Warn("rescore model queue", "model", modelID, "error", err)
+	}
 }
 
 func (s *Scheduler) rescoreAll() {
 	for modelID := range s.config.Models {
 		s.rescoreModel(modelID)
 	}
+}
+
+func (s *Scheduler) updateJobState(jobID, state string, opts ...func(*stateUpdate)) bool {
+	if err := s.store.UpdateState(jobID, state, opts...); err != nil {
+		slog.Error("update job state", "job", jobID, "state", state, "error", err)
+		return false
+	}
+	return true
 }
 
 func (s *Scheduler) pendingJobsByModel() map[string]int {
@@ -1158,7 +1173,9 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 		if r := recover(); r != nil {
 			slog.Error("panic in dispatchJobToInstance — recovered", "panic", r, "job", job.ID, "model", job.ModelID)
 			s.logger.Log("job.panic", map[string]any{"job_id": job.ID, "model_id": job.ModelID, "panic": fmt.Sprintf("%v", r)})
-			s.store.UpdateState(job.ID, "failed", WithError(fmt.Sprintf("internal panic: %v", r)))
+			if err := s.store.UpdateState(job.ID, "failed", WithError(fmt.Sprintf("internal panic: %v", r))); err != nil {
+				slog.Error("mark panicked job failed", "job", job.ID, "error", err)
+			}
 		}
 		// Release the activeJobs slot + pressure through the in-flight registry.
 		// Idempotent: if the reconciler already healed this dispatch (store went
@@ -1178,7 +1195,9 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 		if _, ok := err.(insufficientMemoryError); ok {
 			slog.Warn("can't load instance yet, leaving job queued until memory is available",
 				"instance", inst.InstanceID, "job", job.ID, "error", err)
-			s.store.UpdateState(job.ID, "queued")
+			if updateErr := s.store.UpdateState(job.ID, "queued", WithClearStartedAt()); updateErr != nil {
+				slog.Error("requeue job after memory shortage", "job", job.ID, "error", updateErr)
+			}
 			s.cooldownMu.Lock()
 			s.cooldownUntil[job.ModelID] = time.Now().Add(30 * time.Second)
 			s.cooldownMu.Unlock()
@@ -1206,7 +1225,9 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 			errMsg := fmt.Sprintf("load failed after %d attempts: %s", attempts, err)
 			slog.Error("giving up on job after repeated load failures",
 				"instance", inst.InstanceID, "job", job.ID, "attempts", attempts, "error", err)
-			s.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
+			if updateErr := s.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS())); updateErr != nil {
+				slog.Error("mark job failed after load retries", "job", job.ID, "error", updateErr)
+			}
 			if n := s.store.ResolveFollowers(job.ID, "failed", nil, errMsg, s.outputDir); n > 0 {
 				slog.Info("resolved follower jobs", "original", job.ID, "followers", n, "state", "failed")
 			}
@@ -1225,7 +1246,9 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 
 		slog.Warn("can't load instance, requeueing",
 			"instance", inst.InstanceID, "job", job.ID, "attempt", attempts, "error", err)
-		s.store.UpdateState(job.ID, "queued")
+		if updateErr := s.store.UpdateState(job.ID, "queued", WithClearStartedAt()); updateErr != nil {
+			slog.Error("requeue job after load failure", "job", job.ID, "error", updateErr)
+		}
 		return
 	}
 	s.loadAttemptsMu.Lock()
@@ -1235,7 +1258,10 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 
 	// Mark running
 	now := nowTS()
-	s.store.UpdateState(job.ID, "running", WithStartedAt(now))
+	if err := s.store.UpdateState(job.ID, "running", WithStartedAt(now)); err != nil {
+		slog.Error("mark dispatched job running", "job", job.ID, "error", err)
+		return
+	}
 	s.logger.Log("job.started", map[string]any{
 		"job_id":      job.ID,
 		"model_id":    job.ModelID,
@@ -1252,7 +1278,11 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 
 	// Run inference (blocking) — we use InferRaw which skips activeJobs management
 	jobDir := filepath.Join(s.outputDir, "jobs", job.ID)
-	os.MkdirAll(jobDir, 0o755)
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		slog.Error("create job output directory", "job", job.ID, "error", err)
+		s.updateJobState(job.ID, "failed", WithError(err.Error()), WithFinishedAt(nowTS()))
+		return
+	}
 
 	// Kill the worker if inference exceeds max_runtime_seconds.
 	// This unblocks the goroutine (subprocess death → readLoop broadcasts → sendAndReceive returns).
@@ -1298,7 +1328,7 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 	}
 
 	if s.shouldRequeueForShutdown(err, resp) {
-		s.store.UpdateState(job.ID, "queued")
+		s.updateJobState(job.ID, "queued", WithClearStartedAt())
 		s.logger.Log("job.requeued", map[string]any{
 			"job_id":            job.ID,
 			"model_id":          job.ModelID,
@@ -1311,7 +1341,7 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 
 	if err != nil {
 		errMsg := fmt.Sprintf("inference error: %s", err)
-		s.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
+		s.updateJobState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
 		if n := s.store.ResolveFollowers(job.ID, "failed", nil, errMsg, s.outputDir); n > 0 {
 			slog.Info("resolved follower jobs", "original", job.ID, "followers", n, "state", "failed")
 		}
@@ -1334,13 +1364,14 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 	// failover counter is no longer needed.
 	s.clearFailoverAttempts(job.ID)
 
-	if resp.Status == "cancelled" {
-		s.store.UpdateState(job.ID, "cancelled", WithFinishedAt(nowTS()))
+	switch resp.Status {
+	case "cancelled":
+		s.updateJobState(job.ID, "cancelled", WithFinishedAt(nowTS()))
 		s.logger.Log("job.cancelled", map[string]any{"job_id": job.ID, "model_id": job.ModelID})
 		s.cleanupJobInbox(job)
 		// Cancellation is intentional — don't penalise the model.
-	} else if resp.Status == "error" {
-		s.store.UpdateState(job.ID, "failed", WithError(resp.Error), WithFinishedAt(nowTS()))
+	case "error":
+		s.updateJobState(job.ID, "failed", WithError(resp.Error), WithFinishedAt(nowTS()))
 		s.logger.Log("job.failed", map[string]any{
 			"job_id":            job.ID,
 			"model_id":          job.ModelID,
@@ -1351,7 +1382,7 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 			s.RecordFailure(job.ModelID)
 		}
 		s.cleanupJobInbox(job)
-	} else {
+	default:
 		// Relocate the job output to the share mount so spark's local disk
 		// doesn't accumulate result files. Done before persisting state so
 		// the stored result reflects the final path.
@@ -1359,7 +1390,7 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 		if newDir != jobDir {
 			resp.Result = rewriteResultPaths(resp.Result, jobDir, newDir)
 		}
-		s.store.UpdateState(job.ID, "completed", WithResult(resp.Result), WithFinishedAt(nowTS()))
+		s.updateJobState(job.ID, "completed", WithResult(resp.Result), WithFinishedAt(nowTS()))
 		s.cacheChatResult(job, resp.Result)
 		rssEntry := map[string]any{
 			"job_id":            job.ID,
@@ -1388,12 +1419,13 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 		var finalState string
 		var finalResult *json.RawMessage
 		var finalErr string
-		if resp.Status == "cancelled" {
+		switch resp.Status {
+		case "cancelled":
 			finalState = "cancelled"
-		} else if resp.Status == "error" {
+		case "error":
 			finalState = "failed"
 			finalErr = resp.Error
-		} else {
+		default:
 			finalState = "completed"
 			finalResult = &resp.Result
 		}
@@ -1416,7 +1448,7 @@ func (s *Scheduler) dispatchStreamHandoff(job *Job, inst *Instance) {
 	h := s.waitForStreamHandoff(job.ID, handoffWait)
 	if h == nil {
 		errMsg := "stream handler did not register handoff"
-		s.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
+		s.updateJobState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
 		s.logger.Log("job.failed", map[string]any{
 			"job_id": job.ID, "model_id": job.ModelID, "error": errMsg,
 		})
@@ -1443,7 +1475,7 @@ func (s *Scheduler) dispatchStreamHandoff(job *Job, inst *Instance) {
 				return
 			}
 			errMsg := fmt.Sprintf("stream error: %s", err)
-			s.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
+			s.updateJobState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
 			s.logger.Log("job.failed", map[string]any{
 				"job_id": job.ID, "model_id": job.ModelID,
 				"error": errMsg, "inference_seconds": elapsed,
@@ -1452,7 +1484,7 @@ func (s *Scheduler) dispatchStreamHandoff(job *Job, inst *Instance) {
 			s.clearFailoverAttempts(job.ID)
 			return
 		}
-		s.store.UpdateState(job.ID, "completed", WithFinishedAt(nowTS()))
+		s.updateJobState(job.ID, "completed", WithFinishedAt(nowTS()))
 		s.logger.Log("job.completed", map[string]any{
 			"job_id": job.ID, "model_id": job.ModelID,
 			"inference_seconds": elapsed, "stream": true,
@@ -1464,7 +1496,7 @@ func (s *Scheduler) dispatchStreamHandoff(job *Job, inst *Instance) {
 		s.clearFailoverAttempts(job.ID)
 	case <-time.After(streamMax):
 		errMsg := fmt.Sprintf("stream exceeded %s", streamMax)
-		s.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
+		s.updateJobState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS()))
 		s.logger.Log("job.failed", map[string]any{
 			"job_id": job.ID, "model_id": job.ModelID, "error": errMsg,
 		})
@@ -1485,7 +1517,7 @@ func (s *Scheduler) requeueNoInstance(job *Job) {
 	slog.Info("scheduler.requeue: no instance available",
 		"job", job.ID, "model", job.ModelID,
 		"reason", "PickInstanceForJob returned nil — all eligible hosts at max_concurrent, excluded, or absent")
-	s.store.UpdateState(job.ID, "queued")
+	s.updateJobState(job.ID, "queued", WithClearStartedAt())
 	s.cooldownMu.Lock()
 	s.cooldownUntil[job.ModelID] = time.Now().Add(3 * time.Second)
 	s.cooldownMu.Unlock()
@@ -1636,13 +1668,13 @@ func (s *Scheduler) Run(ctx context.Context) {
 		// Re-dispatching is exactly what stranded duplicate goroutines and
 		// leaked activeJobs + pressure.
 		if s.isInFlight(job.ID) {
-			s.store.UpdateState(job.ID, "scheduled", WithStartedAt(nowTS()))
+			s.updateJobState(job.ID, "scheduled", WithStartedAt(nowTS()))
 			continue
 		}
 
 		// Mark scheduled so it won't be re-picked. Stamp the dispatch time so a
 		// watchdog can recover orphaned scheduled jobs if the dispatch path wedges.
-		s.store.UpdateState(job.ID, "scheduled", WithStartedAt(nowTS()))
+		s.updateJobState(job.ID, "scheduled", WithStartedAt(nowTS()))
 
 		// Pick instance NOW (synchronous) so concurrent goroutines
 		// don't race to pick the same instance. Host-aware: walks the model's
@@ -1676,7 +1708,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 		// a second time.
 		pressure := *s.config.Models[job.ModelID].PressureIndex
 		if !s.markInFlight(job.ID, inst, pressure) {
-			s.store.UpdateState(job.ID, "scheduled", WithStartedAt(nowTS()))
+			s.updateJobState(job.ID, "scheduled", WithStartedAt(nowTS()))
 			continue
 		}
 		slog.Info("pressure reserved", "model", job.ModelID, "pressure", pressure, "total", s.currentPressure)
@@ -1838,32 +1870,34 @@ func (s *Scheduler) RunScheduledWatchdog(ctx context.Context) {
 		case <-ticker.C:
 		}
 
-		stuck, err := s.store.ListStuckScheduled(staleSec)
-		if err != nil {
-			slog.Warn("scheduled watchdog: failed to list stuck jobs", "error", err)
-			continue
-		}
-		recovered := 0
-		for _, jobID := range stuck {
-			// Skip jobs whose dispatch goroutine is still alive. A slow model
-			// load (minutes for denoise) legitimately keeps a job 'scheduled';
-			// requeuing it would cause the double-dispatch that leaks
-			// activeJobs + pressure. Only genuinely orphaned scheduled jobs
-			// (no live dispatch — e.g. survived a restart) get requeued.
-			if s.isInFlight(jobID) {
-				continue
-			}
-			if err := s.store.UpdateState(jobID, "queued"); err != nil {
-				slog.Warn("scheduled watchdog: requeue failed", "job", jobID, "error", err)
-				continue
-			}
-			recovered++
-		}
+		recovered := s.requeueStuckScheduled(staleSec)
 		if recovered > 0 {
 			slog.Warn("scheduled watchdog: requeued orphaned scheduled jobs", "count", recovered)
 			s.Wake()
 		}
 	}
+}
+
+func (s *Scheduler) requeueStuckScheduled(staleSec float64) int {
+	stuck, err := s.store.ListStuckScheduled(staleSec)
+	if err != nil {
+		slog.Warn("scheduled watchdog: failed to list stuck jobs", "error", err)
+		return 0
+	}
+	recovered := 0
+	for _, jobID := range stuck {
+		// A slow model load legitimately keeps a job scheduled. Only dispatches
+		// with no live owner, such as jobs orphaned by a restart, are requeued.
+		if s.isInFlight(jobID) {
+			continue
+		}
+		if err := s.store.UpdateState(jobID, "queued", WithClearStartedAt()); err != nil {
+			slog.Warn("scheduled watchdog: requeue failed", "job", jobID, "error", err)
+			continue
+		}
+		recovered++
+	}
+	return recovered
 }
 
 // RunInFlightReconciler keeps the in-memory reservation accounting (instance
@@ -2051,7 +2085,7 @@ func (s *Scheduler) RunJobWatchdog(ctx context.Context) {
 				"elapsed_seconds", int(elapsed),
 				"max_runtime_seconds", cfg.MaxRuntimeSec,
 			)
-			s.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(now))
+			s.updateJobState(job.ID, "failed", WithError(errMsg), WithFinishedAt(now))
 			s.logger.Log("job.timeout", map[string]any{
 				"job_id":              job.ID,
 				"model_id":            job.ModelID,
@@ -2272,10 +2306,10 @@ func (s *Scheduler) cleanupJobInbox(job *Job) {
 // stages boundary jpgs, then submits encode → defect-check (gemma) →
 // denoise1 → denoise2 in serial waves. With shared GPU contention from
 // other workloads (tts queues etc.) the gap between first submission
-// and last reference can run several hours. Will be replaced by the
-// arbiter-client lease ledger; 24h is the safe-by-default conservative
-// fallback in the meantime.
-const inboxOrphanMinAge = 24 * time.Hour
+// and last reference can exceed a day. Seven days matches arbiter-client's
+// maximum lease and prevents the orphan fallback from undercutting that
+// contract while retaining a finite cleanup bound.
+const inboxOrphanMinAge = 7 * 24 * time.Hour
 
 // ValidateJobInputs returns a detailed error if any file path declared in
 // the payload can't be opened. Checks every absolute path under known
@@ -2576,7 +2610,7 @@ func (s *Scheduler) failQueuedJobsWithMissingInputs(active []*Job) int {
 			continue
 		}
 		errMsg := err.Error()
-		s.store.UpdateState(j.ID, "failed",
+		s.updateJobState(j.ID, "failed",
 			WithError(errMsg), WithFinishedAt(nowTS()))
 		s.logger.Log("job.failed", map[string]any{
 			"job_id":   j.ID,

@@ -96,7 +96,11 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	defer func() {
+		if err := in.Close(); err != nil {
+			slog.Debug("close relocation source", "path", src, "error", err)
+		}
+	}()
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
@@ -105,7 +109,9 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
+		if closeErr := out.Close(); closeErr != nil {
+			slog.Debug("close failed relocation destination", "path", dst, "error", closeErr)
+		}
 		return err
 	}
 	return out.Close()

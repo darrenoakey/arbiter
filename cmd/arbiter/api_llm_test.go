@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -124,7 +125,11 @@ func readCaptureFile(t *testing.T, path string) []map[string]any {
 	if err != nil {
 		t.Fatalf("open capture file: %v", err)
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close capture file: %v", err)
+		}
+	}()
 
 	var entries []map[string]any
 	scanner := bufio.NewScanner(f)
@@ -348,7 +353,11 @@ func TestChatCompletionStreamReservesInstanceWhileStreaming(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer listener.Close()
+	defer func() {
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("close listener: %v", err)
+		}
+	}()
 
 	upstream := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -366,8 +375,16 @@ func TestChatCompletionStreamReservesInstanceWhileStreaming(t *testing.T) {
 			}
 		}),
 	}
-	defer upstream.Close()
-	go upstream.Serve(listener)
+	defer func() {
+		if err := upstream.Close(); err != nil {
+			t.Errorf("close upstream: %v", err)
+		}
+	}()
+	go func() {
+		if err := upstream.Serve(listener); err != nil && err != http.ErrServerClosed {
+			t.Errorf("serve upstream: %v", err)
+		}
+	}()
 
 	streamPort := listener.Addr().(*net.TCPAddr).Port
 	workerPath := filepath.Join(t.TempDir(), "fake-stream-worker.py")

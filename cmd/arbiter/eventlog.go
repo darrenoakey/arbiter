@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -18,7 +19,9 @@ type EventLogger struct {
 }
 
 func NewEventLogger(dir string) *EventLogger {
-	os.MkdirAll(dir, 0o755)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		slog.Error("create event log directory", "dir", dir, "error", err)
+	}
 	return &EventLogger{dir: dir}
 }
 
@@ -38,7 +41,9 @@ func (l *EventLogger) Log(event string, fields map[string]any) {
 	today := time.Now().UTC().Format("2006-01-02")
 	if today != l.currentDate {
 		if l.file != nil {
-			l.file.Close()
+			if err := l.file.Close(); err != nil {
+				slog.Warn("close rotated event log", "error", err)
+			}
 		}
 		path := filepath.Join(l.dir, fmt.Sprintf("arbiter-%s.jsonl", today))
 		l.file, _ = os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
@@ -46,8 +51,9 @@ func (l *EventLogger) Log(event string, fields map[string]any) {
 	}
 
 	if l.file != nil {
-		l.file.Write(data)
-		l.file.Write([]byte("\n"))
+		if _, err := l.file.Write(append(data, '\n')); err != nil {
+			slog.Error("write event log", "error", err)
+		}
 	}
 }
 
@@ -55,7 +61,9 @@ func (l *EventLogger) Close() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.file != nil {
-		l.file.Close()
+		if err := l.file.Close(); err != nil {
+			slog.Warn("close event log", "error", err)
+		}
 		l.file = nil
 	}
 }

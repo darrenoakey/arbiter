@@ -6,14 +6,12 @@ Requires guidance_scale=0.0 and num_inference_steps=9 (8 NFEs).
 """
 from __future__ import annotations
 
-import base64
-import io
 import logging
 import os
 import threading
 from pathlib import Path
 
-from arbiter.adapters.base import ModelAdapter, InferenceError
+from arbiter.adapters.base import ModelAdapter
 from arbiter.adapters.registry import register
 
 log = logging.getLogger(__name__)

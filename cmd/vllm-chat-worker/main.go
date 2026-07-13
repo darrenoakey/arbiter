@@ -58,11 +58,10 @@ type Response struct {
 }
 
 var (
-	vllmCmd    *exec.Cmd
-	vllmDone   chan error
-	vllmPort   int
-	cancelFlag bool
-	stdoutMu   sync.Mutex
+	vllmCmd  *exec.Cmd
+	vllmDone chan error
+	vllmPort int
+	stdoutMu sync.Mutex
 )
 
 // respond serialises one Response line on stdout. Multiple in-flight infer
@@ -81,7 +80,9 @@ func findFreePort() int {
 		return 18100
 	}
 	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
+	if err := l.Close(); err != nil {
+		log.Printf("close free-port listener: %v", err)
+	}
 	return port
 }
 
@@ -168,7 +169,9 @@ func startVLLM() error {
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(url)
 		if err == nil {
-			resp.Body.Close()
+			if err := resp.Body.Close(); err != nil {
+				log.Printf("close health response: %v", err)
+			}
 			if resp.StatusCode == 200 {
 				log.Printf("vllm ready on port %d", vllmPort)
 				return nil
@@ -191,7 +194,9 @@ func startVLLM() error {
 
 func stopVLLM() {
 	if vllmCmd != nil && vllmCmd.Process != nil {
-		vllmCmd.Process.Signal(syscall.SIGTERM)
+		if err := vllmCmd.Process.Signal(syscall.SIGTERM); err != nil {
+			log.Printf("signal vllm: %v", err)
+		}
 		done := vllmDone
 		if done == nil {
 			done = make(chan error, 1)
@@ -200,7 +205,9 @@ func stopVLLM() {
 		select {
 		case <-done:
 		case <-time.After(30 * time.Second):
-			vllmCmd.Process.Kill()
+			if err := vllmCmd.Process.Kill(); err != nil {
+				log.Printf("kill vllm: %v", err)
+			}
 			<-done
 		}
 		vllmCmd = nil
@@ -238,7 +245,11 @@ func proxyChat(reqID string, params json.RawMessage) Response {
 	if err != nil {
 		return Response{Status: "error", ReqID: reqID, Error: fmt.Sprintf("proxy error: %s", err)}
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("close chat response: %v", err)
+		}
+	}()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -263,7 +274,9 @@ func proxyChat(reqID string, params json.RawMessage) Response {
 			TotalTokens      int `json:"total_tokens"`
 		} `json:"usage"`
 	}
-	json.Unmarshal(body, &chatResp)
+	if err := json.Unmarshal(body, &chatResp); err != nil {
+		return Response{Status: "error", ReqID: reqID, Error: fmt.Sprintf("decode vllm response: %s", err)}
+	}
 
 	result := map[string]any{
 		"format":   "json",
@@ -292,7 +305,6 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGUSR1)
 	go func() {
 		for range sigCh {
-			cancelFlag = true
 			log.Println("Cancel signal received")
 		}
 	}()
@@ -325,7 +337,6 @@ func main() {
 			// new infer commands. vLLM batches concurrent HTTP requests
 			// internally; the worker just needs to not serialise them at the
 			// stdin protocol layer.
-			cancelFlag = false
 			reqID := req.ReqID
 			params := req.Params
 			go func() {

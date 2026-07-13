@@ -1,7 +1,6 @@
 """BiRefNet background-removal adapter."""
 from __future__ import annotations
 
-import base64
 import io
 import logging
 import threading
@@ -23,7 +22,6 @@ class BiRefNetAdapter(ModelAdapter):
         self._model = None
 
     def load(self, device: str = "cuda") -> None:
-        import torch
         from transformers import AutoModelForImageSegmentation
 
         log.info("Loading BiRefNet_HR on %s ...", device)

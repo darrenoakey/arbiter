@@ -1,5 +1,4 @@
 """Tests for the Arbiter CLI."""
-import json
 
 import pytest
 

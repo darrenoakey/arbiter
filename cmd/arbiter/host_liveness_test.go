@@ -12,8 +12,6 @@ import (
 	"time"
 )
 
-func boolPtr(b bool) *bool { return &b }
-
 // TestLivenessPollMarksAbsentThenRecovered drives the real poll loop against a
 // REAL ollama endpoint and a dead addr. Phase 3 core: N consecutive failures →
 // absent (+ host.absent event + Cancel fired); a return to reachable → recovered
@@ -30,7 +28,9 @@ func TestLivenessPollMarksAbsentThenRecovered(t *testing.T) {
 			hj, ok := w.(http.Hijacker)
 			if ok {
 				conn, _, _ := hj.Hijack()
-				conn.Close()
+				if err := conn.Close(); err != nil {
+					t.Errorf("close hijacked connection: %v", err)
+				}
 				return
 			}
 			w.WriteHeader(http.StatusInternalServerError)
@@ -38,7 +38,9 @@ func TestLivenessPollMarksAbsentThenRecovered(t *testing.T) {
 		}
 		if r.URL.Path == "/api/version" {
 			w.WriteHeader(200)
-			w.Write([]byte(`{"version":"test"}`))
+			if _, err := w.Write([]byte(`{"version":"test"}`)); err != nil {
+				t.Errorf("write version response: %v", err)
+			}
 			return
 		}
 		w.WriteHeader(404)
@@ -242,7 +244,9 @@ func TestKillSwitchFlipsRoutingAndPersists(t *testing.T) {
 		t.Fatalf("PATCH returned %d: %s", rec.Code, rec.Body.String())
 	}
 	var resp map[string]any
-	json.Unmarshal(rec.Body.Bytes(), &resp)
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode PATCH response: %v", err)
+	}
 	if resp["remote_enabled"] != false {
 		t.Fatalf("response remote_enabled=%v, want false; body=%s", resp["remote_enabled"], rec.Body.String())
 	}
