@@ -19,6 +19,7 @@ from arbiter.adapters.registry import register
 log = logging.getLogger(__name__)
 
 _MODEL_REPOSITORY = "nomic-ai/nomic-embed-text-v1.5"
+_MODEL_VERSION = "nomic-embed-text-v1.5-F16"
 _MAX_SEQ_LENGTH = 8192
 _EMBEDDING_DIM = 768
 
@@ -101,6 +102,11 @@ class EmbedTextAdapter(ModelAdapter):
         }
         if task not in valid_tasks:
             raise InferenceError(f"invalid task '{task}'; valid: {sorted(valid_tasks)}")
+        model_version = str(params.get("model_version", _MODEL_VERSION))
+        if model_version != _MODEL_VERSION:
+            raise InferenceError(
+                f"invalid model_version '{model_version}'; required: {_MODEL_VERSION}"
+            )
         prefix = f"{task}: "
         prefixed = [prefix + t for t in raw_texts]
 
@@ -137,6 +143,7 @@ class EmbedTextAdapter(ModelAdapter):
             "count": len(all_embeddings),
             "task": task,
             "model_repository": _MODEL_REPOSITORY,
+            "model_version": _MODEL_VERSION,
             "dtype": "float16",
             "elapsed_ms": round(elapsed_ms, 1),
         }

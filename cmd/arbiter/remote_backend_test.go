@@ -119,6 +119,9 @@ func TestBuildEmbedRequestMatchesLocalTaskContract(t *testing.T) {
 	if _, _, err := wrongTag.buildEmbedRequest(json.RawMessage(`{"text":"fact"}`)); err == nil {
 		t.Fatal("expected quantization/model-tag mismatch to fail")
 	}
+	if _, _, err := backend.buildEmbedRequest(json.RawMessage(`{"text":"fact","model_version":"nomic-embed-text-v1.5-Q4"}`)); err == nil {
+		t.Fatal("expected model-version mismatch to fail")
+	}
 }
 
 func TestMapEmbedBodyToResultValidatesAndMatchesLocalShape(t *testing.T) {
@@ -136,14 +139,14 @@ func TestMapEmbedBodyToResultValidatesAndMatchesLocalShape(t *testing.T) {
 	if err := json.Unmarshal(result, &decoded); err != nil {
 		t.Fatalf("decode result: %v", err)
 	}
-	if len(decoded) != 7 || decoded["embeddings"] == nil || decoded["dimension"] == nil || decoded["count"] == nil {
+	if len(decoded) != 8 || decoded["embeddings"] == nil || decoded["dimension"] == nil || decoded["count"] == nil {
 		t.Fatalf("result keys=%v, want local adapter-compatible shape", decoded)
 	}
 	if string(decoded["dimension"]) != "768" || string(decoded["count"]) != "2" {
 		t.Fatalf("result dimension=%s count=%s", decoded["dimension"], decoded["count"])
 	}
-	if string(decoded["task"]) != `"search_query"` || string(decoded["model_repository"]) != `"nomic-ai/nomic-embed-text-v1.5"` || string(decoded["dtype"]) != `"float16"` {
-		t.Fatalf("result identity metadata task=%s repo=%s dtype=%s", decoded["task"], decoded["model_repository"], decoded["dtype"])
+	if string(decoded["task"]) != `"search_query"` || string(decoded["model_repository"]) != `"nomic-ai/nomic-embed-text-v1.5"` || string(decoded["model_version"]) != `"nomic-embed-text-v1.5-F16"` || string(decoded["dtype"]) != `"float16"` {
+		t.Fatalf("result identity metadata task=%s repo=%s version=%s dtype=%s", decoded["task"], decoded["model_repository"], decoded["model_version"], decoded["dtype"])
 	}
 }
 

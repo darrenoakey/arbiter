@@ -149,6 +149,7 @@ const (
 	remoteEmbedMaxContext  = 8192
 	remoteEmbedModelTag    = "nomic-embed-text:latest"
 	remoteEmbedRepository  = "nomic-ai/nomic-embed-text-v1.5"
+	remoteEmbedVersion     = "nomic-embed-text-v1.5-F16"
 	remoteEmbedDType       = "float16"
 )
 
@@ -392,6 +393,9 @@ func (b *RemoteHTTPBackend) buildEmbedRequest(params json.RawMessage) ([]byte, i
 	if err != nil {
 		return nil, 0, err
 	}
+	if err := validateEmbedModelVersion(params); err != nil {
+		return nil, 0, err
+	}
 	for index := range texts {
 		texts[index] = task + ": " + texts[index]
 	}
@@ -403,6 +407,25 @@ func (b *RemoteHTTPBackend) buildEmbedRequest(params json.RawMessage) ([]byte, i
 		return nil, 0, fmt.Errorf("encoding remote embed request: %w", err)
 	}
 	return body, len(texts), nil
+}
+
+func validateEmbedModelVersion(params json.RawMessage) error {
+	var values map[string]any
+	if err := json.Unmarshal(params, &values); err != nil || values == nil {
+		return fmt.Errorf("embed-text params must be a JSON object")
+	}
+	value, exists := values["model_version"]
+	if !exists {
+		return nil
+	}
+	version, valid := value.(string)
+	if !valid {
+		return fmt.Errorf("'model_version' must be a string")
+	}
+	if version != remoteEmbedVersion {
+		return fmt.Errorf("embed-text model_version must be %q, got %q", remoteEmbedVersion, version)
+	}
+	return nil
 }
 
 func embedTaskFromParams(params json.RawMessage) (string, error) {
@@ -580,12 +603,14 @@ func mapEmbedBodyToResult(body []byte, inputCount int, task string) (json.RawMes
 		Count           int         `json:"count"`
 		Task            string      `json:"task"`
 		ModelRepository string      `json:"model_repository"`
+		ModelVersion    string      `json:"model_version"`
 		DType           string      `json:"dtype"`
 		ElapsedMS       float64     `json:"elapsed_ms"`
 	}{
 		Embeddings: upstream.Embeddings, Dimension: remoteEmbedDimension,
 		Count: len(upstream.Embeddings), Task: task,
-		ModelRepository: remoteEmbedRepository, DType: remoteEmbedDType,
+		ModelRepository: remoteEmbedRepository, ModelVersion: remoteEmbedVersion,
+		DType:     remoteEmbedDType,
 		ElapsedMS: float64(upstream.TotalDuration) / float64(time.Millisecond),
 	}
 	encoded, err := json.Marshal(result)
