@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"sync"
@@ -144,6 +145,11 @@ const (
 	// leaving content empty with finish_reason:length. 4096 keeps content
 	// populated for normal chat/summary/planning replies.
 	remoteMaxTokensDefault = 4096
+	remoteEmbedDimension   = 768
+	remoteEmbedMaxContext  = 8192
+	remoteEmbedModelTag    = "nomic-embed-text:latest"
+	remoteEmbedRepository  = "nomic-ai/nomic-embed-text-v1.5"
+	remoteEmbedDType       = "float16"
 )
 
 // errRemoteAbsent classifies a confirmed host-absence failure: dial refused,
@@ -223,13 +229,6 @@ func (b *RemoteHTTPBackend) Load(device string) error {
 	if b.inst != nil {
 		b.inst.setState("loading")
 	}
-	warm := map[string]any{
-		"model":      b.modelTag,
-		"messages":   []map[string]string{{"role": "user", "content": "ok"}},
-		"max_tokens": 1,
-		"keep_alive": "10m",
-	}
-	body, _ := json.Marshal(warm)
 	to := b.loadTimeout
 	if to == 0 {
 		to = defaultRemoteLoadTimeout
@@ -237,7 +236,26 @@ func (b *RemoteHTTPBackend) Load(device string) error {
 	// Detached context: a slow warm must drain, not be cancelled.
 	ctx, cancel := context.WithTimeout(context.Background(), to)
 	defer cancel()
-	_, err := b.doChat(ctx, body)
+	var err error
+	if b.inst != nil && b.inst.ModelID == "embed-text" {
+		body, _, buildErr := b.buildEmbedRequest(json.RawMessage(`{"text":"warm","task":"search_document"}`))
+		if buildErr != nil {
+			err = buildErr
+		} else if response, requestErr := b.doEmbed(ctx, body); requestErr != nil {
+			err = requestErr
+		} else {
+			_, err = mapEmbedBodyToResult(response, 1, "search_document")
+		}
+	} else {
+		warm := map[string]any{
+			"model":      b.modelTag,
+			"messages":   []map[string]string{{"role": "user", "content": "ok"}},
+			"max_tokens": 1,
+			"keep_alive": "10m",
+		}
+		body, _ := json.Marshal(warm)
+		_, err = b.doChat(ctx, body)
+	}
 	if err != nil {
 		if isRemoteAbsence(err) {
 			if b.inst != nil {
@@ -269,6 +287,9 @@ func (b *RemoteHTTPBackend) Load(device string) error {
 // caller's failover signal is the per-backend Cancel() channel, which makes
 // Infer RETURN an INFRA error but leaves the upstream call draining.
 func (b *RemoteHTTPBackend) InferRaw(jobID, jobType string, params json.RawMessage, outputDir string) (*WorkerResponse, error) {
+	if jobType == "embed-text" {
+		return b.inferEmbedText(jobID, params)
+	}
 	reqBody := b.buildChatRequest(params)
 
 	to := b.inferTimeout
@@ -311,6 +332,133 @@ func (b *RemoteHTTPBackend) InferRaw(jobID, jobType string, params json.RawMessa
 		result := mapChatBodyToResult(res.body)
 		return &WorkerResponse{Status: "ok", ReqID: jobID, Result: result}, nil
 	}
+}
+
+func (b *RemoteHTTPBackend) inferEmbedText(jobID string, params json.RawMessage) (*WorkerResponse, error) {
+	requestBody, inputCount, err := b.buildEmbedRequest(params)
+	if err != nil {
+		return nil, err
+	}
+	task, err := embedTaskFromParams(params)
+	if err != nil {
+		return nil, err
+	}
+	timeout := b.inferTimeout
+	if timeout == 0 {
+		timeout = defaultRemoteInferTimeout
+	}
+	requestContext, cancel := context.WithTimeout(context.Background(), timeout)
+	type embedResult struct {
+		body []byte
+		err  error
+	}
+	resultChannel := make(chan embedResult, 1)
+	go func() {
+		body, requestErr := b.doEmbed(requestContext, requestBody)
+		cancel()
+		resultChannel <- embedResult{body: body, err: requestErr}
+	}()
+	select {
+	case <-b.currentCancelChan():
+		return nil, errRemoteAbsent{err: fmt.Errorf("host %s flagged absent mid-request", b.host)}
+	case response := <-resultChannel:
+		return b.embedWorkerResponse(jobID, response.body, inputCount, task, response.err)
+	}
+}
+
+func (b *RemoteHTTPBackend) embedWorkerResponse(jobID string, body []byte, inputCount int, task string, requestErr error) (*WorkerResponse, error) {
+	if requestErr != nil {
+		if isRemoteAbsence(requestErr) {
+			return nil, errRemoteAbsent{err: requestErr}
+		}
+		return nil, requestErr
+	}
+	result, err := mapEmbedBodyToResult(body, inputCount, task)
+	if err != nil {
+		return nil, err
+	}
+	return &WorkerResponse{Status: "ok", ReqID: jobID, Result: result}, nil
+}
+
+func (b *RemoteHTTPBackend) buildEmbedRequest(params json.RawMessage) ([]byte, int, error) {
+	if b.modelTag != remoteEmbedModelTag {
+		return nil, 0, fmt.Errorf("embed-text remote_model_tag must be %q, got %q", remoteEmbedModelTag, b.modelTag)
+	}
+	texts, err := embedTextsFromParams(params)
+	if err != nil {
+		return nil, 0, err
+	}
+	task, err := embedTaskFromParams(params)
+	if err != nil {
+		return nil, 0, err
+	}
+	for index := range texts {
+		texts[index] = task + ": " + texts[index]
+	}
+	body, err := json.Marshal(map[string]any{
+		"model": b.modelTag, "input": texts, "truncate": true, "keep_alive": "10m",
+		"options": map[string]int{"num_ctx": remoteEmbedMaxContext},
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("encoding remote embed request: %w", err)
+	}
+	return body, len(texts), nil
+}
+
+func embedTaskFromParams(params json.RawMessage) (string, error) {
+	var values map[string]any
+	if err := json.Unmarshal(params, &values); err != nil || values == nil {
+		return "", fmt.Errorf("embed-text params must be a JSON object")
+	}
+	task := "search_document"
+	if rawTask, exists := values["task"]; exists {
+		var valid bool
+		task, valid = rawTask.(string)
+		if !valid {
+			return "", fmt.Errorf("'task' must be a string")
+		}
+	}
+	switch task {
+	case "search_document", "search_query", "classification", "clustering":
+		return task, nil
+	default:
+		return "", fmt.Errorf("invalid task %q; valid: classification, clustering, search_document, search_query", task)
+	}
+}
+
+func embedTextsFromParams(params json.RawMessage) ([]string, error) {
+	var values map[string]any
+	if err := json.Unmarshal(params, &values); err != nil || values == nil {
+		return nil, fmt.Errorf("embed-text params must be a JSON object")
+	}
+	if rawTexts, exists := values["texts"]; exists && rawTexts != nil {
+		return validateEmbedTexts(rawTexts)
+	}
+	rawText, exists := values["text"]
+	if !exists || rawText == nil {
+		return nil, fmt.Errorf("embed-text requires 'texts' (list[string]) or 'text' (string)")
+	}
+	text, valid := rawText.(string)
+	if !valid {
+		return nil, fmt.Errorf("'text' must be a string")
+	}
+	return []string{text}, nil
+}
+
+func validateEmbedTexts(value any) ([]string, error) {
+	items, valid := value.([]any)
+	if !valid || len(items) == 0 {
+		return nil, fmt.Errorf("'texts' must be a non-empty list of strings")
+	}
+	texts := make([]string, len(items))
+	for index, item := range items {
+		text, isString := item.(string)
+		if !isString {
+			return nil, fmt.Errorf("texts[%d] is not a string", index)
+		}
+		texts[index] = text
+	}
+	return texts, nil
 }
 
 // buildChatRequest maps arbiter chat params → an ollama/OpenAI chat request:
@@ -372,6 +520,93 @@ func (b *RemoteHTTPBackend) doChat(ctx context.Context, body []byte) ([]byte, er
 		return nil, fmt.Errorf("remote %s returned %d: %s", b.host, resp.StatusCode, string(respBody))
 	}
 	return respBody, nil
+}
+
+func (b *RemoteHTTPBackend) doEmbed(ctx context.Context, body []byte) ([]byte, error) {
+	timeout := b.inferTimeout
+	if timeout == 0 {
+		timeout = defaultRemoteInferTimeout
+	}
+	if deadline, exists := ctx.Deadline(); exists {
+		if remaining := time.Until(deadline); remaining > 0 {
+			timeout = remaining
+		}
+	}
+	client := newRemoteHTTPClient(timeout)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, b.addr+"/api/embed", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := response.Body.Close(); closeErr != nil {
+			slog.Debug("close remote embed response", "host", b.host, "error", closeErr)
+		}
+	}()
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("remote %s returned %d: %s", b.host, response.StatusCode, string(responseBody))
+	}
+	return responseBody, nil
+}
+
+func mapEmbedBodyToResult(body []byte, inputCount int, task string) (json.RawMessage, error) {
+	var upstream struct {
+		Embeddings    [][]float64 `json:"embeddings"`
+		TotalDuration int64       `json:"total_duration"`
+	}
+	if err := json.Unmarshal(body, &upstream); err != nil {
+		return nil, fmt.Errorf("decoding remote embed response: %w", err)
+	}
+	if len(upstream.Embeddings) == 0 {
+		return nil, fmt.Errorf("remote embed response has no embeddings")
+	}
+	if len(upstream.Embeddings) != inputCount {
+		return nil, fmt.Errorf("remote embed response count %d does not match input count %d", len(upstream.Embeddings), inputCount)
+	}
+	if err := validateRemoteEmbeddings(upstream.Embeddings); err != nil {
+		return nil, err
+	}
+	result := struct {
+		Embeddings      [][]float64 `json:"embeddings"`
+		Dimension       int         `json:"dimension"`
+		Count           int         `json:"count"`
+		Task            string      `json:"task"`
+		ModelRepository string      `json:"model_repository"`
+		DType           string      `json:"dtype"`
+		ElapsedMS       float64     `json:"elapsed_ms"`
+	}{
+		Embeddings: upstream.Embeddings, Dimension: remoteEmbedDimension,
+		Count: len(upstream.Embeddings), Task: task,
+		ModelRepository: remoteEmbedRepository, DType: remoteEmbedDType,
+		ElapsedMS: float64(upstream.TotalDuration) / float64(time.Millisecond),
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("encoding remote embed result: %w", err)
+	}
+	return encoded, nil
+}
+
+func validateRemoteEmbeddings(embeddings [][]float64) error {
+	for index, embedding := range embeddings {
+		if len(embedding) != remoteEmbedDimension {
+			return fmt.Errorf("remote embed response embedding %d has dimension %d, want %d", index, len(embedding), remoteEmbedDimension)
+		}
+		for valueIndex, value := range embedding {
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				return fmt.Errorf("remote embed response embedding %d value %d is not finite", index, valueIndex)
+			}
+		}
+	}
+	return nil
 }
 
 // mapChatBodyToResult converts a raw OpenAI chat-completion response body into

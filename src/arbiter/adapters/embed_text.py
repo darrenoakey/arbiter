@@ -4,6 +4,7 @@ Exposes a single job type `embed-text` that takes a list of strings and
 returns a list of 768-dim float embeddings (mean-pooled + L2-normalized,
 matching the nomic-embed-text convention the rest of the monorepo uses).
 """
+
 from __future__ import annotations
 
 import json
@@ -41,6 +42,7 @@ class EmbedTextAdapter(ModelAdapter):
         self._device = "cpu"
 
     def load(self, device: str = "cuda") -> None:
+        import torch
         from transformers import AutoModel, AutoTokenizer
 
         log.info("Loading %s on %s ...", _MODEL_REPOSITORY, device)
@@ -49,6 +51,7 @@ class EmbedTextAdapter(ModelAdapter):
             _MODEL_REPOSITORY,
             trust_remote_code=True,
             safe_serialization=True,
+            torch_dtype=torch.float16,
         )
         model.eval()
         self._model = model.to(device)
@@ -63,7 +66,9 @@ class EmbedTextAdapter(ModelAdapter):
         self._tokenizer = None
         self._cleanup_gpu()
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         import torch
         import torch.nn.functional as F
 
@@ -73,7 +78,9 @@ class EmbedTextAdapter(ModelAdapter):
         if raw_texts is None:
             single = params.get("text")
             if single is None:
-                raise InferenceError("embed-text requires 'texts' (list[str]) or 'text' (str)")
+                raise InferenceError(
+                    "embed-text requires 'texts' (list[str]) or 'text' (str)"
+                )
             raw_texts = [single]
         if not isinstance(raw_texts, list) or not raw_texts:
             raise InferenceError("'texts' must be a non-empty list of strings")
@@ -86,7 +93,12 @@ class EmbedTextAdapter(ModelAdapter):
         # callers can override via params["task"] ("search_query" for
         # querying, "classification", "clustering", "search_document").
         task = str(params.get("task", "search_document"))
-        valid_tasks = {"search_document", "search_query", "classification", "clustering"}
+        valid_tasks = {
+            "search_document",
+            "search_query",
+            "classification",
+            "clustering",
+        }
         if task not in valid_tasks:
             raise InferenceError(f"invalid task '{task}'; valid: {sorted(valid_tasks)}")
         prefix = f"{task}: "
@@ -125,6 +137,7 @@ class EmbedTextAdapter(ModelAdapter):
             "count": len(all_embeddings),
             "task": task,
             "model_repository": _MODEL_REPOSITORY,
+            "dtype": "float16",
             "elapsed_ms": round(elapsed_ms, 1),
         }
 
