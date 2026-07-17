@@ -297,7 +297,13 @@ func (inst *Instance) Spawn() error {
 	inst.cmd = cmd
 	inst.stdin = stdin
 	inst.stdout = bufio.NewScanner(stdout)
-	inst.stdout.Buffer(make([]byte, 10*1024*1024), 10*1024*1024) // 10MB buffer for large responses
+	// Grow up to 96MB per response line. Small initial buffer keeps baseline
+	// memory low; the ceiling accommodates adapters that inline base64 audio
+	// (e.g. demucs two-stem or rvc-convert output for a verse) in the result
+	// JSON. A single response line exceeding the max makes Scan() fail with
+	// bufio.ErrTooLong, which readLoop reports as "subprocess died" even though
+	// the worker is healthy — so this ceiling bounds the largest inlined payload.
+	inst.stdout.Buffer(make([]byte, 256*1024), 96*1024*1024)
 	inst.stderr = stderr
 	inst.readerDone = make(chan struct{})
 	inst.state = "unloaded"

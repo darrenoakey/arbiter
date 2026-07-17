@@ -30,6 +30,9 @@ class JobType(str, Enum):
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
     EMBED_TEXT = "embed-text"
+    DEMUCS = "demucs"
+    RVC_TRAIN = "rvc-train"
+    RVC_CONVERT = "rvc-convert"
 
 
 # Maps job type to model_id
@@ -54,6 +57,9 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
     "embed-text": "embed-text",
+    "demucs": "demucs",
+    "rvc-train": "rvc-train",
+    "rvc-convert": "rvc-convert",
 }
 
 
@@ -300,6 +306,35 @@ class EmbedTextParams(BaseModel):
     batch_size: int = 16
 
 
+class DemucsParams(BaseModel):
+    audio: Optional[str] = None  # base64
+    audio_file: Optional[str] = None
+    return_b64: bool = False  # inline vocals/accompaniment base64 in the result
+    duration: Optional[float] = None  # optional hint for time estimation
+
+
+class RvcTrainParams(BaseModel):
+    name: str  # voice/model id (sanitized -> stable model dir)
+    dataset_b64: Optional[str] = None  # zip of wavs, or a single wav
+    dataset_file: Optional[str] = None  # path to a dir of wavs, a zip, or a wav
+    epochs: int = 300
+    sample_rate: int = 40000
+    batch_size: int = 4
+    f0_method: str = "rmvpe"
+
+
+class RvcConvertParams(BaseModel):
+    model: str  # trained model id or absolute .pth path
+    audio: Optional[str] = None  # base64
+    audio_file: Optional[str] = None
+    transpose: int = 0  # semitone pitch shift
+    index_rate: float = 0.5
+    f0_method: str = "rmvpe"
+    protect: float = 0.33
+    index_path: Optional[str] = None
+    return_b64: bool = False
+
+
 # Maps job type to its parameter validation schema
 JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "image-generate": ImageGenerateParams,
@@ -322,4 +357,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "tts-voxtral": TTSVoxtralParams,
     "lora-train": LoraTrainParams,
     "embed-text": EmbedTextParams,
+    "demucs": DemucsParams,
+    "rvc-train": RvcTrainParams,
+    "rvc-convert": RvcConvertParams,
 }

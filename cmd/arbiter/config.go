@@ -220,6 +220,9 @@ var JobTypeToModel = map[string]string{
 	"lora-train":              "lora-train",
 	"composite":               "composite",
 	"embed-text":              "embed-text",
+	"demucs":                  "demucs",
+	"rvc-train":               "rvc-train",
+	"rvc-convert":             "rvc-convert",
 }
 
 func LoadConfig(projectRoot string) (*Config, error) {

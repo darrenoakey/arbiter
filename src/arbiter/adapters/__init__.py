@@ -39,6 +39,8 @@ _ADAPTERS = [
     "composite",
     "insightface",
     "embed_text",
+    "demucs_sep",
+    "rvc",
 ]
 
 for _name in _ADAPTERS:
