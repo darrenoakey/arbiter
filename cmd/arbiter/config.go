@@ -13,10 +13,11 @@ import (
 )
 
 const (
-	maximumModelInstances   = 128
-	maximumModelConcurrency = 1024
-	maximumDurationSeconds  = 604800
-	maximumMetricMillis     = 604800000
+	maximumModelInstances           = 128
+	maximumModelConcurrency         = 1024
+	maximumDurationSeconds          = 604800
+	maximumLatentSyncRuntimeSeconds = 4000000
+	maximumMetricMillis             = 604800000
 )
 
 type ModelConfig struct {
@@ -332,7 +333,7 @@ func LoadConfig(projectRoot string) (*Config, error) {
 		return nil, fmt.Errorf("vram_budget_gb must be finite and > 0")
 	}
 	for id, modelConfig := range cfg.Models {
-		if err := validateModelConfigNumbers(modelConfig, cfg.VRAMBudgetGB); err != nil {
+		if err := validateModelConfigNumbers(id, modelConfig, cfg.VRAMBudgetGB); err != nil {
 			return nil, fmt.Errorf("model %q: %w", id, err)
 		}
 	}
@@ -405,7 +406,7 @@ func SaveModelConfig(projectRoot, modelID string, cfg ModelConfig) error {
 	if err != nil {
 		return err
 	}
-	if err := validateModelConfigNumbers(cfg, hostCapacityGB); err != nil {
+	if err := validateModelConfigNumbers(modelID, cfg, hostCapacityGB); err != nil {
 		return err
 	}
 	requiresLocal := len(cfg.Placements) == 0
@@ -483,7 +484,7 @@ func callModelRuntimeOperation(name string, operation func() error) (operationEr
 }
 
 func validatePersistedModelConfig(projectRoot, modelID string, config ModelConfig, hostCapacityGB float64) error {
-	if err := validateModelConfigNumbers(config, hostCapacityGB); err != nil {
+	if err := validateModelConfigNumbers(modelID, config, hostCapacityGB); err != nil {
 		return err
 	}
 	requiresLocal := len(config.Placements) == 0
@@ -493,11 +494,11 @@ func validatePersistedModelConfig(projectRoot, modelID string, config ModelConfi
 	return validateModelWorkerPolicy(projectRoot, modelID, config, requiresLocal)
 }
 
-func validateModelConfigNumbers(config ModelConfig, hostCapacityGB float64) error {
+func validateModelConfigNumbers(modelID string, config ModelConfig, hostCapacityGB float64) error {
 	if err := validateModelAllocationNumbers(config, hostCapacityGB); err != nil {
 		return err
 	}
-	if err := validateModelTimingNumbers(config); err != nil {
+	if err := validateModelTimingNumbers(modelID, config); err != nil {
 		return err
 	}
 	if config.PressureIndex != nil && !finiteRange(*config.PressureIndex, 0, 1) {
@@ -525,12 +526,13 @@ func validateModelAllocationNumbers(config ModelConfig, hostCapacityGB float64) 
 	return nil
 }
 
-func validateModelTimingNumbers(config ModelConfig) error {
+func validateModelTimingNumbers(modelID string, config ModelConfig) error {
 	if config.KeepAliveSec < 0 || config.KeepAliveSec > maximumDurationSeconds {
 		return fmt.Errorf("keep_alive_seconds must be between 0 and %d", maximumDurationSeconds)
 	}
-	if config.MaxRuntimeSec < 1 || config.MaxRuntimeSec > maximumDurationSeconds {
-		return fmt.Errorf("max_runtime_seconds must be between 1 and %d", maximumDurationSeconds)
+	maximumRuntime := maximumRuntimeSecondsForModel(modelID)
+	if config.MaxRuntimeSec < 1 || config.MaxRuntimeSec > maximumRuntime {
+		return fmt.Errorf("max_runtime_seconds must be between 1 and %d", maximumRuntime)
 	}
 	if !finiteRange(config.AvgInferenceMs, 0, maximumMetricMillis) {
 		return fmt.Errorf("avg_inference_ms must be finite and between 0 and %d", maximumMetricMillis)
@@ -539,6 +541,13 @@ func validateModelTimingNumbers(config ModelConfig) error {
 		return fmt.Errorf("load_ms must be finite and between 0 and %d", maximumMetricMillis)
 	}
 	return nil
+}
+
+func maximumRuntimeSecondsForModel(modelID string) int {
+	if modelID == "latentsync" {
+		return maximumLatentSyncRuntimeSeconds
+	}
+	return maximumDurationSeconds
 }
 
 func finitePositive(value float64) bool {

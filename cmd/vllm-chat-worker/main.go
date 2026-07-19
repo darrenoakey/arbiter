@@ -20,6 +20,7 @@
 //	VLLM_MAX_MODEL_LEN, VLLM_QUANTIZATION, VLLM_DTYPE,
 //	VLLM_TENSOR_PARALLEL_SIZE, VLLM_GPU_MEMORY_UTILIZATION, VLLM_MAX_NUM_SEQS
 //	                   — structured vllm tuning values
+//	VLLM_EXTRA_ARGS  — policy-validated legacy tuning for named production models
 //	VLLM_BIN         — path to vllm CLI (default: ~/src/arbiter/.venv-vllm/bin/vllm)
 //	VLLM_READY_TIMEOUT_SEC — how long to wait for health (default 900)
 package main
@@ -208,6 +209,9 @@ func appendVllmTuning(args []string) []string {
 		if value := os.Getenv(setting.environment); value != "" {
 			args = append(args, setting.flag, value)
 		}
+	}
+	if legacy := os.Getenv("VLLM_EXTRA_ARGS"); legacy != "" {
+		args = append(args, strings.Fields(legacy)...)
 	}
 	return args
 }

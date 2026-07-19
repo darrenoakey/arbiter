@@ -20,15 +20,15 @@ var disabledStillImageMarkers = []string{
 }
 
 var trustedPythonAdapters = map[string]string{
-	"aesthetic-scorer":        "",
-	"birefnet":                "",
+	"aesthetic-scorer":        "aesthetic",
+	"birefnet":                "birefnet",
 	"composite":               "",
 	"demucs":                  "demucs",
 	"echomimic":               "",
-	"embed-text":              "",
+	"embed-text":              "embed",
 	"face-restore":            "",
 	"face-restore-codeformer": "",
-	"insightface":             "",
+	"insightface":             "insightface",
 	"latentsync":              "",
 	"lora-train":              "",
 	"ltx2":                    "",
@@ -37,7 +37,7 @@ var trustedPythonAdapters = map[string]string{
 	"ltx2-dev-denoise1":       "",
 	"ltx2-dev-denoise2":       "",
 	"ltx2-encode":             "",
-	"moondream":               "",
+	"moondream":               "moondream",
 	"rvc-convert":             "rvc",
 	"rvc-train":               "rvc",
 	"sadtalker":               "",
@@ -47,7 +47,7 @@ var trustedPythonAdapters = map[string]string{
 	"tts-design":              "qwentts",
 	"tts-kokoro":              "kokoro",
 	"wan-s2v":                 "",
-	"whisper-large":           "",
+	"whisper-large":           "whisper",
 }
 
 var trustedRepositoryWorkers = map[string]string{

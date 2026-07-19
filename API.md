@@ -643,11 +643,26 @@ You can also roll just that model's workers to pick up new adapter code or confi
 model-compatible repository identities: `llm-worker` for `llm:*` llama.cpp
 models, `vllm-chat-worker` for `llm:*` vLLM models, `vllm-worker` for
 `tts-voxtral`, and `python -m arbiter.worker_main <adapter>` through the
-documented repository venvs for Qwen TTS, Kokoro, Demucs, and RVC. Executables
-must use their exact path under the Arbiter project root; arguments, scripts,
-path aliases, repository-worker symlinks, and unknown Python modules are
-rejected. Standard venv interpreter symlinks at the exact documented path are
-allowed. Built-in adapters normally omit `worker_cmd` entirely.
+following exact adapter-to-venv mappings:
+
+| Adapter | Venv under the Arbiter project root |
+|---|---|
+| `aesthetic-scorer` | `venvs/aesthetic` |
+| `birefnet` | `venvs/birefnet` |
+| `demucs` | `venvs/demucs` |
+| `embed-text` | `venvs/embed` |
+| `insightface` | `venvs/insightface` |
+| `moondream` | `venvs/moondream` |
+| `rvc-convert`, `rvc-train` | `venvs/rvc` |
+| `tts-clone`, `tts-custom`, `tts-design` | `venvs/qwentts` |
+| `tts-kokoro` | `venvs/kokoro` |
+| `whisper-large` | `venvs/whisper` |
+
+The executable must be `<venv>/bin/python` at that exact project-relative
+path. Arguments, scripts, path aliases, repository-worker symlinks, unknown
+Python modules, and any other adapter/venv pairing are rejected. Standard venv
+interpreter symlinks at the exact documented path are allowed. Built-in
+adapters normally omit `worker_cmd` entirely.
 
 `adapter_params` is also a closed schema, not an environment-variable map.
 Unknown keys, non-ASCII/case variants, loader variables (`LD_*`, `DYLD_*`),
@@ -662,11 +677,26 @@ environment rather than Arbiter's complete environment.
 | Built-in Python adapters (LTX2/video, BiRefNet, vision, TTS/STT, talking-head, composite) | None. Their documented tuning remains job parameters, not process environment. |
 | Remote placement | `remote_model_tag` (canonical model identifier; metadata only, never exported to a subprocess) |
 | llama.cpp `llm-worker` | `LLM_BACKEND=llamacpp`, `LLM_HF_REPO`, `LLM_HF_FILE`, `LLM_MODEL_PATH` (existing canonical `.gguf` file), `LLM_CTX_SIZE`, `LLM_GPU_LAYERS`, `LLM_PARALLEL`, `LLAMA_SERVER_BIN` (sanctioned path only), `LLAMA_ARG_CACHE_TYPE_K`, `LLAMA_ARG_CACHE_TYPE_V`, `LLAMA_ARG_FLASH_ATTN`, `LLAMA_ARG_JINJA` |
-| vLLM chat / Voxtral TTS | `LLM_BACKEND=vllm`, `LLM_CTX_SIZE`, `VLLM_MODEL`, `VLLM_MAX_MODEL_LEN`, `VLLM_QUANTIZATION`, `VLLM_DTYPE`, `VLLM_TENSOR_PARALLEL_SIZE`, `VLLM_GPU_MEMORY_UTILIZATION`, `VLLM_MAX_NUM_SEQS`, `VLLM_READY_TIMEOUT_SEC` |
+| vLLM chat | `LLM_BACKEND=vllm`, `LLM_CTX_SIZE`, `VLLM_MODEL`, `VLLM_MAX_MODEL_LEN`, `VLLM_QUANTIZATION`, `VLLM_DTYPE`, `VLLM_TENSOR_PARALLEL_SIZE`, `VLLM_GPU_MEMORY_UTILIZATION`, `VLLM_MAX_NUM_SEQS`, `VLLM_READY_TIMEOUT_SEC`, plus the model-specific `VLLM_EXTRA_ARGS` exception below |
+| Voxtral TTS | The production mode selector is only `VLLM_MODE=tts`, not `LLM_BACKEND`; the remaining sanctioned vLLM keys above are accepted where applicable. |
 
 All numeric and enum values use canonical spelling and bounded ranges. vLLM
-tuning is translated into fixed argument/value pairs. The legacy
-`vllm_extra_args` and `VLLM_EXTRA_ARGS` forms are rejected.
+tuning normally uses fixed structured keys. `vllm_extra_args` is always
+rejected. `VLLM_EXTRA_ARGS` is accepted only for these exact model/value pairs:
+
+```text
+llm:gemma4-26b       = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}
+llm:gemma4-26b-mtp   = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}
+llm:gemma4-26b-plain = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager
+llm:qwen3.6-35b      = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager
+```
+
+Matching is byte-for-byte and model-specific. Every other model, reordered or
+missing argument, alternate spelling or JSON layout, duplicate or extra
+argument, and cross-model vector is rejected. A sanctioned vector is also
+rejected when combined with either overlapping structured key
+`VLLM_MAX_MODEL_LEN` or `VLLM_GPU_MEMORY_UTILIZATION`; non-overlapping
+structured keys remain permitted.
 
 **Response (200)**
 

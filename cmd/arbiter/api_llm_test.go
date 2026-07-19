@@ -364,6 +364,43 @@ func TestModelAndLLMNumericBoundsRejectWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestModelAPIAllowsExtendedRuntimeOnlyForExactLatentSyncID(t *testing.T) {
+	api, cleanup := newTestAPI(t)
+	defer cleanup()
+
+	create := httptest.NewRequest(http.MethodPost, "/v1/models", strings.NewReader(
+		`{"model_id":"latentsync","memory_gb":1,"max_instances":0,"max_runtime_seconds":4000000}`))
+	createResponse := httptest.NewRecorder()
+	api.Handler().ServeHTTP(createResponse, create)
+	if createResponse.Code != http.StatusOK {
+		t.Fatalf("latentsync create status = %d, body = %s", createResponse.Code, createResponse.Body.String())
+	}
+
+	neighbor := httptest.NewRequest(http.MethodPost, "/v1/models", strings.NewReader(
+		`{"model_id":"latentsync-copy","memory_gb":1,"max_instances":0,"max_runtime_seconds":4000000}`))
+	neighborResponse := httptest.NewRecorder()
+	api.Handler().ServeHTTP(neighborResponse, neighbor)
+	if neighborResponse.Code != http.StatusBadRequest || !strings.Contains(neighborResponse.Body.String(), "604800") {
+		t.Fatalf("neighbor create status = %d, body = %s", neighborResponse.Code, neighborResponse.Body.String())
+	}
+
+	overflow := httptest.NewRequest(http.MethodPatch, "/v1/models/latentsync", strings.NewReader(
+		`{"max_runtime_seconds":4000001}`))
+	overflowResponse := httptest.NewRecorder()
+	api.Handler().ServeHTTP(overflowResponse, overflow)
+	if overflowResponse.Code != http.StatusBadRequest || !strings.Contains(overflowResponse.Body.String(), "4000000") {
+		t.Fatalf("latentsync overflow patch status = %d, body = %s", overflowResponse.Code, overflowResponse.Body.String())
+	}
+
+	accepted := httptest.NewRequest(http.MethodPatch, "/v1/models/latentsync", strings.NewReader(
+		`{"max_runtime_seconds":4000000}`))
+	acceptedResponse := httptest.NewRecorder()
+	api.Handler().ServeHTTP(acceptedResponse, accepted)
+	if acceptedResponse.Code != http.StatusOK {
+		t.Fatalf("latentsync exact patch status = %d, body = %s", acceptedResponse.Code, acceptedResponse.Body.String())
+	}
+}
+
 func TestLLMUpdateNumericBoundsPreserveDiskAndLiveRuntime(t *testing.T) {
 	api, cleanup := newTestAPI(t)
 	defer cleanup()

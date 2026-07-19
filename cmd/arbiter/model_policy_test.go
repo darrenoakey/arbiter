@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -135,6 +136,48 @@ func TestWorkerPolicyAllowsDocumentedWorkerIdentities(t *testing.T) {
 	}
 }
 
+func TestLoadConfigAllowsMinimizedObservedProductionConfig(t *testing.T) {
+	root := t.TempDir()
+	models := map[string]ModelConfig{
+		"aesthetic-scorer": productionPythonConfig(root, "aesthetic", "aesthetic-scorer"),
+		"birefnet":         productionPythonConfig(root, "birefnet", "birefnet"),
+		"embed-text":       productionPythonConfig(root, "embed", "embed-text"),
+		"insightface":      productionPythonConfig(root, "insightface", "insightface"),
+		"moondream":        productionPythonConfig(root, "moondream", "moondream"),
+		"whisper-large":    productionPythonConfig(root, "whisper", "whisper-large"),
+		"tts-voxtral": productionRepositoryConfig(root, "vllm-worker", map[string]string{
+			"VLLM_MODE": "tts", "VLLM_MODEL": "mistralai/Voxtral-4B-TTS-2603",
+		}),
+		"llm:gemma4-26b": productionRepositoryConfig(root, "vllm-chat-worker", map[string]string{
+			"LLM_BACKEND": "vllm", "LLM_CTX_SIZE": "8192", "VLLM_MODEL": "RedHatAI/gemma-4-26B-A4B-it-NVFP4",
+			"VLLM_EXTRA_ARGS": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {\"method\":\"mtp\",\"model\":\"google/gemma-4-26B-A4B-it-assistant\",\"num_speculative_tokens\":4}",
+		}),
+		"llm:gemma4-26b-plain": productionRepositoryConfig(root, "vllm-chat-worker", map[string]string{
+			"LLM_BACKEND": "vllm", "LLM_CTX_SIZE": "8192", "VLLM_MODEL": "RedHatAI/gemma-4-26B-A4B-it-NVFP4",
+			"VLLM_EXTRA_ARGS": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager",
+		}),
+		"llm:gemma4-26b-mtp": productionRepositoryConfig(root, "vllm-chat-worker", map[string]string{
+			"LLM_BACKEND": "vllm", "LLM_CTX_SIZE": "8192", "VLLM_MODEL": "RedHatAI/gemma-4-26B-A4B-it-NVFP4",
+			"VLLM_EXTRA_ARGS": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {\"method\":\"mtp\",\"model\":\"google/gemma-4-26B-A4B-it-assistant\",\"num_speculative_tokens\":4}",
+		}),
+		"llm:qwen3.6-35b": productionRepositoryConfig(root, "vllm-chat-worker", map[string]string{
+			"LLM_BACKEND": "vllm", "LLM_CTX_SIZE": "8192", "VLLM_MODEL": "RedHatAI/Qwen3.6-35B-A3B-NVFP4",
+			"VLLM_EXTRA_ARGS": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager",
+		}),
+		"latentsync": {MemoryGB: 28, MaxRuntimeSec: 4000000},
+	}
+	writeModelConfigFixture(t, root, models)
+	config, err := LoadConfig(root)
+	if err != nil {
+		t.Fatalf("load minimized production config: %v", err)
+	}
+	for modelID := range models {
+		if _, ok := config.Models[modelID]; !ok {
+			t.Errorf("observed production model %q was omitted", modelID)
+		}
+	}
+}
+
 func TestWorkerPolicyRejectsAdversarialCommands(t *testing.T) {
 	root := t.TempDir()
 	cases := []struct {
@@ -149,6 +192,7 @@ func TestWorkerPolicyRejectsAdversarialCommands(t *testing.T) {
 		{name: "ArbitraryExecutable", modelID: "birefnet", command: []string{"/tmp/worker"}},
 		{name: "TrustedBasenameOutsideRoot", modelID: "llm:test", command: []string{"/tmp/llm-worker"}},
 		{name: "NonCanonicalPathSpelling", modelID: "llm:test", command: []string{root + "/sub/../llm-worker"}},
+		{name: "WrongSanctionedVenv", modelID: "birefnet", command: []string{filepath.Join(root, "venvs", "moondream", "bin", "python"), "-m", "arbiter.worker_main", "birefnet"}},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -233,5 +277,32 @@ func repositoryWorkerConfig(root, worker, backend string) ModelConfig {
 	return ModelConfig{
 		MemoryGB: 1, MaxConcurrent: 1, MaxInstances: &one, KeepAliveSec: 300,
 		MaxRuntimeSec: 7200, WorkerCmd: []string{filepath.Join(root, worker)}, AdapterParams: params,
+	}
+}
+
+func productionPythonConfig(root, venv, modelID string) ModelConfig {
+	config := pythonWorkerConfig(root, venv, modelID)
+	config.MemoryGB = 1
+	return config
+}
+
+func productionRepositoryConfig(root, worker string, params map[string]string) ModelConfig {
+	config := repositoryWorkerConfig(root, worker, "")
+	config.AdapterParams = params
+	return config
+}
+
+func writeModelConfigFixture(t *testing.T, root string, models map[string]ModelConfig) {
+	t.Helper()
+	data, err := json.Marshal(map[string]any{"models": models})
+	if err != nil {
+		t.Fatal(err)
+	}
+	localDirectory := filepath.Join(root, "local")
+	if err := os.MkdirAll(localDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localDirectory, "config.json"), data, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

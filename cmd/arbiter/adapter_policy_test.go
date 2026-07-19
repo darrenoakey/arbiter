@@ -42,6 +42,105 @@ func TestAdapterParamsAllowEverySanctionedProductionKey(t *testing.T) {
 	}
 }
 
+func TestAdapterParamsAllowObservedProductionVllmCompatibilityValues(t *testing.T) {
+	root := t.TempDir()
+	gemmaMTP := `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}`
+	tests := map[string]string{
+		"llm:gemma4-26b":       gemmaMTP,
+		"llm:gemma4-26b-mtp":   gemmaMTP,
+		"llm:gemma4-26b-plain": `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager`,
+		"llm:qwen3.6-35b":      `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager`,
+	}
+	for modelID, legacy := range tests {
+		t.Run(modelID, func(t *testing.T) {
+			chat := repositoryWorkerConfig(root, "vllm-chat-worker", "vllm")
+			chat.AdapterParams["VLLM_EXTRA_ARGS"] = legacy
+			if err := validateAdapterParams(root, modelID, chat); err != nil {
+				t.Fatalf("observed vllm chat settings rejected: %v", err)
+			}
+		})
+	}
+
+	tts := repositoryWorkerConfig(root, "vllm-worker", "")
+	tts.AdapterParams = map[string]string{"VLLM_MODE": "tts", "VLLM_MODEL": "mistralai/Voxtral-4B-TTS-2603"}
+	if err := validateAdapterParams(root, "tts-voxtral", tts); err != nil {
+		t.Fatalf("observed vllm TTS settings rejected: %v", err)
+	}
+}
+
+func TestAdapterParamsRejectVllmCompatibilityNearNeighbors(t *testing.T) {
+	root := t.TempDir()
+	gemmaMTP := `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}`
+	gemmaPlain := `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager`
+	qwen := `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager`
+	tests := []struct {
+		name    string
+		modelID string
+		worker  string
+		key     string
+		value   string
+	}{
+		{name: "unlisted model", modelID: "llm:gemma4-26b-copy", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: gemmaMTP},
+		{name: "reordered", modelID: "llm:gemma4-26b", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: `--max-num-batched-tokens 32768 --max-model-len 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}`},
+		{name: "missing", modelID: "llm:gemma4-26b-plain", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: strings.TrimSuffix(gemmaPlain, " --enforce-eager")},
+		{name: "duplicated", modelID: "llm:qwen3.6-35b", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: qwen + " --enforce-eager"},
+		{name: "alternate integer spelling", modelID: "llm:gemma4-26b-plain", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: strings.Replace(gemmaPlain, "32768", "032768", 1)},
+		{name: "alternate decimal spelling", modelID: "llm:gemma4-26b", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: strings.Replace(gemmaMTP, "0.50", "0.5", 1)},
+		{name: "alternate json layout", modelID: "llm:gemma4-26b-mtp", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: strings.Replace(gemmaMTP, `{"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}`, `{"model":"google/gemma-4-26B-A4B-it-assistant","method":"mtp","num_speculative_tokens":4}`, 1)},
+		{name: "alternate speculative model", modelID: "llm:gemma4-26b", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: strings.Replace(gemmaMTP, "google/gemma-4-26B-A4B-it-assistant", "org/model", 1)},
+		{name: "alternate speculative count", modelID: "llm:gemma4-26b-mtp", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: strings.Replace(gemmaMTP, `"num_speculative_tokens":4`, `"num_speculative_tokens":5`, 1)},
+		{name: "extra flag", modelID: "llm:gemma4-26b-plain", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: gemmaPlain + " --served-model-name injected"},
+		{name: "gemma values on qwen", modelID: "llm:qwen3.6-35b", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: gemmaPlain},
+		{name: "speculation on plain", modelID: "llm:gemma4-26b-plain", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: gemmaMTP},
+		{name: "chat mode on TTS", modelID: "tts-voxtral", worker: "vllm-worker", key: "VLLM_MODE", value: "chat"},
+		{name: "mode on chat worker", modelID: "llm:gemma4-26b", worker: "vllm-chat-worker", key: "VLLM_MODE", value: "tts"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := repositoryWorkerConfig(root, test.worker, "")
+			config.AdapterParams[test.key] = test.value
+			if err := validateAdapterParams(root, test.modelID, config); err == nil {
+				t.Fatalf("near-neighbor %s=%q was accepted", test.key, test.value)
+			}
+		})
+	}
+}
+
+func TestAdapterParamsRejectVoxtralLlmBackendSelector(t *testing.T) {
+	root := t.TempDir()
+	config := repositoryWorkerConfig(root, "vllm-worker", "vllm")
+	config.AdapterParams["VLLM_MODE"] = "tts"
+	if err := validateAdapterParams(root, "tts-voxtral", config); err == nil {
+		t.Fatal("Voxtral accepted LLM_BACKEND=vllm")
+	}
+}
+
+func TestAdapterParamsRejectOverlappingStructuredAndLegacyVllmTuning(t *testing.T) {
+	root := t.TempDir()
+	legacy := `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager`
+	overlaps := map[string]string{"VLLM_MAX_MODEL_LEN": "32768", "VLLM_GPU_MEMORY_UTILIZATION": "0.25"}
+	for key, value := range overlaps {
+		t.Run(key, func(t *testing.T) {
+			config := repositoryWorkerConfig(root, "vllm-chat-worker", "vllm")
+			config.AdapterParams["VLLM_EXTRA_ARGS"] = legacy
+			config.AdapterParams[key] = value
+			if err := validateAdapterParams(root, "llm:qwen3.6-35b", config); err == nil {
+				t.Fatalf("overlapping structured key %q accepted", key)
+			}
+		})
+	}
+
+	config := repositoryWorkerConfig(root, "vllm-chat-worker", "vllm")
+	config.AdapterParams["LLM_CTX_SIZE"] = "8192"
+	config.AdapterParams["VLLM_MODEL"] = "RedHatAI/Qwen3.6-35B-A3B-NVFP4"
+	config.AdapterParams["VLLM_DTYPE"] = "bfloat16"
+	config.AdapterParams["VLLM_MAX_NUM_SEQS"] = "16"
+	config.AdapterParams["VLLM_EXTRA_ARGS"] = legacy
+	if err := validateAdapterParams(root, "llm:qwen3.6-35b", config); err != nil {
+		t.Fatalf("non-overlapping production settings rejected: %v", err)
+	}
+}
+
 func TestAdapterParamsRejectInjectionSensitiveKeysAndSpellings(t *testing.T) {
 	root := t.TempDir()
 	keys := []string{
@@ -276,11 +375,12 @@ func TestResolvedVenvInterpreterCannotBeReplacedThroughOriginalSymlink(t *testin
 }
 
 func TestEverySanctionedCustomVenvInterpreterChainResolves(t *testing.T) {
-	root := t.TempDir()
-	for adapter, venv := range map[string]string{
-		"tts-custom": "qwentts", "tts-kokoro": "kokoro", "demucs": "demucs", "rvc-convert": "rvc",
-	} {
+	for adapter, venv := range trustedPythonAdapters {
+		if venv == "" {
+			continue
+		}
 		t.Run(adapter, func(t *testing.T) {
+			root := t.TempDir()
 			bin := filepath.Join(root, "venvs", venv, "bin")
 			writeExecutableTestFile(t, filepath.Join(bin, "python-real"), "#!/bin/sh\nexit 0\n")
 			if err := os.Symlink("python-real", filepath.Join(bin, "python3")); err != nil {

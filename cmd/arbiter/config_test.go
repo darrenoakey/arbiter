@@ -5,17 +5,13 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
 
 func TestValidateModelConfigNumbersRejectsNonFiniteAndEveryBound(t *testing.T) {
-	one := 1
-	pressure := 0.5
-	valid := ModelConfig{
-		MemoryGB: 1, MaxConcurrent: 1, MaxInstances: &one, KeepAliveSec: 300,
-		MaxRuntimeSec: 7200, AvgInferenceMs: 1, LoadMs: 1, PressureIndex: &pressure,
-	}
+	valid := validNumericModelConfig()
 	tests := []struct {
 		name   string
 		change func(*ModelConfig)
@@ -41,10 +37,68 @@ func TestValidateModelConfigNumbersRejectsNonFiniteAndEveryBound(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := valid
 			test.change(&candidate)
-			if err := validateModelConfigNumbers(candidate, 100); err == nil {
+			if err := validateModelConfigNumbers("test-model", candidate, 100); err == nil {
 				t.Fatal("invalid numeric config was accepted")
 			}
 		})
+	}
+}
+
+func TestValidateModelConfigNumbersAllowsExtendedRuntimeOnlyForExactLatentSyncID(t *testing.T) {
+	base := validNumericModelConfig()
+	base.MaxRuntimeSec = maximumDurationSeconds
+	if err := validateModelConfigNumbers("ordinary", base, 100); err != nil {
+		t.Fatalf("ordinary strict maximum rejected: %v", err)
+	}
+
+	base.MaxRuntimeSec = maximumLatentSyncRuntimeSeconds
+	if err := validateModelConfigNumbers("latentsync", base, 100); err != nil {
+		t.Fatalf("latentsync production runtime rejected: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		modelID string
+		runtime int
+	}{
+		{name: "latentsync overflow", modelID: "latentsync", runtime: maximumLatentSyncRuntimeSeconds + 1},
+		{name: "neighbor suffix", modelID: "latentsync-copy", runtime: maximumLatentSyncRuntimeSeconds},
+		{name: "neighbor prefix", modelID: "video:latentsync", runtime: maximumLatentSyncRuntimeSeconds},
+		{name: "neighbor case", modelID: "LatentSync", runtime: maximumLatentSyncRuntimeSeconds},
+		{name: "ordinary previous overflow", modelID: "ordinary", runtime: maximumDurationSeconds + 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := validNumericModelConfig()
+			candidate.MaxRuntimeSec = test.runtime
+			if err := validateModelConfigNumbers(test.modelID, candidate, 100); err == nil {
+				t.Fatalf("model %q accepted runtime %d", test.modelID, test.runtime)
+			}
+		})
+	}
+}
+
+func validNumericModelConfig() ModelConfig {
+	one := 1
+	pressure := 0.5
+	return ModelConfig{
+		MemoryGB: 1, MaxConcurrent: 1, MaxInstances: &one, KeepAliveSec: 300,
+		MaxRuntimeSec: 7200, AvgInferenceMs: 1, LoadMs: 1, PressureIndex: &pressure,
+	}
+}
+
+func TestLoadConfigRejectsExtendedRuntimeForOtherModel(t *testing.T) {
+	projectRoot := t.TempDir()
+	localDirectory := filepath.Join(projectRoot, "local")
+	if err := os.MkdirAll(localDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"models":{"moondream":{"memory_gb":1,"max_runtime_seconds":4000000}}}`
+	if err := os.WriteFile(filepath.Join(localDirectory, "config.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(projectRoot); err == nil || !strings.Contains(err.Error(), "604800") {
+		t.Fatalf("startup model-aware validation error = %v", err)
 	}
 }
 

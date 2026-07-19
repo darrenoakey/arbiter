@@ -984,7 +984,7 @@ func (a *API) listReservations(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
-func validateModelConfigRequest(req modelConfigRequest) error {
+func validateModelConfigRequest(modelID string, req modelConfigRequest) error {
 	if req.MemoryGB != nil && !finitePositive(*req.MemoryGB) {
 		return fmt.Errorf("memory_gb must be finite and > 0")
 	}
@@ -997,8 +997,9 @@ func validateModelConfigRequest(req modelConfigRequest) error {
 	if req.KeepAliveSec != nil && (*req.KeepAliveSec < 0 || *req.KeepAliveSec > maximumDurationSeconds) {
 		return fmt.Errorf("keep_alive_seconds must be between 0 and %d", maximumDurationSeconds)
 	}
-	if req.MaxRuntimeSec != nil && (*req.MaxRuntimeSec < 1 || *req.MaxRuntimeSec > maximumDurationSeconds) {
-		return fmt.Errorf("max_runtime_seconds must be between 1 and %d", maximumDurationSeconds)
+	maximumRuntime := maximumRuntimeSecondsForModel(modelID)
+	if req.MaxRuntimeSec != nil && (*req.MaxRuntimeSec < 1 || *req.MaxRuntimeSec > maximumRuntime) {
+		return fmt.Errorf("max_runtime_seconds must be between 1 and %d", maximumRuntime)
 	}
 	if req.AvgInferenceMs != nil && !finiteRange(*req.AvgInferenceMs, 0, maximumMetricMillis) {
 		return fmt.Errorf("avg_inference_ms must be finite and between 0 and %d", maximumMetricMillis)
@@ -1188,7 +1189,7 @@ func (a *API) registerModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	if err := validateModelConfigRequest(req); err != nil {
+	if err := validateModelConfigRequest(req.ModelID, req); err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
@@ -1216,7 +1217,7 @@ func (a *API) registerModel(w http.ResponseWriter, r *http.Request) {
 		PressureIndex: &fullPressure,
 	}
 	cfg = applyModelConfigRequest(cfg, req)
-	if err := validateModelConfigNumbers(cfg, a.config.VRAMBudgetGB); err != nil {
+	if err := validateModelConfigNumbers(req.ModelID, cfg, a.config.VRAMBudgetGB); err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
@@ -1288,7 +1289,7 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	if err := validateModelConfigRequest(req); err != nil {
+	if err := validateModelConfigRequest(modelID, req); err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
@@ -1298,7 +1299,7 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	updated := applyModelConfigRequest(current, req)
-	if err := validateModelConfigNumbers(updated, a.config.VRAMBudgetGB); err != nil {
+	if err := validateModelConfigNumbers(modelID, updated, a.config.VRAMBudgetGB); err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
@@ -1796,11 +1797,11 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 		KeepAliveSec: &cfg.KeepAliveSec, MaxRuntimeSec: &cfg.MaxRuntimeSec,
 		AvgInferenceMs: &cfg.AvgInferenceMs, LoadMs: &cfg.LoadMs,
 	}
-	if err := validateModelConfigRequest(modelRequest); err != nil {
+	if err := validateModelConfigRequest(modelID, modelRequest); err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
-	if err := validateModelConfigNumbers(cfg, a.config.VRAMBudgetGB); err != nil {
+	if err := validateModelConfigNumbers(modelID, cfg, a.config.VRAMBudgetGB); err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}

@@ -48,6 +48,15 @@ var vllmAdapterParams = map[string]adapterValueValidator{
 	"VLLM_TENSOR_PARALLEL_SIZE":   integerAdapterValue(1, 128),
 }
 
+var vllmLegacyTuningByModel = map[string]string{
+	"llm:gemma4-26b":       `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}`,
+	"llm:gemma4-26b-mtp":   `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}`,
+	"llm:gemma4-26b-plain": `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager`,
+	"llm:qwen3.6-35b":      `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager`,
+}
+
+var vllmLegacyOverlappingParams = []string{"VLLM_MAX_MODEL_LEN", "VLLM_GPU_MEMORY_UTILIZATION"}
+
 var inheritedWorkerEnvironment = []string{
 	"CUDA_VISIBLE_DEVICES", "HOME", "HTTP_PROXY", "HTTPS_PROXY", "LANG", "LC_ALL", "LC_CTYPE",
 	"LOGNAME", "NVIDIA_VISIBLE_DEVICES", "NO_PROXY", "SSL_CERT_DIR", "SSL_CERT_FILE", "TMPDIR",
@@ -66,10 +75,10 @@ var forbiddenAdapterKeys = map[string]bool{
 
 func validateAdapterParams(projectRoot, modelID string, config ModelConfig) error {
 	allowed := adapterParamPolicy(modelID, config)
+	if err := validateVllmLegacyTuningOverlap(config); err != nil {
+		return err
+	}
 	for key, value := range config.AdapterParams {
-		if forbiddenAdapterKey(key) {
-			return adapterParamError(key, fmt.Errorf("loader, path, shell, interpreter, and command-option variables are forbidden"))
-		}
 		if key == "remote_model_tag" {
 			if err := modelReferenceAdapterValue(projectRoot, value); err != nil {
 				return adapterParamError(key, err)
@@ -80,6 +89,9 @@ func validateAdapterParams(projectRoot, modelID string, config ModelConfig) erro
 			return adapterParamError(key, fmt.Errorf("key must use exact ASCII spelling"))
 		}
 		validator, ok := allowed[key]
+		if forbiddenAdapterKey(key) && (key != "VLLM_EXTRA_ARGS" || !ok) {
+			return adapterParamError(key, fmt.Errorf("loader, path, shell, interpreter, and command-option variables are forbidden"))
+		}
 		if !ok {
 			return adapterParamError(key, fmt.Errorf("key is not allowlisted for model %q", modelID))
 		}
@@ -101,14 +113,44 @@ func adapterParamPolicy(modelID string, config ModelConfig) map[string]adapterVa
 		switch filepath.Base(config.WorkerCmd[0]) {
 		case "llm-worker":
 			return llamaAdapterParams
-		case "vllm-chat-worker", "vllm-worker":
-			return vllmAdapterParams
+		case "vllm-chat-worker":
+			allowed := maps.Clone(vllmAdapterParams)
+			if legacy, ok := vllmLegacyTuningByModel[modelID]; ok {
+				allowed["VLLM_EXTRA_ARGS"] = exactAdapterValue(legacy)
+			}
+			return allowed
+		case "vllm-worker":
+			allowed := maps.Clone(vllmAdapterParams)
+			delete(allowed, "LLM_BACKEND")
+			allowed["VLLM_MODE"] = enumAdapterValue("tts")
+			return allowed
 		}
 	}
 	if strings.HasPrefix(modelID, "llm:") && config.AdapterParams["LLM_BACKEND"] == "llamacpp" {
 		return llamaAdapterParams
 	}
 	return map[string]adapterValueValidator{}
+}
+
+func validateVllmLegacyTuningOverlap(config ModelConfig) error {
+	if _, ok := config.AdapterParams["VLLM_EXTRA_ARGS"]; !ok {
+		return nil
+	}
+	for _, key := range vllmLegacyOverlappingParams {
+		if _, ok := config.AdapterParams[key]; ok {
+			return adapterParamError(key, fmt.Errorf("must not overlap with VLLM_EXTRA_ARGS"))
+		}
+	}
+	return nil
+}
+
+func exactAdapterValue(expected string) adapterValueValidator {
+	return func(_ string, value string) error {
+		if value != expected {
+			return fmt.Errorf("value must exactly match the sanctioned production vector")
+		}
+		return nil
+	}
 }
 
 func adapterParamError(key string, cause error) error {

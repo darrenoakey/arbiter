@@ -12,10 +12,12 @@ func TestAppendVllmTuningUsesStructuredArgumentBoundaries(t *testing.T) {
 	t.Setenv("VLLM_TENSOR_PARALLEL_SIZE", "2")
 	t.Setenv("VLLM_GPU_MEMORY_UTILIZATION", "0.9")
 	t.Setenv("VLLM_MAX_NUM_SEQS", "16")
+	t.Setenv("VLLM_EXTRA_ARGS", "--max-num-batched-tokens 32768 --enforce-eager")
 	want := []string{
 		"serve", "model", "--max-model-len", "32768", "--quantization", "awq",
 		"--dtype", "bfloat16", "--tensor-parallel-size", "2",
 		"--gpu-memory-utilization", "0.9", "--max-num-seqs", "16",
+		"--max-num-batched-tokens", "32768", "--enforce-eager",
 	}
 	if got := appendVllmTuning([]string{"serve", "model"}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("structured arguments = %#v, want %#v", got, want)
