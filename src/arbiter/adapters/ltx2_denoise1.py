@@ -13,10 +13,12 @@ Expected params dict:
     width         : int
     height        : int
 """
+
 from __future__ import annotations
 
 import gc
 import logging
+import importlib
 import sys
 import threading
 from pathlib import Path
@@ -57,13 +59,14 @@ class LTX2Denoise1Adapter(GroupAdapter):
             sys.path.insert(0, spark_str)
 
         try:
-            import ltx_core  # noqa: F401
-            import ltx_pipelines  # noqa: F401
+            importlib.import_module("ltx_core")
+            importlib.import_module("ltx_pipelines")
         except ImportError as e:
             raise LoadError(f"ltx_core / ltx_pipelines not importable: {e}")
 
         try:
-            from video_fast_gpu import FastPipeline
+            FastPipeline = importlib.import_module("video_fast_gpu").FastPipeline
+
             self._pipeline = FastPipeline()
             # Safetensors staging clones are short lived, but glibc otherwise
             # retains their heap pages and creates a second checkpoint-sized
@@ -89,7 +92,9 @@ class LTX2Denoise1Adapter(GroupAdapter):
             self._pipeline = None
         self._cleanup_gpu()
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         if self._pipeline is None:
             raise InferenceError("denoise1 pipeline not loaded")
 
@@ -121,7 +126,10 @@ class LTX2Denoise1Adapter(GroupAdapter):
             with self._gpu_lock:
                 self._check_cancel(cancel_flag)
                 result = self._pipeline.run_denoise1_gpu(
-                    data, width, height, progress_fn=_progress,
+                    data,
+                    width,
+                    height,
+                    progress_fn=_progress,
                 )
 
             self._check_cancel(cancel_flag)
@@ -136,6 +144,7 @@ class LTX2Denoise1Adapter(GroupAdapter):
         gc.collect()
         try:
             import torch
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except ImportError:

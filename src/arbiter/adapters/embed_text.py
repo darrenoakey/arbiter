@@ -12,6 +12,11 @@ import logging
 import threading
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, cast
+
+if TYPE_CHECKING:
+    import torch
+    from transformers.tokenization_utils_base import BatchEncoding
 
 from arbiter.adapters.base import ModelAdapter, InferenceError
 from arbiter.adapters.registry import register
@@ -22,6 +27,18 @@ _MODEL_REPOSITORY = "nomic-ai/nomic-embed-text-v1.5"
 _MODEL_VERSION = "nomic-embed-text-v1.5-F16"
 _MAX_SEQ_LENGTH = 8192
 _EMBEDDING_DIM = 768
+
+
+class _Tokenizer(Protocol):
+    def __call__(self, texts: list[str], **kwargs: object) -> "BatchEncoding": ...
+
+
+class _ModelOutput(Protocol):
+    last_hidden_state: "torch.Tensor"
+
+
+class _EmbeddingModel(Protocol):
+    def __call__(self, **kwargs: object) -> _ModelOutput: ...
 
 
 def _mean_pool(last_hidden_state, attention_mask):
@@ -38,8 +55,8 @@ class EmbedTextAdapter(ModelAdapter):
     model_id = "embed-text"
 
     def __init__(self):
-        self._tokenizer = None
-        self._model = None
+        self._tokenizer: _Tokenizer | None = None
+        self._model: _EmbeddingModel | None = None
         self._device = "cpu"
 
     def load(self, device: str = "cuda") -> None:
@@ -47,7 +64,9 @@ class EmbedTextAdapter(ModelAdapter):
         from transformers import AutoModel, AutoTokenizer
 
         log.info("Loading %s on %s ...", _MODEL_REPOSITORY, device)
-        self._tokenizer = AutoTokenizer.from_pretrained(_MODEL_REPOSITORY)
+        self._tokenizer = cast(
+            _Tokenizer, AutoTokenizer.from_pretrained(_MODEL_REPOSITORY)
+        )
         model = AutoModel.from_pretrained(
             _MODEL_REPOSITORY,
             trust_remote_code=True,
@@ -55,7 +74,7 @@ class EmbedTextAdapter(ModelAdapter):
             torch_dtype=torch.float16,
         )
         model.eval()
-        self._model = model.to(device)
+        self._model = cast(_EmbeddingModel, model.to(device))
         self._device = device
         log.info("embed-text ready (dim=%d).", _EMBEDDING_DIM)
 
@@ -120,7 +139,11 @@ class EmbedTextAdapter(ModelAdapter):
         for i in range(0, len(prefixed), batch_size):
             self._check_cancel(cancel_flag)
             chunk = prefixed[i : i + batch_size]
-            encoded = self._tokenizer(
+            tokenizer = self._tokenizer
+            model = self._model
+            if tokenizer is None or model is None:
+                raise InferenceError("embed-text not loaded")
+            encoded = tokenizer(
                 chunk,
                 padding=True,
                 truncation=True,
@@ -129,7 +152,7 @@ class EmbedTextAdapter(ModelAdapter):
             ).to(self._device)
 
             with torch.no_grad():
-                output = self._model(**encoded)
+                output = model(**dict(encoded))
 
             pooled = _mean_pool(output.last_hidden_state, encoded["attention_mask"])
             normalized = F.normalize(pooled, p=2, dim=1)

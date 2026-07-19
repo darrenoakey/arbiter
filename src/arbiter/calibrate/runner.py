@@ -1,4 +1,5 @@
 """Calibration orchestrator — measures model performance characteristics."""
+
 from __future__ import annotations
 
 import json
@@ -35,6 +36,7 @@ def run_calibration(model_name: str, concurrency_levels: list[int], samples: int
     load_times = []
     unload_times = []
 
+    memory_gb = 0.0
     for i in range(3):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
@@ -56,7 +58,9 @@ def run_calibration(model_name: str, concurrency_levels: list[int], samples: int
         unload_time = (time.perf_counter() - t0) * 1000
         unload_times.append(unload_time)
 
-        print(f"  Iteration {i+1}: load={load_time:.0f}ms, unload={unload_time:.0f}ms, vram={memory_gb:.2f}GB")
+        print(
+            f"  Iteration {i + 1}: load={load_time:.0f}ms, unload={unload_time:.0f}ms, vram={memory_gb:.2f}GB"
+        )
 
     results["measurements"]["load_time_ms"] = statistics.median(load_times)
     results["measurements"]["unload_time_ms"] = statistics.median(unload_times)
@@ -73,6 +77,7 @@ def run_calibration(model_name: str, concurrency_levels: list[int], samples: int
     cal_output.mkdir(parents=True, exist_ok=True)
 
     import threading
+
     cancel = threading.Event()
 
     profiles = []
@@ -93,7 +98,9 @@ def run_calibration(model_name: str, concurrency_levels: list[int], samples: int
                     job_dir.mkdir(parents=True, exist_ok=True)
                     # Use estimate_time to get a test params dict
                     test_params = _get_test_params(model_name)
-                    futures.append(pool.submit(_timed_infer, adapter, test_params, job_dir, cancel))
+                    futures.append(
+                        pool.submit(_timed_infer, adapter, test_params, job_dir, cancel)
+                    )
 
                 for f in as_completed(futures):
                     try:
@@ -117,18 +124,31 @@ def run_calibration(model_name: str, concurrency_levels: list[int], samples: int
             "concurrency": level,
             "avg_inference_time_ms": round(statistics.mean(latencies), 1),
             "p50_ms": round(statistics.median(latencies), 1),
-            "p95_ms": round(sorted(latencies)[int(len(latencies) * 0.95)] if len(latencies) >= 2 else latencies[-1], 1),
+            "p95_ms": round(
+                sorted(latencies)[int(len(latencies) * 0.95)]
+                if len(latencies) >= 2
+                else latencies[-1],
+                1,
+            ),
             "memory_peak_gb": round(peak_gb, 3),
             "memory_per_request_gb": round(mem_per_req, 3),
-            "throughput_rps": round(level / (statistics.mean(latencies) / 1000), 2) if latencies else 0,
+            "throughput_rps": round(level / (statistics.mean(latencies) / 1000), 2)
+            if latencies
+            else 0,
             "errors": errors,
             "samples": len(latencies),
         }
         profiles.append(profile)
-        print(f"    avg={profile['avg_inference_time_ms']:.0f}ms  peak_vram={profile['memory_peak_gb']:.2f}GB  throughput={profile['throughput_rps']:.1f}rps")
+        print(
+            f"    avg={profile['avg_inference_time_ms']:.0f}ms  peak_vram={profile['memory_peak_gb']:.2f}GB  throughput={profile['throughput_rps']:.1f}rps"
+        )
 
         # Stop if latency is degrading badly (>3x single-request)
-        if len(profiles) > 1 and profiles[-1]["avg_inference_time_ms"] > profiles[0]["avg_inference_time_ms"] * 3:
+        if (
+            len(profiles) > 1
+            and profiles[-1]["avg_inference_time_ms"]
+            > profiles[0]["avg_inference_time_ms"] * 3
+        ):
             print("    Latency degraded >3x, stopping higher concurrency.")
             break
 
@@ -167,16 +187,19 @@ def run_calibration(model_name: str, concurrency_levels: list[int], samples: int
         json.dump(results, f, indent=2)
 
     # Print summary
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f" Calibration complete: {model_name}")
     print(f" Load: {results['measurements']['load_time_ms']:.0f}ms")
     print(f" VRAM: {results['measurements']['memory_after_load_gb']:.2f}GB")
-    print(f" Recommended max_concurrent: {results['measurements']['recommended_max_concurrent']}")
+    print(
+        f" Recommended max_concurrent: {results['measurements']['recommended_max_concurrent']}"
+    )
     print(f" Results: {out_file}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     # Clean up temp dir
     import shutil
+
     shutil.rmtree(cal_output, ignore_errors=True)
 
     return results
@@ -197,13 +220,30 @@ def _get_test_params(model_name: str) -> dict:
     audio = get_test_audio_b64()
 
     defaults = {
-        "flux-schnell": {"prompt": "A red fox in a forest", "width": 512, "height": 512, "steps": 4, "seed": 42},
+        "flux-schnell": {
+            "prompt": "A red fox in a forest",
+            "width": 512,
+            "height": 512,
+            "steps": 4,
+            "seed": 42,
+        },
         "birefnet": {"image": img},
         "moondream": {"image": img, "task": "caption", "length": "short"},
         "whisper-large": {"audio": audio, "language": "en"},
-        "tts-custom": {"text": "Hello world, this is a calibration test.", "speaker": "Aiden", "language": "English"},
-        "tts-clone": {"text": "Hello world, this is a calibration test.", "ref_audio": audio, "language": "English"},
-        "tts-design": {"text": "Hello world, this is a calibration test.", "voice_description": "A clear neutral voice."},
+        "tts-custom": {
+            "text": "Hello world, this is a calibration test.",
+            "speaker": "Aiden",
+            "language": "English",
+        },
+        "tts-clone": {
+            "text": "Hello world, this is a calibration test.",
+            "ref_audio": audio,
+            "language": "English",
+        },
+        "tts-design": {
+            "text": "Hello world, this is a calibration test.",
+            "voice_description": "A clear neutral voice.",
+        },
         "sonic": {"image": img, "audio": audio},
         "ltx2": {"images": [img], "audio": audio, "resolution": "small"},
         "aesthetic-scorer": {"image": img},

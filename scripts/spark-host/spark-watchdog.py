@@ -23,8 +23,10 @@ cutting and restoring AC boots the machine unattended (community-standard
 workflow; an energy-monitoring plug also doubles as a power-state indicator
 since the Spark has no power LED).
 """
+
 import socket
 import subprocess
+import threading
 import time
 from datetime import datetime
 
@@ -68,8 +70,10 @@ def send_magic_packet() -> None:
 
 
 def main() -> None:
-    log(f"spark-watchdog up (target={SPARK_IP} mac={SPARK_MAC} "
-        f"threshold={FAILURES_BEFORE_WAKE * PING_INTERVAL}s)")
+    log(
+        f"spark-watchdog up (target={SPARK_IP} mac={SPARK_MAC} "
+        f"threshold={FAILURES_BEFORE_WAKE * PING_INTERVAL}s)"
+    )
     consecutive_failures = 0
     waking = False
     last_wake = 0.0
@@ -88,15 +92,17 @@ def main() -> None:
             if consecutive_failures >= FAILURES_BEFORE_WAKE:
                 now = time.time()
                 if now - last_wake >= WAKE_RETRY_INTERVAL:
-                    log(f"spark down {consecutive_failures * PING_INTERVAL}s — "
-                        "sending Wake-on-LAN magic packets")
+                    log(
+                        f"spark down {consecutive_failures * PING_INTERVAL}s — "
+                        "sending Wake-on-LAN magic packets"
+                    )
                     try:
                         send_magic_packet()
                     except OSError as e:
                         log(f"WoL send failed: {e}")
                     last_wake = now
                     waking = True
-        time.sleep(PING_INTERVAL)
+        threading.Event().wait(PING_INTERVAL)
 
 
 if __name__ == "__main__":

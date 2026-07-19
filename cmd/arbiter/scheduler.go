@@ -1775,6 +1775,12 @@ func (s *Scheduler) autoWakeParkedModels() {
 		if !ok || cfg.MaxInstances == nil || *cfg.MaxInstances != 0 {
 			continue
 		}
+		if disabledStillImageConfig(id, cfg) {
+			slog.Error("security policy: auto-wake refused for disabled still-image model",
+				"model", id, "policy", stillImageDisabledMessage)
+			delete(s.starvedSince, id)
+			continue
+		}
 		first, seen := s.starvedSince[id]
 		if !seen {
 			s.starvedSince[id] = now
@@ -1786,12 +1792,24 @@ func (s *Scheduler) autoWakeParkedModels() {
 			continue
 		}
 
+		current := cfg
 		one := 1
 		cfg.MaxInstances = &one
-		s.config.Models[id] = cfg
-		scaleResult := s.mgr.ScaleModel(id, 1, cfg)
-		if err := PatchModelMaxInstances(s.mgr.projectRoot, id, 1); err != nil {
-			slog.Error("scheduler.auto_wake persist failed", "model", id, "error", err)
+		var scaleResult map[string]any
+		err := persistModelConfigTransaction(s.mgr.projectRoot, id, cfg, s.config.VRAMBudgetGB, func() error {
+			s.config.Models[id] = cfg
+			scaleResult = s.mgr.ScaleModel(id, 1, cfg)
+			s.mgr.ApplyModelConfig(id, cfg)
+			return verifyModelRuntime(s.config, s.mgr, id, cfg, 1)
+		}, func() error {
+			s.config.Models[id] = current
+			s.mgr.ScaleModel(id, 0, current)
+			s.mgr.ApplyModelConfig(id, current)
+			return verifyModelRuntime(s.config, s.mgr, id, current, 0)
+		})
+		if err != nil {
+			slog.Error("scheduler.auto_wake transaction failed", "model", id, "error", err)
+			continue
 		}
 		s.rescoreModel(id)
 		s.logger.Log("model.auto_wake", map[string]any{

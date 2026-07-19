@@ -8,8 +8,10 @@ callers use for face clustering / identification.
 Weights are downloaded on first use into ~/.insightface/models/buffalo_l/
 by the insightface package itself — no manual download needed.
 """
+
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import threading
@@ -35,7 +37,8 @@ class InsightFaceAdapter(ModelAdapter):
 
     def load(self, device: str = "cuda") -> None:
         import onnxruntime
-        from insightface.app import FaceAnalysis
+
+        FaceAnalysis = importlib.import_module("insightface.app").FaceAnalysis
 
         available = onnxruntime.get_available_providers()
         if device == "cuda" and "CUDAExecutionProvider" in available:
@@ -45,8 +48,12 @@ class InsightFaceAdapter(ModelAdapter):
             providers = ["CPUExecutionProvider"]
             ctx_id = -1
 
-        log.info("Loading insightface %s (providers=%s, ctx_id=%d)",
-                 _MODEL_PACK, providers, ctx_id)
+        log.info(
+            "Loading insightface %s (providers=%s, ctx_id=%d)",
+            _MODEL_PACK,
+            providers,
+            ctx_id,
+        )
 
         app = FaceAnalysis(name=_MODEL_PACK, providers=providers)
         app.prepare(ctx_id=ctx_id, det_size=_DET_SIZE)
@@ -60,7 +67,9 @@ class InsightFaceAdapter(ModelAdapter):
         self._app = None
         self._cleanup_gpu()
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         import cv2
         import numpy as np
 

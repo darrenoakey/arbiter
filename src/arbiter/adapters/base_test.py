@@ -1,5 +1,4 @@
 import threading
-import time
 
 from arbiter.adapters.base import HeapTrimGuard
 
@@ -8,7 +7,7 @@ def test_heap_trim_guard_stops_its_real_background_thread() -> None:
     before = {thread.ident for thread in threading.enumerate()}
 
     with HeapTrimGuard(interval_seconds=0.01) as guard:
-        time.sleep(0.05)
+        threading.Event().wait(0.05)
 
     leaked = [
         thread

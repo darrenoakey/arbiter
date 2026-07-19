@@ -49,10 +49,10 @@ func TestPatchModelMemoryGB_PreservesOtherFields(t *testing.T) {
 	original := map[string]any{
 		"vram_budget_gb": 100.0,
 		"models": map[string]any{
-			"flux-schnell": map[string]any{
+			"birefnet": map[string]any{
 				"memory_gb":      24.0,
 				"max_concurrent": 1.0,
-				"adapter_params": map[string]any{"hand_edited": "yes"},
+				"adapter_params": map[string]any{"remote_model_tag": "birefnet-v1"},
 			},
 		},
 	}
@@ -60,7 +60,7 @@ func TestPatchModelMemoryGB_PreservesOtherFields(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "local", "config.json"), raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := PatchModelMemoryGB(root, "flux-schnell", 32.0); err != nil {
+	if err := PatchModelMemoryGB(root, "birefnet", 2.0); err != nil {
 		t.Fatalf("patch: %v", err)
 	}
 	got, _ := os.ReadFile(filepath.Join(root, "local", "config.json"))
@@ -68,8 +68,8 @@ func TestPatchModelMemoryGB_PreservesOtherFields(t *testing.T) {
 	if err := json.Unmarshal(got, &parsed); err != nil {
 		t.Fatal(err)
 	}
-	model := parsed["models"].(map[string]any)["flux-schnell"].(map[string]any)
-	if model["memory_gb"] != 32.0 {
+	model := parsed["models"].(map[string]any)["birefnet"].(map[string]any)
+	if model["memory_gb"] != 2.0 {
 		t.Fatalf("memory_gb not patched: %v", model["memory_gb"])
 	}
 	// Other fields preserved
@@ -77,7 +77,7 @@ func TestPatchModelMemoryGB_PreservesOtherFields(t *testing.T) {
 		t.Fatalf("max_concurrent lost: %v", model["max_concurrent"])
 	}
 	ap, ok := model["adapter_params"].(map[string]any)
-	if !ok || ap["hand_edited"] != "yes" {
+	if !ok || ap["remote_model_tag"] != "birefnet-v1" {
 		t.Fatalf("adapter_params lost: %v", model["adapter_params"])
 	}
 }

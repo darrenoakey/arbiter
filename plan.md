@@ -1,4 +1,9 @@
-# Arbiter — Unified GPU Model Serving Platform
+# Arbiter — Unified GPU Model Serving Platform (Historical Plan)
+
+> Owner policy update: still-image generation and editing are actively disabled
+> in Arbiter. Flux, Kontext, Z-Image, and still-image LoRA details below are
+> implementation history only, never operational guidance. Use the Mac mini
+> Codex image service. BiRefNet background removal and LTX2 video are supported.
 
 ## Context
 
@@ -31,7 +36,7 @@ arbiter/
 │       │   ├── __init__.py        # Auto-imports all, populates registry
 │       │   ├── base.py            # ModelAdapter ABC, GroupAdapter ABC
 │       │   ├── registry.py        # model_id -> adapter class mapping
-│       │   ├── flux.py            # flux-schnell (text2img, img2img)
+│       │   ├── flux.py            # retained disabled adapter; load/infer refuse
 │       │   ├── birefnet.py        # birefnet (background removal)
 │       │   ├── moondream.py       # moondream (vision-language)
 │       │   ├── whisper_large.py   # whisper-large (transcription)
@@ -87,7 +92,7 @@ arbiter/
 
 | Adapter ID | Model | Est. VRAM | Max Concurrent | Framework | Source |
 |-----------|-------|----------|----------------|-----------|--------|
-| `flux-schnell` | FLUX.1-schnell | ~12GB | 1 | Diffusers | images/server.py |
+| still-image generators | **disabled by owner policy** | -- | -- | -- | Mac mini Codex service |
 | `birefnet` | BiRefNet HR | ~2GB | 2 | Transformers | images/server.py |
 | `moondream` | Moondream2 | ~4GB | 1 | Transformers | moondream-station/server.py |
 | `whisper-large` | Whisper Large-v3 | ~3GB | 1 | whisper | ltx2-spark/transcribe.py |
@@ -240,8 +245,8 @@ All endpoints. No streaming. Data transfer only (base64 for binary).
 
 | `type` field | Model | Input | Output |
 |-------------|-------|-------|--------|
-| `image-generate` | flux-schnell | prompt, width, height, steps, seed | PNG base64 |
-| `image-edit` | flux-schnell | prompt, image (base64), strength | PNG base64 |
+| `image-generate` | rejected | -- | HTTP 400 owner-policy error |
+| `image-edit` | rejected | -- | HTTP 400 owner-policy error |
 | `background-remove` | birefnet | image (base64) | PNG RGBA base64 |
 | `caption` | moondream | image (base64), length | JSON text |
 | `query` | moondream | image (base64), question | JSON text |
@@ -278,7 +283,7 @@ class GroupAdapter(ModelAdapter):
 
 **Adapter <-> existing code strategy**:
 - **Import from source** for complex code: Sonic (adds Sonic repo to sys.path), LTX-2 (pip-installs ltx-core/ltx-pipelines packages)
-- **Rewrite** for simple code: FLUX (~50 lines), BiRefNet (~30 lines), Moondream (~20 lines), Whisper (~5 lines), TTS (~30 lines per variant)
+- **Rewrite** for simple code: BiRefNet, Moondream, Whisper, and TTS adapters
 
 ### 6. Worker Threading
 
@@ -354,7 +359,7 @@ When an adapter's `load()` is called and the model isn't found locally, check `a
 - `birefnet.py` -- simplest, good first test
 - `whisper_large.py` -- exercises audio handling
 - `moondream.py` -- exercises multi-task dispatch
-- `flux.py` -- exercises aspect ratio logic
+- `flux.py` -- exercises the unconditional fail-closed policy only
 - `tts_custom.py`, `tts_clone.py`, `tts_design.py` -- three variants
 - `sonic.py` -- first GroupAdapter, 8 sub-models
 - `ltx2.py` -- most complex, phased loading

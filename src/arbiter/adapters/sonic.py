@@ -5,10 +5,12 @@ adapter, Audio2Token, Audio2Bucket, Whisper Tiny, YOLOFace, RIFE) and bridges
 between the Arbiter byte-oriented API and Sonic's file-path-oriented internals
 using temporary files.
 """
+
 from __future__ import annotations
 
 import base64
 import logging
+import importlib
 import os
 import subprocess
 import sys
@@ -45,7 +47,7 @@ class SonicAdapter(GroupAdapter):
             sys.path.insert(0, sonic_dir)
 
         try:
-            from sonic import Sonic
+            Sonic = importlib.import_module("sonic").Sonic
 
             if device == "cpu":
                 raise LoadError("Sonic requires CUDA — refusing to load on CPU")
@@ -243,7 +245,7 @@ class SonicAdapter(GroupAdapter):
                 audio_bytes = base64.b64decode(audio_b64)
             duration = self._wav_duration(audio_bytes)
         except Exception:
-            # Fallback: assume 5 seconds of audio
+            # Conservative default: assume 5 seconds of audio.
             duration = 5.0
 
         return duration * 2500.0
@@ -256,7 +258,7 @@ class SonicAdapter(GroupAdapter):
         """Estimate WAV duration from raw bytes using the header."""
         # Standard WAV: bytes 28-31 = byte rate, bytes 40-43 = data chunk size
         if len(raw) < 44 or raw[:4] != b"RIFF":
-            return 5.0  # not a WAV or too short; fallback
+            return 5.0  # not a WAV or too short; use the conservative default
         byte_rate = int.from_bytes(raw[28:32], "little")
         if byte_rate == 0:
             return 5.0
@@ -270,10 +272,14 @@ class SonicAdapter(GroupAdapter):
             result = subprocess.run(
                 [
                     "ffprobe",
-                    "-v", "error",
-                    "-select_streams", "v:0",
-                    "-show_entries", "stream=width,height",
-                    "-of", "csv=p=0:s=x",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "csv=p=0:s=x",
                     path,
                 ],
                 capture_output=True,
@@ -285,5 +291,5 @@ class SonicAdapter(GroupAdapter):
                 return int(parts[0]), int(parts[1])
         except Exception:
             pass
-        # Fallback
+        # Use the model's canonical square dimensions when probing fails.
         return 512, 512

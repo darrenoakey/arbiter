@@ -1,4 +1,5 @@
 """Persistent job store backed by SQLite."""
+
 from __future__ import annotations
 
 import json
@@ -83,7 +84,9 @@ class JobStore:
             finished_at=row["finished_at"],
         )
 
-    def create_job(self, model_id: str, job_type: str, payload: dict, priority: float = 0.0) -> Job:
+    def create_job(
+        self, model_id: str, job_type: str, payload: dict, priority: float = 0.0
+    ) -> Job:
         """Create a new job in 'queued' state. Returns the Job."""
         job_id = uuid.uuid4().hex[:12]
         now = time.time()
@@ -95,25 +98,37 @@ class JobStore:
             )
             self._conn.commit()
         return Job(
-            id=job_id, model_id=model_id, job_type=job_type,
-            state="queued", priority=priority, payload=payload, created_at=now,
+            id=job_id,
+            model_id=model_id,
+            job_type=job_type,
+            state="queued",
+            priority=priority,
+            payload=payload,
+            created_at=now,
         )
 
     def get_job(self, job_id: str) -> Optional[Job]:
         """Get a job by ID."""
         with self._lock:
-            row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            row = self._conn.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
         return self._row_to_job(row) if row else None
 
-    def list_jobs(self, state: Optional[str] = None, model_id: Optional[str] = None, limit: int = 100) -> list[Job]:
+    def list_jobs(
+        self,
+        state: Optional[str] = None,
+        model_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[Job]:
         """List jobs, optionally filtered by state and/or model_id."""
         query = "SELECT * FROM jobs WHERE 1=1"
         params: list = []
         if state:
             # Support comma-separated states
             states = [s.strip() for s in state.split(",")]
-            placeholders = ",".join("?" for _ in states)
-            query += f" AND state IN ({placeholders})"
+            parameter_markers = ",".join("?" for _ in states)
+            query += f" AND state IN ({parameter_markers})"
             params.extend(states)
         if model_id:
             query += " AND model_id = ?"
@@ -129,8 +144,8 @@ class JobStore:
         query = "SELECT * FROM jobs WHERE state = 'queued'"
         params: list = []
         if exclude_models:
-            placeholders = ",".join("?" for _ in exclude_models)
-            query += f" AND model_id NOT IN ({placeholders})"
+            parameter_markers = ",".join("?" for _ in exclude_models)
+            query += f" AND model_id NOT IN ({parameter_markers})"
             params.extend(exclude_models)
         query += " ORDER BY priority ASC, created_at ASC LIMIT 1"
         with self._lock:

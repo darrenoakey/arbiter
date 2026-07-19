@@ -1,10 +1,11 @@
+//go:build linux
+
 package main
 
 import (
 	"os"
 	"os/exec"
 	"strconv"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -36,9 +37,6 @@ func startSelfChild(t *testing.T) (int, func()) {
 }
 
 func TestDescendantPIDs_IncludesSelf(t *testing.T) {
-	if _, err := os.Stat("/proc/self"); err != nil {
-		t.Skip("non-Linux: /proc not available")
-	}
 	got := descendantPIDs(os.Getpid())
 	if len(got) == 0 || got[0] != os.Getpid() {
 		t.Fatalf("expected self pid as first element, got %v", got)
@@ -46,9 +44,6 @@ func TestDescendantPIDs_IncludesSelf(t *testing.T) {
 }
 
 func TestDescendantPIDs_SeesChild(t *testing.T) {
-	if _, err := os.Stat("/proc/self"); err != nil {
-		t.Skip("non-Linux: /proc not available")
-	}
 	childPID, cleanup := startSelfChild(t)
 	defer cleanup()
 
@@ -66,9 +61,6 @@ func TestDescendantPIDs_SeesChild(t *testing.T) {
 }
 
 func TestTreeVRAMBytes_SumsAcrossDescendants(t *testing.T) {
-	if _, err := os.Stat("/proc/self"); err != nil {
-		t.Skip("non-Linux: /proc not available")
-	}
 	childPID, cleanup := startSelfChild(t)
 	defer cleanup()
 
@@ -86,9 +78,6 @@ func TestTreeVRAMBytes_SumsAcrossDescendants(t *testing.T) {
 }
 
 func TestTreeRSSAnonMB_NonZeroForLiveProcess(t *testing.T) {
-	if _, err := os.Stat("/proc/self"); err != nil {
-		t.Skip("non-Linux: /proc not available")
-	}
 	rss := treeRSSAnonMB(os.Getpid())
 	if rss <= 0 {
 		t.Fatalf("expected positive tree RSS for live process, got %f", rss)
@@ -101,7 +90,3 @@ func TestTreeRSSAnonMB_ZeroForInvalidPID(t *testing.T) {
 		t.Fatalf("expected 0 for pid 0, got %f", rss)
 	}
 }
-
-// _ is referenced to silence unused-import warnings in environments where the
-// /proc tests skip. Prevents `atomic` from being flagged.
-var _ atomic.Int32

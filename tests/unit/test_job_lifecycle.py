@@ -1,7 +1,6 @@
 """Tests for job state transitions."""
+
 import time
-
-
 
 
 class TestJobLifecycle:
@@ -15,7 +14,9 @@ class TestJobLifecycle:
         store.update_state(job.id, "running", started_at=time.time())
         assert store.get_job(job.id).state == "running"
 
-        store.update_state(job.id, "completed", result={"ok": True}, finished_at=time.time())
+        store.update_state(
+            job.id, "completed", result={"ok": True}, finished_at=time.time()
+        )
         j = store.get_job(job.id)
         assert j.state == "completed"
         assert j.result == {"ok": True}
@@ -23,7 +24,9 @@ class TestJobLifecycle:
 
     def test_queued_to_failed(self, store):
         job = store.create_job("m", "t", {})
-        store.update_state(job.id, "failed", error="load error", finished_at=time.time())
+        store.update_state(
+            job.id, "failed", error="load error", finished_at=time.time()
+        )
         j = store.get_job(job.id)
         assert j.state == "failed"
         assert j.error == "load error"

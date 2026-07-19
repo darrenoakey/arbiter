@@ -15,6 +15,7 @@ venv's python, so the Applio subprocesses inherit the working CUDA build.
 - ``rvc-convert``: model (id or .pth path) + input audio (+ transpose) ->
   converted wav.
 """
+
 from __future__ import annotations
 
 import base64
@@ -41,7 +42,7 @@ RVC_MODELS_DIR = Path("/home/darren/rvc-models")
 
 # Cap inline base64 (raw bytes). rvc-convert returns ONE stem; keep its b64
 # under the worker stdout pipe ceiling (96MB, see proc.go). 60MB raw -> ~80MB
-# b64. Larger output gets a skip note and must be fetched as a file.
+# b64. Larger output gets an omission note and must be fetched as a file.
 _B64_CAP_BYTES = 60 * 1024 * 1024
 
 
@@ -62,7 +63,9 @@ def _ensure_applio_config() -> None:
 def _sanitize_name(name: str) -> str:
     clean = re.sub(r"[^A-Za-z0-9_-]+", "_", (name or "").strip()).strip("_")
     if not clean:
-        raise InferenceError("rvc: 'name'/'model' must contain at least one alphanumeric char")
+        raise InferenceError(
+            "rvc: 'name'/'model' must contain at least one alphanumeric char"
+        )
     return clean
 
 
@@ -70,12 +73,17 @@ def _run(cmd: list[str], timeout: int, cancel_flag: threading.Event, label: str)
     """Run an Applio CLI step from APPLIO_DIR. Raise InferenceError on failure."""
     if cancel_flag.is_set():
         from arbiter.adapters.base import CancelledException
+
         raise CancelledException(f"cancelled before {label}")
     log.info("rvc: %s -> %s", label, " ".join(cmd[1:]))
     t0 = time.time()
     try:
         proc = subprocess.run(
-            cmd, cwd=str(APPLIO_DIR), capture_output=True, text=True, timeout=timeout,
+            cmd,
+            cwd=str(APPLIO_DIR),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired as e:
         raise InferenceError(f"rvc {label} timed out after {timeout}s") from e
@@ -105,7 +113,9 @@ class RvcTrainAdapter(ModelAdapter):
         self._ready = False
         self._cleanup_gpu()
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         if not self._ready:
             raise InferenceError("rvc-train not loaded")
         self._check_cancel(cancel_flag)
@@ -123,7 +133,13 @@ class RvcTrainAdapter(ModelAdapter):
         n_wavs = self._materialize_dataset(params, dataset_dir)
         if n_wavs == 0:
             raise InferenceError("rvc-train: dataset contained no .wav files")
-        log.info("rvc-train '%s': %d wav(s), sr=%d, epochs=%d", name, n_wavs, sample_rate, epochs)
+        log.info(
+            "rvc-train '%s': %d wav(s), sr=%d, epochs=%d",
+            name,
+            n_wavs,
+            sample_rate,
+            epochs,
+        )
 
         # Clean any stale Applio run dir for this name so globbing picks fresh outputs.
         run_dir = APPLIO_LOGS / name
@@ -131,34 +147,95 @@ class RvcTrainAdapter(ModelAdapter):
             shutil.rmtree(run_dir, ignore_errors=True)
 
         py = sys.executable
-        _run([py, "core.py", "preprocess",
-              "--model_name", name, "--dataset_path", str(dataset_dir),
-              "--sample_rate", str(sample_rate), "--cpu_cores", "8",
-              "--cut_preprocess", "Automatic"],
-             timeout=3600, cancel_flag=cancel_flag, label="preprocess")
+        _run(
+            [
+                py,
+                "core.py",
+                "preprocess",
+                "--model_name",
+                name,
+                "--dataset_path",
+                str(dataset_dir),
+                "--sample_rate",
+                str(sample_rate),
+                "--cpu_cores",
+                "8",
+                "--cut_preprocess",
+                "Automatic",
+            ],
+            timeout=3600,
+            cancel_flag=cancel_flag,
+            label="preprocess",
+        )
         self._check_cancel(cancel_flag)
-        _run([py, "core.py", "extract",
-              "--model_name", name, "--sample_rate", str(sample_rate),
-              "--f0_method", f0_method, "--embedder_model", "contentvec",
-              "--gpu", "0", "--cpu_cores", "8", "--include_mutes", "2"],
-             timeout=3600, cancel_flag=cancel_flag, label="extract")
+        _run(
+            [
+                py,
+                "core.py",
+                "extract",
+                "--model_name",
+                name,
+                "--sample_rate",
+                str(sample_rate),
+                "--f0_method",
+                f0_method,
+                "--embedder_model",
+                "contentvec",
+                "--gpu",
+                "0",
+                "--cpu_cores",
+                "8",
+                "--include_mutes",
+                "2",
+            ],
+            timeout=3600,
+            cancel_flag=cancel_flag,
+            label="extract",
+        )
         self._check_cancel(cancel_flag)
         # save_every_epoch must be <= total so the final epoch is a save point;
         # this Applio build does not force a save at completion, so a run whose
         # epoch count never hits the interval produces no deployable weight.
         save_every = max(1, min(25, epochs))
         t_train = time.time()
-        _run([py, "core.py", "train",
-              "--model_name", name, "--sample_rate", str(sample_rate),
-              "--total_epoch", str(epochs), "--batch_size", str(batch_size),
-              "--save_every_epoch", str(save_every), "--save_only_latest", "False",
-              "--save_every_weights", "True", "--gpu", "0",
-              "--pretrained", "True", "--vocoder", "HiFi-GAN"],
-             timeout=6 * 3600, cancel_flag=cancel_flag, label="train")
+        _run(
+            [
+                py,
+                "core.py",
+                "train",
+                "--model_name",
+                name,
+                "--sample_rate",
+                str(sample_rate),
+                "--total_epoch",
+                str(epochs),
+                "--batch_size",
+                str(batch_size),
+                "--save_every_epoch",
+                str(save_every),
+                "--save_only_latest",
+                "False",
+                "--save_every_weights",
+                "True",
+                "--gpu",
+                "0",
+                "--pretrained",
+                "True",
+                "--vocoder",
+                "HiFi-GAN",
+            ],
+            timeout=6 * 3600,
+            cancel_flag=cancel_flag,
+            label="train",
+        )
         train_seconds = time.time() - t_train
         self._check_cancel(cancel_flag)
-        _run([py, "core.py", "index", "--model_name", name],
-             timeout=1800, cancel_flag=cancel_flag, label="index")
+        _run(
+            [py, "core.py", "index", "--model_name", name],
+            timeout=1800,
+            cancel_flag=cancel_flag,
+            label="index",
+        )
 
         pth = self._pick_weight(run_dir)
         index = self._pick_index(run_dir)
@@ -207,7 +284,9 @@ class RvcTrainAdapter(ModelAdapter):
         elif params.get("dataset_b64"):
             raw = base64.b64decode(params["dataset_b64"])
         if raw is None:
-            raise InferenceError("rvc-train: provide dataset_file (dir/zip/wav) or dataset_b64")
+            raise InferenceError(
+                "rvc-train: provide dataset_file (dir/zip/wav) or dataset_b64"
+            )
 
         if raw[:2] == b"PK":  # zip archive
             zpath = dataset_dir.parent / "_dataset.zip"
@@ -229,8 +308,9 @@ class RvcTrainAdapter(ModelAdapter):
     def _pick_weight(run_dir: Path) -> Path | None:
         if not run_dir.is_dir():
             return None
-        cands = [p for p in run_dir.glob("*.pth")
-                 if not p.name.startswith(("G_", "D_"))]
+        cands = [
+            p for p in run_dir.glob("*.pth") if not p.name.startswith(("G_", "D_"))
+        ]
         if not cands:
             return None
         return max(cands, key=lambda p: p.stat().st_mtime)
@@ -268,7 +348,9 @@ class RvcConvertAdapter(ModelAdapter):
         self._ready = False
         self._cleanup_gpu()
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         if not self._ready:
             raise InferenceError("rvc-convert not loaded")
         self._check_cancel(cancel_flag)
@@ -291,14 +373,35 @@ class RvcConvertAdapter(ModelAdapter):
         in_path.write_bytes(audio_bytes)
         out_path = output_dir / "result.wav"
 
-        cmd = [sys.executable, "core.py", "infer",
-               "--pth_path", str(pth),
-               "--index_path", str(index) if index is not None else "",
-               "--input_path", str(in_path), "--output_path", str(out_path),
-               "--f0_method", f0_method, "--pitch", str(transpose),
-               "--index_rate", str(index_rate), "--protect", str(protect),
-               "--embedder_model", "contentvec", "--export_format", "WAV",
-               "--clean_audio", "False", "--split_audio", "False"]
+        cmd = [
+            sys.executable,
+            "core.py",
+            "infer",
+            "--pth_path",
+            str(pth),
+            "--index_path",
+            str(index) if index is not None else "",
+            "--input_path",
+            str(in_path),
+            "--output_path",
+            str(out_path),
+            "--f0_method",
+            f0_method,
+            "--pitch",
+            str(transpose),
+            "--index_rate",
+            str(index_rate),
+            "--protect",
+            str(protect),
+            "--embedder_model",
+            "contentvec",
+            "--export_format",
+            "WAV",
+            "--clean_audio",
+            "False",
+            "--split_audio",
+            "False",
+        ]
         _run(cmd, timeout=1800, cancel_flag=cancel_flag, label="infer")
         in_path.unlink(missing_ok=True)
 
@@ -310,8 +413,12 @@ class RvcConvertAdapter(ModelAdapter):
             else:
                 raise InferenceError("rvc-convert produced no output wav")
 
-        result = {"format": "wav", "file": out_path.name, "audio": out_path.name,
-                  "converted": out_path.name}
+        result = {
+            "format": "wav",
+            "file": out_path.name,
+            "audio": out_path.name,
+            "converted": out_path.name,
+        }
         if return_b64:
             raw = out_path.read_bytes()
             if len(raw) <= _B64_CAP_BYTES:
@@ -322,7 +429,9 @@ class RvcConvertAdapter(ModelAdapter):
 
     @staticmethod
     def _resolve_model(params: dict) -> tuple[Path, Path | None]:
-        model = params.get("model") or params.get("model_path") or params.get("model_id")
+        model = (
+            params.get("model") or params.get("model_path") or params.get("model_id")
+        )
         if not model:
             raise InferenceError("rvc-convert: 'model' (id or .pth path) is required")
         explicit_index = params.get("index_path")
@@ -339,7 +448,11 @@ class RvcConvertAdapter(ModelAdapter):
             if not pth.is_file():
                 raise InferenceError(f"rvc-convert: model '{model}' not found at {pth}")
             idx = model_dir / "model.index"
-            index = idx if idx.is_file() else (Path(explicit_index) if explicit_index else None)
+            index = (
+                idx
+                if idx.is_file()
+                else (Path(explicit_index) if explicit_index else None)
+            )
         return pth, index
 
     def estimate_time(self, params: dict) -> float:

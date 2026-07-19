@@ -1,4 +1,5 @@
 """Configuration loader for Arbiter."""
+
 from __future__ import annotations
 
 import json

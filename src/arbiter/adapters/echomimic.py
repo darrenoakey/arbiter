@@ -15,6 +15,7 @@ talking-head task and far more robust than re-implementing the pipeline.
 
 Invoked via `{"type":"talking-head","model":"echomimic","params":{...}}`.
 """
+
 from __future__ import annotations
 
 import logging
@@ -50,8 +51,14 @@ class EchoMimicV3Adapter(ModelAdapter):
         # Subprocess-per-job model: load() only validates the install.
         # The heavy ~1.3B+T5+CLIP load happens inside infer()'s subprocess;
         # the memory manager budgets memory_gb for the whole job duration.
-        for p in (ECHO_PY, ECHO_DIR / "infer_flash.py", CONFIG, BASE_MODEL,
-                  TRANSFORMER, WAV2VEC):
+        for p in (
+            ECHO_PY,
+            ECHO_DIR / "infer_flash.py",
+            CONFIG,
+            BASE_MODEL,
+            TRANSFORMER,
+            WAV2VEC,
+        ):
             if not Path(p).exists():
                 raise LoadError(f"EchoMimicV3 install incomplete, missing: {p}")
         self._device = device
@@ -61,7 +68,9 @@ class EchoMimicV3Adapter(ModelAdapter):
         log.info("Unloading EchoMimicV3 (no resident state).")
         self._cleanup_gpu()
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         self._check_cancel(cancel_flag)
         try:
             image_bytes = self._resolve_media(params, "image")
@@ -73,10 +82,10 @@ class EchoMimicV3Adapter(ModelAdapter):
             raise InferenceError(f"Failed to resolve audio: {e}") from e
 
         prompt = params.get("prompt") or "A person is speaking, natural expression."
-        steps = int(params.get("steps", 5))                    # README: 5 = talking-head
+        steps = int(params.get("steps", 5))  # README: 5 = talking-head
         seed = int(params.get("seed", 43))
         a_cfg = float(params.get("audio_guidance_scale", 2.0))  # 1.8-2 best lip-sync
-        t_cfg = float(params.get("guidance_scale", 4.5))        # 3-6 optimal
+        t_cfg = float(params.get("guidance_scale", 4.5))  # 3-6 optimal
         fps = int(params.get("fps", 25))
         # Cap; the script auto-trims to the audio duration (min(audio*fps, cap)).
         video_length = int(params.get("video_length", 1000))
@@ -96,24 +105,41 @@ class EchoMimicV3Adapter(ModelAdapter):
             self._check_cancel(cancel_flag)
 
             cmd = [
-                str(ECHO_PY), "infer_flash.py",
-                "--image_path", img_p,
-                "--audio_path", aud_p,
-                "--prompt", prompt,
-                "--num_inference_steps", str(steps),
-                "--config_path", "config/config.yaml",
-                "--model_name", str(BASE_MODEL),
-                "--ckpt_idx", "50000",
-                "--transformer_path", str(TRANSFORMER),
-                "--wav2vec_model_dir", str(WAV2VEC),
-                "--sampler_name", "Flow_Unipc",
-                "--save_path", out_dir,
+                str(ECHO_PY),
+                "infer_flash.py",
+                "--image_path",
+                img_p,
+                "--audio_path",
+                aud_p,
+                "--prompt",
+                prompt,
+                "--num_inference_steps",
+                str(steps),
+                "--config_path",
+                "config/config.yaml",
+                "--model_name",
+                str(BASE_MODEL),
+                "--ckpt_idx",
+                "50000",
+                "--transformer_path",
+                str(TRANSFORMER),
+                "--wav2vec_model_dir",
+                str(WAV2VEC),
+                "--sampler_name",
+                "Flow_Unipc",
+                "--save_path",
+                out_dir,
                 "--use_un_ip_mask",
-                "--audio_guidance_scale", str(a_cfg),
-                "--guidance_scale", str(t_cfg),
-                "--video_length", str(video_length),
-                "--fps", str(fps),
-                "--seed", str(seed),
+                "--audio_guidance_scale",
+                str(a_cfg),
+                "--guidance_scale",
+                str(t_cfg),
+                "--video_length",
+                str(video_length),
+                "--fps",
+                str(fps),
+                "--seed",
+                str(seed),
             ]
             log.info("EchoMimicV3: %s", " ".join(cmd[2:]))
             env = dict(os.environ)
@@ -121,8 +147,12 @@ class EchoMimicV3Adapter(ModelAdapter):
             env.pop("CLAUDECODE", None)  # don't leak into the child
 
             proc = subprocess.Popen(
-                cmd, cwd=str(ECHO_DIR), env=env,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                cmd,
+                cwd=str(ECHO_DIR),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
             )
             out_lines: list[str] = []
             while True:
@@ -148,9 +178,19 @@ class EchoMimicV3Adapter(ModelAdapter):
             result = str(mp4s[-1])
 
             probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                 "-of", "csv=p=0", result],
-                capture_output=True, text=True, timeout=30,
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "csv=p=0",
+                    result,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
             dur = float(probe.stdout.strip()) if probe.stdout.strip() else 0.0
             if dur < 0.5:
@@ -165,8 +205,11 @@ class EchoMimicV3Adapter(ModelAdapter):
             w, h = self._probe_dims(str(out_path))
             log.info("EchoMimicV3 done: %.1fs %dx%d", dur, w, h)
             return {
-                "format": "mp4", "file": "result.mp4",
-                "width": w, "height": h, "duration_seconds": round(dur, 2),
+                "format": "mp4",
+                "file": "result.mp4",
+                "width": w,
+                "height": h,
+                "duration_seconds": round(dur, 2),
             }
         except InferenceError:
             raise
@@ -190,9 +233,21 @@ class EchoMimicV3Adapter(ModelAdapter):
     def _probe_dims(path: str) -> tuple[int, int]:
         try:
             r = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
-                capture_output=True, text=True, timeout=10,
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "csv=p=0:s=x",
+                    path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             p = r.stdout.strip().split("x")
             if len(p) == 2:

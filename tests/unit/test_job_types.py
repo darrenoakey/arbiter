@@ -6,6 +6,7 @@ map (cmd/arbiter/config.go — validated separately by `go test`). These tests
 guard the Python side and specifically the voice-pipeline additions so a
 half-registered type can't ship.
 """
+
 from __future__ import annotations
 
 from arbiter.schemas import JOB_TYPE_PARAMS, JOB_TYPE_TO_MODEL, JobType
@@ -13,7 +14,9 @@ from arbiter.schemas import JOB_TYPE_PARAMS, JOB_TYPE_TO_MODEL, JobType
 
 def test_every_jobtype_has_a_model_and_params():
     for jt in JobType:
-        assert jt.value in JOB_TYPE_TO_MODEL, f"{jt.value} missing from JOB_TYPE_TO_MODEL"
+        assert jt.value in JOB_TYPE_TO_MODEL, (
+            f"{jt.value} missing from JOB_TYPE_TO_MODEL"
+        )
         assert jt.value in JOB_TYPE_PARAMS, f"{jt.value} missing from JOB_TYPE_PARAMS"
 
 

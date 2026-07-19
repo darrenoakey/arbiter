@@ -2,11 +2,51 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 )
+
+func TestValidateModelConfigNumbersRejectsNonFiniteAndEveryBound(t *testing.T) {
+	one := 1
+	pressure := 0.5
+	valid := ModelConfig{
+		MemoryGB: 1, MaxConcurrent: 1, MaxInstances: &one, KeepAliveSec: 300,
+		MaxRuntimeSec: 7200, AvgInferenceMs: 1, LoadMs: 1, PressureIndex: &pressure,
+	}
+	tests := []struct {
+		name   string
+		change func(*ModelConfig)
+	}{
+		{name: "memory nan", change: func(config *ModelConfig) { config.MemoryGB = math.NaN() }},
+		{name: "memory positive infinity", change: func(config *ModelConfig) { config.MemoryGB = math.Inf(1) }},
+		{name: "memory negative infinity", change: func(config *ModelConfig) { config.MemoryGB = math.Inf(-1) }},
+		{name: "memory host overflow", change: func(config *ModelConfig) { config.MemoryGB = 101 }},
+		{name: "instances negative", change: func(config *ModelConfig) { config.MaxInstances = intPtr(-1) }},
+		{name: "instances overflow", change: func(config *ModelConfig) { config.MaxInstances = intPtr(maximumModelInstances + 1) }},
+		{name: "concurrency zero", change: func(config *ModelConfig) { config.MaxConcurrent = 0 }},
+		{name: "concurrency overflow", change: func(config *ModelConfig) { config.MaxConcurrent = maximumModelConcurrency + 1 }},
+		{name: "runtime zero", change: func(config *ModelConfig) { config.MaxRuntimeSec = 0 }},
+		{name: "runtime overflow", change: func(config *ModelConfig) { config.MaxRuntimeSec = maximumDurationSeconds + 1 }},
+		{name: "average nan", change: func(config *ModelConfig) { config.AvgInferenceMs = math.NaN() }},
+		{name: "load infinity", change: func(config *ModelConfig) { config.LoadMs = math.Inf(1) }},
+		{name: "pressure nan", change: func(config *ModelConfig) { value := math.NaN(); config.PressureIndex = &value }},
+		{name: "pressure overflow", change: func(config *ModelConfig) { value := 1.01; config.PressureIndex = &value }},
+		{name: "priority underflow", change: func(config *ModelConfig) { config.GroupPriority = -1000001 }},
+		{name: "priority overflow", change: func(config *ModelConfig) { config.GroupPriority = 1000001 }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := valid
+			test.change(&candidate)
+			if err := validateModelConfigNumbers(candidate, 100); err == nil {
+				t.Fatal("invalid numeric config was accepted")
+			}
+		})
+	}
+}
 
 func intPtr(n int) *int {
 	return &n
@@ -19,15 +59,18 @@ func TestSaveAndDeleteModelConfig(t *testing.T) {
 		MaxConcurrent:  2,
 		MaxInstances:   intPtr(3),
 		KeepAliveSec:   900,
+		MaxRuntimeSec:  7200,
 		AvgInferenceMs: 1500,
 		LoadMs:         2500,
-		WorkerCmd:      []string{"worker-bin", "--serve"},
+		WorkerCmd:      []string{filepath.Join(projectRoot, "llm-worker")},
 		AdapterParams: map[string]string{
-			"FOO": "bar",
+			"LLM_BACKEND":  "llamacpp",
+			"LLM_CTX_SIZE": "8192",
 		},
 	}
 
-	if err := SaveModelConfig(projectRoot, "demo-model", cfg); err != nil {
+	modelID := "llm:demo-model"
+	if err := SaveModelConfig(projectRoot, modelID, cfg); err != nil {
 		t.Fatalf("SaveModelConfig() error = %v", err)
 	}
 
@@ -35,7 +78,7 @@ func TestSaveAndDeleteModelConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
-	saved, ok := loaded.Models["demo-model"]
+	saved, ok := loaded.Models[modelID]
 	if !ok {
 		t.Fatalf("saved model missing from config.json at %s", filepath.Join(projectRoot, "local", "config.json"))
 	}
@@ -46,7 +89,7 @@ func TestSaveAndDeleteModelConfig(t *testing.T) {
 		t.Fatalf("saved max_instances mismatch: got %+v want %+v", saved.MaxInstances, cfg.MaxInstances)
 	}
 
-	if err := DeleteModelConfig(projectRoot, "demo-model"); err != nil {
+	if err := DeleteModelConfig(projectRoot, modelID); err != nil {
 		t.Fatalf("DeleteModelConfig() error = %v", err)
 	}
 
@@ -54,7 +97,7 @@ func TestSaveAndDeleteModelConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig() after delete error = %v", err)
 	}
-	if _, ok := loaded.Models["demo-model"]; ok {
+	if _, ok := loaded.Models[modelID]; ok {
 		t.Fatalf("model still present after delete")
 	}
 }
@@ -82,10 +125,10 @@ func writeTestConfig(t *testing.T, projectRoot, body string) *Config {
 func TestPlacementsDefaultToLocalSpark(t *testing.T) {
 	cfg := writeTestConfig(t, t.TempDir(), `{
 		"models": {
-			"flux2": {"memory_gb": 31, "max_concurrent": 1}
+			"birefnet": {"memory_gb": 1, "max_concurrent": 1}
 		}
 	}`)
-	m := cfg.Models["flux2"]
+	m := cfg.Models["birefnet"]
 	if got := m.PlacementsOrDefault(); len(got) != 1 || got[0] != LocalHost {
 		t.Fatalf("default placements = %v, want [%q]", got, LocalHost)
 	}
@@ -214,8 +257,10 @@ func TestSaveModelConfigConcurrentWritesRemainValid(t *testing.T) {
 				MaxConcurrent:  1,
 				MaxInstances:   intPtr(1),
 				KeepAliveSec:   900,
+				MaxRuntimeSec:  7200,
 				AvgInferenceMs: 1500,
 				LoadMs:         2500,
+				Placements:     []string{"remote-test"},
 			}
 			errs <- SaveModelConfig(projectRoot, fmt.Sprintf("model-%02d", i), cfg)
 		}()

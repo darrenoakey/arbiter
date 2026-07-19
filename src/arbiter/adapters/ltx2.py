@@ -15,9 +15,11 @@ Expected params dict:
     seed           : int          — RNG seed (default 42)
     chunk_frames   : int          — frames per chunk (default 121)
 """
+
 from __future__ import annotations
 
 import base64
+import importlib
 import io
 import logging
 import subprocess
@@ -44,12 +46,18 @@ def _get_audio_duration(audio_path: str) -> float:
     """Probe audio duration with ffprobe."""
     result = subprocess.run(
         [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
             audio_path,
         ],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     return float(result.stdout.strip())
 
@@ -71,23 +79,41 @@ def _assemble_mp4(
         if i == 0:
             all_frames.append(chunk_frames)
         else:
-            # Skip first frame (overlap with previous chunk's last frame)
+            # Drop first frame because it overlaps the previous chunk's last frame.
             all_frames.append(chunk_frames[1:])
 
     video_frames = np.concatenate(all_frames, axis=0)
-    total_frames, h, w = video_frames.shape[0], video_frames.shape[1], video_frames.shape[2]
+    total_frames, h, w = (
+        video_frames.shape[0],
+        video_frames.shape[1],
+        video_frames.shape[2],
+    )
     log.info("Assembling %d frames (%dx%d) at %d fps", total_frames, w, h, fps)
 
     # Encode raw frames to temp video via ffmpeg pipe
     temp_video = str(output_path) + ".temp.mp4"
     proc = subprocess.Popen(
         [
-            "ffmpeg", "-y",
-            "-f", "rawvideo", "-pix_fmt", "rgb24",
-            "-s", f"{w}x{h}", "-r", str(fps),
-            "-i", "pipe:0",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-pix_fmt", "yuv420p",
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{w}x{h}",
+            "-r",
+            str(fps),
+            "-i",
+            "pipe:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
             temp_video,
         ],
         stdin=subprocess.PIPE,
@@ -95,29 +121,43 @@ def _assemble_mp4(
         stderr=subprocess.PIPE,
     )
     batch_size = 50
+    proc_stdin = proc.stdin
+    if proc_stdin is None:
+        raise InferenceError("ffmpeg encode stdin pipe failed to open")
     for start in range(0, len(video_frames), batch_size):
-        batch = video_frames[start:start + batch_size]
+        batch = video_frames[start : start + batch_size]
         try:
-            proc.stdin.write(batch.tobytes())
+            proc_stdin.write(batch.tobytes())
         except BrokenPipeError:
             break
-    proc.stdin.close()
+    proc_stdin.close()
     proc.wait()
     if proc.returncode != 0:
         stderr = proc.stderr.read().decode() if proc.stderr else ""
-        raise InferenceError(f"ffmpeg encode failed (rc={proc.returncode}): {stderr[-500:]}")
+        raise InferenceError(
+            f"ffmpeg encode failed (rc={proc.returncode}): {stderr[-500:]}"
+        )
 
     # Mux with audio if available
     if audio_path:
         try:
             subprocess.run(
                 [
-                    "ffmpeg", "-y",
-                    "-i", temp_video, "-i", audio_path,
-                    "-c:v", "copy", "-c:a", "aac", "-shortest",
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    temp_video,
+                    "-i",
+                    audio_path,
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-shortest",
                     str(output_path),
                 ],
-                check=True, capture_output=True,
+                check=True,
+                capture_output=True,
             )
             Path(temp_video).unlink(missing_ok=True)
         except subprocess.CalledProcessError:
@@ -129,32 +169,80 @@ def _assemble_mp4(
     return total_frames, h, w
 
 
-def _assemble_single_chunk_mp4(frames, audio_path, start_time, end_time, output_path, fps):
+def _assemble_single_chunk_mp4(
+    frames, audio_path, start_time, end_time, output_path, fps
+):
     """Assemble numpy frames + audio slice into an mp4."""
     import os
     import subprocess
     import tempfile
+
     tmp_vid = tempfile.mktemp(suffix=".mp4")
     h, w = frames.shape[1], frames.shape[2]
     proc = subprocess.Popen(
-        ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
-         "-s", f"{w}x{h}", "-r", str(fps), "-pix_fmt", "rgb24",
-         "-i", "-", "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p", tmp_vid],
-        stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-s",
+            f"{w}x{h}",
+            "-r",
+            str(fps),
+            "-pix_fmt",
+            "rgb24",
+            "-i",
+            "-",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-pix_fmt",
+            "yuv420p",
+            tmp_vid,
+        ],
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
+    proc_stdin = proc.stdin
+    if proc_stdin is None:
+        raise InferenceError("ffmpeg chunk stdin pipe failed to open")
     for frame in frames:
-        proc.stdin.write(frame.tobytes())
-    proc.stdin.close()
+        proc_stdin.write(frame.tobytes())
+    proc_stdin.close()
     proc.wait()
 
     # Mux with audio
     duration = end_time - start_time
-    subprocess.run([
-        "ffmpeg", "-y", "-i", tmp_vid,
-        "-ss", str(start_time), "-t", str(duration), "-i", audio_path,
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-        "-map", "0:v", "-map", "1:a", "-shortest", output_path,
-    ], capture_output=True)
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            tmp_vid,
+            "-ss",
+            str(start_time),
+            "-t",
+            str(duration),
+            "-i",
+            audio_path,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-shortest",
+            output_path,
+        ],
+        capture_output=True,
+    )
     os.unlink(tmp_vid)
 
 
@@ -195,8 +283,8 @@ class LTX2Adapter(GroupAdapter):
 
         try:
             # Verify core packages are importable
-            import ltx_core  # noqa: F401
-            import ltx_pipelines  # noqa: F401
+            importlib.import_module("ltx_core")
+            importlib.import_module("ltx_pipelines")
         except ImportError as e:
             raise LoadError(
                 f"ltx_core / ltx_pipelines not importable. "
@@ -204,7 +292,7 @@ class LTX2Adapter(GroupAdapter):
             )
 
         try:
-            from video_fast_gpu import FastPipeline
+            FastPipeline = importlib.import_module("video_fast_gpu").FastPipeline
 
             self._pipeline = FastPipeline()
             # Models loaded per-phase in infer()
@@ -238,7 +326,9 @@ class LTX2Adapter(GroupAdapter):
     # infer
     # ------------------------------------------------------------------
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         """Generate a video from segments + audio using phased FastPipeline.
 
         Steps:
@@ -254,7 +344,7 @@ class LTX2Adapter(GroupAdapter):
 
         # Single-segment fast path (all models pre-loaded)
         segments_check = params.get("segments", [])
-        if len(segments_check) == 1 and hasattr(self._pipeline, '_transformer_s1'):
+        if len(segments_check) == 1 and hasattr(self._pipeline, "_transformer_s1"):
             return self._infer_single_chunk(params, output_dir, cancel_flag)
 
         # -- Read params -----------------------------------------------
@@ -268,7 +358,8 @@ class LTX2Adapter(GroupAdapter):
         seed = int(params.get("seed", 42))
         chunk_frames = int(params.get("chunk_frames", 121))
 
-        from constants import RESOLUTION_PRESETS
+        RESOLUTION_PRESETS = importlib.import_module("constants").RESOLUTION_PRESETS
+
         if resolution not in RESOLUTION_PRESETS:
             raise InferenceError(
                 f"Unknown resolution '{resolution}'. "
@@ -316,28 +407,36 @@ class LTX2Adapter(GroupAdapter):
                 seg.get("end_image_b64", ""),
                 images_dir / f"seg_{idx:03d}_end.png",
             )
-            processed_segments.append({
-                "description": seg.get("description", seg.get("prompt", "")),
-                "start_time": float(seg.get("start_time", 0)),
-                "end_time": float(seg.get("end_time", audio_duration)),
-                "start_image": str(start_img_path) if start_img_path else None,
-                "end_image": str(end_img_path) if end_img_path else None,
-            })
+            processed_segments.append(
+                {
+                    "description": seg.get("description", seg.get("prompt", "")),
+                    "start_time": float(seg.get("start_time", 0)),
+                    "end_time": float(seg.get("end_time", audio_duration)),
+                    "start_image": str(start_img_path) if start_img_path else None,
+                    "end_image": str(end_img_path) if end_img_path else None,
+                }
+            )
 
         self._check_cancel(cancel_flag)
 
         # -- Build chunk plan ------------------------------------------
-        from video import plan_chunks
+        plan_chunks = importlib.import_module("video").plan_chunks
 
         chunk_plan = plan_chunks(processed_segments, audio_duration, chunk_frames, fps)
         num_chunks = len(chunk_plan)
         log.info(
             "Chunk plan: %d chunks, %dx%d @ %d fps, seed=%d",
-            num_chunks, width, height, fps, seed,
+            num_chunks,
+            width,
+            height,
+            fps,
+            seed,
         )
 
         if num_chunks == 0:
-            raise InferenceError("Chunk plan produced zero chunks — check segments/audio")
+            raise InferenceError(
+                "Chunk plan produced zero chunks — check segments/audio"
+            )
 
         # -- Progress callback that also checks cancellation -----------
         def _progress(stage: str, status: str, **kwargs):
@@ -397,7 +496,6 @@ class LTX2Adapter(GroupAdapter):
     # estimate_time
     # ------------------------------------------------------------------
 
-
     def _infer_single_chunk(self, params, output_dir, cancel_flag):
         """Fast path: generate a single chunk with all models pre-loaded."""
         import base64
@@ -413,7 +511,8 @@ class LTX2Adapter(GroupAdapter):
         seed = int(params.get("seed", 42))
         resolution = params.get("resolution", "small")
 
-        from constants import RESOLUTION_PRESETS
+        RESOLUTION_PRESETS = importlib.import_module("constants").RESOLUTION_PRESETS
+
         height, width = RESOLUTION_PRESETS.get(resolution, (512, 768))
 
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -431,7 +530,10 @@ class LTX2Adapter(GroupAdapter):
         # Decode images
         start_img_path = str(work / "start.png")
         end_img_path = str(work / "end.png")
-        for key, path in [("start_image_b64", start_img_path), ("end_image_b64", end_img_path)]:
+        for key, path in [
+            ("start_image_b64", start_img_path),
+            ("end_image_b64", end_img_path),
+        ]:
             raw = seg.get(key, "")
             if raw.startswith("data:"):
                 raw = raw.split(",", 1)[1]
@@ -461,13 +563,22 @@ class LTX2Adapter(GroupAdapter):
             log.info("LTX-2 progress: %s/%s %s", stage, status, kw)
             if cancel_flag.is_set():
                 from arbiter.adapters.base import CancelledException
+
                 raise CancelledException(f"Cancelled during {stage}/{status}")
 
+        pipeline = self._pipeline
+        if pipeline is None:
+            raise InferenceError("LTX-2 pipeline not loaded")
         try:
-            self._pipeline.generate_single_chunk(
-                chunk=chunk, audio_path=audio_path,
-                height=height, width=width, fps=fps, seed=seed,
-                output_path=output_npy, progress_fn=_progress,
+            pipeline.generate_single_chunk(
+                chunk=chunk,
+                audio_path=audio_path,
+                height=height,
+                width=width,
+                fps=fps,
+                seed=seed,
+                output_path=output_npy,
+                progress_fn=_progress,
             )
         except Exception as e:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -477,7 +588,9 @@ class LTX2Adapter(GroupAdapter):
         frames = np.load(output_npy)
         result_path = output_dir / "result.mp4"
 
-        _assemble_single_chunk_mp4(frames, audio_path, start_time, end_time, str(result_path), fps)
+        _assemble_single_chunk_mp4(
+            frames, audio_path, start_time, end_time, str(result_path), fps
+        )
 
         shutil.rmtree(tmp, ignore_errors=True)
 

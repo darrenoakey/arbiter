@@ -1,11 +1,14 @@
 """Whisper large-v3 transcription adapter."""
+
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import tempfile
 import threading
 from pathlib import Path
+from typing import Protocol, cast
 
 from arbiter.adapters.base import ModelAdapter, InferenceError
 from arbiter.adapters.registry import register
@@ -13,18 +16,22 @@ from arbiter.adapters.registry import register
 log = logging.getLogger(__name__)
 
 
+class _WhisperModel(Protocol):
+    def transcribe(self, audio: str, **kwargs: object) -> dict[str, object]: ...
+
+
 @register
 class WhisperLargeAdapter(ModelAdapter):
     model_id = "whisper-large"
 
     def __init__(self):
-        self._model = None
+        self._model: _WhisperModel | None = None
 
     def load(self, device: str = "cuda") -> None:
-        import whisper
+        whisper = importlib.import_module("whisper")
 
         log.info("Loading Whisper large-v3 on %s ...", device)
-        self._model = whisper.load_model("large-v3", device=device)
+        self._model = cast(_WhisperModel, whisper.load_model("large-v3", device=device))
         self._device = device
         log.info("Whisper large-v3 ready.")
 
@@ -34,7 +41,9 @@ class WhisperLargeAdapter(ModelAdapter):
         self._model = None
         self._cleanup_gpu()
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         self._check_cancel(cancel_flag)
 
         # Decode audio to a temp file
@@ -46,7 +55,9 @@ class WhisperLargeAdapter(ModelAdapter):
         except Exception as e:
             raise InferenceError(f"Failed to decode audio: {e}")
 
-        with tempfile.NamedTemporaryFile(suffix=f".{audio_format}", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(
+            suffix=f".{audio_format}", delete=False
+        ) as tmp:
             tmp.write(audio_bytes)
             tmp_path = tmp.name
 
@@ -56,7 +67,10 @@ class WhisperLargeAdapter(ModelAdapter):
             transcribe_kwargs = {"word_timestamps": True}
             if language:
                 transcribe_kwargs["language"] = language
-            result = self._model.transcribe(tmp_path, **transcribe_kwargs)
+            model = self._model
+            if model is None:
+                raise InferenceError("whisper-large not loaded")
+            result = model.transcribe(tmp_path, **transcribe_kwargs)
         except Exception as e:
             raise InferenceError(f"Transcription failed: {e}")
         finally:

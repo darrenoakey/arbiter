@@ -174,11 +174,13 @@ The `ref:` prefix is resolved in `_resolve_media()` in `src/arbiter/adapters/bas
 ## Key Design Decisions
 
 - **Single process, ThreadPoolExecutor**: PyTorch releases GIL during CUDA ops. Threads share GPU memory efficiently.
-- **No Spark image generation.** `POST /v1/jobs` rejects `image-generate`,
-  `image-edit`, and explicit `z-image-turbo` model submissions. User-facing
-  image creation belongs to the mac mini `image-generation-service`, which uses
-  Codex; Arbiter may still run `background-remove` via BiRefNet for transparent
-  post-processing.
+- **No Arbiter still-image generation.** This unconditional owner policy is
+  enforced at API routing, persistent config loading/mutation, registration,
+  reload, auto-wake, worker startup, and retained adapter load/infer boundaries.
+  Flux/Flux2/Schnell/Kontext/LoRA and Z-Image aliases are denied even when
+  disguised as another job type. User-facing image creation/editing belongs to
+  the Mac mini Codex image service. BiRefNet `background-remove` and every LTX2
+  video stage remain supported.
 - **SJF scheduling**: `priority = avg_inference_ms + (load_ms if not loaded else 0)`. Shortest jobs run first. Already-loaded models get natural priority.
 - **SQLite queue**: Persistent, crash-recoverable. On restart, incomplete jobs are re-queued.
 - **Dedup followers**: Duplicate requests are persisted as jobs with `state=following` and `error=following:<original_job_id>`. Startup recovery must requeue `scheduled`/`running` jobs, then reconcile followers so none remain attached to terminal or missing originals.
@@ -191,7 +193,6 @@ The `ref:` prefix is resolved in `_resolve_media()` in `src/arbiter/adapters/bas
 | Model | VRAM (GB) | Load Time | Inference Time | Max Concurrent |
 |-------|-----------|-----------|----------------|----------------|
 | birefnet | 0.83 | 5.4s | 1.0s | 2 |
-| flux-schnell | 31.42 | 248s | 12s | 1 |
 | moondream (v3) | 17.28 | 142s | 103s | 1 |
 | whisper-large | 5.88 | 11.3s | 1.8s | 1 |
 | tts-custom | 3.89 | 43s | 4s | 1 |
@@ -200,14 +201,14 @@ The `ref:` prefix is resolved in `_resolve_media()` in `src/arbiter/adapters/bas
 | sonic (group) | 4.84 | 11s | ~45s | 1 |
 | ltx2 (group) | ~55 | ~30s | ~120s | 1 |
 
-Note: FLUX at 31GB was a surprise (estimated 12GB). Moondream3 at 17GB is 4x moondream2.
+Note: Moondream3 uses substantially more memory than moondream2.
 Sonic at 5GB is much lighter than the 15GB estimate.
 
 ## Known Issues & Compatibility
 
 ### transformers version
 - **Must use transformers 4.57.3** — qwen-tts pins this exact version
-- moondream3, FLUX, BiRefNet all work fine on 4.57.3
+- moondream3 and BiRefNet work on 4.57.3
 - transformers 5.x breaks qwen-tts import (`check_model_inputs` removed)
 
 ### Model-specific notes
@@ -217,7 +218,6 @@ Sonic at 5GB is much lighter than the 15GB estimate.
 - **TTS-clone**: Requires `ref_text` parameter alongside `ref_audio` for voice cloning.
 - **Sonic**: Requires a real face in the input image — fails with "cannot access local variable 'bbox_s'" if no face detected.
 - **LTX-2**: `load()` is instant (~2ms) — only creates config objects. Heavy model loading happens inside `infer()` per-phase. Memory manager should budget 55GB for the full job duration.
-- **FLUX.1-schnell**: Needs `sentencepiece` package for tokenizer.
 - **BiRefNet**: Needs `kornia` package.
 - **vLLM chat worker**: `cmd/vllm-chat-worker` wraps `vllm serve`. When checking whether the child died during readiness polling, use a goroutine running `cmd.Wait()` and select on that channel; `exec.Cmd.ProcessState` stays nil for a zombie child until `Wait()` runs, which can leave Arbiter jobs stuck in `scheduled` with `active_jobs=1`.
 
@@ -225,7 +225,7 @@ Sonic at 5GB is much lighter than the 15GB estimate.
 
 Core: fastapi, uvicorn, pydantic, httpx
 ML: torch 2.10+cu130, transformers==4.57.3, diffusers, openai-whisper, qwen-tts
-Model-specific: kornia (birefnet), sentencepiece (flux), omegaconf opencv-python-headless (sonic)
+Model-specific: kornia (birefnet), omegaconf opencv-python-headless (sonic)
 Packages: ltx-core, ltx-pipelines (installed from /home/darren/src/ltx2-spark/packages/)
 
 ## Model Weight Locations
@@ -236,7 +236,7 @@ Weights owned by Arbiter (in local/models/):
 - Symlinks exist at the old locations pointing back here
 
 HuggingFace cache (loaded by repo ID, shared ~/.cache/huggingface/):
-- FLUX.1-schnell, BiRefNet, Moondream3, Qwen3-TTS variants
+- BiRefNet, Moondream3, Qwen3-TTS variants
 
 Whisper cache: ~/.cache/whisper/large-v3.pt
 

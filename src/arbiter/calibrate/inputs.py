@@ -1,7 +1,9 @@
 """Test input generators for calibration."""
+
 from __future__ import annotations
 
 import base64
+import importlib
 import io
 from pathlib import Path
 
@@ -16,6 +18,7 @@ def get_test_image_b64() -> str:
     # Generate a simple test image
     try:
         from PIL import Image
+
         img = Image.new("RGB", (512, 512), (128, 128, 200))
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -32,7 +35,9 @@ def get_test_audio_b64() -> str:
     # Generate 3 seconds of silence
     try:
         import numpy as np
-        import soundfile as sf
+
+        sf = importlib.import_module("soundfile")
+
         samples = np.zeros(24000 * 3, dtype=np.float32)
         buf = io.BytesIO()
         sf.write(buf, samples, 24000, format="WAV")

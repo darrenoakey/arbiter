@@ -20,6 +20,7 @@ Notes for this box:
 
 Invoked via {"type":"talking-head","model":"wan-s2v","params":{...}}.
 """
+
 from __future__ import annotations
 
 import logging
@@ -60,7 +61,9 @@ class WanS2VAdapter(ModelAdapter):
         log.info("Unloading Wan2.2-S2V (no resident state).")
         self._cleanup_gpu()
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         self._check_cancel(cancel_flag)
         try:
             image_bytes = self._resolve_media(params, "image")
@@ -94,16 +97,25 @@ class WanS2VAdapter(ModelAdapter):
             self._check_cancel(cancel_flag)
 
             cmd = [
-                str(WAN_PY), "generate.py",
-                "--task", "s2v-14B",
-                "--ckpt_dir", str(CKPT),
-                "--image", img_p,
-                "--audio", aud_p,
-                "--prompt", prompt,
-                "--size", size,
+                str(WAN_PY),
+                "generate.py",
+                "--task",
+                "s2v-14B",
+                "--ckpt_dir",
+                str(CKPT),
+                "--image",
+                img_p,
+                "--audio",
+                aud_p,
+                "--prompt",
+                prompt,
+                "--size",
+                size,
                 "--convert_model_dtype",
-                "--base_seed", str(seed),
-                "--save_file", save_file,
+                "--base_seed",
+                str(seed),
+                "--save_file",
+                save_file,
             ]
             if offload:
                 cmd += ["--offload_model", "True", "--t5_cpu"]
@@ -118,8 +130,12 @@ class WanS2VAdapter(ModelAdapter):
             env["TRITON_CACHE_DIR"] = str(CACHE / "triton")
 
             proc = subprocess.Popen(
-                cmd, cwd=str(WAN_DIR), env=env,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                cmd,
+                cwd=str(WAN_DIR),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
             )
             out_lines: list[str] = []
             while True:
@@ -141,15 +157,26 @@ class WanS2VAdapter(ModelAdapter):
             result = save_file
             if not os.path.isfile(result):
                 mp4s = sorted(Path(tmp).rglob("*.mp4")) or sorted(
-                    Path(WAN_DIR).glob("s2v-14B_*.mp4"))
+                    Path(WAN_DIR).glob("s2v-14B_*.mp4")
+                )
                 if not mp4s:
                     raise InferenceError(f"Wan2.2-S2V produced no mp4. Tail:\n{tail}")
                 result = str(mp4s[-1])
 
             probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                 "-of", "csv=p=0", result],
-                capture_output=True, text=True, timeout=30,
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "csv=p=0",
+                    result,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
             dur = float(probe.stdout.strip()) if probe.stdout.strip() else 0.0
             if dur < 0.5:
@@ -164,8 +191,11 @@ class WanS2VAdapter(ModelAdapter):
             w, h = self._probe_dims(str(out_path))
             log.info("Wan2.2-S2V done: %.1fs %dx%d", dur, w, h)
             return {
-                "format": "mp4", "file": "result.mp4",
-                "width": w, "height": h, "duration_seconds": round(dur, 2),
+                "format": "mp4",
+                "file": "result.mp4",
+                "width": w,
+                "height": h,
+                "duration_seconds": round(dur, 2),
             }
         except InferenceError:
             raise
@@ -194,9 +224,21 @@ class WanS2VAdapter(ModelAdapter):
     def _probe_dims(path: str) -> tuple[int, int]:
         try:
             r = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
-                capture_output=True, text=True, timeout=10,
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "csv=p=0:s=x",
+                    path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             p = r.stdout.strip().split("x")
             if len(p) == 2:

@@ -5,19 +5,19 @@ Usage:
 
     client = ArbiterClient()  # defaults to http://localhost:8400
 
-    # Submit and wait for result
-    result = client.run("image-generate", prompt="a red fox", steps=4)
-    with open("fox.png", "wb") as f:
-        f.write(result["data_bytes"])
+    # Submit and wait for a non-generative vision result
+    result = client.run("caption", image_file="/staged/photo.jpg")
 
     # Or async: submit and poll separately
     job_id = client.submit("transcribe", audio=base64_audio)
     status = client.poll(job_id)  # returns when done
 """
+
 from __future__ import annotations
 
 import base64
 import json
+import threading
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -29,6 +29,7 @@ _DEFAULT_URL = "http://localhost:8400"
 
 class ArbiterError(Exception):
     """Error from Arbiter API."""
+
     def __init__(self, message: str, status_code: int = 0, job_id: str = ""):
         super().__init__(message)
         self.status_code = status_code
@@ -92,10 +93,12 @@ class ArbiterClient:
                 )
             elif state == "cancelled":
                 raise ArbiterError(f"Job {job_id} was cancelled", job_id=job_id)
-            time.sleep(interval)
+            threading.Event().wait(interval)
         raise ArbiterError(f"Job {job_id} timed out after {timeout}s", job_id=job_id)
 
-    def run(self, job_type: str, timeout: float = 600, poll_interval: float = 1.0, **params) -> dict:
+    def run(
+        self, job_type: str, timeout: float = 600, poll_interval: float = 1.0, **params
+    ) -> dict:
         """Submit a job and wait for result. Returns result dict with data_bytes if applicable."""
         job_id = self.submit(job_type, **params)
         return self.poll(job_id, interval=poll_interval, timeout=timeout)
@@ -103,9 +106,12 @@ class ArbiterClient:
     # --- Convenience methods ---
 
     def image_generate(self, prompt: str, **kwargs) -> bytes:
-        """Generate an image. Returns PNG bytes."""
-        result = self.run("image-generate", prompt=prompt, **kwargs)
-        return result["result"]["data_bytes"]
+        """Reject the retired still-image path; use the Mac mini Codex service."""
+        del prompt, kwargs
+        raise ArbiterError(
+            "still-image generation is actively disabled in Arbiter; "
+            "use the Mac mini Codex image service"
+        )
 
     def background_remove(self, image_b64: str) -> bytes:
         """Remove background from image. Returns RGBA PNG bytes."""
@@ -132,32 +138,47 @@ class ArbiterClient:
         result = self.run("transcribe", audio=audio_b64, language=language)
         return result["result"]
 
-    def tts(self, text: str, mode: str = "custom", speaker: str = "Aiden",
-            ref_audio: str = "", ref_text: str = "",
-            voice_description: str = "", **kwargs) -> bytes:
+    def tts(
+        self,
+        text: str,
+        mode: str = "custom",
+        speaker: str = "Aiden",
+        ref_audio: str = "",
+        ref_text: str = "",
+        voice_description: str = "",
+        **kwargs,
+    ) -> bytes:
         """Text to speech. Returns WAV bytes."""
         if mode == "custom":
             result = self.run("tts-custom", text=text, speaker=speaker, **kwargs)
         elif mode == "clone":
-            result = self.run("tts-clone", text=text, ref_audio=ref_audio,
-                            ref_text=ref_text, **kwargs)
+            result = self.run(
+                "tts-clone", text=text, ref_audio=ref_audio, ref_text=ref_text, **kwargs
+            )
         elif mode == "design":
-            result = self.run("tts-design", text=text,
-                            voice_description=voice_description, **kwargs)
+            result = self.run(
+                "tts-design", text=text, voice_description=voice_description, **kwargs
+            )
         else:
             raise ValueError(f"Unknown TTS mode: {mode}")
         return result["result"]["data_bytes"]
 
     def talking_head(self, image_b64: str, audio_b64: str, **kwargs) -> bytes:
         """Generate talking head video. Returns MP4 bytes."""
-        result = self.run("talking-head", timeout=300,
-                         image=image_b64, audio=audio_b64, **kwargs)
+        result = self.run(
+            "talking-head", timeout=300, image=image_b64, audio=audio_b64, **kwargs
+        )
         return result["result"]["data_bytes"]
 
     def video_generate(self, segments: list[dict], audio_b64: str, **kwargs) -> bytes:
         """Generate video from segments + audio. Returns MP4 bytes."""
-        result = self.run("video-generate", timeout=1800,
-                         segments=segments, audio_b64=audio_b64, **kwargs)
+        result = self.run(
+            "video-generate",
+            timeout=1800,
+            segments=segments,
+            audio_b64=audio_b64,
+            **kwargs,
+        )
         return result["result"]["data_bytes"]
 
     # --- System ---

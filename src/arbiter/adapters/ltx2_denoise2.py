@@ -20,10 +20,12 @@ Expected params dict:
     width         : int   — exact requested output width after model-only padding
     height        : int   — exact requested output height after model-only padding
 """
+
 from __future__ import annotations
 
 import gc
 import logging
+import importlib
 import subprocess
 import sys
 import tempfile
@@ -56,7 +58,7 @@ def _crop_frames_to_target(frames, target_width: int, target_height: int):
         )
     left = (width - target_width) // 2
     top = (height - target_height) // 2
-    return frames[:, top:top + target_height, left:left + target_width, :]
+    return frames[:, top : top + target_height, left : left + target_width, :]
 
 
 def _mux_audio_slice(
@@ -70,11 +72,30 @@ def _mux_audio_slice(
     duration = format(video_duration, ".12g")
     result = subprocess.run(
         [
-            "ffmpeg", "-y", "-i", video_path,
-            "-ss", str(start_time), "-t", duration, "-i", audio_path,
-            "-filter:a", f"apad=whole_dur={duration},atrim=duration={duration}",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-map", "0:v", "-map", "1:a", "-t", duration,
+            "ffmpeg",
+            "-y",
+            "-i",
+            video_path,
+            "-ss",
+            str(start_time),
+            "-t",
+            duration,
+            "-i",
+            audio_path,
+            "-filter:a",
+            f"apad=whole_dur={duration},atrim=duration={duration}",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-t",
+            duration,
             str(output_path),
         ],
         capture_output=True,
@@ -84,7 +105,9 @@ def _mux_audio_slice(
         raise InferenceError(f"ffmpeg mux failed: {err}")
 
 
-def _assemble_single_chunk_mp4(frames, audio_path, start_time, end_time, output_path, fps):
+def _assemble_single_chunk_mp4(
+    frames, audio_path, start_time, end_time, output_path, fps
+):
     """Assemble numpy frames + an exact-duration audio slice via ffmpeg nvenc."""
     import os
 
@@ -92,20 +115,41 @@ def _assemble_single_chunk_mp4(frames, audio_path, start_time, end_time, output_
     h, w = frames.shape[1], frames.shape[2]
     proc = subprocess.Popen(
         [
-            "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
-            "-s", f"{w}x{h}", "-r", str(fps), "-pix_fmt", "rgb24",
-            "-i", "-",
-            "-c:v", "h264_nvenc", "-preset", "fast", "-pix_fmt", "yuv420p",
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-s",
+            f"{w}x{h}",
+            "-r",
+            str(fps),
+            "-pix_fmt",
+            "rgb24",
+            "-i",
+            "-",
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "fast",
+            "-pix_fmt",
+            "yuv420p",
             tmp_vid,
         ],
-        stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
+    proc_stdin = proc.stdin
+    proc_stderr = proc.stderr
+    if proc_stdin is None or proc_stderr is None:
+        raise InferenceError("ffmpeg nvenc pipes failed to open")
     for frame in frames:
-        proc.stdin.write(frame.tobytes())
-    proc.stdin.close()
+        proc_stdin.write(frame.tobytes())
+    proc_stdin.close()
     proc.wait()
     if proc.returncode != 0:
-        err = proc.stderr.read().decode()[-500:]
+        err = proc_stderr.read().decode()[-500:]
         raise InferenceError(f"ffmpeg nvenc failed: {err}")
 
     # The decoded frame count is authoritative. The requested audio endpoint can
@@ -146,21 +190,26 @@ class LTX2Denoise2Adapter(GroupAdapter):
             sys.path.insert(0, spark_str)
 
         try:
-            import ltx_core  # noqa: F401
-            import ltx_pipelines  # noqa: F401
+            importlib.import_module("ltx_core")
+            importlib.import_module("ltx_pipelines")
         except ImportError as e:
             raise LoadError(f"ltx_core / ltx_pipelines not importable: {e}")
 
         try:
-            from video_fast_gpu import FastPipeline
+            FastPipeline = importlib.import_module("video_fast_gpu").FastPipeline
+
             self._pipeline = FastPipeline()
 
             # Pre-load stage-2 transformer + video decoder so they are cached
             # across chunks (key speedup — 40GB of weights stay resident).
             log.info("LTX2-denoise2: pre-loading stage-2 transformer + decoder")
             with HeapTrimGuard():
-                self._pipeline._s2_transformer = self._pipeline.stage_2_ledger.transformer()
-                self._pipeline._s2_decoder = self._pipeline.stage_1_ledger.video_decoder()
+                self._pipeline._s2_transformer = (
+                    self._pipeline.stage_2_ledger.transformer()
+                )
+                self._pipeline._s2_decoder = (
+                    self._pipeline.stage_1_ledger.video_decoder()
+                )
             self._pipeline._s2_loaded = True
             log.info("LTX2-denoise2: models loaded")
         except Exception as e:
@@ -184,7 +233,9 @@ class LTX2Denoise2Adapter(GroupAdapter):
             self._pipeline = None
         self._cleanup_gpu()
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         if self._pipeline is None:
             raise InferenceError("denoise2 pipeline not loaded")
 
@@ -261,6 +312,7 @@ class LTX2Denoise2Adapter(GroupAdapter):
         gc.collect()
         try:
             import torch
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except ImportError:

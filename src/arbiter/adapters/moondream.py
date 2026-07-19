@@ -20,6 +20,7 @@ run on that one thread, regardless of which worker_main pool thread called
 infer(). Verified thread-safe driven from the 8-pool, query ~1.3-1.6x
 faster, outputs unchanged. One-time ~50-115s compile/warmup on first call.
 """
+
 from __future__ import annotations
 
 import json
@@ -28,6 +29,19 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Iterable,
+    Protocol,
+    TypeVar,
+    TypedDict,
+    cast,
+)
+
+if TYPE_CHECKING:
+    import torch
+    from PIL import Image
 
 from arbiter.adapters.base import ModelAdapter, InferenceError
 from arbiter.adapters.registry import register
@@ -35,6 +49,75 @@ from arbiter.adapters.registry import register
 log = logging.getLogger(__name__)
 
 MODEL_HF_ID = "moondream/moondream3-preview"
+_Result = TypeVar("_Result")
+
+
+class _Vision(Protocol):
+    pos_emb: "torch.Tensor"
+
+
+class _TextConfig(Protocol):
+    dim: int
+    max_context: int
+
+
+class _Config(Protocol):
+    text: _TextConfig
+
+
+class _MoondreamInner(Protocol):
+    causal_block_mask: object
+    point_gen_indices: object
+    device: "torch.device"
+    vision: _Vision
+    config: _Config
+    _vis_enc: Callable[..., "torch.Tensor"]
+    _decode_one_tok: Callable[..., "torch.Tensor"]
+
+    def modules(self) -> Iterable[object]: ...
+
+
+class _CaptionResult(TypedDict):
+    caption: str
+
+
+class _QueryResult(TypedDict):
+    answer: str
+
+
+class _Detection(TypedDict):
+    x_min: float
+    y_min: float
+    x_max: float
+    y_max: float
+    confidence: float
+
+
+class _DetectResult(TypedDict):
+    objects: list[_Detection]
+
+
+class _Point(TypedDict):
+    x: float
+    y: float
+
+
+class _PointResult(TypedDict):
+    points: list[_Point]
+
+
+class _Unpackable(Protocol):
+    def unpack(self) -> None: ...
+
+
+class _MoondreamModel(Protocol):
+    model: _MoondreamInner
+
+    def _setup_caches(self) -> None: ...
+    def caption(self, image: "Image.Image", **kwargs: object) -> _CaptionResult: ...
+    def query(self, **kwargs: object) -> _QueryResult: ...
+    def detect(self, image: "Image.Image", target: str) -> _DetectResult: ...
+    def point(self, image: "Image.Image", target: str) -> _PointResult: ...
 
 
 @register
@@ -42,12 +125,14 @@ class MoondreamAdapter(ModelAdapter):
     model_id = "moondream"
 
     def __init__(self):
-        self._model = None
+        self._model: _MoondreamModel | None = None
         self._device = "cuda"
         # Private single-thread executor: pins CUDA-graph capture + every
         # replay to ONE thread so reduce-overhead compile is safe under
         # worker_main's 8-thread infer pool.
-        self._gpu = ThreadPoolExecutor(max_workers=1, thread_name_prefix="moondream-gpu")
+        self._gpu = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="moondream-gpu"
+        )
         self._compiled = False
         self._compile_failed = False
         self._compile_lock = threading.Lock()
@@ -57,11 +142,14 @@ class MoondreamAdapter(ModelAdapter):
         from transformers import AutoModelForCausalLM
 
         log.info("Loading %s on %s with bfloat16 ...", MODEL_HF_ID, device)
-        self._model = AutoModelForCausalLM.from_pretrained(
-            MODEL_HF_ID,
-            trust_remote_code=True,
-            dtype=torch.bfloat16,
-            device_map={"": device},
+        self._model = cast(
+            _MoondreamModel,
+            AutoModelForCausalLM.from_pretrained(
+                MODEL_HF_ID,
+                trust_remote_code=True,
+                dtype=torch.bfloat16,
+                device_map={"": device},
+            ),
         )
         self._device = device
         # KV caches are plain tensors (not graph-captured) — fine to set up
@@ -83,11 +171,14 @@ class MoondreamAdapter(ModelAdapter):
         every later replay (also routed through this thread) is valid."""
         import torch
 
-        m = self._model.model
+        model = self._model
+        if model is None:
+            raise InferenceError("moondream not loaded")
+        m = model.model
         t0 = time.time()
         for mod in m.modules():
             if type(mod).__name__ == "QuantizedLinear" and hasattr(mod, "unpack"):
-                mod.unpack()
+                cast(_Unpackable, mod).unpack()
         # Materialise lazy props before capture (avoids first-call overhead).
         m.causal_block_mask
         m.point_gen_indices
@@ -101,22 +192,30 @@ class MoondreamAdapter(ModelAdapter):
         dtype = m.vision.pos_emb.dtype
         with torch.no_grad():
             m._vis_enc(torch.randn(1, 3, 378, 378, device=device, dtype=dtype))
-            dummy_emb = torch.randn(1, 1, m.config.text.dim, device=device, dtype=dtype)
-            dummy_mask = torch.ones(
+            warmup_embedding = torch.randn(
+                1, 1, m.config.text.dim, device=device, dtype=dtype
+            )
+            warmup_mask = torch.ones(
                 1, 1, m.config.text.max_context, device=device, dtype=torch.bool
             )
-            dummy_pos = torch.tensor([100], device=device, dtype=torch.long)
-            m._decode_one_tok(dummy_emb, dummy_mask, dummy_pos, None)
+            warmup_position = torch.tensor([100], device=device, dtype=torch.long)
+            m._decode_one_tok(warmup_embedding, warmup_mask, warmup_position, None)
             m._decode_one_tok(
-                dummy_emb, dummy_mask, dummy_pos, None,
+                warmup_embedding,
+                warmup_mask,
+                warmup_position,
+                None,
                 lm_head_indices=m.point_gen_indices,
             )
-        log.info("Moondream3 flex_attention compiled+warmed in %.0fs.", time.time() - t0)
+        log.info(
+            "Moondream3 flex_attention compiled+warmed in %.0fs.", time.time() - t0
+        )
 
-    def _run(self, fn):
+    def _run(self, fn: Callable[[], _Result]) -> _Result:
         """Run fn on the private GPU thread. First call compiles there.
         If compile ever fails, fall back to UNCOMPILED (still on this
         thread for consistency) rather than taking the vision path down."""
+
         def task():
             if not self._compiled and not self._compile_failed:
                 with self._compile_lock:
@@ -136,7 +235,9 @@ class MoondreamAdapter(ModelAdapter):
     def _decode_image(self, params: dict):
         return self._resolve_image(params)
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         self._check_cancel(cancel_flag)
 
         image = self._decode_image(params)
@@ -183,7 +284,10 @@ class MoondreamAdapter(ModelAdapter):
     def _caption(self, image, params: dict) -> dict:
         length = params.get("length", "normal")
         skw = self._sampling_kwargs(params)
-        result = self._run(lambda: self._model.caption(image, length=length, **skw))
+        model = self._model
+        if model is None:
+            raise InferenceError("moondream not loaded")
+        result = self._run(lambda: model.caption(image, length=length, **skw))
         return {"caption": result["caption"]}
 
     def _query(self, image, params: dict) -> dict:
@@ -192,8 +296,11 @@ class MoondreamAdapter(ModelAdapter):
             raise InferenceError("question is required for query task")
         reasoning = str(params.get("reasoning", "false")).lower() == "true"
         skw = self._sampling_kwargs(params)
+        model = self._model
+        if model is None:
+            raise InferenceError("moondream not loaded")
         result = self._run(
-            lambda: self._model.query(
+            lambda: model.query(
                 image=image, question=question, reasoning=reasoning, **skw
             )
         )
@@ -204,18 +311,23 @@ class MoondreamAdapter(ModelAdapter):
         if not obj:
             raise InferenceError("object is required for detect task")
         w, h = image.size
-        result = self._run(lambda: self._model.detect(image, obj))
+        model = self._model
+        if model is None:
+            raise InferenceError("moondream not loaded")
+        result = self._run(lambda: model.detect(image, obj))
         objects = []
         for det in result.get("objects", []):
-            objects.append({
-                "bbox": [
-                    round(det["x_min"] * w),
-                    round(det["y_min"] * h),
-                    round(det["x_max"] * w),
-                    round(det["y_max"] * h),
-                ],
-                "confidence": det.get("confidence", 1.0),
-            })
+            objects.append(
+                {
+                    "bbox": [
+                        round(det["x_min"] * w),
+                        round(det["y_min"] * h),
+                        round(det["x_max"] * w),
+                        round(det["y_max"] * h),
+                    ],
+                    "confidence": det.get("confidence", 1.0),
+                }
+            )
         return {"objects": objects}
 
     def _point(self, image, params: dict) -> dict:
@@ -223,8 +335,14 @@ class MoondreamAdapter(ModelAdapter):
         if not obj:
             raise InferenceError("object is required for point task")
         w, h = image.size
-        result = self._run(lambda: self._model.point(image, obj))
-        points = [{"x": round(p["x"] * w), "y": round(p["y"] * h)} for p in result.get("points", [])]
+        model = self._model
+        if model is None:
+            raise InferenceError("moondream not loaded")
+        result = self._run(lambda: model.point(image, obj))
+        points = [
+            {"x": round(p["x"] * w), "y": round(p["y"] * h)}
+            for p in result.get("points", [])
+        ]
         return {"points": points, "count": len(points)}
 
     def estimate_time(self, params: dict) -> float:

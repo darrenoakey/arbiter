@@ -10,6 +10,7 @@ Usage:
     python -m arbiter.adapter_test sadtalker --reserve 5
     python -m arbiter.adapter_test --list
 """
+
 from __future__ import annotations
 
 import argparse
@@ -38,7 +39,9 @@ def _ensure_test_assets():
 
     if not portrait.exists():
         # Try to copy from SadTalker examples
-        src = Path("/home/darren/src/talking-head/local-sadtalker/examples/source_image/art_0.png")
+        src = Path(
+            "/home/darren/src/talking-head/local-sadtalker/examples/source_image/art_0.png"
+        )
         if src.exists():
             shutil.copy2(str(src), str(portrait))
         else:
@@ -49,15 +52,24 @@ def _ensure_test_assets():
         # Generate a 3-second sine wave
         result = subprocess.run(
             [
-                "ffmpeg", "-y", "-f", "lavfi",
-                "-i", "sine=frequency=440:duration=3",
-                "-ar", "16000", "-ac", "1",
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=3",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
                 str(audio),
             ],
             capture_output=True,
         )
         if result.returncode != 0:
-            print(f"ERROR: Failed to create test audio: {result.stderr.decode()[-200:]}")
+            print(
+                f"ERROR: Failed to create test audio: {result.stderr.decode()[-200:]}"
+            )
             sys.exit(1)
 
     return portrait, audio
@@ -67,6 +79,7 @@ def _reserve_memory(gb: float) -> str | None:
     """Reserve VRAM via arbiter API. Returns reservation_id or None."""
     try:
         import requests
+
         resp = requests.post(
             f"{ARBITER_URL}/v1/reserve",
             json={"memory_gb": gb, "label": "adapter-test"},
@@ -86,6 +99,7 @@ def _release_reservation(rid: str):
     """Release a reservation via arbiter API."""
     try:
         import requests
+
         requests.delete(f"{ARBITER_URL}/v1/reserve/{rid}", timeout=10)
         print(f"  Released reservation {rid}")
     except Exception:
@@ -96,10 +110,15 @@ def _probe_video(path: str) -> dict:
     """Use ffprobe to get video info."""
     result = subprocess.run(
         [
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,duration,codec_name",
-            "-of", "json",
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,duration,codec_name",
+            "-of",
+            "json",
             path,
         ],
         capture_output=True,
@@ -109,6 +128,7 @@ def _probe_video(path: str) -> dict:
     if result.returncode != 0:
         return {}
     import json
+
     data = json.loads(result.stdout)
     streams = data.get("streams", [])
     return streams[0] if streams else {}
@@ -116,17 +136,23 @@ def _probe_video(path: str) -> dict:
 
 def test_adapter(model_id: str, reserve_gb: float = 0, verbose: bool = False):
     """Test a single adapter's full lifecycle."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Testing adapter: {model_id}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     portrait, audio = _ensure_test_assets()
-    results = {"load": "SKIP", "infer": "SKIP", "verify": "SKIP", "unload": "SKIP"}
+    results = {
+        "load": "NOT_RUN",
+        "infer": "NOT_RUN",
+        "verify": "NOT_RUN",
+        "unload": "NOT_RUN",
+    }
     reservation_id = None
 
     try:
         # Import adapter
         from arbiter.adapters import registry
+
         try:
             adapter_cls = registry.get_adapter_class(model_id)
         except KeyError as e:
@@ -156,7 +182,7 @@ def test_adapter(model_id: str, reserve_gb: float = 0, verbose: bool = False):
         print("\n  [INFER] Running inference...")
         output_dir = Path(tempfile.mkdtemp(prefix=f"adapter-test-{model_id}-"))
         cancel_flag = threading.Event()
-        params = {
+        params: dict[str, object] = {
             "image_file": str(portrait),
             "audio_file": str(audio),
         }
@@ -178,6 +204,7 @@ def test_adapter(model_id: str, reserve_gb: float = 0, verbose: bool = False):
             print(f"  [INFER] FAIL: {e}")
             if verbose:
                 import traceback
+
                 traceback.print_exc()
             return False
 
@@ -189,7 +216,9 @@ def test_adapter(model_id: str, reserve_gb: float = 0, verbose: bool = False):
 
             out_file = output_dir / result["file"]
             assert out_file.exists(), f"Output file missing: {out_file}"
-            assert out_file.stat().st_size > 1000, f"Output too small: {out_file.stat().st_size} bytes"
+            assert out_file.stat().st_size > 1000, (
+                f"Output too small: {out_file.stat().st_size} bytes"
+            )
 
             # ffprobe validation
             probe = _probe_video(str(out_file))
@@ -230,7 +259,7 @@ def test_adapter(model_id: str, reserve_gb: float = 0, verbose: bool = False):
             _release_reservation(reservation_id)
 
     # Summary
-    print(f"\n  {'─'*40}")
+    print(f"\n  {'─' * 40}")
     all_pass = all(v == "PASS" for v in results.values())
     for step, status in results.items():
         marker = "✓" if status == "PASS" else "✗" if status == "FAIL" else "○"
@@ -242,6 +271,7 @@ def test_adapter(model_id: str, reserve_gb: float = 0, verbose: bool = False):
 def list_adapters():
     """List all registered adapters."""
     from arbiter.adapters import registry
+
     print("Registered adapters:")
     for model_id in registry.list_registered():
         print(f"  - {model_id}")
@@ -252,7 +282,9 @@ def main():
     parser.add_argument("model_id", nargs="?", help="Model ID to test")
     parser.add_argument("--list", action="store_true", help="List available adapters")
     parser.add_argument("--all", action="store_true", help="Test all adapters")
-    parser.add_argument("--reserve", type=float, default=0, help="Reserve VRAM (GB) before testing")
+    parser.add_argument(
+        "--reserve", type=float, default=0, help="Reserve VRAM (GB) before testing"
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     args = parser.parse_args()
 
@@ -262,6 +294,7 @@ def main():
 
     if args.all:
         from arbiter.adapters import registry
+
         models = registry.list_registered()
         passed = 0
         failed = 0
@@ -270,7 +303,7 @@ def main():
                 passed += 1
             else:
                 failed += 1
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Results: {passed} passed, {failed} failed")
         sys.exit(1 if failed > 0 else 0)
 

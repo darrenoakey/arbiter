@@ -21,8 +21,10 @@ so the current pipeline maps character descriptions onto the built-in bank
 instead. A hybrid model — pre-evolve a few hundred custom voices once, then
 map onto that enlarged bank — is the natural next step.
 """
+
 from __future__ import annotations
 
+import importlib
 import threading
 from pathlib import Path
 
@@ -53,7 +55,9 @@ class KokoroTTSAdapter(ModelAdapter):
     # build one shared KModel; pipelines are created lazily per lang code
     def load(self, device: str = "cuda") -> None:
         import torch
-        from kokoro import KModel
+
+        KModel = importlib.import_module("kokoro").KModel
+
         dev = "cuda" if device == "cuda" and torch.cuda.is_available() else "cpu"
         self._model = KModel(repo_id=self._HF_REPO).to(dev).eval()
         self._device = dev
@@ -77,9 +81,12 @@ class KokoroTTSAdapter(ModelAdapter):
             pipelines = {}
             self._local.pipelines = pipelines
         if lang_code not in pipelines:
-            from kokoro import KPipeline
+            KPipeline = importlib.import_module("kokoro").KPipeline
+
             pipelines[lang_code] = KPipeline(
-                lang_code=lang_code, repo_id=self._HF_REPO, model=self._model,
+                lang_code=lang_code,
+                repo_id=self._HF_REPO,
+                model=self._model,
             )
         return pipelines[lang_code]
 
@@ -119,9 +126,16 @@ class KokoroTTSAdapter(ModelAdapter):
     # ----------------------------------------------------------------
     # synth one
     # synthesize a single (text, voice, speed) → float32 mono samples @ 24 kHz
-    def _synth_one(self, text: str, voice_spec: str, speed: float,
-                   lang_override: str, cancel_flag: threading.Event):
+    def _synth_one(
+        self,
+        text: str,
+        voice_spec: str,
+        speed: float,
+        lang_override: str,
+        cancel_flag: threading.Event,
+    ):
         import numpy as np
+
         # Empty / whitespace-only text is a valid script line (e.g. a blank
         # narration beat) — emit a short silence rather than failing, so a
         # single empty item can't sink (and infinitely retry) a whole batch.
@@ -154,9 +168,13 @@ class KokoroTTSAdapter(ModelAdapter):
     #           counts) so the caller can slice it back into per-line WAVs.
     #           Batching amortises the scheduler's per-job dispatch overhead,
     #           which otherwise dwarfs kokoro's sub-second synthesis time.
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         import numpy as np
-        import soundfile as sf
+
+        sf = importlib.import_module("soundfile")
+
         self._check_cancel(cancel_flag)
         sr = 24000
         out_path = output_dir / "result.wav"
@@ -165,27 +183,41 @@ class KokoroTTSAdapter(ModelAdapter):
         if items:
             gap = float(params.get("gap_seconds", 0.0))
             gap_samples = int(gap * sr)
-            silence = np.zeros(gap_samples, dtype=np.float32) if gap_samples > 0 else None
+            silence = (
+                np.zeros(gap_samples, dtype=np.float32) if gap_samples > 0 else None
+            )
             segments: list = []
             item_samples: list[int] = []
             for it in items:
                 self._check_cancel(cancel_flag)
                 wav = self._synth_one(
-                    it["text"], it.get("voice", "af_heart"),
-                    float(it.get("speed", 1.0)), it.get("lang_code", ""), cancel_flag,
+                    it["text"],
+                    it.get("voice", "af_heart"),
+                    float(it.get("speed", 1.0)),
+                    it.get("lang_code", ""),
+                    cancel_flag,
                 )
                 item_samples.append(int(wav.shape[0]))
                 segments.append(wav)
                 if silence is not None:
                     segments.append(silence)
-            full = np.concatenate(segments) if segments else np.zeros(0, dtype=np.float32)
+            full = (
+                np.concatenate(segments) if segments else np.zeros(0, dtype=np.float32)
+            )
             sf.write(str(out_path), full, sr)
-            return {"format": "wav", "sample_rate": sr,
-                    "item_samples": item_samples, "gap_samples": gap_samples}
+            return {
+                "format": "wav",
+                "sample_rate": sr,
+                "item_samples": item_samples,
+                "gap_samples": gap_samples,
+            }
 
         wav = self._synth_one(
-            params["text"], params.get("voice", "af_heart"),
-            float(params.get("speed", 1.0)), params.get("lang_code", ""), cancel_flag,
+            params["text"],
+            params.get("voice", "af_heart"),
+            float(params.get("speed", 1.0)),
+            params.get("lang_code", ""),
+            cancel_flag,
         )
         sf.write(str(out_path), wav, sr)
         return {"format": "wav", "sample_rate": sr}

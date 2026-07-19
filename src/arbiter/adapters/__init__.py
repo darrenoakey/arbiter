@@ -1,19 +1,9 @@
-"""Model adapters — auto-import to trigger registration.
+"""Model adapters — import every supported adapter or fail initialization."""
 
-Each adapter is imported in isolation. If one adapter has a broken import
-(missing file, syntax error, bad dependency), it does NOT take down the
-whole package — it's logged and skipped. Workers for other models will
-still start fine.
-"""
 import importlib
-import logging
 
-_log = logging.getLogger(__name__)
-
-_ADAPTERS = [
+_ADAPTER_MODULES = (
     "birefnet",
-    "flux",
-    "flux2",
     "moondream",
     "whisper_large",
     "tts_custom",
@@ -34,17 +24,13 @@ _ADAPTERS = [
     "face_restore",
     "face_restore_codeformer",
     "aesthetic_scorer",
-    "z_image",
     "lora_train",
     "composite",
     "insightface",
     "embed_text",
     "demucs_sep",
     "rvc",
-]
+)
 
-for _name in _ADAPTERS:
-    try:
-        importlib.import_module(f".{_name}", __name__)
-    except Exception as e:  # noqa: BLE001
-        _log.warning("adapter %s failed to import: %s", _name, e)
+for _module_name in _ADAPTER_MODULES:
+    importlib.import_module(f".{_module_name}", __name__)

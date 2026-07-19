@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Test lora-train via arbiter API — submits a real job and polls for completion."""
+
 import sys
+import threading
 import time
 
 import requests
@@ -40,7 +42,7 @@ print(f"Job submitted: {job_id}")
 # Poll for completion
 start = time.monotonic()
 while True:
-    time.sleep(5)
+    threading.Event().wait(5)
     elapsed = time.monotonic() - start
     resp = requests.get(f"{ARBITER_URL}/v1/jobs/{job_id}", timeout=10)
     status = resp.json()["status"]

@@ -3,9 +3,11 @@
 Loads sub-models for both 256px (pirender) and 512px (facevid2vid) and keeps
 them on GPU. Inference runs the full pipeline without spawning subprocesses.
 """
+
 from __future__ import annotations
 
 import gc
+import importlib
 import logging
 import os
 import shutil
@@ -27,12 +29,19 @@ SADTALKER_CHECKPOINTS = SADTALKER_DIR / "checkpoints"
 def _patch_numpy_compat():
     """Monkey-patch numpy 2.x to restore attributes removed in 2.0."""
     import numpy as np
-    for name, repl in [("float", float), ("int", int), ("complex", complex),
-                        ("object", object), ("bool", bool), ("str", str)]:
+
+    for name, repl in [
+        ("float", float),
+        ("int", int),
+        ("complex", complex),
+        ("object", object),
+        ("bool", bool),
+        ("str", str),
+    ]:
         if not hasattr(np, name):
             setattr(np, name, repl)
     if not hasattr(np, "VisibleDeprecationWarning"):
-        np.VisibleDeprecationWarning = FutureWarning
+        setattr(np, "VisibleDeprecationWarning", FutureWarning)
 
 
 def _add_sadtalker_to_path():
@@ -63,24 +72,31 @@ class SadTalkerAdapter(ModelAdapter):
 
         _add_sadtalker_to_path()
 
-        from src.utils.init_path import init_path
-        from src.utils.preprocess import CropAndExtract
-        from src.test_audio2coeff import Audio2Coeff
-        from src.facerender.pirender_animate import AnimateFromCoeff_PIRender
-        from src.facerender.animate import AnimateFromCoeff as AnimateFromCoeff_FaceVid2Vid
+        init_path = importlib.import_module("src.utils.init_path").init_path
+        CropAndExtract = importlib.import_module("src.utils.preprocess").CropAndExtract
+        Audio2Coeff = importlib.import_module("src.test_audio2coeff").Audio2Coeff
+        AnimateFromCoeff_PIRender = importlib.import_module(
+            "src.facerender.pirender_animate"
+        ).AnimateFromCoeff_PIRender
+        AnimateFromCoeff_FaceVid2Vid = importlib.import_module(
+            "src.facerender.animate"
+        ).AnimateFromCoeff
 
         config_dir = str(SADTALKER_DIR / "src" / "config")
 
         for size, renderer in SIZE_RENDERER.items():
             ckpt = SADTALKER_CHECKPOINTS / f"SadTalker_V0.0.2_{size}.safetensors"
             if not ckpt.exists():
-                log.warning("Checkpoint missing for %dpx: %s — skipping", size, ckpt)
+                log.warning("Checkpoint missing for %dpx: %s — omitting", size, ckpt)
                 continue
 
             try:
                 paths = init_path(
-                    str(SADTALKER_CHECKPOINTS), config_dir,
-                    size=size, old_version=False, preprocess="crop",
+                    str(SADTALKER_CHECKPOINTS),
+                    config_dir,
+                    size=size,
+                    old_version=False,
+                    preprocess="crop",
                 )
 
                 if renderer == "pirender":
@@ -121,6 +137,7 @@ class SadTalkerAdapter(ModelAdapter):
         self._device = None
         try:
             import torch
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except Exception:
@@ -178,7 +195,9 @@ class SadTalkerAdapter(ModelAdapter):
             log.warning(
                 "Requested facerender=%s but %dpx loaded with %s. "
                 "Using loaded renderer.",
-                renderer, size, models["renderer"],
+                renderer,
+                size,
+                models["renderer"],
             )
             renderer = models["renderer"]
 
@@ -203,16 +222,21 @@ class SadTalkerAdapter(ModelAdapter):
             self._check_cancel(cancel_flag)
 
             _add_sadtalker_to_path()
-            from src.generate_batch import get_data
-            from src.generate_facerender_batch import get_facerender_data
+            get_data = importlib.import_module("src.generate_batch").get_data
+            get_facerender_data = importlib.import_module(
+                "src.generate_facerender_batch"
+            ).get_facerender_data
 
             log.info("SadTalker: 3DMM extraction (size=%d)", size)
             first_frame_dir = os.path.join(save_dir, "first_frame_dir")
             os.makedirs(first_frame_dir, exist_ok=True)
 
             first_coeff_path, crop_pic_path, crop_info = models["preprocess"].generate(
-                tmp_image, first_frame_dir, preprocess,
-                source_image_flag=True, pic_size=size,
+                tmp_image,
+                first_frame_dir,
+                preprocess,
+                source_image_flag=True,
+                pic_size=size,
             )
             if first_coeff_path is None:
                 raise InferenceError("3DMM extraction failed")
@@ -221,26 +245,43 @@ class SadTalkerAdapter(ModelAdapter):
 
             log.info("SadTalker: audio2coeff")
             batch = get_data(
-                first_coeff_path, tmp_audio, self._device,
-                ref_eyeblink_coeff_path=None, still=still,
+                first_coeff_path,
+                tmp_audio,
+                self._device,
+                ref_eyeblink_coeff_path=None,
+                still=still,
             )
             coeff_path = models["audio2coeff"].generate(
-                batch, save_dir, pose_style=0, ref_pose_coeff_path=None,
+                batch,
+                save_dir,
+                pose_style=0,
+                ref_pose_coeff_path=None,
             )
 
             self._check_cancel(cancel_flag)
 
             log.info("SadTalker: rendering %dpx (%s)", size, renderer)
             data = get_facerender_data(
-                coeff_path, crop_pic_path, first_coeff_path, tmp_audio,
-                batch_size, expression_scale=expression_scale,
-                still_mode=still, preprocess=preprocess,
-                size=size, facemodel=renderer,
+                coeff_path,
+                crop_pic_path,
+                first_coeff_path,
+                tmp_audio,
+                batch_size,
+                expression_scale=expression_scale,
+                still_mode=still,
+                preprocess=preprocess,
+                size=size,
+                facemodel=renderer,
             )
             result_path = models["animate"].generate(
-                data, save_dir, tmp_image, crop_info,
-                enhancer=None, background_enhancer=None,
-                preprocess=preprocess, img_size=size,
+                data,
+                save_dir,
+                tmp_image,
+                crop_info,
+                enhancer=None,
+                background_enhancer=None,
+                preprocess=preprocess,
+                img_size=size,
             )
 
             self._check_cancel(cancel_flag)
@@ -254,34 +295,44 @@ class SadTalkerAdapter(ModelAdapter):
 
             # Ensure file is fully flushed to disk
             import subprocess as _sp
+
             _sp.run(["sync"], timeout=10)
 
             # Verify the output video is valid
             probe = _sp.run(
-                ["ffprobe", "-v", "error",
-                 "-show_entries", "format=duration",
-                 "-of", "csv=p=0", result_path],
-                capture_output=True, text=True, timeout=30,
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "csv=p=0",
+                    result_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
             out_duration = float(probe.stdout.strip()) if probe.stdout.strip() else 0
             if out_duration < 1.0:
                 raise InferenceError(
                     f"SadTalker output too short: {out_duration:.1f}s at {result_path}"
                 )
-            log.info("SadTalker output verified: %.1fs at %s", out_duration, result_path)
+            log.info(
+                "SadTalker output verified: %.1fs at %s", out_duration, result_path
+            )
 
             output_dir = Path(output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
             out_path = output_dir / "result.mp4"
             shutil.copy2(result_path, str(out_path))
-            
+
             # Verify copy matches original
             orig_size = os.path.getsize(result_path)
             copy_size = os.path.getsize(str(out_path))
             if orig_size != copy_size:
-                raise InferenceError(
-                    f"Copy size mismatch: {orig_size} vs {copy_size}"
-                )
+                raise InferenceError(f"Copy size mismatch: {orig_size} vs {copy_size}")
 
             width, height = self._probe_video_dimensions(str(out_path))
 
@@ -313,11 +364,24 @@ class SadTalkerAdapter(ModelAdapter):
     @staticmethod
     def _probe_video_dimensions(path: str) -> tuple[int, int]:
         import subprocess
+
         try:
             result = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
-                capture_output=True, text=True, timeout=10,
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "csv=p=0:s=x",
+                    path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             parts = result.stdout.strip().split("x")
             if len(parts) == 2:

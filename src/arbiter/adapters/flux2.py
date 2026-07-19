@@ -5,29 +5,46 @@ access accepted for this account): step-distilled (4 steps, guidance 1.0)
 9B transformer with an integrated ~8B Qwen3 text encoder. A SINGLE
 Flux2KleinPipeline handles both text-to-image and image editing
 (image-to-image / reference editing) — pass ``image=`` to edit. The
-smaller ungated klein-4B is the fallback if 9B access is ever revoked.
+smaller ungated klein-4B is the secondary choice if 9B access is ever revoked.
 
-Runs in the isolated ``venvs/flux2`` environment (torch 2.12 / git
-diffusers / transformers 5.x) via a custom ``worker_cmd`` in the model
+Legacy disabled adapter that ran in the isolated ``venvs/flux2`` environment
+(torch 2.12 / git diffusers / transformers 5.x) via an old ``worker_cmd`` entry
 config, so the bleeding-edge stack never touches the shared arbiter
 .venv. ``diffusers`` is imported lazily inside load()/_get_pipe so the
 main-venv adapter-registry smoke test (deploy-to-spark.sh) still passes.
 """
+
 from __future__ import annotations
 
 import logging
+import importlib
 import os
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, cast
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 from arbiter.adapters.base import ModelAdapter
 from arbiter.adapters.registry import register
+from arbiter.image_policy import raise_still_image_disabled
 
 log = logging.getLogger(__name__)
 
 FLUX2_HF_ID = "black-forest-labs/FLUX.2-klein-9B"
-DEFAULT_STEPS = 4      # klein is step-distilled
-GUIDANCE_SCALE = 1.0   # klein recommended guidance
+DEFAULT_STEPS = 4  # klein is step-distilled
+GUIDANCE_SCALE = 1.0  # klein recommended guidance
+
+
+class _PipelineResult(Protocol):
+    images: list["Image.Image"]
+
+
+class _ImagePipeline(Protocol):
+    def __call__(self, **kwargs: object) -> _PipelineResult: ...
+    def enable_xformers_memory_efficient_attention(self) -> None: ...
+
 
 ASPECT_RATIOS = {
     "1:1": (1024, 1024),
@@ -45,17 +62,22 @@ class Flux2KleinAdapter(ModelAdapter):
     model_id = "flux2"
 
     def __init__(self):
-        self._pipe = None
+        self._pipe: _ImagePipeline | None = None
         self._device = "cuda"
 
     def load(self, device: str = "cuda") -> None:
+        raise_still_image_disabled()
         import torch
-        from diffusers import Flux2KleinPipeline
+
+        Flux2KleinPipeline = importlib.import_module("diffusers").Flux2KleinPipeline
 
         log.info("Loading %s on %s ...", FLUX2_HF_ID, device)
-        self._pipe = Flux2KleinPipeline.from_pretrained(
-            FLUX2_HF_ID,
-            torch_dtype=torch.bfloat16,
+        self._pipe = cast(
+            _ImagePipeline,
+            Flux2KleinPipeline.from_pretrained(
+                FLUX2_HF_ID,
+                torch_dtype=torch.bfloat16,
+            ),
         )
         # GB10 mmap->cuda workaround: clone each tensor off mmap-backed
         # storage before moving to device. Same fix flux/z-image rely on;
@@ -85,7 +107,10 @@ class Flux2KleinAdapter(ModelAdapter):
         height = int(params.get("height", 1024))
         return width, height
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
+        raise_still_image_disabled()
         import torch
 
         self._check_cancel(cancel_flag)
@@ -101,10 +126,13 @@ class Flux2KleinAdapter(ModelAdapter):
 
         self._check_cancel(cancel_flag)
 
+        pipe = self._pipe
+        if pipe is None:
+            raise RuntimeError("flux2 not loaded")
         if has_input_image:
             # Unified editing path — same pipeline, pass image=.
             input_image = self._resolve_image(params)
-            result_image = self._pipe(
+            result_image = pipe(
                 prompt=prompt,
                 image=input_image,
                 num_inference_steps=steps,
@@ -112,7 +140,7 @@ class Flux2KleinAdapter(ModelAdapter):
                 generator=generator,
             ).images[0]
         else:
-            result_image = self._pipe(
+            result_image = pipe(
                 prompt=prompt,
                 width=width,
                 height=height,

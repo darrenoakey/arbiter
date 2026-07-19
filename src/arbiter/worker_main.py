@@ -11,6 +11,7 @@ commands to send concurrently.
 
 Cancel: parent sends SIGUSR1 to set cancel_flag during inference.
 """
+
 from __future__ import annotations
 
 import json
@@ -48,6 +49,12 @@ def main():
     model_id = sys.argv[1]
     log.info("Worker starting for model: %s", model_id)
 
+    from arbiter.image_policy import require_still_image_disabled
+
+    # Run before the CUDA cap and adapter import so a direct invocation cannot
+    # import a pipeline or touch disabled model weights.
+    require_still_image_disabled(model_id)
+
     _apply_cuda_memory_cap()
 
     from arbiter.adapters import registry
@@ -57,7 +64,10 @@ def main():
     adapter = adapter_cls()
 
     cancel_flag = threading.Event()
-    signal.signal(signal.SIGUSR1, lambda *_: (cancel_flag.set(), log.info("Cancel signal received")))
+    signal.signal(
+        signal.SIGUSR1,
+        lambda *_: (cancel_flag.set(), log.info("Cancel signal received")),
+    )
 
     executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="infer")
 
@@ -80,7 +90,13 @@ def main():
             respond({"status": "cancelled", "req_id": req_id})
         except Exception as e:
             log.exception("Infer failed")
-            respond({"status": "error", "req_id": req_id, "error": f"{type(e).__name__}: {e}"})
+            respond(
+                {
+                    "status": "error",
+                    "req_id": req_id,
+                    "error": f"{type(e).__name__}: {e}",
+                }
+            )
 
     # Main loop: read stdin, dispatch commands
     for line in sys.stdin:
@@ -154,12 +170,15 @@ def _apply_cuda_memory_cap():
         if not torch.cuda.is_available():
             return
         total = torch.cuda.get_device_properties(0).total_memory
-        want = float(mem_gb) * (1024 ** 3) * 1.15
+        want = float(mem_gb) * (1024**3) * 1.15
         fraction = max(0.01, min(0.92, want / total))
         torch.cuda.set_per_process_memory_fraction(fraction)
         log.info(
             "CUDA memory cap applied: declared=%.1f GB -> fraction %.3f (%.1f GB of %.1f GB)",
-            float(mem_gb), fraction, fraction * total / (1024 ** 3), total / (1024 ** 3),
+            float(mem_gb),
+            fraction,
+            fraction * total / (1024**3),
+            total / (1024**3),
         )
     except Exception:
         log.exception("Failed to apply CUDA memory cap (continuing uncapped)")
@@ -168,6 +187,7 @@ def _apply_cuda_memory_cap():
 def _get_vram_bytes() -> int:
     try:
         import torch
+
         if torch.cuda.is_available():
             return torch.cuda.memory_allocated()
     except Exception:

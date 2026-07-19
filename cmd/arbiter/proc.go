@@ -85,10 +85,10 @@ type Instance struct {
 	// Background reader goroutine
 	readerDone chan struct{}
 
-	pythonBin   string
-	projectRoot string
-	workerCmd   []string // custom worker command (overrides python)
-	workerEnv   []string // extra env vars for worker
+	pythonBin     string
+	projectRoot   string
+	workerCmd     []string          // validated repository-owned worker identity (overrides python)
+	adapterParams map[string]string // validated worker settings; revalidated immediately before execution
 
 	// placementReason records why the most recent job landed on this instance's
 	// host (preferred|spill|fallback). Set at dispatch by the scheduler; surfaced
@@ -225,6 +225,19 @@ func (inst *Instance) Spawn() error {
 	if inst.state != "stopped" && inst.state != "error" {
 		return nil // already running
 	}
+	workerConfig := ModelConfig{
+		WorkerCmd:     cloneStrings(inst.workerCmd),
+		AdapterParams: cloneAdapterParams(inst.adapterParams),
+	}
+	if err := validateModelWorkerPolicy(inst.projectRoot, inst.ModelID, workerConfig, true); err != nil {
+		inst.state = "error"
+		return fmt.Errorf("worker execution policy: %w", err)
+	}
+	executable, err := resolveWorkerExecutable(inst.projectRoot, inst.workerCmd, inst.pythonBin)
+	if err != nil {
+		inst.state = "error"
+		return fmt.Errorf("worker execution policy: %w", err)
+	}
 
 	// Defence-in-depth: refuse to spawn if a prior OS process is still
 	// alive. If we get here it means Kill failed silently and we'd
@@ -245,24 +258,15 @@ func (inst *Instance) Spawn() error {
 
 	var cmd *exec.Cmd
 	if len(inst.workerCmd) > 0 {
-		cmd = exec.Command(inst.workerCmd[0], inst.workerCmd[1:]...)
+		cmd = exec.Command(executable, inst.workerCmd[1:]...)
 	} else {
-		cmd = exec.Command(inst.pythonBin, "-m", "arbiter.worker_main", inst.ModelID)
+		cmd = exec.Command(executable, "-m", "arbiter.worker_main", inst.ModelID)
 	}
 	cmd.Dir = inst.projectRoot
-	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1")
-	if inst.memoryGB > 0 {
-		// On GB10 unified memory, GPU allocations are NOT charged to the
-		// process's memory cgroup (verified: a MemoryMax=4G scope let a CUDA
-		// process allocate 8G unhindered). A runaway adapter therefore exhausts
-		// physical RAM while keeping a tiny RSS, so the kernel OOM killer can't
-		// identify it — the host livelocks and needs a physical reset. The only
-		// containment that works is a per-process CUDA cap inside the worker:
-		// worker_main applies torch.cuda.set_per_process_memory_fraction so an
-		// over-allocation raises a catchable CUDA OOM instead of wedging the box.
-		cmd.Env = append(cmd.Env, fmt.Sprintf("ARBITER_MEMORY_GB=%g", inst.memoryGB))
-	}
-	cmd.Env = append(cmd.Env, inst.workerEnv...)
+	// Start from a finite trusted environment. In particular, loader, shell,
+	// interpreter, and caller-controlled PATH variables from either config or
+	// Arbiter's own parent process never reach the worker.
+	cmd.Env = buildCleanWorkerEnvironment(inst.projectRoot, cmd.Path, inst.memoryGB, workerConfig.AdapterParams)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -990,6 +994,34 @@ func (m *InstanceManager) EnsureModel(modelID string) {
 	if _, ok := m.byModel[modelID]; !ok {
 		m.byModel[modelID] = []string{}
 	}
+}
+
+// RemoveModelRuntime removes a newly registered model whose surrounding
+// persistence transaction failed. It refuses to erase active work.
+func (m *InstanceManager) RemoveModelRuntime(modelID string) error {
+	m.mu.Lock()
+	identifiers := append([]string(nil), m.byModel[modelID]...)
+	instances := make([]*Instance, 0, len(identifiers))
+	for _, identifier := range identifiers {
+		instance := m.instances[identifier]
+		if instance != nil && instance.ActiveJobs() > 0 {
+			m.mu.Unlock()
+			return fmt.Errorf("remove model runtime %q: instance %q has active jobs", modelID, identifier)
+		}
+		if instance != nil {
+			instances = append(instances, instance)
+		}
+	}
+	delete(m.byModel, modelID)
+	for _, identifier := range identifiers {
+		delete(m.instances, identifier)
+		delete(m.condemned, identifier)
+	}
+	m.mu.Unlock()
+	for _, instance := range instances {
+		instance.Kill()
+	}
+	return nil
 }
 
 func (m *InstanceManager) Get(instanceID string) *Instance {
@@ -2049,6 +2081,9 @@ func (m *InstanceManager) EvictIdleNoQueueModels(queuedJobs map[string]int) (int
 //  2. Excess instances (model with MOST loaded instances loses an idle one first)
 //  3. Regular LRU among remaining idle instances
 func (m *InstanceManager) CreateReservation(memoryGB float64, label string, keepAliveSecs map[string]int) (string, error) {
+	if !finitePositive(memoryGB) || memoryGB > m.budgetGB {
+		return "", fmt.Errorf("memory_gb must be finite, > 0, and <= %.3g", m.budgetGB)
+	}
 	m.mu.Lock()
 	available := m.budgetGB - m.usedGB - m.reservedGB
 	m.mu.Unlock()
@@ -2450,17 +2485,6 @@ func cloneStrings(values []string) []string {
 	return out
 }
 
-func buildWorkerEnv(cfg ModelConfig) []string {
-	if len(cfg.AdapterParams) == 0 {
-		return nil
-	}
-	env := make([]string, 0, len(cfg.AdapterParams))
-	for k, v := range cfg.AdapterParams {
-		env = append(env, k+"="+v)
-	}
-	return env
-}
-
 func (m *InstanceManager) newInstance(modelID, instanceID string, cfg ModelConfig) *Instance {
 	inst := NewInstance(
 		modelID, instanceID,
@@ -2469,7 +2493,7 @@ func (m *InstanceManager) newInstance(modelID, instanceID string, cfg ModelConfi
 		m.pythonBin, m.projectRoot,
 	)
 	inst.workerCmd = cloneStrings(cfg.WorkerCmd)
-	inst.workerEnv = buildWorkerEnv(cfg)
+	inst.adapterParams = cloneAdapterParams(cfg.AdapterParams)
 	return inst
 }
 
@@ -2478,7 +2502,7 @@ func (m *InstanceManager) ApplyModelConfig(modelID string, cfg ModelConfig) {
 		inst.mu.Lock()
 		inst.MaxConcurrent = cfg.MaxConcurrent
 		inst.workerCmd = cloneStrings(cfg.WorkerCmd)
-		inst.workerEnv = buildWorkerEnv(cfg)
+		inst.adapterParams = cloneAdapterParams(cfg.AdapterParams)
 		if state := inst.state; state == "stopped" || state == "unloaded" || state == "error" {
 			inst.memoryGB = cfg.MemoryGB
 		}

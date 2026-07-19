@@ -11,7 +11,9 @@
 //
 //	VLLM_MODEL       — HuggingFace model ID (e.g., "mistralai/Voxtral-4B-TTS-2603")
 //	VLLM_MODE        — endpoint mode: "tts" or "chat" (default: "tts")
-//	VLLM_EXTRA_ARGS  — additional args for vllm serve (space-separated)
+//	VLLM_MAX_MODEL_LEN, VLLM_QUANTIZATION, VLLM_DTYPE,
+//	VLLM_TENSOR_PARALLEL_SIZE, VLLM_GPU_MEMORY_UTILIZATION, VLLM_MAX_NUM_SEQS
+//	                   — structured vllm tuning values
 //	VLLM_PYTHON      — python binary to use (default: python from arbiter .venv)
 package main
 
@@ -108,9 +110,7 @@ func startVLLM() error {
 		"--host", "127.0.0.1",
 	}
 
-	if extra := os.Getenv("VLLM_EXTRA_ARGS"); extra != "" {
-		args = append(args, strings.Fields(extra)...)
-	}
+	args = appendVllmTuning(args)
 
 	log.Printf("Starting vllm serve --omni on port %d: %s %s", vllmPort, vllmBin, strings.Join(args, " "))
 
@@ -171,6 +171,26 @@ func startVLLM() error {
 		time.Sleep(2 * time.Second)
 	}
 	return fmt.Errorf("vllm did not become ready within 15 minutes")
+}
+
+func appendVllmTuning(args []string) []string {
+	settings := []struct {
+		environment string
+		flag        string
+	}{
+		{environment: "VLLM_MAX_MODEL_LEN", flag: "--max-model-len"},
+		{environment: "VLLM_QUANTIZATION", flag: "--quantization"},
+		{environment: "VLLM_DTYPE", flag: "--dtype"},
+		{environment: "VLLM_TENSOR_PARALLEL_SIZE", flag: "--tensor-parallel-size"},
+		{environment: "VLLM_GPU_MEMORY_UTILIZATION", flag: "--gpu-memory-utilization"},
+		{environment: "VLLM_MAX_NUM_SEQS", flag: "--max-num-seqs"},
+	}
+	for _, setting := range settings {
+		if value := os.Getenv(setting.environment); value != "" {
+			args = append(args, setting.flag, value)
+		}
+	}
+	return args
 }
 
 func stopVLLM() {

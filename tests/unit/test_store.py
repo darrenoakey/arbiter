@@ -1,4 +1,5 @@
 """Tests for SQLite job store."""
+
 import time
 
 
@@ -7,7 +8,9 @@ from arbiter.store import JobStore
 
 class TestJobStore:
     def test_create_and_get(self, store):
-        job = store.create_job("model-a", "image-generate", {"prompt": "test"}, priority=100)
+        job = store.create_job(
+            "model-a", "image-generate", {"prompt": "test"}, priority=100
+        )
         assert job.id
         assert job.state == "queued"
         assert job.model_id == "model-a"
@@ -72,7 +75,9 @@ class TestJobStore:
 
     def test_update_result(self, store):
         job = store.create_job("model-a", "t", {})
-        store.update_state(job.id, "completed", result={"format": "png"}, finished_at=time.time())
+        store.update_state(
+            job.id, "completed", result={"format": "png"}, finished_at=time.time()
+        )
         fetched = store.get_job(job.id)
         assert fetched.state == "completed"
         assert fetched.result == {"format": "png"}
@@ -129,13 +134,15 @@ class TestJobStore:
         store1.update_state(j2.id, "scheduled")
         store1.close()
 
-        # Simulate restart
+        # Reopen the durable database after the first process lifetime.
         store2 = JobStore(tmp_db)
         recovered = store2.recover_from_crash()
         assert recovered == 2
 
         f1 = store2.get_job(j1.id)
         f2 = store2.get_job(j2.id)
+        assert f1 is not None
+        assert f2 is not None
         assert f1.state == "queued"
         assert f2.state == "queued"
         assert f1.started_at is None

@@ -4,11 +4,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
+)
+
+const (
+	maximumModelInstances   = 128
+	maximumModelConcurrency = 1024
+	maximumDurationSeconds  = 604800
+	maximumMetricMillis     = 604800000
 )
 
 type ModelConfig struct {
@@ -22,9 +30,9 @@ type ModelConfig struct {
 	AutoDownload   string            `json:"auto_download"`
 	ModelPath      string            `json:"model_path"`
 	Group          bool              `json:"group"`
-	WorkerCmd      []string          `json:"worker_cmd,omitempty"`
-	AdapterParams  map[string]string `json:"adapter_params,omitempty"`
-	PressureIndex  *float64          `json:"pressure_index"` // 0..1 memory bandwidth fraction; sum across in-flight jobs must stay ≤ 1.0. Omitted/nil defaults to 1.0 (serialize). Explicit 0 means "no pressure" — runs alongside anything.
+	WorkerCmd      []string          `json:"worker_cmd,omitempty"`     // Restricted to repository-owned identities; see API.md.
+	AdapterParams  map[string]string `json:"adapter_params,omitempty"` // Closed, typed per-worker schema; never arbitrary subprocess environment.
+	PressureIndex  *float64          `json:"pressure_index"`           // 0..1 memory bandwidth fraction; sum across in-flight jobs must stay ≤ 1.0. Omitted/nil defaults to 1.0 (serialize). Explicit 0 means "no pressure" — runs alongside anything.
 	// ConflictGroup names a hard mutual-exclusion set. Models sharing a
 	// ConflictGroup never run at the same time (independent of pressure); models
 	// in different/no groups are unconstrained by each other. GroupPriority
@@ -161,6 +169,12 @@ type Config struct {
 	LLMCacheTTLHours float64 `json:"llm_cache_ttl_hours,omitempty"`
 }
 
+type configFileSnapshot struct {
+	data   []byte
+	mode   os.FileMode
+	exists bool
+}
+
 // LLMCacheEnabledOrDefault reports whether the chat-completion cache is on.
 // It is on unless explicitly disabled.
 func (c *Config) LLMCacheEnabledOrDefault() bool {
@@ -193,8 +207,6 @@ var mutableConfigMu sync.Mutex
 
 // JobTypeToModel maps job type strings to model IDs.
 var JobTypeToModel = map[string]string{
-	"image-generate":          "flux2",
-	"image-edit":              "flux2",
 	"background-remove":       "birefnet",
 	"caption":                 "moondream",
 	"query":                   "moondream",
@@ -255,6 +267,18 @@ func LoadConfig(projectRoot string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
+	// Owner policy is unconditional: persisted configs cannot resurrect a
+	// still-image generator after restart. Keep the file intact for audit and
+	// operator recovery, but exclude offenders from the runnable config.
+	for id, modelCfg := range cfg.Models {
+		policyErr := validateModelWorkerPolicy(projectRoot, id, modelCfg, cfg.HasLocalPlacement(modelCfg))
+		if policyErr != nil {
+			slog.Error("security policy: model omitted from runnable config",
+				"model", id, "policy", policyErr)
+			delete(cfg.Models, id)
+		}
+	}
+
 	// Apply defaults
 	for id, m := range cfg.Models {
 		if m.MaxConcurrent < 1 {
@@ -303,6 +327,14 @@ func LoadConfig(projectRoot string) (*Config, error) {
 	}
 	if v := os.Getenv("ARBITER_OUTPUT_DIR"); v != "" {
 		cfg.OutputDir = v
+	}
+	if !finitePositive(cfg.VRAMBudgetGB) {
+		return nil, fmt.Errorf("vram_budget_gb must be finite and > 0")
+	}
+	for id, modelConfig := range cfg.Models {
+		if err := validateModelConfigNumbers(modelConfig, cfg.VRAMBudgetGB); err != nil {
+			return nil, fmt.Errorf("model %q: %w", id, err)
+		}
 	}
 
 	return cfg, nil
@@ -369,6 +401,20 @@ func writeConfigData(projectRoot string, data map[string]any) error {
 }
 
 func SaveModelConfig(projectRoot, modelID string, cfg ModelConfig) error {
+	hostCapacityGB, err := mutableHostCapacity(projectRoot)
+	if err != nil {
+		return err
+	}
+	if err := validateModelConfigNumbers(cfg, hostCapacityGB); err != nil {
+		return err
+	}
+	requiresLocal := len(cfg.Placements) == 0
+	for _, placement := range cfg.Placements {
+		requiresLocal = requiresLocal || placement == "" || placement == LocalHost
+	}
+	if err := validateModelWorkerPolicy(projectRoot, modelID, cfg, requiresLocal); err != nil {
+		return err
+	}
 	mutableConfigMu.Lock()
 	defer mutableConfigMu.Unlock()
 	data, err := loadMutableConfigData(projectRoot)
@@ -384,10 +430,208 @@ func SaveModelConfig(projectRoot, modelID string, cfg ModelConfig) error {
 	return writeConfigData(projectRoot, data)
 }
 
+func mutableHostCapacity(projectRoot string) (float64, error) {
+	data, err := loadMutableConfigData(projectRoot)
+	if err != nil {
+		return 0, err
+	}
+	value, exists := data["vram_budget_gb"]
+	if !exists {
+		return 90, nil
+	}
+	hostCapacityGB, ok := value.(float64)
+	if !ok || !finitePositive(hostCapacityGB) {
+		return 0, fmt.Errorf("vram_budget_gb must be finite and > 0")
+	}
+	return hostCapacityGB, nil
+}
+
+func persistModelConfigTransaction(
+	projectRoot, modelID string,
+	config ModelConfig,
+	hostCapacityGB float64,
+	apply func() error,
+	rollback func() error,
+) error {
+	if err := validatePersistedModelConfig(projectRoot, modelID, config, hostCapacityGB); err != nil {
+		return err
+	}
+	mutableConfigMu.Lock()
+	defer mutableConfigMu.Unlock()
+	snapshot, err := captureConfigFile(projectRoot)
+	if err != nil {
+		return err
+	}
+	if err := saveModelConfigLocked(projectRoot, modelID, config); err != nil {
+		return err
+	}
+	if applyErr := callModelRuntimeOperation("apply", apply); applyErr != nil {
+		rollbackErr := callModelRuntimeOperation("rollback", rollback)
+		restoreErr := restoreConfigFile(projectRoot, snapshot)
+		return transactionRollbackError(applyErr, rollbackErr, restoreErr)
+	}
+	return nil
+}
+
+func callModelRuntimeOperation(name string, operation func() error) (operationError error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			operationError = fmt.Errorf("%s model runtime panic: %v", name, recovered)
+		}
+	}()
+	return operation()
+}
+
+func validatePersistedModelConfig(projectRoot, modelID string, config ModelConfig, hostCapacityGB float64) error {
+	if err := validateModelConfigNumbers(config, hostCapacityGB); err != nil {
+		return err
+	}
+	requiresLocal := len(config.Placements) == 0
+	for _, placement := range config.Placements {
+		requiresLocal = requiresLocal || placement == "" || placement == LocalHost
+	}
+	return validateModelWorkerPolicy(projectRoot, modelID, config, requiresLocal)
+}
+
+func validateModelConfigNumbers(config ModelConfig, hostCapacityGB float64) error {
+	if err := validateModelAllocationNumbers(config, hostCapacityGB); err != nil {
+		return err
+	}
+	if err := validateModelTimingNumbers(config); err != nil {
+		return err
+	}
+	if config.PressureIndex != nil && !finiteRange(*config.PressureIndex, 0, 1) {
+		return fmt.Errorf("pressure_index must be finite and between 0 and 1")
+	}
+	if config.GroupPriority < -1000000 || config.GroupPriority > 1000000 {
+		return fmt.Errorf("group_priority must be between -1000000 and 1000000")
+	}
+	return nil
+}
+
+func validateModelAllocationNumbers(config ModelConfig, hostCapacityGB float64) error {
+	if !finitePositive(hostCapacityGB) {
+		return fmt.Errorf("host memory capacity must be finite and > 0")
+	}
+	if !finitePositive(config.MemoryGB) || config.MemoryGB > hostCapacityGB {
+		return fmt.Errorf("memory_gb must be finite, > 0, and <= %.3g", hostCapacityGB)
+	}
+	if config.MaxInstances == nil || *config.MaxInstances < 0 || *config.MaxInstances > maximumModelInstances {
+		return fmt.Errorf("max_instances must be between 0 and %d", maximumModelInstances)
+	}
+	if config.MaxConcurrent < 1 || config.MaxConcurrent > maximumModelConcurrency {
+		return fmt.Errorf("max_concurrent must be between 1 and %d", maximumModelConcurrency)
+	}
+	return nil
+}
+
+func validateModelTimingNumbers(config ModelConfig) error {
+	if config.KeepAliveSec < 0 || config.KeepAliveSec > maximumDurationSeconds {
+		return fmt.Errorf("keep_alive_seconds must be between 0 and %d", maximumDurationSeconds)
+	}
+	if config.MaxRuntimeSec < 1 || config.MaxRuntimeSec > maximumDurationSeconds {
+		return fmt.Errorf("max_runtime_seconds must be between 1 and %d", maximumDurationSeconds)
+	}
+	if !finiteRange(config.AvgInferenceMs, 0, maximumMetricMillis) {
+		return fmt.Errorf("avg_inference_ms must be finite and between 0 and %d", maximumMetricMillis)
+	}
+	if !finiteRange(config.LoadMs, 0, maximumMetricMillis) {
+		return fmt.Errorf("load_ms must be finite and between 0 and %d", maximumMetricMillis)
+	}
+	return nil
+}
+
+func finitePositive(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0) && value > 0
+}
+
+func finiteRange(value, minimum, maximum float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= minimum && value <= maximum
+}
+
+func saveModelConfigLocked(projectRoot, modelID string, config ModelConfig) error {
+	data, err := loadMutableConfigData(projectRoot)
+	if err != nil {
+		return err
+	}
+	models, ok := data["models"].(map[string]any)
+	if !ok {
+		models = make(map[string]any)
+		data["models"] = models
+	}
+	models[modelID] = config
+	return writeConfigData(projectRoot, data)
+}
+
+func captureConfigFile(projectRoot string) (configFileSnapshot, error) {
+	path := filepath.Join(projectRoot, "local", "config.json")
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return configFileSnapshot{}, nil
+	}
+	if err != nil {
+		return configFileSnapshot{}, fmt.Errorf("inspect config snapshot: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return configFileSnapshot{}, fmt.Errorf("config snapshot path is not a regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return configFileSnapshot{}, fmt.Errorf("read config snapshot: %w", err)
+	}
+	return configFileSnapshot{data: data, mode: info.Mode().Perm(), exists: true}, nil
+}
+
+func restoreConfigFile(projectRoot string, snapshot configFileSnapshot) error {
+	path := filepath.Join(projectRoot, "local", "config.json")
+	if !snapshot.exists {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove rolled-back config: %w", err)
+		}
+		return nil
+	}
+	if err := writeConfigBytes(projectRoot, snapshot.data, snapshot.mode); err != nil {
+		return fmt.Errorf("restore rolled-back config: %w", err)
+	}
+	return nil
+}
+
+func writeConfigBytes(projectRoot string, data []byte, mode os.FileMode) error {
+	localDirectory := filepath.Join(projectRoot, "local")
+	temporary, err := os.CreateTemp(localDirectory, ".config.rollback.*.tmp")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Chmod(mode); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, filepath.Join(localDirectory, "config.json"))
+}
+
+func transactionRollbackError(applyErr, rollbackErr, restoreErr error) error {
+	if rollbackErr == nil && restoreErr == nil {
+		return fmt.Errorf("apply persisted model runtime: %w", applyErr)
+	}
+	return fmt.Errorf("apply persisted model runtime: %w; runtime rollback: %v; persistence rollback: %v", applyErr, rollbackErr, restoreErr)
+}
+
 // patchModelField updates a single field for a model in local/config.json,
 // preserving every other key (including ones not in ModelConfig), so callers
 // never clobber hand-edited fields.
 func patchModelField(projectRoot, modelID, field string, value any) error {
+	if isDisabledStillImageModel(modelID) {
+		return fmt.Errorf("%s", stillImageDisabledMessage)
+	}
 	mutableConfigMu.Lock()
 	defer mutableConfigMu.Unlock()
 	data, err := loadMutableConfigData(projectRoot)
@@ -411,12 +655,22 @@ func patchModelField(projectRoot, modelID, field string, value any) error {
 // PatchModelMemoryGB is used by the drift watchdog to write back observed
 // high-water marks.
 func PatchModelMemoryGB(projectRoot, modelID string, newMemoryGB float64) error {
+	hostCapacityGB, err := mutableHostCapacity(projectRoot)
+	if err != nil {
+		return err
+	}
+	if !finitePositive(newMemoryGB) || newMemoryGB > hostCapacityGB {
+		return fmt.Errorf("memory_gb must be finite, > 0, and <= %.3g", hostCapacityGB)
+	}
 	return patchModelField(projectRoot, modelID, "memory_gb", newMemoryGB)
 }
 
 // PatchModelMaxInstances is used by the scheduler's auto-wake guard to undo a
 // persisted scale-to-zero.
 func PatchModelMaxInstances(projectRoot, modelID string, n int) error {
+	if n < 0 || n > maximumModelInstances {
+		return fmt.Errorf("max_instances must be between 0 and %d", maximumModelInstances)
+	}
 	return patchModelField(projectRoot, modelID, "max_instances", n)
 }
 

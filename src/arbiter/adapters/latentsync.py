@@ -4,6 +4,7 @@ Takes a video + audio and re-inpaints the lip region using diffusion-based
 latent space inpainting for accurate lip synchronization. Typically used as
 a post-processing step after SadTalker or other talking-head generators.
 """
+
 from __future__ import annotations
 
 import logging
@@ -115,20 +116,31 @@ class LatentSyncAdapter(ModelAdapter):
 
             cmd = [
                 str(LATENTSYNC_PYTHON),
-                "-m", "scripts.inference",
-                "--unet_config_path", str(LATENTSYNC_UNET_CONFIG),
-                "--inference_ckpt_path", str(LATENTSYNC_CHECKPOINT),
-                "--video_path", tmp_video,
-                "--audio_path", tmp_audio,
-                "--video_out_path", tmp_output,
-                "--inference_steps", str(inference_steps),
-                "--guidance_scale", str(guidance_scale),
+                "-m",
+                "scripts.inference",
+                "--unet_config_path",
+                str(LATENTSYNC_UNET_CONFIG),
+                "--inference_ckpt_path",
+                str(LATENTSYNC_CHECKPOINT),
+                "--video_path",
+                tmp_video,
+                "--audio_path",
+                tmp_audio,
+                "--video_out_path",
+                tmp_output,
+                "--inference_steps",
+                str(inference_steps),
+                "--guidance_scale",
+                str(guidance_scale),
                 "--enable_deepcache",
             ]
 
             log.info(
                 "Running LatentSync: steps=%d, guidance=%.1f, duration=%.1fs, timeout=%ds",
-                inference_steps, guidance_scale, duration_s, timeout_s,
+                inference_steps,
+                guidance_scale,
+                duration_s,
+                timeout_s,
             )
 
             proc = subprocess.run(
@@ -182,9 +194,19 @@ class LatentSyncAdapter(ModelAdapter):
         if video_file and Path(video_file).is_file():
             try:
                 result = subprocess.run(
-                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                     "-of", "default=noprint_wrappers=1:nokey=1", video_file],
-                    capture_output=True, text=True, timeout=10,
+                    [
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-show_entries",
+                        "format=duration",
+                        "-of",
+                        "default=noprint_wrappers=1:nokey=1",
+                        video_file,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
                 )
                 duration = float(result.stdout.strip())
                 return duration * 50000 + 10000  # 50s/s + 10s overhead
@@ -197,9 +219,19 @@ class LatentSyncAdapter(ModelAdapter):
         """Use ffprobe to get video duration in seconds. Returns 60 on failure."""
         try:
             result = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1", path],
-                capture_output=True, text=True, timeout=10,
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             return float(result.stdout.strip())
         except Exception:
@@ -211,13 +243,20 @@ class LatentSyncAdapter(ModelAdapter):
         try:
             result = subprocess.run(
                 [
-                    "ffprobe", "-v", "error",
-                    "-select_streams", "v:0",
-                    "-show_entries", "stream=width,height",
-                    "-of", "csv=p=0:s=x",
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "csv=p=0:s=x",
                     path,
                 ],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             parts = result.stdout.strip().split("x")
             if len(parts) == 2:

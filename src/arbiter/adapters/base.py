@@ -1,4 +1,5 @@
 """Abstract base classes for model adapters."""
+
 from __future__ import annotations
 
 import base64
@@ -69,21 +70,25 @@ class ModelState(str, Enum):
 
 class AdapterError(Exception):
     """Base error for adapter failures."""
+
     pass
 
 
 class LoadError(AdapterError):
     """Model failed to load."""
+
     pass
 
 
 class InferenceError(AdapterError):
     """Inference failed."""
+
     pass
 
 
 class CancelledException(AdapterError):
     """Inference was cancelled."""
+
     pass
 
 
@@ -107,7 +112,9 @@ class ModelAdapter(ABC):
         ...
 
     @abstractmethod
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         """Run inference.
 
         Args:
@@ -132,7 +139,9 @@ class ModelAdapter(ABC):
             raise CancelledException(f"Job cancelled for model {self.model_id}")
 
     @staticmethod
-    def _resolve_media(params: dict, key: str = "image", file_key: str | None = None) -> bytes:
+    def _resolve_media(
+        params: dict, key: str = "image", file_key: str | None = None
+    ) -> bytes:
         """Resolve media bytes from either a file path or base64 data.
 
         Checks for a file path first (key + "_file" or explicit file_key),
@@ -164,16 +173,18 @@ class ModelAdapter(ABC):
             # The shared inbox is a CIFS mount; the client writes the file on
             # the Mac side then immediately submits the job, but spark's CIFS
             # attribute cache can lag briefly. Poll for up to 10s before
-            # giving up — dropping to base64 fallback (which isn't sent by
+            # giving up — dropping to base64 input (which isn't sent by
             # most clients) was previously swallowing every transient miss
             # as "No image or image_file provided".
             deadline = time.monotonic() + 10.0
             while not p.is_file() and time.monotonic() < deadline:
-                time.sleep(0.2)
+                threading.Event().wait(0.2)
             if p.is_file():
                 _base_log.debug("Reading %s from file: %s", key, p)
                 return p.read_bytes()
-            _base_log.warning("%s file not found after wait, falling back to base64: %s", key, p)
+            _base_log.warning(
+                "%s file not found after wait, falling back to base64: %s", key, p
+            )
         # Fall back to base64
         b64_data = params.get(key) or params.get(f"{key}_url", "")
         if not b64_data:
@@ -186,6 +197,7 @@ class ModelAdapter(ABC):
     def _resolve_image(params: dict) -> "Image.Image":
         """Convenience: resolve image media and return a PIL Image."""
         from PIL import Image
+
         try:
             raw = ModelAdapter._resolve_media(params, "image")
             img = Image.open(io.BytesIO(raw))
@@ -207,6 +219,7 @@ class ModelAdapter(ABC):
         gc.collect()
         try:
             import torch
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()

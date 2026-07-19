@@ -28,6 +28,7 @@ The report's headline output per backend is the recommended max_concurrent —
 the largest N where throughput gain over N/2 is >= 5% AND p95 latency stays
 within 2x of N=1.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -58,20 +59,24 @@ CELL_TIMEOUT_S = 180
 # whole cell.
 REQUEST_TIMEOUT_S = 90
 
+
 # Prompt sizes (approx tokens) → (label, prompt_text_builder, completion_max_tokens)
 # We seed each prompt with a unique planted token the model is asked to echo
 # back, and validate the echo to catch silent failures (truncations, refusals).
 def _filler(n_words: int) -> str:
-    base = ("the quick brown fox jumps over the lazy dog and then continues "
-            "walking through the forest while reciting prime numbers. ")
+    base = (
+        "the quick brown fox jumps over the lazy dog and then continues "
+        "walking through the forest while reciting prime numbers. "
+    )
     out = []
     while sum(len(s) for s in out) < n_words * 6:
         out.append(base)
     return "".join(out)
 
+
 PROMPT_SIZES = [
-    ("small",  256,    128),  # ~256 prompt tokens, 128 completion
-    ("medium", 4096,   256),  # ~4k prompt tokens
+    ("small", 256, 128),  # ~256 prompt tokens, 128 completion
+    ("medium", 4096, 256),  # ~4k prompt tokens
 ]
 
 # Whether to ask the model to do chain-of-thought reasoning. Some backends
@@ -113,6 +118,7 @@ class RunResult:
 @dataclass
 class CellResult:
     """One (model, prompt_size, N, reasoning) cell of the sweep."""
+
     model: str
     prompt_label: str
     n_concurrent: int
@@ -165,8 +171,9 @@ def _http_post(url: str, payload: dict | None = None, timeout: float = 1800) -> 
     body = b""
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
-    req = urlrequest.Request(url, data=body, method="POST",
-                             headers={"Content-Type": "application/json"})
+    req = urlrequest.Request(
+        url, data=body, method="POST", headers={"Content-Type": "application/json"}
+    )
     with urlrequest.urlopen(req, timeout=timeout) as resp:
         raw = resp.read()
         if not raw:
@@ -211,8 +218,9 @@ def memory_for_model(ps: dict, model_id: str) -> dict[str, float]:
     return out
 
 
-def chat_once(base: str, model_name: str, prompt: str,
-              max_tokens: int, reasoning: bool) -> RunResult:
+def chat_once(
+    base: str, model_name: str, prompt: str, max_tokens: int, reasoning: bool
+) -> RunResult:
     """Send one chat completion via the normal /v1/chat/completions endpoint.
     The arbiter has one queue and one MaxConcurrent — there is no benchmark
     bypass. To get clean numbers, pause non-benchmark traffic via
@@ -227,7 +235,9 @@ def chat_once(base: str, model_name: str, prompt: str,
     }
     t0 = time.perf_counter()
     try:
-        resp = _http_post(f"{base}/v1/chat/completions", payload, timeout=REQUEST_TIMEOUT_S)
+        resp = _http_post(
+            f"{base}/v1/chat/completions", payload, timeout=REQUEST_TIMEOUT_S
+        )
     except Exception as e:
         return RunResult(ok=False, elapsed_s=time.perf_counter() - t0, error=str(e))
     elapsed = time.perf_counter() - t0
@@ -251,9 +261,18 @@ def chat_once(base: str, model_name: str, prompt: str,
     )
 
 
-def sweep_concurrency(base: str, model_name: str, prompt: str, max_tokens: int,
-                      n: int, reasoning: bool, runs_per_n: int = 1) -> CellResult:
-    cell = CellResult(model=model_name, prompt_label="", n_concurrent=n, reasoning=reasoning)
+def sweep_concurrency(
+    base: str,
+    model_name: str,
+    prompt: str,
+    max_tokens: int,
+    n: int,
+    reasoning: bool,
+    runs_per_n: int = 1,
+) -> CellResult:
+    cell = CellResult(
+        model=model_name, prompt_label="", n_concurrent=n, reasoning=reasoning
+    )
     t0 = time.perf_counter()
     with cf.ThreadPoolExecutor(max_workers=n) as ex:
         futures = [
@@ -272,7 +291,10 @@ def sweep_concurrency(base: str, model_name: str, prompt: str, max_tokens: int,
                         cell.runs.append(f.result(timeout=0))
                     except Exception:
                         pass
-            print(f"  [TIMEOUT] cell n={n} reasoning={reasoning} after {CELL_TIMEOUT_S}s — partial results: {len(cell.runs)}/{n*runs_per_n}", flush=True)
+            print(
+                f"  [TIMEOUT] cell n={n} reasoning={reasoning} after {CELL_TIMEOUT_S}s — partial results: {len(cell.runs)}/{n * runs_per_n}",
+                flush=True,
+            )
     cell.set_wall_clock(time.perf_counter() - t0)
     return cell
 
@@ -290,9 +312,11 @@ class ModelReport:
     notes: list[str] = field(default_factory=list)
 
 
-def recommend_max_concurrent(cells_by_n: dict[int, CellResult],
-                             min_throughput_gain: float = 0.05,
-                             max_p95_blowup: float = 2.0) -> int:
+def recommend_max_concurrent(
+    cells_by_n: dict[int, CellResult],
+    min_throughput_gain: float = 0.05,
+    max_p95_blowup: float = 2.0,
+) -> int:
     """Largest N where throughput gain >= min_throughput_gain over the next-lower
     sample AND p95 latency stays within max_p95_blowup x of N=1."""
     levels = sorted(cells_by_n.keys())
@@ -335,8 +359,12 @@ def run_for_model(base: str, model_id: str, name: str, backend: str) -> ModelRep
 
     # For each (prompt size, reasoning mode), sweep N. Save a partial JSON
     # snapshot after each cell so a hang doesn't lose all the data.
-    snapshot_path = Path(os.environ.get("BENCH_SNAPSHOT_PATH",
-                                       str(Path.home() / "src/arbiter/benchmark_partial.json")))
+    snapshot_path = Path(
+        os.environ.get(
+            "BENCH_SNAPSHOT_PATH",
+            str(Path.home() / "src/arbiter/benchmark_partial.json"),
+        )
+    )
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     for reasoning in REASONING_MODES:
         for label, prompt_tokens, max_tokens in PROMPT_SIZES:
@@ -347,20 +375,25 @@ def run_for_model(base: str, model_id: str, name: str, backend: str) -> ModelRep
                 cell.prompt_label = label
                 rep.cells.append(cell)
                 tps = cell.aggregate_throughput_tps
-                print(f"  cell {label} N={n} reasoning={'ON' if reasoning else 'OFF'} → "
-                      f"{tps:.1f} tok/s, p50={cell.p50:.1f}s, valid={sum(1 for r in cell.runs if r.valid)}/{len(cell.runs)}, "
-                      f"took {time.perf_counter()-t_cell:.1f}s",
-                      flush=True)
+                print(
+                    f"  cell {label} N={n} reasoning={'ON' if reasoning else 'OFF'} → "
+                    f"{tps:.1f} tok/s, p50={cell.p50:.1f}s, valid={sum(1 for r in cell.runs if r.valid)}/{len(cell.runs)}, "
+                    f"took {time.perf_counter() - t_cell:.1f}s",
+                    flush=True,
+                )
                 # Snapshot after each cell.
                 try:
-                    snapshot_path.write_text(json.dumps(asdict(rep), default=str, indent=2))
+                    snapshot_path.write_text(
+                        json.dumps(asdict(rep), default=str, indent=2)
+                    )
                 except Exception as e:
                     print(f"  [snapshot write failed: {e}]", flush=True)
 
     # Recommend max_concurrent based on the medium-prompt + reasoning-OFF sweep
     # (the most common production case).
     cells_med: dict[int, CellResult] = {
-        c.n_concurrent: c for c in rep.cells
+        c.n_concurrent: c
+        for c in rep.cells
         if c.prompt_label == "medium" and not c.reasoning
     }
     rep.recommended_max_concurrent = recommend_max_concurrent(cells_med)
@@ -373,10 +406,13 @@ def render_html(reports: list[ModelReport], out_path: Path) -> None:
     def cell_to_dict(c: CellResult) -> dict[str, Any]:
         had_reason = sum(1 for r in c.runs if r.had_reasoning)
         return {
-            "model": c.model, "prompt": c.prompt_label, "n": c.n_concurrent,
+            "model": c.model,
+            "prompt": c.prompt_label,
+            "n": c.n_concurrent,
             "reasoning": c.reasoning,
             "throughput_tps": round(c.aggregate_throughput_tps, 2),
-            "p50_s": round(c.p50, 3), "p95_s": round(c.p95, 3),
+            "p50_s": round(c.p50, 3),
+            "p95_s": round(c.p95, 3),
             "wall_s": round(c.wall_clock_s, 3),
             "ok": sum(1 for r in c.runs if r.ok),
             "valid": sum(1 for r in c.runs if r.valid),
@@ -387,15 +423,19 @@ def render_html(reports: list[ModelReport], out_path: Path) -> None:
 
     data = []
     for rep in reports:
-        data.append({
-            "model_id": rep.model_id, "name": rep.name, "backend": rep.backend,
-            "cold_load_s": round(rep.cold_load_s, 2),
-            "warm_load_s": round(rep.warm_load_s, 2),
-            "memory": rep.memory_after_load,
-            "cells": [cell_to_dict(c) for c in rep.cells],
-            "recommended_max_concurrent": rep.recommended_max_concurrent,
-            "notes": rep.notes,
-        })
+        data.append(
+            {
+                "model_id": rep.model_id,
+                "name": rep.name,
+                "backend": rep.backend,
+                "cold_load_s": round(rep.cold_load_s, 2),
+                "warm_load_s": round(rep.warm_load_s, 2),
+                "memory": rep.memory_after_load,
+                "cells": [cell_to_dict(c) for c in rep.cells],
+                "recommended_max_concurrent": rep.recommended_max_concurrent,
+                "notes": rep.notes,
+            }
+        )
 
     vllm_note = ""
     if not any(r.backend == "vllm" for r in reports):
@@ -516,9 +556,14 @@ root.innerHTML = html;
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--arbiter", default=DEFAULT_ARBITER)
-    ap.add_argument("--models", required=True,
-                    help="comma-separated model_ids, e.g. 'llm:gemma4-26b,llm:gemma4-26b-vllm'")
-    ap.add_argument("--out", default=str(Path.home() / "src/arbiter/benchmark_report.html"))
+    ap.add_argument(
+        "--models",
+        required=True,
+        help="comma-separated model_ids, e.g. 'llm:gemma4-26b,llm:gemma4-26b-vllm'",
+    )
+    ap.add_argument(
+        "--out", default=str(Path.home() / "src/arbiter/benchmark_report.html")
+    )
     ap.add_argument("--no-open", action="store_true")
     args = ap.parse_args()
 
@@ -531,6 +576,7 @@ def main() -> int:
         print(f"\n=== Running {mid} ===", flush=True)
         # Look up backend + name from the live config (URL-quote the colon).
         from urllib.parse import quote
+
         try:
             cfg = _http_get(f"{base}/v1/models/{quote(mid, safe='')}")
         except Exception:
@@ -539,8 +585,10 @@ def main() -> int:
         backend = (cfg.get("adapter_params", {}) or {}).get("LLM_BACKEND", "llamacpp")
         rep = run_for_model(base, mid, name, backend)
         reports.append(rep)
-        print(f"  cold load: {rep.cold_load_s:.1f}s | recommended max_concurrent: {rep.recommended_max_concurrent}",
-              flush=True)
+        print(
+            f"  cold load: {rep.cold_load_s:.1f}s | recommended max_concurrent: {rep.recommended_max_concurrent}",
+            flush=True,
+        )
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

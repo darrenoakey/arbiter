@@ -13,10 +13,12 @@ in-process apply_model crash seen when demucs' internal pool runs inside the
 arbiter worker thread. htdemucs reloads per call (~1-2s) — fine for the
 low-volume verse workload.
 """
+
 from __future__ import annotations
 
 import base64
 import logging
+import importlib
 import subprocess
 import sys
 import threading
@@ -30,7 +32,7 @@ log = logging.getLogger(__name__)
 # Cap inline base64 per stem (raw bytes). demucs returns TWO stems in one
 # result, so keep 2x this under the worker stdout pipe ceiling (96MB, see
 # proc.go). 30MB raw/stem -> ~40MB b64/stem -> ~80MB for both, safely under.
-# Larger stems get a skip note and must be fetched as files. Files always written.
+# Larger stems get an omission note and must be fetched as files. Files always written.
 _B64_CAP_BYTES = 30 * 1024 * 1024
 
 # Standalone separation: reads argv[1] (input audio), writes vocals.wav +
@@ -83,8 +85,8 @@ class DemucsAdapter(ModelAdapter):
         # Verify the sphn-free import path works in this venv; the model loads
         # inside the subprocess (no persistent GPU held between jobs).
         try:
-            import demucs.apply  # noqa: F401
-            import demucs.pretrained  # noqa: F401
+            importlib.import_module("demucs.apply")
+            importlib.import_module("demucs.pretrained")
         except Exception as e:  # noqa: BLE001
             raise LoadError(f"demucs not importable in this venv: {e}") from e
         self._ready = True
@@ -94,7 +96,9 @@ class DemucsAdapter(ModelAdapter):
         log.info("Unloading demucs (no persistent GPU held).")
         self._ready = False
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         self._check_cancel(cancel_flag)
         if not self._ready:
             raise InferenceError("demucs not loaded (call load first)")
@@ -114,11 +118,17 @@ class DemucsAdapter(ModelAdapter):
         duration = _probe_duration(str(src_path))
         timeout_s = max(600, int(duration * 5 + 120))
 
-        log.info("Separating %.1fs of audio (demucs two-stem, timeout=%ds) ...", duration, timeout_s)
+        log.info(
+            "Separating %.1fs of audio (demucs two-stem, timeout=%ds) ...",
+            duration,
+            timeout_s,
+        )
         try:
             proc = subprocess.run(
                 [sys.executable, "-c", _SEP_SCRIPT, str(src_path), str(output_dir)],
-                capture_output=True, text=True, timeout=timeout_s,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
             )
         except subprocess.TimeoutExpired as e:
             raise InferenceError(f"demucs timed out after {timeout_s}s") from e
@@ -127,7 +137,9 @@ class DemucsAdapter(ModelAdapter):
 
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "").strip()[-800:]
-            raise InferenceError(f"demucs separation failed (exit {proc.returncode}): {tail}")
+            raise InferenceError(
+                f"demucs separation failed (exit {proc.returncode}): {tail}"
+            )
         self._check_cancel(cancel_flag)
 
         vocals_path = output_dir / "vocals.wav"
@@ -144,12 +156,17 @@ class DemucsAdapter(ModelAdapter):
             "duration_seconds": round(duration, 3),
         }
         if return_b64:
-            for name, path in (("vocals_b64", vocals_path), ("accompaniment_b64", accompaniment_path)):
+            for name, path in (
+                ("vocals_b64", vocals_path),
+                ("accompaniment_b64", accompaniment_path),
+            ):
                 raw = path.read_bytes()
                 if len(raw) <= _B64_CAP_BYTES:
                     result[name] = base64.b64encode(raw).decode("ascii")
                 else:
-                    result[name + "_skipped"] = f"stem {len(raw)} bytes exceeds {_B64_CAP_BYTES} cap; fetch the file"
+                    result[name + "_skipped"] = (
+                        f"stem {len(raw)} bytes exceeds {_B64_CAP_BYTES} cap; fetch the file"
+                    )
         return result
 
     def estimate_time(self, params: dict) -> float:
@@ -166,9 +183,19 @@ class DemucsAdapter(ModelAdapter):
 def _probe_duration(path: str) -> float:
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, timeout=10,
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         return float(out.stdout.strip())
     except Exception:  # noqa: BLE001

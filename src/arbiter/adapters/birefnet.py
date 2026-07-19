@@ -1,10 +1,15 @@
 """BiRefNet background-removal adapter."""
+
 from __future__ import annotations
 
 import io
 import logging
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, cast
+
+if TYPE_CHECKING:
+    import torch
 
 from arbiter.adapters.base import ModelAdapter, InferenceError
 from arbiter.adapters.registry import register
@@ -14,12 +19,16 @@ log = logging.getLogger(__name__)
 _INPUT_SIZE = (1024, 1024)
 
 
+class _SegmentationModel(Protocol):
+    def __call__(self, image: "torch.Tensor") -> list["torch.Tensor"]: ...
+
+
 @register
 class BiRefNetAdapter(ModelAdapter):
     model_id = "birefnet"
 
     def __init__(self):
-        self._model = None
+        self._model: _SegmentationModel | None = None
 
     def load(self, device: str = "cuda") -> None:
         from transformers import AutoModelForImageSegmentation
@@ -30,7 +39,7 @@ class BiRefNetAdapter(ModelAdapter):
             trust_remote_code=True,
         )
         model.eval()
-        self._model = model.to(device).float()
+        self._model = cast(_SegmentationModel, model.to(device).float())
         self._device = device
         log.info("BiRefNet ready.")
 
@@ -40,7 +49,9 @@ class BiRefNetAdapter(ModelAdapter):
         self._model = None
         self._cleanup_gpu()
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         import torch
         from torchvision import transforms
         from PIL import Image, ImageOps
@@ -49,6 +60,7 @@ class BiRefNetAdapter(ModelAdapter):
 
         # Decode input image from base64
         from arbiter.adapters.base import InferenceError as _IE
+
         try:
             raw = self._resolve_media(params, "image")
             original = Image.open(io.BytesIO(raw))
@@ -60,17 +72,24 @@ class BiRefNetAdapter(ModelAdapter):
         original = ImageOps.exif_transpose(original)
         rgb = original.convert("RGB")
 
-        transform = transforms.Compose([
-            transforms.Resize(_INPUT_SIZE),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
+        transform = transforms.Compose(
+            [
+                transforms.Resize(_INPUT_SIZE),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
 
         self._check_cancel(cancel_flag)
 
-        input_tensor = transform(rgb).unsqueeze(0).to(self._device)
+        input_tensor = (
+            cast("torch.Tensor", transform(rgb)).unsqueeze(0).to(self._device)
+        )
+        model = self._model
+        if model is None:
+            raise InferenceError("birefnet not loaded")
         with torch.no_grad():
-            outputs = self._model(input_tensor)
+            outputs = model(input_tensor)
             prediction = outputs[-1].sigmoid().cpu()
 
         self._check_cancel(cancel_flag)

@@ -4,15 +4,22 @@ Tongyi-MAI/Z-Image-Turbo: 6B parameter distilled model with strong
 prompt adherence and good img2img performance at low step counts.
 Requires guidance_scale=0.0 and num_inference_steps=9 (8 NFEs).
 """
+
 from __future__ import annotations
 
 import logging
+import importlib
 import os
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, cast
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 from arbiter.adapters.base import ModelAdapter
 from arbiter.adapters.registry import register
+from arbiter.image_policy import raise_still_image_disabled
 
 log = logging.getLogger(__name__)
 
@@ -21,30 +28,51 @@ DEFAULT_STEPS = 9  # 9 steps = 8 NFEs (recommended for turbo)
 GUIDANCE_SCALE = 0.0  # Must be 0 for turbo distilled models
 
 
+class _PipelineResult(Protocol):
+    images: list["Image.Image"]
+
+
+class _AttentionTransformer(Protocol):
+    def set_attention_backend(self, backend: str) -> None: ...
+
+
+class _ImagePipeline(Protocol):
+    transformer: _AttentionTransformer
+
+    def __call__(self, **kwargs: object) -> _PipelineResult: ...
+
+
 @register
 class ZImageTurboAdapter(ModelAdapter):
     model_id = "z-image-turbo"
 
     def __init__(self):
-        self._pipe = None
-        self._img2img_pipe = None
+        self._pipe: _ImagePipeline | None = None
+        self._img2img_pipe: _ImagePipeline | None = None
         self._device = "cuda"
         self._txt2img_backend = "native"
         self._img2img_backend = "native"
 
     def load(self, device: str = "cuda") -> None:
+        raise_still_image_disabled()
         import torch
-        from diffusers import ZImagePipeline
+
+        ZImagePipeline = importlib.import_module("diffusers").ZImagePipeline
 
         log.info("Loading Z-Image-Turbo on %s ...", device)
-        self._pipe = ZImagePipeline.from_pretrained(
-            ZIMAGE_HF_ID,
-            torch_dtype=torch.bfloat16,
+        self._pipe = cast(
+            _ImagePipeline,
+            ZImagePipeline.from_pretrained(
+                ZIMAGE_HF_ID,
+                torch_dtype=torch.bfloat16,
+            ),
         )
         # GB10 mmap→cuda workaround: clone each tensor off mmap-backed
         # storage before moving to device. See base._pipe_to_cuda_cloned.
         self._pipe_to_cuda_cloned(self._pipe, device)
-        self._txt2img_backend = self._enable_fast_attention(self._pipe, pipeline_name="txt2img")
+        self._txt2img_backend = self._enable_fast_attention(
+            self._pipe, pipeline_name="txt2img"
+        )
 
         self._device = device
         log.info("Z-Image-Turbo ready.")
@@ -59,36 +87,60 @@ class ZImageTurboAdapter(ModelAdapter):
         self._cleanup_gpu()
 
     def _get_img2img_pipe(self):
+        raise_still_image_disabled()
         if self._img2img_pipe is not None:
             return self._img2img_pipe
         import torch
-        from diffusers import ZImageImg2ImgPipeline
+
+        ZImageImg2ImgPipeline = importlib.import_module(
+            "diffusers"
+        ).ZImageImg2ImgPipeline
 
         log.info("Loading Z-Image-Turbo img2img pipeline ...")
-        self._img2img_pipe = ZImageImg2ImgPipeline.from_pretrained(
-            ZIMAGE_HF_ID,
-            torch_dtype=torch.bfloat16,
+        self._img2img_pipe = cast(
+            _ImagePipeline,
+            ZImageImg2ImgPipeline.from_pretrained(
+                ZIMAGE_HF_ID,
+                torch_dtype=torch.bfloat16,
+            ),
         )
         self._pipe_to_cuda_cloned(self._img2img_pipe, self._device)
-        self._img2img_backend = self._enable_fast_attention(self._img2img_pipe, pipeline_name="img2img")
+        self._img2img_backend = self._enable_fast_attention(
+            self._img2img_pipe, pipeline_name="img2img"
+        )
 
         return self._img2img_pipe
 
     def _enable_fast_attention(self, pipe, pipeline_name: str) -> str:
         transformer = getattr(pipe, "transformer", None)
         if transformer is None or not hasattr(transformer, "set_attention_backend"):
-            log.info("Z-Image-Turbo %s using default attention; transformer backend switch unsupported", pipeline_name)
+            log.info(
+                "Z-Image-Turbo %s using default attention; transformer backend switch unsupported",
+                pipeline_name,
+            )
             return "native"
 
         for backend in ("_native_cudnn", "native"):
             try:
                 transformer.set_attention_backend(backend)
-                log.info("Z-Image-Turbo %s enabled attention backend: %s", pipeline_name, backend)
+                log.info(
+                    "Z-Image-Turbo %s enabled attention backend: %s",
+                    pipeline_name,
+                    backend,
+                )
                 return backend
             except Exception as exc:
-                log.info("Z-Image-Turbo %s attention backend %s unavailable: %s", pipeline_name, backend, exc)
+                log.info(
+                    "Z-Image-Turbo %s attention backend %s unavailable: %s",
+                    pipeline_name,
+                    backend,
+                    exc,
+                )
 
-        log.warning("Z-Image-Turbo %s could not enable a preferred attention backend; leaving default in place", pipeline_name)
+        log.warning(
+            "Z-Image-Turbo %s could not enable a preferred attention backend; leaving default in place",
+            pipeline_name,
+        )
         return "native"
 
     def _retry_with_native_attention(self, pipe, pipeline_name: str, exc: Exception):
@@ -107,7 +159,10 @@ class ZImageTurboAdapter(ModelAdapter):
         else:
             self._img2img_backend = "native"
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
+        raise_still_image_disabled()
         import torch
 
         self._check_cancel(cancel_flag)
@@ -149,8 +204,11 @@ class ZImageTurboAdapter(ModelAdapter):
                     generator=generator,
                 ).images[0]
         else:
+            pipe = self._pipe
+            if pipe is None:
+                raise RuntimeError("z-image-turbo not loaded")
             try:
-                result_image = self._pipe(
+                result_image = pipe(
                     prompt=prompt,
                     width=width,
                     height=height,
@@ -159,8 +217,8 @@ class ZImageTurboAdapter(ModelAdapter):
                     generator=generator,
                 ).images[0]
             except Exception as exc:
-                self._retry_with_native_attention(self._pipe, "txt2img", exc)
-                result_image = self._pipe(
+                self._retry_with_native_attention(pipe, "txt2img", exc)
+                result_image = pipe(
                     prompt=prompt,
                     width=width,
                     height=height,

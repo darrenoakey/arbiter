@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -142,8 +143,9 @@ func TestDispatchJobPromotesFollowerWhenWorkerDies(t *testing.T) {
 		t.Fatalf("mkdir output jobs: %v", err)
 	}
 
-	workerPath := filepath.Join(projectRoot, "dying_worker.py")
-	workerScript := `import json, os, sys
+	workerPath := filepath.Join(projectRoot, "llm-worker")
+	workerScript := `#!/usr/bin/env python3
+import json, os, sys
 for line in sys.stdin:
     msg = json.loads(line)
     cmd = msg.get("cmd")
@@ -168,35 +170,35 @@ for line in sys.stdin:
 	cfg := &Config{
 		VRAMBudgetGB: 100,
 		Models: map[string]ModelConfig{
-			"demo": {
+			"llm:demo": {
 				MemoryGB:      1,
 				MaxConcurrent: 1,
 				MaxInstances:  intPtr(1),
-				WorkerCmd:     []string{"python3", workerPath},
+				WorkerCmd:     []string{workerPath},
 			},
 		},
 	}
 	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
 	defer logger.Close()
 	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 100}, "python3", projectRoot)
-	mgr.ScaleModel("demo", 1, cfg.Models["demo"])
+	mgr.ScaleModel("llm:demo", 1, cfg.Models["llm:demo"])
 	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
 
 	payload := json.RawMessage(`{"prompt":"die"}`)
-	orig, err := store.CreateJob("demo", "image-generate", payload, 1)
+	orig, err := store.CreateJob("llm:demo", "image-generate", payload, 1)
 	if err != nil {
 		t.Fatalf("create original job: %v", err)
 	}
-	followerA, err := store.CreateFollowerJob("demo", "image-generate", payload, orig.ID)
+	followerA, err := store.CreateFollowerJob("llm:demo", "image-generate", payload, orig.ID)
 	if err != nil {
 		t.Fatalf("create follower A: %v", err)
 	}
-	followerB, err := store.CreateFollowerJob("demo", "image-generate", payload, orig.ID)
+	followerB, err := store.CreateFollowerJob("llm:demo", "image-generate", payload, orig.ID)
 	if err != nil {
 		t.Fatalf("create follower B: %v", err)
 	}
 
-	inst := mgr.GetModelInstances("demo")[0]
+	inst := mgr.GetModelInstances("llm:demo")[0]
 	atomic.AddInt32(&inst.activeJobs, 1)
 	sched.dispatchJobToInstance(orig, inst, 1.0)
 
@@ -226,8 +228,9 @@ func TestDispatchJobRequeuesOnShutdownWhenWorkerDies(t *testing.T) {
 		t.Fatalf("mkdir output jobs: %v", err)
 	}
 
-	workerPath := filepath.Join(projectRoot, "dying_worker.py")
-	workerScript := `import json, os, sys
+	workerPath := filepath.Join(projectRoot, "llm-worker")
+	workerScript := `#!/usr/bin/env python3
+import json, os, sys
 for line in sys.stdin:
     msg = json.loads(line)
     cmd = msg.get("cmd")
@@ -252,36 +255,36 @@ for line in sys.stdin:
 	cfg := &Config{
 		VRAMBudgetGB: 100,
 		Models: map[string]ModelConfig{
-			"demo": {
+			"llm:demo": {
 				MemoryGB:      1,
 				MaxConcurrent: 1,
 				MaxInstances:  intPtr(1),
-				WorkerCmd:     []string{"python3", workerPath},
+				WorkerCmd:     []string{workerPath},
 			},
 		},
 	}
 	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
 	defer logger.Close()
 	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 100}, "python3", projectRoot)
-	mgr.ScaleModel("demo", 1, cfg.Models["demo"])
+	mgr.ScaleModel("llm:demo", 1, cfg.Models["llm:demo"])
 	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
 	sched.MarkShuttingDown()
 
 	payload := json.RawMessage(`{"prompt":"die"}`)
-	orig, err := store.CreateJob("demo", "image-generate", payload, 1)
+	orig, err := store.CreateJob("llm:demo", "image-generate", payload, 1)
 	if err != nil {
 		t.Fatalf("create original job: %v", err)
 	}
-	followerA, err := store.CreateFollowerJob("demo", "image-generate", payload, orig.ID)
+	followerA, err := store.CreateFollowerJob("llm:demo", "image-generate", payload, orig.ID)
 	if err != nil {
 		t.Fatalf("create follower A: %v", err)
 	}
-	followerB, err := store.CreateFollowerJob("demo", "image-generate", payload, orig.ID)
+	followerB, err := store.CreateFollowerJob("llm:demo", "image-generate", payload, orig.ID)
 	if err != nil {
 		t.Fatalf("create follower B: %v", err)
 	}
 
-	inst := mgr.GetModelInstances("demo")[0]
+	inst := mgr.GetModelInstances("llm:demo")[0]
 	atomic.AddInt32(&inst.activeJobs, 1)
 	sched.dispatchJobToInstance(orig, inst, 1.0)
 
@@ -593,7 +596,7 @@ func TestConflictGroupExclusionAndPriority(t *testing.T) {
 // primitive a safe redeploy relies on — bounce only once nothing is in flight.
 func TestDrainModeBlocksNewDispatch(t *testing.T) {
 	projectRoot := t.TempDir()
-	workerPath := filepath.Join(projectRoot, "idle_worker.py")
+	workerPath := filepath.Join(projectRoot, "llm-worker")
 	writeIdleWorker(t, workerPath)
 	outputDir := filepath.Join(projectRoot, "output")
 	if err := os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755); err != nil {
@@ -614,15 +617,15 @@ func TestDrainModeBlocksNewDispatch(t *testing.T) {
 	cfg := &Config{
 		VRAMBudgetGB: 100,
 		Models: map[string]ModelConfig{
-			"m": {MemoryGB: 1, MaxConcurrent: 1, MaxInstances: intPtr(1), PressureIndex: &pi},
+			"llm:m": {MemoryGB: 1, MaxConcurrent: 1, MaxInstances: intPtr(1), PressureIndex: &pi},
 		},
 	}
 	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
 	defer logger.Close()
 	mgr := NewInstanceManager(cfg, "python3", projectRoot)
-	mgr.ScaleModel("m", 1, cfg.Models["m"])
+	mgr.ScaleModel("llm:m", 1, cfg.Models["llm:m"])
 	// Point the instance at the idle worker so load succeeds without a real model.
-	mgr.GetModelInstances("m")[0].workerCmd = []string{"python3", workerPath}
+	mgr.GetModelInstances("llm:m")[0].workerCmd = []string{workerPath}
 	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
 
 	sched.SetDraining(true)
@@ -630,7 +633,7 @@ func TestDrainModeBlocksNewDispatch(t *testing.T) {
 		t.Fatal("IsDraining() = false after SetDraining(true)")
 	}
 
-	job, err := store.CreateJob("m", "embed-text", json.RawMessage(`{}`), 1)
+	job, err := store.CreateJob("llm:m", "embed-text", json.RawMessage(`{}`), 1)
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
@@ -667,7 +670,7 @@ func TestDrainModeBlocksNewDispatch(t *testing.T) {
 	}
 
 	cancel()
-	mgr.GetModelInstances("m")[0].Kill()
+	mgr.GetModelInstances("llm:m")[0].Kill()
 }
 
 // TestGetFullModelsGatesOnVRAMFeasibility verifies the hard VRAM gate: a model
@@ -763,8 +766,8 @@ func TestGetFullModelsBypassesVRAMForReachableRemote(t *testing.T) {
 			"boringstack": {Addr: "http://10.255.255.1:11434", Kind: "mlx", BudgetGB: 96},
 		},
 		Models: map[string]ModelConfig{
-			// blocker holds 80GB → only 20GB free locally while it runs.
-			"blocker": {MemoryGB: 80, MaxConcurrent: 1, MaxInstances: intPtr(1), PressureIndex: &pi},
+			// moondream holds 80GB → only 20GB free locally while it runs.
+			"moondream": {MemoryGB: 80, MaxConcurrent: 1, MaxInstances: intPtr(1), PressureIndex: &pi},
 			// gemma "needs" 90GB locally but is placed on boringstack first, spark
 			// last. It can never fit in 20GB free — but it must NOT be marked full
 			// because boringstack is reachable and serves it for zero spark VRAM.
@@ -783,9 +786,9 @@ func TestGetFullModelsBypassesVRAMForReachableRemote(t *testing.T) {
 	mgr.SetReachabilityFunc(func(string) bool { return true })
 	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
 
-	// blocker loaded + actively running → 80GB pinned, free = 20GB.
-	markLoaded(t, mgr, "blocker")
-	blockerInst := mgr.GetModelInstances("blocker")[0]
+	// moondream loaded + actively running → 80GB pinned, free = 20GB.
+	markLoaded(t, mgr, "moondream")
+	blockerInst := mgr.GetModelInstances("moondream")[0]
 	atomic.AddInt32(&blockerInst.activeJobs, 1)
 
 	full := sched.getFullModels("")
@@ -995,13 +998,13 @@ func TestRecoverStuckScheduledRequeuesOldScheduledJobs(t *testing.T) {
 
 func TestEvictIdleNoQueueModelsPrefersQueuedModelResidency(t *testing.T) {
 	projectRoot := t.TempDir()
-	workerPath := filepath.Join(projectRoot, "idle_worker.py")
+	workerPath := filepath.Join(projectRoot, "llm-worker")
 	writeIdleWorker(t, workerPath)
 
 	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 100}, "python3", projectRoot)
 
-	instA := NewInstance("model-a", "model-a", 1, 20, "python3", projectRoot)
-	instA.workerCmd = []string{"python3", workerPath}
+	instA := NewInstance("llm:model-a", "llm:model-a", 1, 20, "python3", projectRoot)
+	instA.workerCmd = []string{workerPath}
 	if err := instA.Load("cuda"); err != nil {
 		t.Fatalf("load model-a: %v", err)
 	}
@@ -1010,8 +1013,8 @@ func TestEvictIdleNoQueueModelsPrefersQueuedModelResidency(t *testing.T) {
 	instA.mu.Unlock()
 	mgr.Register(instA)
 
-	instB := NewInstance("model-b", "model-b", 1, 30, "python3", projectRoot)
-	instB.workerCmd = []string{"python3", workerPath}
+	instB := NewInstance("llm:model-b", "llm:model-b", 1, 30, "python3", projectRoot)
+	instB.workerCmd = []string{workerPath}
 	if err := instB.Load("cuda"); err != nil {
 		t.Fatalf("load model-b: %v", err)
 	}
@@ -1021,8 +1024,8 @@ func TestEvictIdleNoQueueModelsPrefersQueuedModelResidency(t *testing.T) {
 	mgr.Register(instB)
 
 	evicted, err := mgr.EvictIdleNoQueueModels(map[string]int{
-		"model-a": 5,
-		"model-b": 0,
+		"llm:model-a": 5,
+		"llm:model-b": 0,
 	})
 	if err != nil {
 		t.Fatalf("EvictIdleNoQueueModels: %v", err)
@@ -1093,8 +1096,9 @@ func TestReadLoopCleansUpPIDOnSubprocessDeath(t *testing.T) {
 	projectRoot := t.TempDir()
 
 	// Worker that loads successfully, then dies on the next command.
-	workerPath := filepath.Join(projectRoot, "die_on_load.py")
-	workerScript := `import json, sys
+	workerPath := filepath.Join(projectRoot, "llm-worker")
+	workerScript := `#!/usr/bin/env python3
+import json, sys
 for line in sys.stdin:
     msg = json.loads(line)
     if msg.get("cmd") == "load":
@@ -1106,8 +1110,8 @@ for line in sys.stdin:
 		t.Fatalf("write worker: %v", err)
 	}
 
-	inst := NewInstance("test", "test", 1, 1, "python3", projectRoot)
-	inst.workerCmd = []string{"python3", workerPath}
+	inst := NewInstance("llm:test", "llm:test", 1, 1, "python3", projectRoot)
+	inst.workerCmd = []string{workerPath}
 
 	if err := inst.Load("cuda"); err != nil {
 		t.Fatalf("load failed: %v", err)
@@ -1786,7 +1790,7 @@ func TestIsClientErrorClassifiesBadInput(t *testing.T) {
 	}
 }
 
-// newAutoWakeHarness builds a scheduler whose "parked" model has
+// newAutoWakeHarness builds a scheduler whose "moondream" model has
 // max_instances=0, mirroring the gemma4 outage of 2026-06-09: a model parked
 // to free VRAM, never restored, accepting jobs it can never run.
 func newAutoWakeHarness(t *testing.T, autoWakeSeconds int) (*Scheduler, *Config, *InstanceManager, *Store, string) {
@@ -1807,7 +1811,7 @@ func newAutoWakeHarness(t *testing.T, autoWakeSeconds int) (*Scheduler, *Config,
 		VRAMBudgetGB:    100,
 		AutoWakeSeconds: autoWakeSeconds,
 		Models: map[string]ModelConfig{
-			"parked": {MemoryGB: 1, MaxConcurrent: 1, MaxInstances: intPtr(0)},
+			"moondream": {MemoryGB: 1, MaxConcurrent: 1, MaxInstances: intPtr(0), MaxRuntimeSec: 7200},
 		},
 	}
 	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
@@ -1820,31 +1824,31 @@ func newAutoWakeHarness(t *testing.T, autoWakeSeconds int) (*Scheduler, *Config,
 func TestAutoWakeParkedModelWithBacklog(t *testing.T) {
 	sched, cfg, mgr, store, projectRoot := newAutoWakeHarness(t, 0)
 
-	if _, err := store.CreateJob("parked", "image-generate", json.RawMessage(`{}`), 1); err != nil {
+	if _, err := store.CreateJob("moondream", "image-generate", json.RawMessage(`{}`), 1); err != nil {
 		t.Fatalf("create job: %v", err)
 	}
 
 	// First pass only starts the grace clock — must not wake yet.
 	sched.autoWakeParkedModels()
-	if got := *cfg.Models["parked"].MaxInstances; got != 0 {
+	if got := *cfg.Models["moondream"].MaxInstances; got != 0 {
 		t.Fatalf("woke before grace elapsed: max_instances=%d", got)
 	}
-	if len(mgr.GetModelInstances("parked")) != 0 {
+	if len(mgr.GetModelInstances("moondream")) != 0 {
 		t.Fatal("instance created before grace elapsed")
 	}
 
 	// Age the starvation past the grace period and bypass the rate limiter.
 	sched.autoWakeMu.Lock()
-	sched.starvedSince["parked"] = time.Now().Add(-defaultAutoWakeGrace - time.Minute)
+	sched.starvedSince["moondream"] = time.Now().Add(-defaultAutoWakeGrace - time.Minute)
 	sched.lastAutoWakeCheck = time.Time{}
 	sched.autoWakeMu.Unlock()
 
 	sched.autoWakeParkedModels()
 
-	if got := *cfg.Models["parked"].MaxInstances; got != 1 {
+	if got := *cfg.Models["moondream"].MaxInstances; got != 1 {
 		t.Fatalf("expected auto-wake to set max_instances=1, got %d", got)
 	}
-	if n := len(mgr.GetModelInstances("parked")); n != 1 {
+	if n := len(mgr.GetModelInstances("moondream")); n != 1 {
 		t.Fatalf("expected 1 instance slot after auto-wake, got %d", n)
 	}
 
@@ -1857,9 +1861,91 @@ func TestAutoWakeParkedModelWithBacklog(t *testing.T) {
 	if err := json.Unmarshal(raw, &persisted); err != nil {
 		t.Fatalf("parse persisted config: %v", err)
 	}
-	entry := persisted["models"].(map[string]any)["parked"].(map[string]any)
+	entry := persisted["models"].(map[string]any)["moondream"].(map[string]any)
 	if got := entry["max_instances"].(float64); got != 1 {
 		t.Fatalf("persisted max_instances = %v, want 1", got)
+	}
+}
+
+func TestAutoWakeRefusesDisabledStillImageModel(t *testing.T) {
+	sched, cfg, mgr, store, _ := newAutoWakeHarness(t, 0)
+	parked := cfg.Models["moondream"]
+	delete(cfg.Models, "moondream")
+	cfg.Models["flux2"] = parked
+	if _, err := store.CreateJob("flux2", "background-remove", json.RawMessage(`{}`), 1); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	sched.autoWakeMu.Lock()
+	sched.starvedSince["flux2"] = time.Now().Add(-defaultAutoWakeGrace - time.Minute)
+	sched.lastAutoWakeCheck = time.Time{}
+	sched.autoWakeMu.Unlock()
+
+	sched.autoWakeParkedModels()
+	if got := *cfg.Models["flux2"].MaxInstances; got != 0 {
+		t.Fatalf("disabled model auto-woke to %d instances", got)
+	}
+	if got := len(mgr.GetModelInstances("flux2")); got != 0 {
+		t.Fatalf("disabled model created %d instances", got)
+	}
+}
+
+func TestAutoWakePersistenceFailureLeavesRuntimeAndMemoryAtZero(t *testing.T) {
+	scheduler, config, manager, store, projectRoot := newAutoWakeHarness(t, 0)
+	if _, err := store.CreateJob("moondream", "background-remove", json.RawMessage(`{}`), 1); err != nil {
+		t.Fatal(err)
+	}
+	scheduler.autoWakeMu.Lock()
+	scheduler.starvedSince["moondream"] = time.Now().Add(-defaultAutoWakeGrace - time.Minute)
+	scheduler.lastAutoWakeCheck = time.Time{}
+	scheduler.autoWakeMu.Unlock()
+	restore := makeConfigStorageUnwritable(t, projectRoot)
+	defer restore()
+	scheduler.autoWakeParkedModels()
+	if *config.Models["moondream"].MaxInstances != 0 || len(manager.GetModelInstances("moondream")) != 0 {
+		t.Fatal("persistence failure changed auto-wake runtime")
+	}
+	manager.mu.RLock()
+	usedMemory := manager.usedGB
+	manager.mu.RUnlock()
+	if usedMemory != 0 {
+		t.Fatalf("persistence failure changed memory accounting to %v", usedMemory)
+	}
+}
+
+func TestAutoWakeRuntimeFailureRestoresDiskAndMemory(t *testing.T) {
+	scheduler, config, manager, store, projectRoot := newAutoWakeHarness(t, 0)
+	config.Hosts = map[string]HostConfig{"local-alias": {Kind: "cuda"}}
+	parked := config.Models["moondream"]
+	parked.Placements = []string{"local-alias"}
+	config.Models["moondream"] = parked
+	if err := SaveModelConfig(projectRoot, "moondream", parked); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(projectRoot, "local", "config.json")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateJob("moondream", "background-remove", json.RawMessage(`{}`), 1); err != nil {
+		t.Fatal(err)
+	}
+	scheduler.autoWakeMu.Lock()
+	scheduler.starvedSince["moondream"] = time.Now().Add(-defaultAutoWakeGrace - time.Minute)
+	scheduler.lastAutoWakeCheck = time.Time{}
+	scheduler.autoWakeMu.Unlock()
+	scheduler.autoWakeParkedModels()
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("runtime failure changed persisted state: equal=%v error=%v", bytes.Equal(before, after), err)
+	}
+	if *config.Models["moondream"].MaxInstances != 0 || len(manager.GetModelInstances("moondream")) != 0 {
+		t.Fatal("runtime failure did not restore parked runtime")
+	}
+	manager.mu.RLock()
+	usedMemory := manager.usedGB
+	manager.mu.RUnlock()
+	if usedMemory != 0 {
+		t.Fatalf("runtime failure changed memory accounting to %v", usedMemory)
 	}
 }
 
@@ -1874,10 +1960,10 @@ func TestAutoWakeIgnoresParkedModelWithEmptyQueue(t *testing.T) {
 	sched.autoWakeMu.Unlock()
 	sched.autoWakeParkedModels()
 
-	if got := *cfg.Models["parked"].MaxInstances; got != 0 {
+	if got := *cfg.Models["moondream"].MaxInstances; got != 0 {
 		t.Fatalf("idle parked model was woken: max_instances=%d", got)
 	}
-	if len(mgr.GetModelInstances("parked")) != 0 {
+	if len(mgr.GetModelInstances("moondream")) != 0 {
 		t.Fatal("instance created for idle parked model")
 	}
 }
@@ -1885,16 +1971,16 @@ func TestAutoWakeIgnoresParkedModelWithEmptyQueue(t *testing.T) {
 func TestAutoWakeDisabledByNegativeConfig(t *testing.T) {
 	sched, cfg, _, store, _ := newAutoWakeHarness(t, -1)
 
-	if _, err := store.CreateJob("parked", "image-generate", json.RawMessage(`{}`), 1); err != nil {
+	if _, err := store.CreateJob("moondream", "image-generate", json.RawMessage(`{}`), 1); err != nil {
 		t.Fatalf("create job: %v", err)
 	}
 	sched.autoWakeMu.Lock()
-	sched.starvedSince["parked"] = time.Now().Add(-24 * time.Hour)
+	sched.starvedSince["moondream"] = time.Now().Add(-24 * time.Hour)
 	sched.autoWakeMu.Unlock()
 
 	sched.autoWakeParkedModels()
 
-	if got := *cfg.Models["parked"].MaxInstances; got != 0 {
+	if got := *cfg.Models["moondream"].MaxInstances; got != 0 {
 		t.Fatalf("guard ran despite auto_wake_seconds=-1: max_instances=%d", got)
 	}
 }

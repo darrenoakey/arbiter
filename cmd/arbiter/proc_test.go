@@ -1,6 +1,26 @@
 package main
 
-import "testing"
+import (
+	"math"
+	"path/filepath"
+	"testing"
+)
+
+func TestCreateReservationRejectsUnsafeMemoryWithoutAccountingChange(t *testing.T) {
+	manager := NewInstanceManager(&Config{VRAMBudgetGB: 70}, "python3", t.TempDir())
+	for _, memoryGB := range []float64{0, -1, 71, math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if _, err := manager.CreateReservation(memoryGB, "invalid", map[string]int{}); err == nil {
+			t.Errorf("CreateReservation(%v) accepted unsafe memory", memoryGB)
+		}
+	}
+	manager.mu.RLock()
+	reservedMemory := manager.reservedGB
+	reservationCount := len(manager.reservations)
+	manager.mu.RUnlock()
+	if reservedMemory != 0 || reservationCount != 0 {
+		t.Fatalf("invalid reservations changed accounting: memory=%v count=%d", reservedMemory, reservationCount)
+	}
+}
 
 func modelInstanceIDs(mgr *InstanceManager, modelID string) []string {
 	instances := mgr.GetModelInstances(modelID)
@@ -21,23 +41,26 @@ func containsString(values []string, want string) bool {
 }
 
 func TestReloadModelReplacesDispatchInstances(t *testing.T) {
-	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 70}, "python3", t.TempDir())
+	projectRoot := t.TempDir()
+	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 70}, "python3", projectRoot)
 	cfg := ModelConfig{
 		MemoryGB:      4,
 		MaxConcurrent: 1,
 		MaxInstances:  intPtr(2),
 	}
 
-	initial := mgr.ScaleModel("demo", 2, cfg)
+	modelID := "llm:demo"
+	initial := mgr.ScaleModel(modelID, 2, cfg)
 	if initial["added"].(int) != 2 {
 		t.Fatalf("initial scale added = %v, want 2", initial["added"])
 	}
-	before := modelInstanceIDs(mgr, "demo")
+	before := modelInstanceIDs(mgr, modelID)
 
 	updated := cfg
-	updated.WorkerCmd = []string{"custom-worker"}
-	reloaded := mgr.ReloadModel("demo", 2, updated)
-	after := modelInstanceIDs(mgr, "demo")
+	updated.WorkerCmd = []string{filepath.Join(projectRoot, "llm-worker")}
+	updated.AdapterParams = map[string]string{"LLM_BACKEND": "llamacpp"}
+	reloaded := mgr.ReloadModel(modelID, 2, updated)
+	after := modelInstanceIDs(mgr, modelID)
 
 	if reloaded["added"].(int) != 2 {
 		t.Fatalf("reload added = %v, want 2", reloaded["added"])
@@ -53,8 +76,8 @@ func TestReloadModelReplacesDispatchInstances(t *testing.T) {
 			t.Fatalf("old instance %s still in dispatch set after reload", id)
 		}
 	}
-	for _, inst := range mgr.GetModelInstances("demo") {
-		if len(inst.workerCmd) != 1 || inst.workerCmd[0] != "custom-worker" {
+	for _, inst := range mgr.GetModelInstances(modelID) {
+		if len(inst.workerCmd) != 1 || inst.workerCmd[0] != filepath.Join(projectRoot, "llm-worker") {
 			t.Fatalf("replacement instance has wrong worker cmd: %+v", inst.workerCmd)
 		}
 	}

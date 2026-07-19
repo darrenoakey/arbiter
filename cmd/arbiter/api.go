@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -102,9 +103,9 @@ type llmRegisterRequest struct {
 	HFFile         string            `json:"hf_file"`
 	ModelPath      string            `json:"model_path"`
 	Name           string            `json:"name"`
-	MemoryGB       float64           `json:"memory_gb"`
-	CtxSize        int               `json:"ctx_size"`
-	GPULayers      int               `json:"gpu_layers"`
+	MemoryGB       *float64          `json:"memory_gb"`
+	CtxSize        *int              `json:"ctx_size"`
+	GPULayers      *int              `json:"gpu_layers"`
 	WorkerCmd      []string          `json:"worker_cmd"`
 	AdapterParams  map[string]string `json:"adapter_params"`
 	LlamaServerBin string            `json:"llama_server_bin"`
@@ -116,9 +117,11 @@ type llmRegisterRequest struct {
 	LoadMs         *float64          `json:"load_ms"`
 	// Backend selects the inference engine: "llamacpp" (default, uses
 	// llm-worker → llama-server) or "vllm" (uses vllm-chat-worker → vllm serve).
-	Backend       string `json:"backend"`
-	VllmModel     string `json:"vllm_model"`      // VLLM_MODEL env (HF id or repo:file GGUF spec); defaults from HFModel
-	VllmExtraArgs string `json:"vllm_extra_args"` // VLLM_EXTRA_ARGS env (e.g., "--max-model-len 32768 --quantization awq")
+	Backend   string `json:"backend"`
+	VllmModel string `json:"vllm_model"` // Hugging Face id or a canonical absolute model path; defaults from HFModel.
+	// VllmExtraArgs is retained only to return a specific migration error.
+	// Free-form subprocess flags are never persisted or executed.
+	VllmExtraArgs string `json:"vllm_extra_args"`
 }
 
 func NewAPI(cfg *Config, store *Store, mgr *InstanceManager, sched *Scheduler, logger *EventLogger, outputDir, projectRoot string) *API {
@@ -344,6 +347,28 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
+	var paramsModel struct {
+		Model string `json:"model"`
+	}
+	if req.Params != nil {
+		if err := json.Unmarshal(req.Params, &paramsModel); err != nil {
+			writeError(w, 400, "invalid job params")
+			return
+		}
+	}
+	// Top-level model is always routing. Nested model is routing only for job
+	// schemas that explicitly support it; voice/model fields owned by RVC, TTS,
+	// and LLM adapters remain semantic payload.
+	if err := rejectDisabledStillImage(req.Type, req.Model); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	if nestedModelRoutesJob(req.Type) {
+		if err := rejectDisabledStillImage(req.Type, paramsModel.Model); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+	}
 
 	// If explicit model provided and configured, use it; otherwise fall back to type mapping
 	var modelID string
@@ -358,18 +383,13 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		modelID, ok = JobTypeToModel[req.Type]
-		// Also check for model inside params (callers may put it there)
-		if ok {
-			var pm struct {
-				Model string `json:"model"`
-			}
-			if err := json.Unmarshal(req.Params, &pm); err != nil {
-				writeError(w, 400, "invalid job params")
-				return
-			}
-			if pm.Model != "" {
-				if _, exists := a.config.Models[pm.Model]; exists {
-					modelID = pm.Model
+		// Also check for a configured model inside params. Job-specific model
+		// fields (for example rvc-convert's trained voice) are otherwise left to
+		// the adapter and do not become routing overrides.
+		if ok && nestedModelRoutesJob(req.Type) {
+			if paramsModel.Model != "" {
+				if _, exists := a.config.Models[paramsModel.Model]; exists {
+					modelID = paramsModel.Model
 				}
 			}
 		}
@@ -398,7 +418,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, fmt.Sprintf("unknown job type: %s", req.Type))
 		return
 	}
-	if err := rejectSparkImageGeneration(req.Type, modelID); err != nil {
+	if err := validateJobModelCompatibility(req.Type, modelID); err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
@@ -575,18 +595,6 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		"model":             modelID,
 		"estimated_seconds": estimated / 1000,
 	})
-}
-
-func rejectSparkImageGeneration(jobType, modelID string) error {
-	if modelID == "z-image-turbo" {
-		return fmt.Errorf("z-image-turbo is permanently disabled on Spark; use the image server/Codex path")
-	}
-	switch jobType {
-	case "image-generate", "image-edit":
-		return fmt.Errorf("spark image generation is permanently disabled; use the image server/Codex path")
-	default:
-		return nil
-	}
 }
 
 func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
@@ -977,23 +985,32 @@ func (a *API) listReservations(w http.ResponseWriter, r *http.Request) {
 }
 
 func validateModelConfigRequest(req modelConfigRequest) error {
-	if req.MemoryGB != nil && *req.MemoryGB <= 0 {
-		return fmt.Errorf("memory_gb must be > 0")
+	if req.MemoryGB != nil && !finitePositive(*req.MemoryGB) {
+		return fmt.Errorf("memory_gb must be finite and > 0")
 	}
-	if req.MaxConcurrent != nil && *req.MaxConcurrent < 1 {
-		return fmt.Errorf("max_concurrent must be >= 1")
+	if req.MaxConcurrent != nil && (*req.MaxConcurrent < 1 || *req.MaxConcurrent > maximumModelConcurrency) {
+		return fmt.Errorf("max_concurrent must be between 1 and %d", maximumModelConcurrency)
 	}
-	if req.MaxInstances != nil && *req.MaxInstances < 0 {
-		return fmt.Errorf("max_instances must be >= 0")
+	if req.MaxInstances != nil && (*req.MaxInstances < 0 || *req.MaxInstances > maximumModelInstances) {
+		return fmt.Errorf("max_instances must be between 0 and %d", maximumModelInstances)
 	}
-	if req.KeepAliveSec != nil && *req.KeepAliveSec < 0 {
-		return fmt.Errorf("keep_alive_seconds must be >= 0")
+	if req.KeepAliveSec != nil && (*req.KeepAliveSec < 0 || *req.KeepAliveSec > maximumDurationSeconds) {
+		return fmt.Errorf("keep_alive_seconds must be between 0 and %d", maximumDurationSeconds)
 	}
-	if req.AvgInferenceMs != nil && *req.AvgInferenceMs < 0 {
-		return fmt.Errorf("avg_inference_ms must be >= 0")
+	if req.MaxRuntimeSec != nil && (*req.MaxRuntimeSec < 1 || *req.MaxRuntimeSec > maximumDurationSeconds) {
+		return fmt.Errorf("max_runtime_seconds must be between 1 and %d", maximumDurationSeconds)
 	}
-	if req.LoadMs != nil && *req.LoadMs < 0 {
-		return fmt.Errorf("load_ms must be >= 0")
+	if req.AvgInferenceMs != nil && !finiteRange(*req.AvgInferenceMs, 0, maximumMetricMillis) {
+		return fmt.Errorf("avg_inference_ms must be finite and between 0 and %d", maximumMetricMillis)
+	}
+	if req.LoadMs != nil && !finiteRange(*req.LoadMs, 0, maximumMetricMillis) {
+		return fmt.Errorf("load_ms must be finite and between 0 and %d", maximumMetricMillis)
+	}
+	if req.PressureIndex != nil && !finiteRange(*req.PressureIndex, 0, 1) {
+		return fmt.Errorf("pressure_index must be finite and between 0 and 1")
+	}
+	if req.GroupPriority != nil && (*req.GroupPriority < -1000000 || *req.GroupPriority > 1000000) {
+		return fmt.Errorf("group_priority must be between -1000000 and 1000000")
 	}
 	if req.WorkerCmd != nil && len(*req.WorkerCmd) == 0 {
 		return fmt.Errorf("worker_cmd must not be empty")
@@ -1103,6 +1120,68 @@ func applyModelConfigRequest(cfg ModelConfig, req modelConfigRequest) ModelConfi
 	return cfg
 }
 
+func (a *API) applyRegisteredModelRuntime(modelID string, config ModelConfig) (map[string]any, error) {
+	a.config.Models[modelID] = config
+	a.mgr.EnsureModel(modelID)
+	result := a.mgr.ScaleModel(modelID, *config.MaxInstances, config)
+	a.mgr.ApplyModelConfig(modelID, config)
+	return result, a.verifyModelRuntime(modelID, config, *config.MaxInstances)
+}
+
+func (a *API) rollbackRegisteredModelRuntime(modelID string) error {
+	delete(a.config.Models, modelID)
+	return a.mgr.RemoveModelRuntime(modelID)
+}
+
+func (a *API) applyUpdatedModelRuntime(modelID string, current, updated ModelConfig, reload bool) (map[string]any, error) {
+	a.config.Models[modelID] = updated
+	a.mgr.ApplyModelConfig(modelID, updated)
+	var result map[string]any
+	if reload {
+		result = a.mgr.ReloadModel(modelID, *updated.MaxInstances, updated)
+	} else if *updated.MaxInstances != *current.MaxInstances {
+		result = a.mgr.ScaleModel(modelID, *updated.MaxInstances, updated)
+	}
+	return result, a.verifyModelRuntime(modelID, updated, *updated.MaxInstances)
+}
+
+func (a *API) rollbackUpdatedModelRuntime(modelID string, current ModelConfig, reload bool) error {
+	a.config.Models[modelID] = current
+	if reload {
+		a.mgr.ReloadModel(modelID, *current.MaxInstances, current)
+	} else {
+		a.mgr.ScaleModel(modelID, *current.MaxInstances, current)
+		a.mgr.ApplyModelConfig(modelID, current)
+	}
+	return a.verifyModelRuntime(modelID, current, *current.MaxInstances)
+}
+
+func (a *API) verifyModelRuntime(modelID string, config ModelConfig, expectedLocal int) error {
+	return verifyModelRuntime(a.config, a.mgr, modelID, config, expectedLocal)
+}
+
+func verifyModelRuntime(rootConfig *Config, manager *InstanceManager, modelID string, config ModelConfig, expectedLocal int) error {
+	localCount := 0
+	for _, instance := range manager.GetModelInstances(modelID) {
+		if instance.isRemote() {
+			continue
+		}
+		localCount++
+		instance.mu.Lock()
+		valid := instance.MaxConcurrent == config.MaxConcurrent &&
+			maps.Equal(instance.adapterParams, config.AdapterParams) &&
+			slices.Equal(instance.workerCmd, config.WorkerCmd)
+		instance.mu.Unlock()
+		if !valid {
+			return fmt.Errorf("runtime config verification failed for instance %q", instance.InstanceID)
+		}
+	}
+	if rootConfig.HasLocalPlacement(config) && localCount != expectedLocal {
+		return fmt.Errorf("runtime scale verification failed for model %q: got %d local instances, want %d", modelID, localCount, expectedLocal)
+	}
+	return nil
+}
+
 func (a *API) registerModel(w http.ResponseWriter, r *http.Request) {
 	var req modelConfigRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1117,24 +1196,39 @@ func (a *API) registerModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "model_id is required")
 		return
 	}
+	candidateCfg := applyModelConfigRequest(ModelConfig{}, req)
+	if err := validateModelWorkerPolicy(a.projectRoot, req.ModelID, candidateCfg, a.config.HasLocalPlacement(candidateCfg)); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
 	if _, exists := a.config.Models[req.ModelID]; exists {
 		writeError(w, 409, fmt.Sprintf("model already configured: %s", req.ModelID))
 		return
 	}
 
 	one := 1
+	fullPressure := 1.0
 	cfg := ModelConfig{
 		MaxConcurrent: 1,
 		MaxInstances:  &one,
 		KeepAliveSec:  300,
+		MaxRuntimeSec: 7200,
+		PressureIndex: &fullPressure,
 	}
 	cfg = applyModelConfigRequest(cfg, req)
-	a.config.Models[req.ModelID] = cfg
-	a.mgr.EnsureModel(req.ModelID)
-
-	scaleResult := a.mgr.ScaleModel(req.ModelID, *cfg.MaxInstances, cfg)
-	a.mgr.ApplyModelConfig(req.ModelID, cfg)
-	if err := SaveModelConfig(a.projectRoot, req.ModelID, cfg); err != nil {
+	if err := validateModelConfigNumbers(cfg, a.config.VRAMBudgetGB); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	var scaleResult map[string]any
+	err := persistModelConfigTransaction(a.projectRoot, req.ModelID, cfg, a.config.VRAMBudgetGB, func() error {
+		var applyErr error
+		scaleResult, applyErr = a.applyRegisteredModelRuntime(req.ModelID, cfg)
+		return applyErr
+	}, func() error {
+		return a.rollbackRegisteredModelRuntime(req.ModelID)
+	})
+	if err != nil {
 		writeError(w, 500, fmt.Sprintf("persist model config: %s", err))
 		return
 	}
@@ -1184,6 +1278,10 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	current := a.config.Models[modelID]
+	if disabledStillImageConfig(modelID, current) {
+		writeError(w, 400, stillImageDisabledMessage)
+		return
+	}
 
 	var req modelConfigRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1200,9 +1298,14 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	updated := applyModelConfigRequest(current, req)
-	a.config.Models[modelID] = updated
-	a.mgr.ApplyModelConfig(modelID, updated)
-
+	if err := validateModelConfigNumbers(updated, a.config.VRAMBudgetGB); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	if err := validateModelWorkerPolicy(a.projectRoot, modelID, updated, a.config.HasLocalPlacement(updated)); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
 	result := map[string]any{
 		"model_id":                modelID,
 		"max_instances":           *updated.MaxInstances,
@@ -1213,8 +1316,18 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var scaleResult map[string]any
+	err := persistModelConfigTransaction(a.projectRoot, modelID, updated, a.config.VRAMBudgetGB, func() error {
+		var applyErr error
+		scaleResult, applyErr = a.applyUpdatedModelRuntime(modelID, current, updated, req.ReloadWorkers)
+		return applyErr
+	}, func() error {
+		return a.rollbackUpdatedModelRuntime(modelID, current, req.ReloadWorkers)
+	})
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("persist model config: %s", err))
+		return
+	}
 	if req.ReloadWorkers {
-		scaleResult = a.mgr.ReloadModel(modelID, *updated.MaxInstances, updated)
 		a.logger.Log("model.reloaded", map[string]any{
 			"model_id":  modelID,
 			"added":     scaleResult["added"],
@@ -1222,7 +1335,6 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 			"condemned": scaleResult["condemned"],
 		})
 	} else if req.MaxInstances != nil && *req.MaxInstances != *current.MaxInstances {
-		scaleResult = a.mgr.ScaleModel(modelID, *updated.MaxInstances, updated)
 		a.logger.Log("model.scaled", map[string]any{
 			"model_id":          modelID,
 			"old_max_instances": *current.MaxInstances,
@@ -1238,11 +1350,6 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 		result["removed"] = scaleResult["removed"]
 		result["condemned"] = scaleResult["condemned"]
 	}
-	if err := SaveModelConfig(a.projectRoot, modelID, updated); err != nil {
-		writeError(w, 500, fmt.Sprintf("persist model config: %s", err))
-		return
-	}
-
 	a.scheduler.rescoreModel(modelID)
 	a.scheduler.Wake()
 	if req.MaxConcurrent != nil && *req.MaxConcurrent != current.MaxConcurrent {
@@ -1287,6 +1394,10 @@ func (a *API) reloadModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg := a.config.Models[modelID]
+	if err := validateModelWorkerPolicy(a.projectRoot, modelID, cfg, a.config.HasLocalPlacement(cfg)); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
 	scaleResult := a.mgr.ReloadModel(modelID, *cfg.MaxInstances, cfg)
 	a.scheduler.rescoreModel(modelID)
 	a.scheduler.Wake()
@@ -1511,12 +1622,7 @@ func llmModelID(name string) string {
 }
 
 func llmWorkerBin(projectRoot string) string {
-	// Try built binary first
-	bin := filepath.Join(projectRoot, "llm-worker")
-	if _, err := os.Stat(bin); err == nil {
-		return bin
-	}
-	return "llm-worker" // hope it's in PATH
+	return filepath.Join(projectRoot, "llm-worker")
 }
 
 func defaultLLMWorkerBin(backend, projectRoot string) string {
@@ -1527,11 +1633,7 @@ func defaultLLMWorkerBin(backend, projectRoot string) string {
 }
 
 func vllmChatWorkerBin(projectRoot string) string {
-	bin := filepath.Join(projectRoot, "vllm-chat-worker")
-	if _, err := os.Stat(bin); err == nil {
-		return bin
-	}
-	return "vllm-chat-worker"
+	return filepath.Join(projectRoot, "vllm-chat-worker")
 }
 
 func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
@@ -1546,6 +1648,18 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 	}
 	if backend != "llamacpp" && backend != "vllm" {
 		writeError(w, 400, "backend must be 'llamacpp' or 'vllm'")
+		return
+	}
+	if strings.TrimSpace(req.VllmExtraArgs) != "" {
+		writeError(w, 400, "vllm_extra_args is disabled; use sanctioned structured adapter_params")
+		return
+	}
+	if req.CtxSize != nil && (*req.CtxSize < 128 || *req.CtxSize > 1048576) {
+		writeError(w, 400, "ctx_size must be between 128 and 1048576")
+		return
+	}
+	if req.GPULayers != nil && (*req.GPULayers < -1 || *req.GPULayers > 10000) {
+		writeError(w, 400, "gpu_layers must be between -1 and 10000")
 		return
 	}
 	if backend == "llamacpp" && req.HFModel == "" && req.ModelPath == "" {
@@ -1586,19 +1700,20 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Estimate memory if not provided
-	memGB := req.MemoryGB
-	if memGB == 0 {
+	memGB := 45.0
+	if req.MemoryGB == nil {
 		// Default conservative estimate: 45GB for a 20B model
-		memGB = 45
 		slog.Warn("no memory_gb specified for LLM, using default", "model", name, "memory_gb", memGB)
+	} else {
+		memGB = *req.MemoryGB
 	}
 
 	// Build adapter params (env vars for the worker). The set of env vars
 	// depends on the backend — llama.cpp consumes LLM_*, vllm consumes VLLM_*.
 	adapterParams := make(map[string]string)
-	ctx := req.CtxSize
-	if ctx == 0 {
-		ctx = 8192
+	ctx := 8192
+	if req.CtxSize != nil {
+		ctx = *req.CtxSize
 	}
 	if backend == "llamacpp" {
 		if req.HFModel != "" {
@@ -1611,9 +1726,9 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 			adapterParams["LLM_MODEL_PATH"] = req.ModelPath
 		}
 		adapterParams["LLM_CTX_SIZE"] = strconv.Itoa(ctx)
-		gpuLayers := req.GPULayers
-		if gpuLayers == 0 {
-			gpuLayers = -1
+		gpuLayers := -1
+		if req.GPULayers != nil {
+			gpuLayers = *req.GPULayers
 		}
 		adapterParams["LLM_GPU_LAYERS"] = strconv.Itoa(gpuLayers)
 		if req.LlamaServerBin != "" {
@@ -1631,16 +1746,7 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		adapterParams["VLLM_MODEL"] = vmodel
-		extra := strings.TrimSpace(req.VllmExtraArgs)
-		// Inject context size if caller didn't explicitly set --max-model-len.
-		if !strings.Contains(extra, "--max-model-len") {
-			if extra == "" {
-				extra = "--max-model-len " + strconv.Itoa(ctx)
-			} else {
-				extra = "--max-model-len " + strconv.Itoa(ctx) + " " + extra
-			}
-		}
-		adapterParams["VLLM_EXTRA_ARGS"] = extra
+		adapterParams["VLLM_MAX_MODEL_LEN"] = strconv.Itoa(ctx)
 		adapterParams["LLM_CTX_SIZE"] = strconv.Itoa(ctx) // for visibility/inspection
 	}
 	adapterParams["LLM_BACKEND"] = backend
@@ -1650,6 +1756,7 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 
 	// Register in config
 	one := 1
+	fullPressure := 1.0
 	cfg := ModelConfig{
 		MemoryGB:       memGB,
 		MaxConcurrent:  1,
@@ -1658,6 +1765,7 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 		MaxRuntimeSec:  600,
 		AvgInferenceMs: 5000,
 		LoadMs:         120000, // LLMs can take a while to download + load
+		PressureIndex:  &fullPressure,
 		WorkerCmd:      []string{defaultLLMWorkerBin(backend, a.projectRoot)},
 		AdapterParams:  adapterParams,
 	}
@@ -1683,17 +1791,39 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 	if req.LoadMs != nil {
 		cfg.LoadMs = *req.LoadMs
 	}
-	a.config.Models[modelID] = cfg
-
-	// Register job type mapping
-	JobTypeToModel["chat-completion:"+name] = modelID
-
-	// Create instance
-	result := a.mgr.ScaleModel(modelID, *cfg.MaxInstances, cfg)
-
-	// Persist
-	if err := SaveModelConfig(a.projectRoot, modelID, cfg); err != nil {
-		slog.Error("failed to persist LLM config", "error", err)
+	modelRequest := modelConfigRequest{
+		MemoryGB: &cfg.MemoryGB, MaxConcurrent: &cfg.MaxConcurrent, MaxInstances: cfg.MaxInstances,
+		KeepAliveSec: &cfg.KeepAliveSec, MaxRuntimeSec: &cfg.MaxRuntimeSec,
+		AvgInferenceMs: &cfg.AvgInferenceMs, LoadMs: &cfg.LoadMs,
+	}
+	if err := validateModelConfigRequest(modelRequest); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	if err := validateModelConfigNumbers(cfg, a.config.VRAMBudgetGB); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	if err := validateModelWorkerPolicy(a.projectRoot, modelID, cfg, true); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	jobType := "chat-completion:" + name
+	var result map[string]any
+	err := persistModelConfigTransaction(a.projectRoot, modelID, cfg, a.config.VRAMBudgetGB, func() error {
+		var applyErr error
+		result, applyErr = a.applyRegisteredModelRuntime(modelID, cfg)
+		if applyErr == nil {
+			JobTypeToModel[jobType] = modelID
+		}
+		return applyErr
+	}, func() error {
+		delete(JobTypeToModel, jobType)
+		return a.rollbackRegisteredModelRuntime(modelID)
+	})
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("persist LLM config: %s", err))
+		return
 	}
 
 	a.scheduler.rescoreModel(modelID)

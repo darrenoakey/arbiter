@@ -1,4 +1,5 @@
 """Aesthetic image scorer adapter — CLIP-based multi-dimensional aesthetic scoring."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -8,6 +9,10 @@ import math
 import threading
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, cast
+
+if TYPE_CHECKING:
+    import torch
 
 from arbiter.adapters.base import ModelAdapter, InferenceError
 from arbiter.adapters.registry import register
@@ -27,13 +32,21 @@ _SCORE_NAMES = (
 )
 
 
+class _Processor(Protocol):
+    def __call__(self, **kwargs: object) -> dict[str, "torch.Tensor"]: ...
+
+
+class _Scorer(Protocol):
+    def __call__(self, pixels: "torch.Tensor") -> "torch.Tensor": ...
+
+
 @register
 class AestheticScorerAdapter(ModelAdapter):
     model_id = "aesthetic-scorer"
 
     def __init__(self):
-        self._processor = None
-        self._model = None
+        self._processor: _Processor | None = None
+        self._model: _Scorer | None = None
         self._device = "cpu"
 
     def load(self, device: str = "cuda") -> None:
@@ -50,8 +63,12 @@ class AestheticScorerAdapter(ModelAdapter):
         backbone = CLIPModel.from_pretrained(_BACKBONE_REPOSITORY).vision_model
 
         # Load custom scorer class from HF repo
-        module_path = Path(hf_hub_download(_MODEL_REPOSITORY, "aesthetic_scorer.py", repo_type="model"))
-        spec = importlib.util.spec_from_file_location("hf_aesthetic_scorer", module_path)
+        module_path = Path(
+            hf_hub_download(_MODEL_REPOSITORY, "aesthetic_scorer.py", repo_type="model")
+        )
+        spec = importlib.util.spec_from_file_location(
+            "hf_aesthetic_scorer", module_path
+        )
         if spec is None or spec.loader is None:
             raise InferenceError(f"Unable to load module spec from {module_path}")
         module = importlib.util.module_from_spec(spec)
@@ -60,13 +77,15 @@ class AestheticScorerAdapter(ModelAdapter):
 
         # Build model and load trained weights
         model = scorer_class(backbone)
-        state_path = Path(hf_hub_download(_MODEL_REPOSITORY, "model.pt", repo_type="model"))
+        state_path = Path(
+            hf_hub_download(_MODEL_REPOSITORY, "model.pt", repo_type="model")
+        )
         state_dict = torch.load(state_path, map_location=device)
         model.load_state_dict(state_dict, strict=True)
         model.eval()
 
-        self._processor = processor
-        self._model = model.to(device)
+        self._processor = cast(_Processor, processor)
+        self._model = cast(_Scorer, model.to(device))
         self._device = device
         log.info("Aesthetic scorer ready.")
 
@@ -78,7 +97,9 @@ class AestheticScorerAdapter(ModelAdapter):
         self._processor = None
         self._cleanup_gpu()
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         import torch
 
         self._check_cancel(cancel_flag)
@@ -89,10 +110,14 @@ class AestheticScorerAdapter(ModelAdapter):
 
         # Run inference
         start = time.perf_counter()
-        pixel_values = self._processor(images=image, return_tensors="pt")["pixel_values"]
+        processor = self._processor
+        model = self._model
+        if processor is None or model is None:
+            raise InferenceError("aesthetic-scorer not loaded")
+        pixel_values = processor(images=image, return_tensors="pt")["pixel_values"]
         pixel_values = pixel_values.to(self._device)
         with torch.no_grad():
-            outputs = self._model(pixel_values)
+            outputs = model(pixel_values)
 
         scores = {}
         for name, value in zip(_SCORE_NAMES, outputs, strict=True):

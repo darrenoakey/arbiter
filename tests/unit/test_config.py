@@ -1,6 +1,9 @@
 """Tests for config loading and validation."""
-import json
 
+import json
+import os
+import subprocess
+import sys
 
 from arbiter.config import ArbiterConfig, ModelConfig, load_config
 
@@ -17,9 +20,14 @@ class TestModelConfig:
 
     def test_all_fields(self):
         mc = ModelConfig(
-            memory_gb=12, max_concurrent=2, keep_alive_seconds=600,
-            avg_inference_ms=2000, load_ms=15000,
-            auto_download="org/model", model_path="/tmp/m", group=True,
+            memory_gb=12,
+            max_concurrent=2,
+            keep_alive_seconds=600,
+            avg_inference_ms=2000,
+            load_ms=15000,
+            auto_download="org/model",
+            model_path="/tmp/m",
+            group=True,
         )
         assert mc.memory_gb == 12
         assert mc.group is True
@@ -40,7 +48,7 @@ class TestArbiterConfig:
         assert cfg.models["model-a"].max_concurrent == 2
 
     def test_unknown_fields_ignored(self):
-        cfg = ArbiterConfig(vram_budget_gb=50, unknown_field="x")
+        cfg = ArbiterConfig.model_validate({"vram_budget_gb": 50, "unknown_field": "x"})
         assert cfg.vram_budget_gb == 50
 
 
@@ -56,18 +64,37 @@ class TestLoadConfig:
     def test_config_overrides_default(self, tmp_path):
         local = tmp_path / "local"
         local.mkdir()
-        (local / "config.default.json").write_text(json.dumps({"vram_budget_gb": 80, "models": {}}))
-        (local / "config.json").write_text(json.dumps({"vram_budget_gb": 90, "models": {}}))
+        (local / "config.default.json").write_text(
+            json.dumps({"vram_budget_gb": 80, "models": {}})
+        )
+        (local / "config.json").write_text(
+            json.dumps({"vram_budget_gb": 90, "models": {}})
+        )
         cfg = load_config(tmp_path)
         assert cfg.vram_budget_gb == 90
 
-    def test_env_override(self, tmp_path, monkeypatch):
+    def test_environment_override_in_child_process(self, tmp_path):
         local = tmp_path / "local"
         local.mkdir()
-        (local / "config.default.json").write_text(json.dumps({"vram_budget_gb": 80, "models": {}}))
-        monkeypatch.setenv("ARBITER_VRAM_BUDGET_GB", "50")
-        cfg = load_config(tmp_path)
-        assert cfg.vram_budget_gb == 50
+        (local / "config.default.json").write_text(
+            json.dumps({"vram_budget_gb": 80, "models": {}})
+        )
+        child_environment = os.environ.copy()
+        child_environment["ARBITER_VRAM_BUDGET_GB"] = "50"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; from pathlib import Path; from arbiter.config import load_config; "
+                "print(load_config(Path(sys.argv[1])).vram_budget_gb)",
+                str(tmp_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=child_environment,
+        )
+        assert completed.stdout.strip() == "50.0"
 
     def test_no_config_returns_default(self, tmp_path):
         cfg = load_config(tmp_path)

@@ -1,15 +1,22 @@
 """FLUX.1-schnell text/image generation adapter."""
+
 from __future__ import annotations
 
 import base64
+import importlib
 import importlib.util
 import io
 import logging
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, cast
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 from arbiter.adapters.base import ModelAdapter, InferenceError
 from arbiter.adapters.registry import register
+from arbiter.image_policy import raise_still_image_disabled
 
 log = logging.getLogger(__name__)
 
@@ -27,22 +34,36 @@ ASPECT_RATIOS = {
 }
 
 
+class _PipelineResult(Protocol):
+    images: list["Image.Image"]
+
+
+class _ImagePipeline(Protocol):
+    def __call__(self, **kwargs: object) -> _PipelineResult: ...
+    def enable_xformers_memory_efficient_attention(self) -> None: ...
+
+
 @register
 class FluxSchnellAdapter(ModelAdapter):
     model_id = "flux-schnell"
 
     def __init__(self):
-        self._pipe = None
-        self._img2img_pipe = None
+        self._pipe: _ImagePipeline | None = None
+        self._img2img_pipe: _ImagePipeline | None = None
 
     def load(self, device: str = "cuda") -> None:
+        raise_still_image_disabled()
         import torch
-        from diffusers import DiffusionPipeline
+
+        DiffusionPipeline = importlib.import_module("diffusers").DiffusionPipeline
 
         log.info("Loading FLUX.1-schnell on %s ...", device)
-        self._pipe = DiffusionPipeline.from_pretrained(
-            FLUX_HF_ID,
-            torch_dtype=torch.bfloat16,
+        self._pipe = cast(
+            _ImagePipeline,
+            DiffusionPipeline.from_pretrained(
+                FLUX_HF_ID,
+                torch_dtype=torch.bfloat16,
+            ),
         )
         # GB10 mmap→cuda workaround: clone each tensor off mmap-backed
         # storage before moving to device. See base._pipe_to_cuda_cloned.
@@ -66,15 +87,20 @@ class FluxSchnellAdapter(ModelAdapter):
         self._cleanup_gpu()
 
     def _get_img2img_pipe(self):
+        raise_still_image_disabled()
         if self._img2img_pipe is not None:
             return self._img2img_pipe
         import torch
-        from diffusers import FluxImg2ImgPipeline
+
+        FluxImg2ImgPipeline = importlib.import_module("diffusers").FluxImg2ImgPipeline
 
         log.info("Loading FLUX.1-schnell img2img pipeline ...")
-        self._img2img_pipe = FluxImg2ImgPipeline.from_pretrained(
-            FLUX_HF_ID,
-            torch_dtype=torch.bfloat16,
+        self._img2img_pipe = cast(
+            _ImagePipeline,
+            FluxImg2ImgPipeline.from_pretrained(
+                FLUX_HF_ID,
+                torch_dtype=torch.bfloat16,
+            ),
         )
         self._pipe_to_cuda_cloned(self._img2img_pipe, self._device)
 
@@ -93,7 +119,10 @@ class FluxSchnellAdapter(ModelAdapter):
         height = int(params.get("height", 1024))
         return width, height
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
+        raise_still_image_disabled()
         import torch
         from PIL import Image
 
@@ -117,7 +146,9 @@ class FluxSchnellAdapter(ModelAdapter):
             if image_b64.startswith("data:"):
                 _, image_b64 = image_b64.split(",", 1)
             try:
-                input_image = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
+                input_image = Image.open(
+                    io.BytesIO(base64.b64decode(image_b64))
+                ).convert("RGB")
             except Exception as e:
                 raise InferenceError(f"Failed to decode input image: {e}")
 
@@ -132,7 +163,10 @@ class FluxSchnellAdapter(ModelAdapter):
             ).images[0]
         else:
             # Text-to-image
-            result_image = self._pipe(
+            pipe = self._pipe
+            if pipe is None:
+                raise InferenceError("flux-schnell not loaded")
+            result_image = pipe(
                 prompt=prompt,
                 width=width,
                 height=height,
@@ -143,11 +177,13 @@ class FluxSchnellAdapter(ModelAdapter):
         self._check_cancel(cancel_flag)
 
         if transparent:
-            # Defer to BiRefNet if available, otherwise skip
+            # Defer to a separate BiRefNet job when that adapter is available.
             if importlib.util.find_spec("arbiter.adapters.birefnet") is not None:
                 # Inline background removal is not supported here;
                 # the caller should chain a birefnet job instead.
-                log.warning("transparent=true requested but should be handled as a separate birefnet job")
+                log.warning(
+                    "transparent=true requested but should be handled as a separate birefnet job"
+                )
 
         output_dir.mkdir(parents=True, exist_ok=True)
         out_path = output_dir / "result.png"

@@ -11,6 +11,7 @@ Expected params:
 Output dict:
     {"file": "result.mp4", "format": "mp4"}
 """
+
 from __future__ import annotations
 
 import logging
@@ -70,7 +71,9 @@ class FaceRestoreAdapter(ModelAdapter):
             self._restorer = None
         self._cleanup_gpu()
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         import numpy as np
 
         if self._restorer is None:
@@ -92,13 +95,20 @@ class FaceRestoreAdapter(ModelAdapter):
         # Probe input video dims + fps
         probe = subprocess.run(
             [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,r_frame_rate",
-                "-of", "csv=p=0",
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height,r_frame_rate",
+                "-of",
+                "csv=p=0",
                 str(video_file),
             ],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         )
         w_str, h_str, fps_str = probe.stdout.strip().split(",")
         width = int(w_str)
@@ -107,29 +117,60 @@ class FaceRestoreAdapter(ModelAdapter):
         fps = float(fr_num) / float(fr_den) if float(fr_den) > 0 else 25.0
         frame_bytes = width * height * 3
 
-        log.info("face-restore: input %dx%d @ %.2f fps, weight=%.2f", width, height, fps, weight)
+        log.info(
+            "face-restore: input %dx%d @ %.2f fps, weight=%.2f",
+            width,
+            height,
+            fps,
+            weight,
+        )
 
         # PHASE 1 (CPU): spawn ffmpeg to decode video into rawvideo rgb24 bytes
         dec = subprocess.Popen(
             [
-                "ffmpeg", "-v", "error", "-i", str(video_file),
-                "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+                "ffmpeg",
+                "-v",
+                "error",
+                "-i",
+                str(video_file),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-",
             ],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
 
         # PHASE 3 (CPU): spawn ffmpeg to encode raw rgb back into a temp video
         tmp_video = str(output_dir / "_restored_video.mp4")
         enc = subprocess.Popen(
             [
-                "ffmpeg", "-y", "-v", "error",
-                "-f", "rawvideo", "-pix_fmt", "rgb24",
-                "-s", f"{width}x{height}", "-r", f"{fps}",
-                "-i", "-",
-                "-c:v", "h264_nvenc", "-preset", "fast", "-pix_fmt", "yuv420p",
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                f"{width}x{height}",
+                "-r",
+                f"{fps}",
+                "-i",
+                "-",
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "fast",
+                "-pix_fmt",
+                "yuv420p",
                 tmp_video,
             ],
-            stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
         if dec.stdout is None or enc.stdin is None:
             raise InferenceError("ffmpeg pipes failed to open")
@@ -165,7 +206,11 @@ class FaceRestoreAdapter(ModelAdapter):
                 enc.stdin.write(restored_rgb.tobytes())
                 frame_count += 1
                 if frame_count % 100 == 0:
-                    log.info("face-restore: processed %d frames (%d with faces)", frame_count, faces_found)
+                    log.info(
+                        "face-restore: processed %d frames (%d with faces)",
+                        frame_count,
+                        faces_found,
+                    )
         except CancelledException:
             dec.kill()
             enc.kill()
@@ -186,11 +231,24 @@ class FaceRestoreAdapter(ModelAdapter):
         # Mux the restored video with the original audio track
         mux = subprocess.run(
             [
-                "ffmpeg", "-y", "-v", "error",
-                "-i", tmp_video,
-                "-i", str(video_file),
-                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                "-map", "0:v", "-map", "1:a",
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                tmp_video,
+                "-i",
+                str(video_file),
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
                 "-shortest",
                 str(result_path),
             ],
@@ -203,7 +261,8 @@ class FaceRestoreAdapter(ModelAdapter):
 
         log.info(
             "face-restore done: %d frames, %d with faces (%.1f%%)",
-            frame_count, faces_found,
+            frame_count,
+            faces_found,
             100.0 * faces_found / max(frame_count, 1),
         )
         return {

@@ -1,4 +1,5 @@
 """Report formatting for calibration results."""
+
 from __future__ import annotations
 
 import json
@@ -9,9 +10,9 @@ def print_report(results: dict):
     name = results["model_name"]
     m = results["measurements"]
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f" Calibration Report: {name}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f" Hardware: {results['hardware'].get('gpu', 'unknown')}")
     print(f" Date: {results['calibrated_at']}")
     print()
@@ -22,8 +23,10 @@ def print_report(results: dict):
 
     profiles = m.get("concurrency_profiles", [])
     if profiles:
-        print(f" {'Conc':<6} {'Avg ms':<10} {'P50 ms':<10} {'P95 ms':<10} {'Peak GB':<10} {'RPS':<8}")
-        print(f" {'-'*54}")
+        print(
+            f" {'Conc':<6} {'Avg ms':<10} {'P50 ms':<10} {'P95 ms':<10} {'Peak GB':<10} {'RPS':<8}"
+        )
+        print(f" {'-' * 54}")
         for p in profiles:
             print(
                 f" {p['concurrency']:<6} {p['avg_inference_time_ms']:<10.0f} "
@@ -38,4 +41,4 @@ def print_report(results: dict):
         print("\n Config entry:")
         print(f"   {json.dumps(results['config_entry'], indent=2)}")
 
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")

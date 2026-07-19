@@ -15,8 +15,8 @@ import (
 	"time"
 )
 
-// localOllama is the real ollama endpoint the Phase-2 remote tests dispatch
-// against. Phase 0 set up llama3.2:3b on this Mac's local ollama; it is the
+// localOllama is the owned SSH forward to the real Mnemos ollama endpoint that
+// the Phase-2 remote tests dispatch against. Mnemos serves llama3.2:3b; it is the
 // small, fast, reliable model the spec mandates (NOT gemma — that would contend
 // with other work and is slow). Host-absence is simulated with an unreachable
 // addr (deadOllamaAddr), so one real endpoint + one dead addr covers routing +
@@ -24,8 +24,8 @@ import (
 const (
 	localOllamaAddr   = "http://127.0.0.1:11434"
 	localOllamaTag    = "llama3.2:3b"
-	mnemosOllamaAddr  = "http://10.0.0.42:11434"
-	macminiOllamaAddr = "http://10.0.0.46:11435"
+	mnemosOllamaAddr  = localOllamaAddr
+	macminiOllamaAddr = "http://127.0.0.1:11435"
 	mnemosEmbedTag    = "nomic-embed-text:latest"
 )
 
@@ -278,16 +278,13 @@ func inferRemoteEmbeddings(t *testing.T, backend *RemoteHTTPBackend, inputs []st
 	return result.Embeddings
 }
 
-// reachableOllama reports whether the local ollama serves the test model. Tests
-// skip (not fail) when it isn't up, so the suite stays runnable on a box without
-// ollama; on this dev Mac it runs for real.
-func reachableOllama(t *testing.T) bool {
+// requireReachableOllama requires the owned Mnemos forward and the live model.
+func requireReachableOllama(t *testing.T) {
 	t.Helper()
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(localOllamaAddr + "/api/tags")
 	if err != nil {
-		t.Logf("local ollama not reachable (%v) — skipping real-remote test", err)
-		return false
+		t.Fatalf("owned Mnemos forward is not reachable: %v", err)
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
@@ -295,8 +292,7 @@ func reachableOllama(t *testing.T) bool {
 		}
 	}()
 	if resp.StatusCode != 200 {
-		t.Logf("local ollama /api/tags returned %d — skipping", resp.StatusCode)
-		return false
+		t.Fatalf("owned Mnemos forward /api/tags returned %d", resp.StatusCode)
 	}
 	var tags struct {
 		Models []struct {
@@ -304,16 +300,14 @@ func reachableOllama(t *testing.T) bool {
 		} `json:"models"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
-		t.Logf("decode local ollama tags: %v", err)
-		return false
+		t.Fatalf("decode Mnemos tags: %v", err)
 	}
 	for _, m := range tags.Models {
 		if m.Name == localOllamaTag {
-			return true
+			return
 		}
 	}
-	t.Logf("local ollama present but %s not pulled — skipping", localOllamaTag)
-	return false
+	t.Fatalf("Mnemos is reachable but required model %s is absent", localOllamaTag)
 }
 
 // deadOllamaAddr returns an addr that will refuse/never-route — a TCP listener
@@ -389,9 +383,7 @@ func pi() *float64 { p := 1.0; return &p }
 
 // (a) A chat job routed to a REMOTE instance returns a real completion.
 func TestRemoteDispatchReturnsRealCompletion(t *testing.T) {
-	if !reachableOllama(t) {
-		t.Skip("local ollama unavailable")
-	}
+	requireReachableOllama(t)
 	cfg := &Config{
 		VRAMBudgetGB: 100,
 		Hosts: map[string]HostConfig{
@@ -446,9 +438,7 @@ func TestRemoteDispatchReturnsRealCompletion(t *testing.T) {
 // (b) CONFIRMED host-absence on the preferred host → the job transparently fails
 // over to a reachable endpoint, NEVER fails, exactly one result.
 func TestRemoteFailoverOnAbsenceCompletesElsewhere(t *testing.T) {
-	if !reachableOllama(t) {
-		t.Skip("local ollama unavailable")
-	}
+	requireReachableOllama(t)
 	dead := deadOllamaAddr(t)
 	cfg := &Config{
 		VRAMBudgetGB: 100,

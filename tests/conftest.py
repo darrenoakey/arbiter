@@ -1,7 +1,6 @@
 """Shared test fixtures for Arbiter tests."""
-from __future__ import annotations
 
-from unittest.mock import MagicMock
+from __future__ import annotations
 
 import pytest
 
@@ -44,6 +43,7 @@ def sample_config_dict():
 def sample_config(sample_config_dict):
     """ArbiterConfig instance from sample dict."""
     from arbiter.config import ArbiterConfig
+
     return ArbiterConfig(**sample_config_dict)
 
 
@@ -57,26 +57,7 @@ def tmp_db(tmp_path):
 def store(tmp_db):
     """JobStore instance with temp database."""
     from arbiter.store import JobStore
+
     s = JobStore(tmp_db)
     yield s
     s.close()
-
-
-@pytest.fixture
-def mock_adapter():
-    """Mock adapter that simulates load/unload/infer."""
-    adapter = MagicMock()
-    adapter.model_id = "mock-model"
-    adapter.load = MagicMock()  # sync
-    adapter.unload = MagicMock()  # sync
-    adapter.infer = MagicMock(return_value={"format": "json"})
-    adapter.estimate_time = MagicMock(return_value=1000.0)
-    return adapter
-
-
-@pytest.fixture
-def mock_logger():
-    """Mock event logger."""
-    logger = MagicMock()
-    logger.log = MagicMock()
-    return logger

@@ -295,6 +295,12 @@ func main() {
 // setupInstances creates Instance objects for all configured models.
 func setupInstances(cfg *Config, mgr *InstanceManager, pythonBin, projectRoot string) {
 	for modelID, modelCfg := range cfg.Models {
+		policyErr := validateModelWorkerPolicy(projectRoot, modelID, modelCfg, cfg.HasLocalPlacement(modelCfg))
+		if policyErr != nil {
+			slog.Error("security policy: refused to register model",
+				"model", modelID, "policy", policyErr)
+			continue
+		}
 		mgr.EnsureModel(modelID)
 		placements := modelCfg.PlacementsOrDefault()
 
@@ -319,13 +325,9 @@ func setupInstances(cfg *Config, mgr *InstanceManager, pythonBin, projectRoot st
 					)
 					inst.host = LocalHost
 					if len(modelCfg.WorkerCmd) > 0 {
-						inst.workerCmd = modelCfg.WorkerCmd
+						inst.workerCmd = cloneStrings(modelCfg.WorkerCmd)
 					}
-					if modelCfg.AdapterParams != nil {
-						for k, v := range modelCfg.AdapterParams {
-							inst.workerEnv = append(inst.workerEnv, k+"="+v)
-						}
-					}
+					inst.adapterParams = cloneAdapterParams(modelCfg.AdapterParams)
 					mgr.Register(inst)
 				}
 				if n > 1 {

@@ -17,8 +17,8 @@ import (
 // absent (+ host.absent event + Cancel fired); a return to reachable → recovered
 // (+ host.recovered). Uses the same real-ollama + dead-addr pattern as Phase 2.
 func TestLivenessPollMarksAbsentThenRecovered(t *testing.T) {
-	// A controllable fake "ollama" whose /api/version we can flip on/off. We
-	// front it with httptest so the test deterministically simulates a host
+	// A controllable HTTP server whose /api/version we can flip on/off. We
+	// front it with httptest so the test deterministically models a host
 	// disappearing and returning — no dependence on actually stopping a daemon.
 	var alive atomic.Bool
 	alive.Store(true)
@@ -55,6 +55,7 @@ func TestLivenessPollMarksAbsentThenRecovered(t *testing.T) {
 		Models: map[string]ModelConfig{
 			"chat": {
 				MemoryGB: 1, MaxConcurrent: 1, MaxInstances: intPtr(1),
+				MaxRuntimeSec: 7200,
 				PressureIndex: pi(),
 				Placements:    []string{"flaky", "spark"},
 				AdapterParams: map[string]string{"remote_model_tag": localOllamaTag},
@@ -214,6 +215,7 @@ func TestKillSwitchFlipsRoutingAndPersists(t *testing.T) {
 		Models: map[string]ModelConfig{
 			"chat": {
 				MemoryGB: 1, MaxConcurrent: 1, MaxInstances: intPtr(1),
+				MaxRuntimeSec: 7200,
 				PressureIndex: pi(),
 				Placements:    []string{"remote1", "spark"},
 			},
@@ -345,9 +347,7 @@ func TestGlobalKillSwitchPinsAllToSpark(t *testing.T) {
 // host + placement_reason and the SEPARATE remote_hosts panel (advisory, NOT in
 // the audited VRAM numbers).
 func TestPSExposesHostPlacementAndRemotePanel(t *testing.T) {
-	if !reachableOllama(t) {
-		t.Skip("local ollama unavailable")
-	}
+	requireReachableOllama(t)
 	projectRoot := t.TempDir()
 	outputDir := filepath.Join(projectRoot, "output")
 	logger := NewEventLogger(filepath.Join(outputDir, "logs"))

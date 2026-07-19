@@ -14,10 +14,12 @@ Expected params dict:
     start_image_file : str — optional path to start keyframe (carried through)
     end_image_file   : str — optional path to end keyframe (carried through)
 """
+
 from __future__ import annotations
 
 import gc
 import logging
+import importlib
 import sys
 import threading
 from pathlib import Path
@@ -59,13 +61,14 @@ class LTX2EncodeAdapter(GroupAdapter):
             sys.path.insert(0, spark_str)
 
         try:
-            import ltx_core  # noqa: F401
-            import ltx_pipelines  # noqa: F401
+            importlib.import_module("ltx_core")
+            importlib.import_module("ltx_pipelines")
         except ImportError as e:
             raise LoadError(f"ltx_core / ltx_pipelines not importable: {e}")
 
         try:
-            from video_fast_gpu import FastPipeline
+            FastPipeline = importlib.import_module("video_fast_gpu").FastPipeline
+
             self._pipeline = FastPipeline()
             # Pre-load the encoders so subsequent chunks reuse them
             self._pipeline._ensure_encode_models()
@@ -88,7 +91,9 @@ class LTX2EncodeAdapter(GroupAdapter):
             self._pipeline = None
         self._cleanup_gpu()
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         if self._pipeline is None:
             raise InferenceError("encode pipeline not loaded")
 
@@ -116,7 +121,11 @@ class LTX2EncodeAdapter(GroupAdapter):
         except ValueError as error:
             raise InferenceError(str(error)) from error
         start_frame_value = params.get("start_frame")
-        start_frame = int(start_frame_value) if start_frame_value is not None else round(start_time * fps)
+        start_frame = (
+            int(start_frame_value)
+            if start_frame_value is not None
+            else round(start_time * fps)
+        )
 
         chunk = {
             "index": chunk_index,
@@ -145,7 +154,10 @@ class LTX2EncodeAdapter(GroupAdapter):
             with self._gpu_lock:
                 self._check_cancel(cancel_flag)
                 result = self._pipeline.run_encode_gpu(
-                    prep=prep, fps=fps, seed=seed, progress_fn=_progress,
+                    prep=prep,
+                    fps=fps,
+                    seed=seed,
+                    progress_fn=_progress,
                 )
 
             self._check_cancel(cancel_flag)
@@ -161,6 +173,7 @@ class LTX2EncodeAdapter(GroupAdapter):
         gc.collect()
         try:
             import torch
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except ImportError:

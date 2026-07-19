@@ -76,13 +76,9 @@ Content-Type: application/json
 
 ```json
 {
-  "type": "image-generate",
+  "type": "background-remove",
   "params": {
-    "prompt": "A cat sitting on a windowsill at sunset",
-    "width": 1024,
-    "height": 1024,
-    "steps": 4,
-    "seed": 42
+    "image_file": "/mnt/arbiter-store/inbox/photo.png"
   }
 }
 ```
@@ -93,8 +89,8 @@ Content-Type: application/json
 {
   "job_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "queued",
-  "model": "flux-schnell",
-  "estimated_seconds": 12.0
+  "model": "birefnet",
+  "estimated_seconds": 1.0
 }
 ```
 
@@ -110,7 +106,7 @@ Content-Type: application/json
 | Status | Condition                         | Body Example                                              |
 |--------|-----------------------------------|-----------------------------------------------------------|
 | 400    | Unknown job type                  | `{"detail": "Unknown job type: foo"}`                     |
-| 400    | Model not configured on server    | `{"detail": "Model not configured: flux-schnell"}`        |
+| 400    | Still-image generation requested  | `{"error": "still-image generation is actively disabled..."}` |
 | 400    | Invalid parameters for job type   | `{"detail": "Invalid params: Field required: 'prompt'"}`  |
 | 422    | Malformed JSON / missing `type`   | Standard FastAPI validation error                         |
 
@@ -132,7 +128,7 @@ GET /v1/jobs/{job_id}
 {
   "job_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "running",
-  "model": "flux-schnell",
+  "model": "birefnet",
   "created_at": 1711000000.0,
   "started_at": 1711000002.5,
   "finished_at": null,
@@ -147,7 +143,7 @@ GET /v1/jobs/{job_id}
 {
   "job_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "completed",
-  "model": "flux-schnell",
+  "model": "birefnet",
   "created_at": 1711000000.0,
   "started_at": 1711000002.5,
   "finished_at": 1711000014.5,
@@ -169,7 +165,7 @@ The `result` object varies by job type (see Section 3 for each type's result sch
 {
   "job_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "failed",
-  "model": "flux-schnell",
+  "model": "birefnet",
   "created_at": 1711000000.0,
   "started_at": 1711000002.5,
   "finished_at": 1711000003.1,
@@ -184,7 +180,7 @@ The `result` object varies by job type (see Section 3 for each type's result sch
 {
   "job_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "cancelled",
-  "model": "flux-schnell",
+  "model": "birefnet",
   "created_at": 1711000000.0,
   "started_at": null,
   "finished_at": 1711000001.2,
@@ -257,13 +253,13 @@ List jobs with optional filters.
 **Request**
 
 ```
-GET /v1/jobs?state=queued&model=flux-schnell&limit=50
+GET /v1/jobs?state=queued&model=birefnet&limit=50
 ```
 
 | Query Param | Type   | Required | Default | Description                                    |
 |-------------|--------|----------|---------|------------------------------------------------|
 | `state`     | string | No       | all     | Filter by state: `queued`, `running`, `completed`, `failed`, `cancelled` |
-| `model`     | string | No       | all     | Filter by model ID (e.g. `flux-schnell`)       |
+| `model`     | string | No       | all     | Filter by model ID (e.g. `birefnet`)           |
 | `limit`     | int    | No       | 100     | Maximum number of jobs to return               |
 
 **Response (200)**
@@ -272,8 +268,8 @@ GET /v1/jobs?state=queued&model=flux-schnell&limit=50
 [
   {
     "job_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-    "type": "image-generate",
-    "model": "flux-schnell",
+    "type": "background-remove",
+    "model": "birefnet",
     "status": "completed",
     "created_at": 1711000000.0,
     "started_at": 1711000002.5,
@@ -314,7 +310,7 @@ GET /v1/ps
   "gpu_utilization_pct": 86,
   "models": [
     {
-      "id": "flux-schnell",
+      "id": "birefnet",
       "state": "loaded",
       "memory_gb": 32.0,
       "active_jobs": 1,
@@ -553,8 +549,8 @@ Content-Type: application/json
     {
       "job_id": "def456",
       "status": "running",
-      "model": "flux-schnell",
-      "type": "image-generate",
+      "model": "birefnet",
+      "type": "background-remove",
       "created_at": 1774045100.0,
       "started_at": 1774045110.0
     },
@@ -573,7 +569,7 @@ Each non-null entry has the same fields as `GET /v1/jobs/{id}` except `result.da
 
 ### POST /v1/models -- Register a Model at Runtime
 
-Add a new model configuration without restarting arbiter. This is useful when the adapter code already exists on disk and you want to start routing work to it immediately via the request `model` field.
+Add configuration for a repository-owned adapter without restarting Arbiter. Model IDs must name a built-in adapter, or be remote-only through `placements`. Still-image generators and unknown local adapters are rejected unconditionally.
 
 **Request**
 
@@ -582,8 +578,8 @@ POST /v1/models
 Content-Type: application/json
 
 {
-  "model_id": "z-image-turbo",
-  "memory_gb": 24,
+  "model_id": "birefnet",
+  "memory_gb": 1,
   "max_concurrent": 1,
   "max_instances": 1,
   "keep_alive_seconds": 1800,
@@ -596,7 +592,7 @@ Content-Type: application/json
 
 ```json
 {
-  "model_id": "z-image-turbo",
+  "model_id": "birefnet",
   "max_instances": 1,
   "max_concurrent": 1,
   "added": 1,
@@ -604,10 +600,10 @@ Content-Type: application/json
 }
 ```
 
-Use the new model immediately by sending it explicitly in job submission:
+Use only the adapter's job-compatible model:
 
 ```json
-{"type": "image-generate", "model": "z-image-turbo", "params": {...}}
+{"type": "background-remove", "model": "birefnet", "params": {"image_file": "..."}}
 ```
 
 ---
@@ -635,15 +631,42 @@ Content-Type: application/json
 {"max_instances": 8}
 ```
 
-You can also roll just that model's workers to pick up new adapter code or env/config without restarting arbiter:
+You can also roll just that model's workers to pick up new adapter code or configuration without restarting Arbiter:
 
 ```json
 {
-  "worker_cmd": ["/home/darren/src/arbiter/vllm-worker"],
-  "adapter_params": {"VLLM_MODEL": "mistralai/Voxtral-4B-TTS-2603"},
   "reload_workers": true
 }
 ```
+
+`worker_cmd` is not an arbitrary command hook. The server accepts only exact,
+model-compatible repository identities: `llm-worker` for `llm:*` llama.cpp
+models, `vllm-chat-worker` for `llm:*` vLLM models, `vllm-worker` for
+`tts-voxtral`, and `python -m arbiter.worker_main <adapter>` through the
+documented repository venvs for Qwen TTS, Kokoro, Demucs, and RVC. Executables
+must use their exact path under the Arbiter project root; arguments, scripts,
+path aliases, repository-worker symlinks, and unknown Python modules are
+rejected. Standard venv interpreter symlinks at the exact documented path are
+allowed. Built-in adapters normally omit `worker_cmd` entirely.
+
+`adapter_params` is also a closed schema, not an environment-variable map.
+Unknown keys, non-ASCII/case variants, loader variables (`LD_*`, `DYLD_*`),
+`PATH`, Python or shell startup variables, runtime option variables such as
+`NODE_OPTIONS`, and free-form command flags are rejected before runtime state
+or `local/config.json` is changed. Persisted configuration is checked again at
+startup and every reload; workers receive a newly constructed minimal
+environment rather than Arbiter's complete environment.
+
+| Worker class | Allowed `adapter_params` |
+|---|---|
+| Built-in Python adapters (LTX2/video, BiRefNet, vision, TTS/STT, talking-head, composite) | None. Their documented tuning remains job parameters, not process environment. |
+| Remote placement | `remote_model_tag` (canonical model identifier; metadata only, never exported to a subprocess) |
+| llama.cpp `llm-worker` | `LLM_BACKEND=llamacpp`, `LLM_HF_REPO`, `LLM_HF_FILE`, `LLM_MODEL_PATH` (existing canonical `.gguf` file), `LLM_CTX_SIZE`, `LLM_GPU_LAYERS`, `LLM_PARALLEL`, `LLAMA_SERVER_BIN` (sanctioned path only), `LLAMA_ARG_CACHE_TYPE_K`, `LLAMA_ARG_CACHE_TYPE_V`, `LLAMA_ARG_FLASH_ATTN`, `LLAMA_ARG_JINJA` |
+| vLLM chat / Voxtral TTS | `LLM_BACKEND=vllm`, `LLM_CTX_SIZE`, `VLLM_MODEL`, `VLLM_MAX_MODEL_LEN`, `VLLM_QUANTIZATION`, `VLLM_DTYPE`, `VLLM_TENSOR_PARALLEL_SIZE`, `VLLM_GPU_MEMORY_UTILIZATION`, `VLLM_MAX_NUM_SEQS`, `VLLM_READY_TIMEOUT_SEC` |
+
+All numeric and enum values use canonical spelling and bounded ranges. vLLM
+tuning is translated into fixed argument/value pairs. The legacy
+`vllm_extra_args` and `VLLM_EXTRA_ARGS` forms are rejected.
 
 **Response (200)**
 
@@ -795,14 +818,14 @@ Remove a model configuration and its routing entry without restarting arbiter.
 **Request**
 
 ```
-DELETE /v1/models/z-image-turbo?force=1
+DELETE /v1/models/birefnet-alt?force=1
 ```
 
 **Response (200)**
 
 ```json
 {
-  "model_id": "z-image-turbo",
+  "model_id": "birefnet-alt",
   "force": true,
   "removed_job_types": [],
   "cancelled_queued": 0,
@@ -850,6 +873,13 @@ Releases a previously created VRAM reservation.
 ---
 
 ## 3. Job Types Reference
+
+Still-image creation and editing are not Arbiter job types. Requests using
+`image-generate`, `image-edit`, Flux/Flux2/Schnell/Kontext/LoRA, Z-Image, or
+other still-image generator aliases return HTTP 400. Use the Mac mini Codex
+image service. BiRefNet background removal and LTX2 video remain supported.
+
+<!-- Retired still-image API reference intentionally hidden; retained only as migration history.
 
 ### 3.1 image-generate
 
@@ -982,6 +1012,8 @@ curl -s http://localhost:8400/v1/jobs/{job_id} | jq -r '.result.data' | base64 -
 ```
 
 ---
+
+-->
 
 ### 3.3 background-remove
 
@@ -1603,14 +1635,8 @@ def run_job(job_type: str, params: dict, poll_interval: float = 1.0) -> dict:
 
 # --- Usage Examples ---
 
-# Generate an image
-result = run_job("image-generate", {
-    "prompt": "A cat in a spacesuit floating through a nebula",
-    "width": 1024,
-    "height": 1024,
-})
-with open("output.png", "wb") as f:
-    f.write(base64.b64decode(result["data"]))
+# Remove a background
+result = run_job("background-remove", {"image_file": "/staged/photo.png"})
 
 
 # Transcribe audio
@@ -1686,7 +1712,7 @@ requests.delete(f"{ARBITER}/v1/refs/{ref_id}")
 ```
 
 Every job type that accepts binary data supports `_file` params. For example:
-- `image_file` for image-edit, background-remove, caption, query, detect, talking-head
+- `image_file` for background-remove, caption, query, detect, talking-head
 - `audio_file` for transcribe, talking-head
 - `ref_audio_file` for tts-clone
 
@@ -1763,7 +1789,6 @@ All values are from calibration on NVIDIA Grace Blackwell (128 GB VRAM, 100 GB b
 
 | Model           | VRAM (GB) | Load Time | Inference Time | Max Concurrent | Keep-Alive | Used By                              |
 |-----------------|-----------|-----------|----------------|----------------|------------|--------------------------------------|
-| `flux-schnell`  | 32        | 248 s     | 12 s           | 1              | 300 s      | image-generate, image-edit           |
 | `birefnet`      | 1         | 5.4 s     | 1 s            | 2              | 300 s      | background-remove                    |
 | `moondream`     | 18        | 142 s     | 103 s          | 1              | 300 s      | caption, query, detect               |
 | `whisper-large` | 6         | 11.3 s    | 1.8 s          | 1              | 120 s      | transcribe                           |
@@ -1783,7 +1808,7 @@ priority = avg_inference_ms + (load_ms if model is not loaded else 0)
 
 **Lower scores run first.** This means:
 
-- A `background-remove` job (birefnet loaded, priority = 1,000) will run before an `image-generate` job (flux-schnell not loaded, priority = 260,000).
+- A loaded `background-remove` job receives no cold-load penalty and can run before a cold video job.
 - Jobs whose model is already in VRAM get a significant priority boost because the `load_ms` penalty is zero.
 - Priorities are re-scored whenever a model is loaded or unloaded, so the queue adapts dynamically.
 
@@ -1801,7 +1826,7 @@ The memory manager enforces a VRAM budget (default 100 GB) using LRU eviction:
 
 ### Tips for Client Developers
 
-- **Batch similar jobs together.** If you need to generate 10 images, submit them all at once. They will all use `flux-schnell`, which only needs to be loaded once. The keep-alive timer resets after each inference.
+- **Batch similar jobs together.** Submit related caption, audio, or video-stage work together to reduce cold loads.
 
 - **Expect cold-start delays.** The first job for a model after it has been evicted will take significantly longer (load time + inference time). Check the table above for load times. Subsequent jobs for the same model will be much faster.
 
@@ -1809,7 +1834,7 @@ The memory manager enforces a VRAM budget (default 100 GB) using LRU eviction:
 
 - **Use `GET /v1/ps` to understand system state.** Before submitting a large batch, check which models are loaded and how much VRAM is free. This helps you estimate wait times.
 
-- **Largest models dominate VRAM.** `ltx2` (55 GB) and `flux-schnell` (32 GB) cannot be loaded simultaneously on a 100 GB budget if `moondream` (18 GB) is also loaded. Plan your workflow accordingly.
+- **Largest models dominate VRAM.** LTX2 video stages can occupy most of the budget; plan other GPU work accordingly.
 
 ---
 

@@ -1,4 +1,5 @@
 """Arbiter CLI — communicate with the running server."""
+
 from __future__ import annotations
 
 import argparse
@@ -26,7 +27,9 @@ def _request(method: str, path: str, data: dict | None = None) -> dict:
         with urlopen(req, timeout=30) as resp:
             return json.loads(resp.read())
     except URLError as e:
-        print(f"Error: Could not connect to Arbiter at {_server_url()}", file=sys.stderr)
+        print(
+            f"Error: Could not connect to Arbiter at {_server_url()}", file=sys.stderr
+        )
         print(f"  {e}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
@@ -47,7 +50,9 @@ def cmd_ps(args):
         return
 
     # Header
-    print(f"{'MODEL':<20} {'STATE':<10} {'VRAM':<8} {'ACTIVE':<8} {'QUEUED':<8} {'IDLE':<10}")
+    print(
+        f"{'MODEL':<20} {'STATE':<10} {'VRAM':<8} {'ACTIVE':<8} {'QUEUED':<8} {'IDLE':<10}"
+    )
     print("-" * 74)
     for m in models:
         idle = f"{m['idle_seconds']:.0f}s" if m.get("idle_seconds") is not None else "-"
@@ -84,7 +89,10 @@ def cmd_jobs(args):
     print("-" * 72)
     for j in jobs:
         from datetime import datetime, timezone
-        created = datetime.fromtimestamp(j["created_at"], tz=timezone.utc).strftime("%H:%M:%S")
+
+        created = datetime.fromtimestamp(j["created_at"], tz=timezone.utc).strftime(
+            "%H:%M:%S"
+        )
         print(
             f"{j['job_id']:<14} {j['type']:<18} {j['model']:<16} "
             f"{j['status']:<12} {created:<12}"
@@ -145,7 +153,9 @@ def cmd_health(args):
 
 def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(prog="arbiter", description="Arbiter CLI")
-    parser.add_argument("--server", help="Server URL (default: $ARBITER_URL or http://localhost:8400)")
+    parser.add_argument(
+        "--server", help="Server URL (default: $ARBITER_URL or http://localhost:8400)"
+    )
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("ps", help="Show loaded models and VRAM")
@@ -157,7 +167,9 @@ def main(argv: list[str] | None = None):
     p_jobs.add_argument("--limit", type=int, default=50)
 
     p_submit = sub.add_parser("submit", help="Submit a job")
-    p_submit.add_argument("type", help="Job type (e.g., image-generate, transcribe)")
+    p_submit.add_argument(
+        "type", help="Job type (e.g., background-remove, video-generate, transcribe)"
+    )
     p_submit.add_argument("params", nargs="?", default="{}", help="JSON params")
 
     p_status = sub.add_parser("status", help="Get job status")

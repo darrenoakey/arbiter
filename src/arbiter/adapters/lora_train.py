@@ -1,12 +1,15 @@
 """LoRA fine-tuning adapter using Unsloth model + standard HF Trainer."""
+
 from __future__ import annotations
 
 import os
+
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import json
+import importlib
 import logging
 import shutil
 import time
@@ -18,12 +21,17 @@ from arbiter.adapters.registry import register
 log = logging.getLogger(__name__)
 
 TRAINING_ROOT = Path("/home/darren/training")
-TRAINING_ROOT.mkdir(parents=True, exist_ok=True)
 
 CHAT_TEMPLATE_MAP = {
-    "llama-3": "llama-3.1", "llama-3.1": "llama-3.1", "llama-3.2": "llama-3.1",
-    "qwen": "qwen-2.5", "gemma": "gemma", "phi": "phi-4", "mistral": "mistral",
+    "llama-3": "llama-3.1",
+    "llama-3.1": "llama-3.1",
+    "llama-3.2": "llama-3.1",
+    "qwen": "qwen-2.5",
+    "gemma": "gemma",
+    "phi": "phi-4",
+    "mistral": "mistral",
 }
+
 
 def _detect_chat_template(model_name):
     lower = model_name.lower()
@@ -42,8 +50,9 @@ class LoraTrainAdapter(ModelAdapter):
 
     def load(self, device="cuda"):
         log.info("Pre-loading training libraries...")
-        import unsloth.models._utils as _u
-        _u.has_internet = lambda *a, **kw: False
+        _u = importlib.import_module("unsloth.models._utils")
+
+        setattr(_u, "has_internet", lambda *a, **kw: False)
         self._device = device
         self._loaded = True
         log.info("Training libraries ready.")
@@ -54,10 +63,14 @@ class LoraTrainAdapter(ModelAdapter):
 
     def infer(self, params, output_dir, cancel_flag):
         import torch
-        from unsloth import FastLanguageModel
-        from unsloth.chat_templates import get_chat_template
+
+        FastLanguageModel = importlib.import_module("unsloth").FastLanguageModel
+        get_chat_template = importlib.import_module(
+            "unsloth.chat_templates"
+        ).get_chat_template
         from transformers import Trainer, TrainingArguments, DataCollatorForSeq2Seq
-        from datasets import Dataset
+
+        Dataset = importlib.import_module("datasets").Dataset
 
         self._check_cancel(cancel_flag)
 
@@ -95,19 +108,30 @@ class LoraTrainAdapter(ModelAdapter):
         adapter_output = run_dir / "adapter"
         adapter_output.mkdir(parents=True, exist_ok=True)
 
-        (run_dir / "config.json").write_text(json.dumps({
-            "model_name": model_name, "lora_rank": lora_rank,
-            "learning_rate": learning_rate, "batch_size": batch_size,
-            "num_epochs": num_epochs, "max_iters": max_iters,
-            "train_samples": train_count, "started_at": time.time(),
-        }, indent=2))
+        (run_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_name": model_name,
+                    "lora_rank": lora_rank,
+                    "learning_rate": learning_rate,
+                    "batch_size": batch_size,
+                    "num_epochs": num_epochs,
+                    "max_iters": max_iters,
+                    "train_samples": train_count,
+                    "started_at": time.time(),
+                },
+                indent=2,
+            )
+        )
 
         self._check_cancel(cancel_flag)
 
         log.info("Loading model: %s (4bit=%s)", model_name, load_in_4bit)
         model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_name, max_seq_length=max_seq_length,
-            load_in_4bit=load_in_4bit, device_map={"": 0},
+            model_name=model_name,
+            max_seq_length=max_seq_length,
+            load_in_4bit=load_in_4bit,
+            device_map={"": 0},
         )
         tokenizer = get_chat_template(tokenizer, chat_template=chat_template)
         if tokenizer.pad_token is None:
@@ -117,14 +141,26 @@ class LoraTrainAdapter(ModelAdapter):
         if not full_finetune:
             log.info("Applying LoRA: rank=%d, alpha=%d", lora_rank, lora_alpha)
             model = FastLanguageModel.get_peft_model(
-                model, r=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
-                target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
+                model,
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=[
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ],
                 use_gradient_checkpointing="unsloth",
             )
         self._check_cancel(cancel_flag)
 
         # Tokenize in-process — no multiprocessing, no SFTTrainer
         log.info("Tokenizing dataset in-process...")
+
         def tokenize_jsonl(path):
             input_ids_list, attention_mask_list, labels_list = [], [], []
             with open(path) as f:
@@ -133,20 +169,33 @@ class LoraTrainAdapter(ModelAdapter):
                     text = tokenizer.apply_chat_template(
                         row["messages"], tokenize=False, add_generation_prompt=False
                     )
-                    enc = tokenizer(text, truncation=True, max_length=max_seq_length,
-                                    padding=False, return_tensors=None)
+                    enc = tokenizer(
+                        text,
+                        truncation=True,
+                        max_length=max_seq_length,
+                        padding=False,
+                        return_tensors=None,
+                    )
                     input_ids_list.append(enc["input_ids"])
                     attention_mask_list.append(enc["attention_mask"])
-                    labels_list.append(enc["input_ids"][:])  # labels = input_ids for causal LM
-            return Dataset.from_dict({
-                "input_ids": input_ids_list,
-                "attention_mask": attention_mask_list,
-                "labels": labels_list,
-            })
+                    labels_list.append(
+                        enc["input_ids"][:]
+                    )  # labels = input_ids for causal LM
+            return Dataset.from_dict(
+                {
+                    "input_ids": input_ids_list,
+                    "attention_mask": attention_mask_list,
+                    "labels": labels_list,
+                }
+            )
 
         train_dataset = tokenize_jsonl(train_file)
         eval_dataset = tokenize_jsonl(valid_file) if has_valid else None
-        log.info("Tokenized: %d train, %d valid", len(train_dataset), len(eval_dataset) if eval_dataset else 0)
+        log.info(
+            "Tokenized: %d train, %d valid",
+            len(train_dataset),
+            len(eval_dataset) if eval_dataset else 0,
+        )
         self._check_cancel(cancel_flag)
 
         data_collator = DataCollatorForSeq2Seq(tokenizer, padding=True)
@@ -174,8 +223,10 @@ class LoraTrainAdapter(ModelAdapter):
 
         log.info("Starting training...")
         trainer = Trainer(
-            model=model, tokenizer=tokenizer,
-            train_dataset=train_dataset, eval_dataset=eval_dataset,
+            model=model,
+            processing_class=tokenizer,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
             data_collator=data_collator,
             args=training_args,
         )
@@ -188,7 +239,8 @@ class LoraTrainAdapter(ModelAdapter):
 
         metrics = train_result.metrics
         summary = {
-            "run_name": run_name, "model_name": model_name,
+            "run_name": run_name,
+            "model_name": model_name,
             "adapter_path": str(adapter_output),
             "train_loss": metrics.get("train_loss"),
             "train_runtime": metrics.get("train_runtime"),
@@ -203,16 +255,21 @@ class LoraTrainAdapter(ModelAdapter):
         shutil.copytree(adapter_output, final)
         (output_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
-        log.info("Training complete: loss=%.4f, runtime=%.1fs",
-                 metrics.get("train_loss", 0), metrics.get("train_runtime", 0))
+        log.info(
+            "Training complete: loss=%.4f, runtime=%.1fs",
+            metrics.get("train_loss", 0),
+            metrics.get("train_runtime", 0),
+        )
         del model, trainer
         self._cleanup_gpu()
         return {
-            "format": "lora-adapter", "run_name": run_name,
+            "format": "lora-adapter",
+            "run_name": run_name,
             "adapter_path": str(adapter_output),
             "train_loss": metrics.get("train_loss"),
             "train_runtime_seconds": metrics.get("train_runtime"),
-            "train_samples": train_count, "epochs": metrics.get("epoch"),
+            "train_samples": train_count,
+            "epochs": metrics.get("epoch"),
         }
 
     def estimate_time(self, params):

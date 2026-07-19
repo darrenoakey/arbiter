@@ -11,8 +11,10 @@ This runs in its own worker process (model_id "ltx2-dev-denoise1"), so
 overriding the module-global CHECKPOINT here cannot affect the distilled
 ltx2-denoise1 adapter — both remain available side by side.
 """
+
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 
@@ -37,11 +39,13 @@ class LTX2DevDenoise1Adapter(LTX2Denoise1Adapter):
         # FastPipeline() reads it. Set both the constants module and the
         # already-bound name in video_fast_gpu so it takes regardless of import
         # order within this worker process.
-        import constants
+        constants = importlib.import_module("constants")
+
         dev = constants.MODELS_DIR / DEV_CHECKPOINT_NAME
         if not Path(dev).exists():
             raise LoadError(f"dev checkpoint missing: {dev}")
-        constants.CHECKPOINT = dev
-        import video_fast_gpu
-        video_fast_gpu.CHECKPOINT = dev
-        super().load(device)
+        setattr(constants, "CHECKPOINT", dev)
+        video_fast_gpu = importlib.import_module("video_fast_gpu")
+
+        setattr(video_fast_gpu, "CHECKPOINT", dev)
+        LTX2Denoise1Adapter.load(self, device)

@@ -6,6 +6,7 @@ No GPU model to load — just runs ffmpeg with h264_nvenc for fast encoding.
 Filter chain runs on CPU (eq, chromakey, despill have no CUDA equivalents),
 but NVENC encode is the big win on long videos.
 """
+
 from __future__ import annotations
 
 import logging
@@ -27,17 +28,22 @@ class CompositeAdapter(ModelAdapter):
         # Verify ffmpeg has NVENC support
         result = subprocess.run(
             ["ffmpeg", "-hide_banner", "-encoders"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if "h264_nvenc" not in result.stdout:
             from arbiter.adapters.base import LoadError
+
             raise LoadError("ffmpeg missing h264_nvenc encoder")
         log.info("Composite adapter ready (h264_nvenc available).")
 
     def unload(self) -> None:
         log.info("Composite adapter unloaded.")
 
-    def infer(self, params: dict, output_dir: Path, cancel_flag: threading.Event) -> dict:
+    def infer(
+        self, params: dict, output_dir: Path, cancel_flag: threading.Event
+    ) -> dict:
         """Composite a green-screen video onto a background image.
 
         params:
@@ -104,21 +110,41 @@ class CompositeAdapter(ModelAdapter):
         out_path = output_dir / "result.mp4"
 
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-loop", "1", "-i", bg_file,
-            "-i", video_file,
-            "-filter_complex", filter_complex,
-            "-c:v", "h264_nvenc", "-preset", "p4", "-cq", str(crf),
-            "-pix_fmt", "yuv420p",
-            "-r", str(fps),
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-loop",
+            "1",
+            "-i",
+            bg_file,
+            "-i",
+            video_file,
+            "-filter_complex",
+            filter_complex,
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p4",
+            "-cq",
+            str(crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            str(fps),
             "-an",
-            "-t", str(duration),
+            "-t",
+            str(duration),
             str(out_path),
         ]
 
         log.info(
             "Compositing %.1fs video (%dx%d), green=#%s, NVENC encode ...",
-            duration, video_width, video_height, green_hex,
+            duration,
+            video_width,
+            video_height,
+            green_hex,
         )
 
         self._check_cancel(cancel_flag)
@@ -153,9 +179,19 @@ class CompositeAdapter(ModelAdapter):
     def _probe_duration(path: str) -> float:
         try:
             result = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                 "-of", "csv=p=0", path],
-                capture_output=True, text=True, timeout=30,
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "csv=p=0",
+                    path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
             return float(result.stdout.strip()) if result.stdout.strip() else 0
         except Exception:
@@ -165,19 +201,39 @@ class CompositeAdapter(ModelAdapter):
     def _detect_green(video_path: str) -> str:
         """Sample corner pixels of first frame to detect chroma key color."""
         import tempfile
+
         tmp = tempfile.mktemp(suffix=".png")
         try:
             subprocess.run(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                 "-i", video_path, "-vframes", "1", "-q:v", "2", tmp],
-                capture_output=True, timeout=30,
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    video_path,
+                    "-vframes",
+                    "1",
+                    "-q:v",
+                    "2",
+                    tmp,
+                ],
+                capture_output=True,
+                timeout=30,
             )
             from PIL import Image
+
             img = Image.open(tmp).convert("RGB")
             w, h = img.size
             samples = []
             for x, y in [(5, 5), (5, h - 5), (w - 5, 5), (w // 2, 5), (5, h // 2)]:
-                r, g, b = img.getpixel((x, y))[:3]
+                pixel = img.getpixel((x, y))
+                if not isinstance(pixel, tuple) or len(pixel) < 3:
+                    raise InferenceError(
+                        f"RGB conversion returned invalid pixel at {(x, y)}: {pixel!r}"
+                    )
+                r, g, b = pixel[:3]
                 if g > 100 and g > r * 1.3 and g > b * 1.3:
                     samples.append((r, g, b))
             if samples:
@@ -189,6 +245,7 @@ class CompositeAdapter(ModelAdapter):
             log.warning("Green detection failed, using default: %s", e)
         finally:
             import os
+
             if os.path.exists(tmp):
                 os.unlink(tmp)
         return "00b000"

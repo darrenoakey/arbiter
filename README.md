@@ -2,20 +2,18 @@
 
 # Arbiter
 
-Arbiter is your personal AI workstation manager. Instead of juggling separate tools for image generation, voice cloning, transcription, and video creation, Arbiter runs them all together on one machine — keeping everything organized, queued, and ready to go.
+Arbiter is your personal GPU workstation manager for vision analysis, background removal, audio, speech, talking heads, and video. Still-image generation is actively disabled; use the Mac mini Codex image service for image creation or editing.
 
-You submit a job (generate an image, transcribe a recording, clone a voice), and Arbiter handles the rest: loading the right model, running your request, and giving you back the result when it's ready. While one model is working on your task, Arbiter can quietly prepare the next one so there's as little waiting as possible.
+You submit a job (transcribe a recording, remove a background, clone a voice), and Arbiter handles the rest: loading the right model, running your request, and giving you back the result when it's ready.
 
 ---
 
 ## What can it do?
 
-Arbiter supports 12 types of AI tasks out of the box:
+Arbiter supports these AI tasks out of the box:
 
 | What you want | Job type |
 |---|---|
-| Generate an image from a text description | `image-generate` |
-| Transform an existing image with a text prompt | `image-edit` |
 | Remove the background from a photo | `background-remove` |
 | Describe what's in an image | `caption` |
 | Ask a question about an image | `query` |
@@ -99,34 +97,6 @@ def run_job(job_type, params):
 ---
 
 ## A guide to every feature
-
-### Generating images
-
-```python
-result = run_job("image-generate", {
-    "prompt": "a red fox sitting in autumn leaves, watercolor style",
-    "width": 1024,
-    "height": 1024,
-})
-
-with open("fox.png", "wb") as f:
-    f.write(base64.b64decode(result["data"]))
-```
-
-You can also set `steps` (more steps = higher quality, slower) and `seed` (for reproducible results). To generate with a transparent background, add `"transparent": true`.
-
-### Editing an existing image
-
-```python
-with open("photo.jpg", "rb") as f:
-    image = base64.b64encode(f.read()).decode()
-
-result = run_job("image-edit", {
-    "prompt": "make it look like a watercolor painting",
-    "image": image,
-    "strength": 0.6,  # how much to transform (0.0 = no change, 1.0 = completely new)
-})
-```
 
 ### Removing a background
 
@@ -320,7 +290,7 @@ curl http://localhost:8400/v1/ps
   "vram_budget_gb": 100.0,
   "vram_used_gb": 37.0,
   "models": [
-    {"id": "flux-schnell", "state": "loaded", "active_jobs": 1, "queued_jobs": 3},
+    {"id": "birefnet", "state": "loaded", "active_jobs": 1, "queued_jobs": 3},
     {"id": "whisper-large", "state": "unloaded", "queued_jobs": 0}
   ],
   "queue": {"queued": 4, "running": 1, "completed": 57, "failed": 2}
@@ -351,7 +321,7 @@ Up to 1,000 job IDs per request, returned in the same order you sent them.
 You can also submit jobs directly without writing any code:
 
 ```bash
-./run submit image-generate '{"prompt": "a mountain lake at sunrise"}'
+./run submit background-remove '{"image_file": "/mnt/arbiter-store/inbox/photo.png"}'
 ./run cancel <job-id>
 ```
 
@@ -359,7 +329,13 @@ You can also submit jobs directly without writing any code:
 
 ## Tips and tricks
 
-**Submit batches together.** If you need 20 images, submit them all at once rather than one at a time. The model only needs to start up once, and each subsequent job runs at full speed. The same applies to audio transcription, captions, and anything else that uses the same model.
+**Model process configuration is closed by default.** Runtime model APIs do not
+accept arbitrary commands or environment variables. `worker_cmd` is restricted
+to repository-owned, model-compatible workers, while `adapter_params` accepts
+only the typed keys documented in [API.md](API.md). Built-in vision, audio,
+talking-head, composite, and LTX2 adapters use job parameters for tuning.
+
+**Submit batches together.** Group audio transcription, captions, and other work that uses the same model to reduce cold loads.
 
 **Shorter jobs jump ahead in line.** Arbiter uses "shortest job first" scheduling. A quick background removal will almost always run before a long video generation — even if the video was submitted first. This keeps average wait times low for everyone.
 

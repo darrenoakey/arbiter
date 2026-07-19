@@ -6,14 +6,14 @@ using threads (same as the concurrent-mode subprocess worker would).
 
 Uses real images from Lorem Picsum.
 """
-import base64
+
 import io
 import json
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Protocol, cast
 from urllib.request import Request, urlopen
 
 # How many images to pre-download
@@ -22,6 +22,10 @@ N_IMAGES = 8
 CONCURRENCY_LEVELS = [1, 2, 3, 4]
 # Inferences per concurrency level
 INFERENCES_PER_LEVEL = 8
+
+
+class _CaptionModel(Protocol):
+    def caption(self, image: object, **kwargs: object) -> dict[str, object]: ...
 
 
 def download_images(n):
@@ -34,7 +38,7 @@ def download_images(n):
         with urlopen(req, timeout=15) as resp:
             data = resp.read()
             images.append(data)
-        print(f"  [{i+1}/{n}] {len(data)} bytes", flush=True)
+        print(f"  [{i + 1}/{n}] {len(data)} bytes", flush=True)
     return images
 
 
@@ -52,11 +56,14 @@ def run_calibration():
     from transformers import AutoModelForCausalLM
     from PIL import Image
 
-    model = AutoModelForCausalLM.from_pretrained(
-        "moondream/moondream3-preview",
-        trust_remote_code=True,
-        dtype=torch.bfloat16,
-        device_map={"": "cuda"},
+    model = cast(
+        _CaptionModel,
+        AutoModelForCausalLM.from_pretrained(
+            "moondream/moondream3-preview",
+            trust_remote_code=True,
+            dtype=torch.bfloat16,
+            device_map={"": "cuda"},
+        ),
     )
     print("Model loaded.", flush=True)
 
@@ -76,9 +83,6 @@ def run_calibration():
     for concurrency in CONCURRENCY_LEVELS:
         print(f"--- Testing concurrency={concurrency} ---", flush=True)
 
-        # Check VRAM before
-        vram_before = torch.cuda.memory_allocated() / (1024**3)
-
         errors = 0
         timings = []
         lock = threading.Lock()
@@ -92,7 +96,8 @@ def run_calibration():
                 elapsed = time.perf_counter() - start
                 with lock:
                     timings.append(elapsed)
-                return elapsed, result.get("caption", "")[:50]
+                caption = result.get("caption", "")
+                return elapsed, str(caption)[:50]
             except Exception as e:
                 elapsed = time.perf_counter() - start
                 with lock:
@@ -109,7 +114,10 @@ def run_calibration():
             for i, future in enumerate(as_completed(futures)):
                 elapsed, caption = future.result()
                 status = "OK" if not caption.startswith("ERROR") else caption
-                print(f"  [{i+1}/{INFERENCES_PER_LEVEL}] {elapsed:.2f}s - {status}", flush=True)
+                print(
+                    f"  [{i + 1}/{INFERENCES_PER_LEVEL}] {elapsed:.2f}s - {status}",
+                    flush=True,
+                )
                 if caption.startswith("ERROR"):
                     errors += 1
 
@@ -147,15 +155,23 @@ def run_calibration():
     print("=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"{'Conc':>5} {'Batch(s)':>10} {'Avg(s)':>8} {'Tput(/s)':>10} {'VRAM(GB)':>10} {'Errors':>7}")
+    print(
+        f"{'Conc':>5} {'Batch(s)':>10} {'Avg(s)':>8} {'Tput(/s)':>10} {'VRAM(GB)':>10} {'Errors':>7}"
+    )
     for c in CONCURRENCY_LEVELS:
         r = results[c]
-        print(f"{c:>5} {r['batch_time_s']:>10.2f} {r['avg_latency_s']:>8.2f} {r['throughput_per_s']:>10.3f} {r['vram_peak_gb']:>10.2f} {r['errors']:>7}")
+        print(
+            f"{c:>5} {r['batch_time_s']:>10.2f} {r['avg_latency_s']:>8.2f} {r['throughput_per_s']:>10.3f} {r['vram_peak_gb']:>10.2f} {r['errors']:>7}"
+        )
 
     # Recommendation
-    best = max(results.values(), key=lambda r: r["throughput_per_s"] if r["errors"] == 0 else 0)
+    best = max(
+        results.values(), key=lambda r: r["throughput_per_s"] if r["errors"] == 0 else 0
+    )
     print(f"\nRecommendation: max_concurrent = {best['concurrency']}")
-    print(f"  Throughput: {best['throughput_per_s']:.3f}/s (vs {results[1]['throughput_per_s']:.3f}/s at concurrency=1)")
+    print(
+        f"  Throughput: {best['throughput_per_s']:.3f}/s (vs {results[1]['throughput_per_s']:.3f}/s at concurrency=1)"
+    )
     if best["concurrency"] > 1:
         speedup = best["throughput_per_s"] / results[1]["throughput_per_s"]
         print(f"  Speedup: {speedup:.2f}x")

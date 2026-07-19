@@ -1,4 +1,5 @@
 """Request and response schemas for all Arbiter job types."""
+
 from __future__ import annotations
 
 from enum import Enum
@@ -9,9 +10,8 @@ from pydantic import BaseModel, Field
 
 # --- Job type enum ---
 
+
 class JobType(str, Enum):
-    IMAGE_GENERATE = "image-generate"
-    IMAGE_EDIT = "image-edit"
     BACKGROUND_REMOVE = "background-remove"
     CAPTION = "caption"
     QUERY = "query"
@@ -37,8 +37,6 @@ class JobType(str, Enum):
 
 # Maps job type to model_id
 JOB_TYPE_TO_MODEL: dict[str, str] = {
-    "image-generate": "flux-schnell",
-    "image-edit": "flux-schnell",
     "background-remove": "birefnet",
     "caption": "moondream",
     "query": "moondream",
@@ -65,6 +63,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
 
 # --- Job submission ---
 
+
 class JobSubmitRequest(BaseModel):
     type: JobType
     params: dict = Field(default_factory=dict)
@@ -78,6 +77,7 @@ class JobSubmitResponse(BaseModel):
 
 
 # --- Job status ---
+
 
 class JobState(str, Enum):
     QUEUED = "queued"
@@ -101,6 +101,7 @@ class JobStatusResponse(BaseModel):
 
 # --- System status ---
 
+
 class ModelStatus(BaseModel):
     id: str
     state: str
@@ -123,27 +124,6 @@ class HealthResponse(BaseModel):
 
 
 # --- Per-job-type parameter schemas (for validation) ---
-
-class ImageGenerateParams(BaseModel):
-    prompt: str
-    width: int = 1024
-    height: int = 1024
-    aspect_ratio: Optional[str] = None
-    steps: int = 4
-    seed: int = 42
-    transparent: bool = False
-
-
-class ImageEditParams(BaseModel):
-    prompt: str
-    image: Optional[str] = None  # base64
-    image_file: Optional[str] = None
-    width: int = 1024
-    height: int = 1024
-    steps: int = 4
-    seed: int = 42
-    strength: float = 0.75
-    transparent: bool = False
 
 
 class BackgroundRemoveParams(BaseModel):
@@ -268,14 +248,12 @@ class AestheticScoreParams(BaseModel):
     image_file: Optional[str] = None
 
 
-
 class TTSVoxtralParams(BaseModel):
     text: str
     voice: str = "alloy"
     language: str = "English"
     temperature: float = 0.7
     speed: float = 1.0
-
 
 
 class LoraTrainParams(BaseModel):
@@ -337,8 +315,6 @@ class RvcConvertParams(BaseModel):
 
 # Maps job type to its parameter validation schema
 JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
-    "image-generate": ImageGenerateParams,
-    "image-edit": ImageEditParams,
     "background-remove": BackgroundRemoveParams,
     "caption": CaptionParams,
     "query": QueryParams,

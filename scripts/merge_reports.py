@@ -1,44 +1,103 @@
 """Merge llama.cpp + vllm benchmark JSON into one combined HTML report."""
-import json, sys, time
+
+import json
+import time
 from pathlib import Path
 
-llama = json.loads(Path.home().joinpath("src/arbiter/benchmark_report.json").read_text())
-vllm  = json.loads(Path.home().joinpath("src/arbiter/benchmark_report_vllm.json").read_text())
+llama = json.loads(
+    Path.home().joinpath("src/arbiter/benchmark_report.json").read_text()
+)
+vllm = json.loads(
+    Path.home().joinpath("src/arbiter/benchmark_report_vllm.json").read_text()
+)
 
 # llama is a list of model reports; pick the llama.cpp one (the second in our run)
-llama_rep = next((r for r in llama if r.get("backend") == "llamacpp" and "vllm" not in r.get("model_id", "")), llama[-1])
-vllm_rep  = next((r for r in vllm  if r.get("backend") == "vllm"), vllm[0])
+llama_rep = next(
+    (
+        r
+        for r in llama
+        if r.get("backend") == "llamacpp" and "vllm" not in r.get("model_id", "")
+    ),
+    llama[-1],
+)
+vllm_rep = next((r for r in vllm if r.get("backend") == "vllm"), vllm[0])
 
 reports = [llama_rep, vllm_rep]
-Path.home().joinpath("src/arbiter/benchmark_combined.json").write_text(json.dumps(reports, indent=2))
+Path.home().joinpath("src/arbiter/benchmark_combined.json").write_text(
+    json.dumps(reports, indent=2)
+)
+
 
 # Inline the renderer (mostly copied from benchmark_llm.py with minor tweaks).
 def cell_to_dict(c):
     return {
-        "model": c["model"], "prompt": c["prompt_label"], "n": c["n_concurrent"],
+        "model": c["model"],
+        "prompt": c["prompt_label"],
+        "n": c["n_concurrent"],
         "reasoning": c["reasoning"],
-        "throughput_tps": round((sum(r.get("completion_tokens",0) for r in c.get("runs",[]) if r.get("ok")) / (c.get("_wall_clock_s") or 1e-9)) if c.get("_wall_clock_s") else 0.0, 2),
-        "p50_s": round(sorted([r["elapsed_s"] for r in c.get("runs",[]) if r.get("ok")])[len([r for r in c.get("runs",[]) if r.get("ok")])//2] if any(r.get("ok") for r in c.get("runs",[])) else 0, 3),
-        "p95_s": round(sorted([r["elapsed_s"] for r in c.get("runs",[]) if r.get("ok")])[max(0,int(round(0.95*len([r for r in c.get("runs",[]) if r.get("ok")])))-1)] if any(r.get("ok") for r in c.get("runs",[])) else 0, 3),
+        "throughput_tps": round(
+            (
+                sum(
+                    r.get("completion_tokens", 0)
+                    for r in c.get("runs", [])
+                    if r.get("ok")
+                )
+                / (c.get("_wall_clock_s") or 1e-9)
+            )
+            if c.get("_wall_clock_s")
+            else 0.0,
+            2,
+        ),
+        "p50_s": round(
+            sorted([r["elapsed_s"] for r in c.get("runs", []) if r.get("ok")])[
+                len([r for r in c.get("runs", []) if r.get("ok")]) // 2
+            ]
+            if any(r.get("ok") for r in c.get("runs", []))
+            else 0,
+            3,
+        ),
+        "p95_s": round(
+            sorted([r["elapsed_s"] for r in c.get("runs", []) if r.get("ok")])[
+                max(
+                    0,
+                    int(
+                        round(0.95 * len([r for r in c.get("runs", []) if r.get("ok")]))
+                    )
+                    - 1,
+                )
+            ]
+            if any(r.get("ok") for r in c.get("runs", []))
+            else 0,
+            3,
+        ),
         "wall_s": round(c.get("_wall_clock_s") or 0, 3),
-        "ok": sum(1 for r in c.get("runs",[]) if r.get("ok")),
-        "valid": sum(1 for r in c.get("runs",[]) if r.get("valid")),
-        "total": len(c.get("runs",[])),
-        "completion_tokens": sum(r.get("completion_tokens",0) for r in c.get("runs",[]) if r.get("ok")),
-        "had_reasoning_count": sum(1 for r in c.get("runs",[]) if r.get("had_reasoning")),
+        "ok": sum(1 for r in c.get("runs", []) if r.get("ok")),
+        "valid": sum(1 for r in c.get("runs", []) if r.get("valid")),
+        "total": len(c.get("runs", [])),
+        "completion_tokens": sum(
+            r.get("completion_tokens", 0) for r in c.get("runs", []) if r.get("ok")
+        ),
+        "had_reasoning_count": sum(
+            1 for r in c.get("runs", []) if r.get("had_reasoning")
+        ),
     }
+
 
 data = []
 for rep in reports:
-    data.append({
-        "model_id": rep["model_id"], "name": rep["name"], "backend": rep["backend"],
-        "cold_load_s": round(rep["cold_load_s"], 2),
-        "warm_load_s": round(rep["warm_load_s"], 2),
-        "memory": rep.get("memory_after_load") or {},
-        "cells": [cell_to_dict(c) for c in rep["cells"]],
-        "recommended_max_concurrent": rep["recommended_max_concurrent"],
-        "notes": rep.get("notes") or [],
-    })
+    data.append(
+        {
+            "model_id": rep["model_id"],
+            "name": rep["name"],
+            "backend": rep["backend"],
+            "cold_load_s": round(rep["cold_load_s"], 2),
+            "warm_load_s": round(rep["warm_load_s"], 2),
+            "memory": rep.get("memory_after_load") or {},
+            "cells": [cell_to_dict(c) for c in rep["cells"]],
+            "recommended_max_concurrent": rep["recommended_max_concurrent"],
+            "notes": rep.get("notes") or [],
+        }
+    )
 
 html_template = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>LLM Backend Benchmark — gemma4-26B-A4B-it</title>
