@@ -221,16 +221,103 @@ func TestWorkerEnvironmentStripsLoaderInterpreterShellAndInheritedPath(t *testin
 	t.Cleanup(instance.Kill)
 
 	environment := readEnvironmentFile(t, capturePath)
-	for _, forbidden := range []string{"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PYTHONPATH", "PYTHONHOME", "BASH_ENV", "NODE_OPTIONS"} {
+	for _, forbidden := range []string{"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PYTHONHOME", "BASH_ENV", "NODE_OPTIONS"} {
 		if _, ok := environment[forbidden]; ok {
 			t.Errorf("forbidden inherited variable reached worker: %s", forbidden)
 		}
+	}
+	// PYTHONPATH is forbidden as a caller-supplied adapter param, but the
+	// server sets its own repo-owned value so the default system-python
+	// worker (whose .venv interpreter resolves to /usr/bin/python3.12 and
+	// loses venv site-packages activation) can still `import arbiter`.
+	// The caller-injected PYTHONPATH must never survive; only the repo path.
+	if got := environment["PYTHONPATH"]; got != filepath.Join(root, "src") {
+		t.Fatalf("PYTHONPATH must be the server-set repo src path, got %q; injected value should not survive", got)
 	}
 	if strings.Contains(environment["PATH"], "/tmp/injected-bin") {
 		t.Fatalf("inherited PATH reached worker: %q", environment["PATH"])
 	}
 	if environment["LLM_CTX_SIZE"] != "8192" {
 		t.Fatalf("sanctioned setting missing: %v", environment)
+	}
+}
+
+// TestDefaultPythonWorkerExposesArbiterPackage regresses the 2026-07-19
+// outage: commit 0289046 hardened the worker environment by dropping the
+// inherited PYTHONPATH, but resolveTrustedPythonExecutable collapses the
+// repo's .venv/bin/python symlink chain to /usr/bin/python3.12 — losing the
+// venv's editable-install .pth. Default system-python workers (ltx2-encode,
+// ltx2, latentsync, composite, sadtalker, …) then died instantly with
+// "No module named 'arbiter'". The server must set its own repo-owned
+// PYTHONPATH so import resolution is independent of interpreter resolution.
+// buildCleanWorkerEnvironment is shared by every worker path (repository
+// worker, sanctioned venv, and default system-python), so we exercise it via
+// the same llm-worker capture harness as the strip test above.
+func TestDefaultPythonWorkerExposesArbiterPackage(t *testing.T) {
+	root := t.TempDir()
+	workerPath := filepath.Join(root, "llm-worker")
+	capturePath := filepath.Join(root, "environment.txt")
+	writeEnvironmentCaptureWorker(t, workerPath, capturePath)
+
+	instance := NewInstance("llm:test", "llm:test#0", 1, 1, "/usr/bin/python3", root)
+	instance.workerCmd = []string{workerPath}
+	if err := instance.Load("cuda"); err != nil {
+		t.Fatalf("load capture worker: %v", err)
+	}
+	t.Cleanup(instance.Kill)
+
+	environment := readEnvironmentFile(t, capturePath)
+	if got := environment["PYTHONPATH"]; got != filepath.Join(root, "src") {
+		t.Fatalf("worker PYTHONPATH = %q, want %q (regression: system-python workers must import arbiter)", got, filepath.Join(root, "src"))
+	}
+}
+
+// TestRepoVenvPythonSymlinkCollapsesToSystemExecutable documents the second
+// half of the 2026-07-19 outage and pins the deploy-to-spark.sh guard.
+// resolveTrustedPythonExecutable deliberately collapses the interpreter via
+// EvalSymlinks (defence against symlink-swap TOCTOU). A repo .venv created
+// with `python -m venv` (the default, symlinked) has .venv/bin/python →
+// python3 → /usr/bin/python3.12; the collapse returns the SYSTEM python,
+// which loses venv activation (pyvenv.cfg lookup) and every site-packages
+// dependency (torch, diffusers, ltx_core). The PYTHONPATH fix above restores
+// `import arbiter`, but site-packages deps require venv activation — so the
+// deploy converts the repo .venv to real binary copies (--copies semantics),
+// exactly like the sanctioned per-adapter venvs. This test proves the trap:
+// a symlinked .venv python collapses to its underlying target and would
+// break venv-only imports, which is why the deploy step is mandatory.
+func TestRepoVenvPythonSymlinkCollapsesToSystemExecutable(t *testing.T) {
+	// EvalSymlinks resolves macOS's /var → /private/var, so evaluate the
+	// projectRoot the same way to keep both sides of trustedPythonLocation
+	// in agreement.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	venvBin := filepath.Join(root, ".venv", "bin")
+	if err := os.MkdirAll(venvBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The symlink target lives inside the repo root (a sanctioned location
+	// for the test) and stands in for /usr/bin/python3.12.
+	underlying := filepath.Join(root, "python3.12-real")
+	writeExecutableTestFile(t, underlying, "#!/bin/sh\nexit 0\n")
+	// Mirror the default `python -m venv` layout: python → python3 → target.
+	if err := os.Symlink(underlying, filepath.Join(venvBin, "python3")); err != nil {
+		t.Fatal(err)
+	}
+	venvPython := filepath.Join(venvBin, "python")
+	if err := os.Symlink("python3", venvPython); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := resolveTrustedPythonExecutable(root, venvPython)
+	if err != nil {
+		t.Fatalf("resolve symlinked .venv python: %v", err)
+	}
+	if resolved == venvPython {
+		t.Fatal("symlinked .venv python resolved to itself; a symlinked venv interpreter must collapse to its target — if that ever changes, revisit the deploy's binary-copy guard")
+	}
+	if resolved != underlying {
+		t.Fatalf("symlinked .venv python resolved to %q, want the underlying target %q", resolved, underlying)
 	}
 }
 

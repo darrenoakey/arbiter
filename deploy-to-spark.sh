@@ -75,6 +75,18 @@ fi
 echo "==> Stopping arbiter on spark..."
 ssh "$SPARK" "/home/darren/local/auto/run stop arbiter" 2>&1 | tail -1 || true
 
+echo "==> Ensuring .venv python is a real binary (not a symlink)..."
+# resolveTrustedPythonExecutable collapses the interpreter via EvalSymlinks to
+# block symlink-swap TOCTOU. If .venv/bin/python is a symlink to
+# /usr/bin/python3.12, that collapse returns the SYSTEM python, which loses
+# venv activation (pyvenv.cfg lookup) and every site-packages dependency
+# (torch, diffusers, ltx_core, …). The sanctioned per-adapter venvs avoid
+# this because `venv` copied a real binary into them; the main .venv was
+# created with symlinks. Replace the symlink chain with binary copies (the
+# same state a `python -m venv --copies` produces) so EvalSymlinks returns
+# .venv/bin/python itself and venv activation survives. Spark-only state.
+ssh "$SPARK" "test -L '$REMOTE/.venv/bin/python' && cp --remove-destination /usr/bin/python3.12 '$REMOTE/.venv/bin/python' '$REMOTE/.venv/bin/python3' '$REMOTE/.venv/bin/python3.12' && echo '    converted .venv python symlinks to real binary copies' || echo '    .venv python already a real binary'"
+
 echo "==> Syncing Python adapters..."
 rsync -az --delete src/arbiter/ "$SPARK:$REMOTE/src/arbiter/"
 

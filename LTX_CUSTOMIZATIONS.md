@@ -193,6 +193,20 @@ objects, not a plain state dict).
   Gemma text encoder especially.
 - Arbiter config registers `ltx2`, `ltx2-encode`, `ltx2-denoise1`,
   `ltx2-denoise2` as separate models with their own memory_gb / max_concurrent.
+- **The main `.venv` must use real binary copies, not symlinks** (`python -m
+  venv --copies .venv`, or the conversion step in `deploy-to-spark.sh`).
+  Arbiter's `resolveTrustedPythonExecutable` collapses the interpreter via
+  `EvalSymlinks` to block symlink-swap TOCTOU. A default (`python -m venv`)
+  `.venv/bin/python` is a symlink chain → `/usr/bin/python3.12`; the collapse
+  returns the SYSTEM python, losing venv activation (`pyvenv.cfg` lookup) and
+  every site-packages dependency (`torch`, `diffusers`, `ltx_core`). The 2026-
+  07-19 outage: `0289046` hardened the worker env to drop the inherited
+  `PYTHONPATH`; the resulting workers then died with `No module named
+  'arbiter'` (fixed: the server sets its own repo-owned `PYTHONPATH=<root>/src`),
+  and after that surfaced as `No module named 'torch'/'ltx_core'` (fixed: real
+  binary copies so `EvalSymlinks` returns `.venv/bin/python` itself and venv
+  activation survives). The sanctioned per-adapter venvs (`venvs/<name>`) are
+  unaffected because `venv` copied a real binary into them.
 
 ---
 

@@ -451,6 +451,18 @@ func buildCleanWorkerEnvironment(projectRoot, executable string, memoryGB float6
 	}
 	values["PATH"] = trustedWorkerPath(projectRoot, executable)
 	values["PYTHONUNBUFFERED"] = "1"
+	// Worker subprocesses import `arbiter.worker_main` via `python -m`. The
+	// trusted interpreter may be the repo's .venv symlink, which
+	// resolveTrustedPythonExecutable collapses via EvalSymlinks to the
+	// underlying system python (/usr/bin/python3.12) — losing the venv's
+	// site-packages activation and the editable-install .pth that exposes
+	// the `arbiter` package. PYTHONPATH is forbidden as a caller-supplied
+	// adapter param (see forbiddenAdapterKeys), but the server sets its own
+	// repo-owned value here so the default system-python worker path (used by
+	// ltx2-encode, ltx2, latentsync, composite, sadtalker, …) resolves the
+	// package regardless of interpreter resolution. A later caller-supplied
+	// PYTHONPATH in `params` cannot reach here: validateAdapterParams rejects it.
+	values["PYTHONPATH"] = filepath.Join(projectRoot, "src")
 	if memoryGB > 0 {
 		values["ARBITER_MEMORY_GB"] = strconv.FormatFloat(memoryGB, 'g', -1, 64)
 	}
