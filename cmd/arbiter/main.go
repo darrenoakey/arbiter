@@ -345,14 +345,15 @@ func setupInstances(cfg *Config, mgr *InstanceManager, pythonBin, projectRoot st
 				continue
 			}
 			modelTag := remoteModelTag(modelCfg, modelID)
-			inst := NewRemoteInstance(
+			inst := NewRemoteInstanceWithKind(
 				modelID, fmt.Sprintf("%s@%s", modelID, host),
-				host, hc.Addr, modelTag,
+				host, hc.Addr, hc.OllamaAddr, modelTag, hc.KindOrDefault(),
 				modelCfg.MaxConcurrent, modelCfg.MemoryGB,
 			)
 			mgr.Register(inst)
 			slog.Info("registered remote model placement",
-				"model", modelID, "host", host, "addr", hc.Addr, "tag", modelTag)
+				"model", modelID, "host", host, "addr", hc.Addr,
+				"kind", hc.KindOrDefault(), "ollama_addr", hc.OllamaAddr, "tag", modelTag)
 		}
 	}
 }

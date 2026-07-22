@@ -53,7 +53,17 @@ type Backend interface {
 // accounting but holds ZERO audited VRAM (isRemote()==true via host != spark).
 // memoryGB is advisory only (tracked on the host's remoteHostBudget, never in
 // usedGB).
+//
+// kind selects the remote protocol dialect:
+//   - "nativ": chat against Nativ mlx-vlm-server; unload via POST /unload;
+//     health/ps/embed use ollamaAddr when set (Ollama still owns embeddings).
+//   - "mlx"/"" (default): legacy ollama/MLX on a single base URL.
 func NewRemoteInstance(modelID, instanceID, host, addr, modelTag string, maxConcurrent int, memoryGB float64) *Instance {
+	return NewRemoteInstanceWithKind(modelID, instanceID, host, addr, "", modelTag, "", maxConcurrent, memoryGB)
+}
+
+// NewRemoteInstanceWithKind is NewRemoteInstance plus explicit kind/ollamaAddr.
+func NewRemoteInstanceWithKind(modelID, instanceID, host, addr, ollamaAddr, modelTag, kind string, maxConcurrent int, memoryGB float64) *Instance {
 	inst := &Instance{
 		ModelID:       modelID,
 		InstanceID:    instanceID,
@@ -63,11 +73,16 @@ func NewRemoteInstance(modelID, instanceID, host, addr, modelTag string, maxConc
 		memoryGB:      memoryGB,
 		pending:       make(map[string]chan json.RawMessage),
 	}
+	if kind == "" {
+		kind = "mlx"
+	}
 	inst.backend = &RemoteHTTPBackend{
-		inst:     inst,
-		host:     host,
-		addr:     addr,
-		modelTag: modelTag,
+		inst:       inst,
+		host:       host,
+		addr:       addr,
+		ollamaAddr: ollamaAddr,
+		modelTag:   modelTag,
+		kind:       kind,
 	}
 	return inst
 }
@@ -113,10 +128,12 @@ func (b *LocalProcBackend) IsRemote() bool        { return false }
 //     pooled connection forever with EHOSTUNREACH (the documented Go net/http
 //     wedge); a fresh client+conn per call dodges it.
 type RemoteHTTPBackend struct {
-	inst     *Instance // owning instance; used to flip its state on Load/Unload
-	host     string    // host id, e.g. "boringstack"
-	addr     string    // base URL of the remote backend, e.g. http://10.0.0.42:11434
-	modelTag string    // remote model tag (e.g. ollama "gemma4-26b-32k")
+	inst       *Instance // owning instance; used to flip its state on Load/Unload
+	host       string    // host id, e.g. "boringstack"
+	addr       string    // chat base URL, e.g. http://10.0.0.42:8080 (nativ) or :11434 (ollama)
+	ollamaAddr string    // optional Ollama base for embed/health/ps when chat is nativ
+	modelTag   string    // remote model tag (ollama name or HF id for nativ)
+	kind       string    // "nativ" | "mlx" (default)
 
 	// loadTimeout / inferTimeout bound the upstream calls. They are generous on
 	// purpose: a slow-but-alive call must DRAIN, not be cancelled (see invariant
@@ -556,7 +573,8 @@ func (b *RemoteHTTPBackend) doEmbed(ctx context.Context, body []byte) ([]byte, e
 		}
 	}
 	client := newRemoteHTTPClient(timeout)
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, b.addr+"/api/embed", bytes.NewReader(body))
+	// Embeddings stay on Ollama even when chat has moved to Nativ.
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, b.ollamaBase()+"/api/embed", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -712,8 +730,9 @@ func (b *RemoteHTTPBackend) Cancel() error {
 	return nil
 }
 
-// Unload best-effort tells ollama to drop the model (keep_alive:0). It never
-// blocks the scheduler — a remote unload failing just leaves the model warm.
+// Unload best-effort drops the remote model. Ollama gets keep_alive:0 on a
+// tiny chat call; Nativ gets POST /unload. Never blocks the scheduler — a
+// remote unload failing just leaves the model warm.
 func (b *RemoteHTTPBackend) Unload() error {
 	if b.inst != nil {
 		b.inst.setState("stopped")
@@ -721,6 +740,12 @@ func (b *RemoteHTTPBackend) Unload() error {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		if b.kind == "nativ" {
+			if err := b.doNativUnload(ctx); err != nil {
+				slog.Debug("remote nativ unload failed", "model", b.modelTag, "error", err)
+			}
+			return
+		}
 		payload, _ := json.Marshal(map[string]any{
 			"model":      b.modelTag,
 			"messages":   []map[string]string{{"role": "user", "content": "ok"}},
@@ -732,6 +757,37 @@ func (b *RemoteHTTPBackend) Unload() error {
 		}
 	}()
 	return nil
+}
+
+// doNativUnload POSTs /unload on the Nativ server (best-effort).
+func (b *RemoteHTTPBackend) doNativUnload(ctx context.Context) error {
+	client := newRemoteHTTPClient(10 * time.Second)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.addr+"/unload", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Debug("close nativ unload response", "host", b.host, "error", err)
+		}
+	}()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("nativ unload returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// ollamaBase returns the base URL for Ollama-native routes on this backend.
+func (b *RemoteHTTPBackend) ollamaBase() string {
+	if b.ollamaAddr != "" {
+		return b.ollamaAddr
+	}
+	return b.addr
 }
 
 func (b *RemoteHTTPBackend) Kill() {

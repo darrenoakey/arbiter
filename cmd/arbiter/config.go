@@ -81,9 +81,46 @@ const LocalHost = "spark"
 // HostConfig describes one executor in the fleet. The implicit host "spark"
 // (LocalHost) is always present and local even when absent from this map.
 type HostConfig struct {
-	Addr     string  `json:"addr"`      // host:port of the remote backend (ollama/mlx); empty for the local host
-	Kind     string  `json:"kind"`      // "cuda" (local spark) | "mlx" (remote Apple Silicon)
-	BudgetGB float64 `json:"budget_gb"` // advisory memory budget on that host; not part of spark's audited ledger
+	// Addr is the base URL for remote chat (and, when OllamaAddr is empty, for
+	// embed/health/ps too). For kind "nativ" this is the Nativ mlx-vlm-server
+	// (OpenAI-compatible, typically :8080). For kind "mlx"/legacy ollama this is
+	// the ollama base (typically :11434).
+	Addr string `json:"addr"`
+	// Kind: "cuda" (local spark) | "mlx" (remote ollama/MLX) | "nativ" (remote
+	// Nativ mlx-vlm-server). Empty is treated as "mlx" for back-compat.
+	Kind string `json:"kind"`
+	// BudgetGB is advisory memory budget on that host; not part of spark's audited ledger.
+	BudgetGB float64 `json:"budget_gb"`
+	// OllamaAddr is an optional second endpoint for Ollama-native routes
+	// (embed-text /api/embed, and — when Kind is nativ — host health /api/version
+	// and loaded-model /api/ps). When empty, Addr is used for those routes too.
+	// Set this when chat has moved to Nativ but embeddings still run on Ollama
+	// on the same box (different port).
+	OllamaAddr string `json:"ollama_addr,omitempty"`
+}
+
+// KindOrDefault returns the host kind, defaulting empty to "mlx".
+func (h HostConfig) KindOrDefault() string {
+	if h.Kind == "" {
+		return "mlx"
+	}
+	return h.Kind
+}
+
+// OllamaBase returns the base URL for Ollama-native HTTP (embed/health/ps).
+// Nativ hosts that still run Ollama for embeddings set OllamaAddr; everyone
+// else falls back to Addr.
+func (h HostConfig) OllamaBase() string {
+	if h.OllamaAddr != "" {
+		return h.OllamaAddr
+	}
+	return h.Addr
+}
+
+// IsNativ reports whether this host speaks Nativ's mlx-vlm-server protocol
+// (health at /health, unload at POST /unload, chat at /v1/chat/completions).
+func (h HostConfig) IsNativ() bool {
+	return h.KindOrDefault() == "nativ"
 }
 
 // HasLocalPlacement reports whether the model's placement chain includes the

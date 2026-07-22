@@ -48,7 +48,10 @@ type HostMonitor struct {
 
 type hostState struct {
 	hostID      string
-	addr        string
+	addr        string // chat / primary base (nativ or ollama)
+	healthAddr  string // base used for liveness poll (/health or /api/version)
+	psAddr      string // base used for loaded-model listing
+	kind        string // nativ | mlx
 	reachable   bool
 	failStreak  int
 	lastChecked time.Time
@@ -65,7 +68,31 @@ func NewHostMonitor(cfg *Config, mgr *InstanceManager, logger *EventLogger, sche
 		if cfg.HostIsLocal(id) {
 			continue
 		}
-		states[id] = &hostState{hostID: id, addr: h.Addr, reachable: true}
+		kind := h.KindOrDefault()
+		healthAddr := h.Addr
+		psAddr := h.Addr
+		// Nativ exposes /health on its own port; Ollama-native /api/ps (and
+		// optional liveness via /api/version) live on OllamaBase when set.
+		// Prefer Nativ /health for chat-host liveness so a dead Nativ is
+		// detected even if Ollama is still up for embeds.
+		if kind == "nativ" {
+			healthAddr = h.Addr
+			if h.OllamaAddr != "" {
+				psAddr = h.OllamaAddr
+			}
+		} else {
+			// legacy ollama: health + ps on the same base
+			healthAddr = h.OllamaBase()
+			psAddr = h.OllamaBase()
+		}
+		states[id] = &hostState{
+			hostID:     id,
+			addr:       h.Addr,
+			healthAddr: healthAddr,
+			psAddr:     psAddr,
+			kind:       kind,
+			reachable:  true,
+		}
 	}
 	return &HostMonitor{
 		mgr:           mgr,
@@ -128,31 +155,37 @@ func (hm *HostMonitor) Run(ctx context.Context) {
 // pollAll polls every monitored host concurrently and applies the result.
 func (hm *HostMonitor) pollAll(ctx context.Context) {
 	hm.mu.RLock()
-	type target struct{ id, addr string }
+	type target struct {
+		id, healthAddr, kind string
+	}
 	targets := make([]target, 0, len(hm.states))
 	for id, st := range hm.states {
-		targets = append(targets, target{id, st.addr})
+		targets = append(targets, target{id, st.healthAddr, st.kind})
 	}
 	hm.mu.RUnlock()
 
 	var wg sync.WaitGroup
 	for _, t := range targets {
 		wg.Add(1)
-		go func(id, addr string) {
+		go func(id, healthAddr, kind string) {
 			defer wg.Done()
-			ok := hm.pollOne(ctx, addr)
+			ok := hm.pollOne(ctx, healthAddr, kind)
 			hm.applyResult(id, ok)
-		}(t.id, t.addr)
+		}(t.id, t.healthAddr, t.kind)
 	}
 	wg.Wait()
 }
 
-// pollOne hits {addr}/api/version. Reachable == a 2xx response. Anything else
-// (dial refused, no route, timeout, non-2xx) is a failure for streak counting.
-func (hm *HostMonitor) pollOne(ctx context.Context, addr string) bool {
+// pollOne hits a cheap health endpoint on the host. Nativ: GET /health.
+// Ollama/MLX: GET /api/version. Reachable == a 2xx response.
+func (hm *HostMonitor) pollOne(ctx context.Context, healthAddr, kind string) bool {
 	reqCtx, cancel := context.WithTimeout(ctx, hm.httpClient.Timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, addr+"/api/version", nil)
+	path := "/api/version"
+	if kind == "nativ" {
+		path = "/health"
+	}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, healthAddr+path, nil)
 	if err != nil {
 		return false
 	}
@@ -252,19 +285,19 @@ func (hm *HostMonitor) cancelHostInstances(hostID string) {
 // and DELIBERATELY disjoint from the audited local VRAM ledger (usedGB /
 // AuditVRAMConsistency) — remote hosts hold ZERO bytes there. Each entry carries
 // the advisory used/budget (from remoteHostBudget), the liveness flag, and the
-// models the host's ollama reports loaded (live /api/ps). Never call this on the
-// hot path: it does a network round-trip per host.
+// models the host reports loaded. Never call this on the hot path: it does a
+// network round-trip per host.
 func (hm *HostMonitor) RemoteHostsPanel() []map[string]any {
 	hm.mu.RLock()
 	type snap struct {
-		id, addr   string
-		reachable  bool
-		failStreak int
-		lastOK     time.Time
+		id, addr, psAddr, kind string
+		reachable              bool
+		failStreak             int
+		lastOK                 time.Time
 	}
 	snaps := make([]snap, 0, len(hm.states))
 	for _, st := range hm.states {
-		snaps = append(snaps, snap{st.hostID, st.addr, st.reachable, st.failStreak, st.lastOK})
+		snaps = append(snaps, snap{st.hostID, st.addr, st.psAddr, st.kind, st.reachable, st.failStreak, st.lastOK})
 	}
 	hm.mu.RUnlock()
 
@@ -273,6 +306,7 @@ func (hm *HostMonitor) RemoteHostsPanel() []map[string]any {
 		entry := map[string]any{
 			"host_id":   s.id,
 			"addr":      s.addr,
+			"kind":      s.kind,
 			"reachable": s.reachable,
 		}
 		if s.failStreak > 0 {
@@ -285,16 +319,63 @@ func (hm *HostMonitor) RemoteHostsPanel() []map[string]any {
 			entry["budget_gb"] = hb.budgetGB
 			entry["used_gb"] = hb.usedGB // advisory only — NOT spark's audited VRAM
 		}
-		// Live loaded-model list from the host's ollama, best-effort. Only attempt
-		// when reachable so a dead host doesn't add a dial-timeout to the request.
+		// Live loaded-model list, best-effort. Only attempt when reachable so a
+		// dead host doesn't add a dial-timeout to the request.
 		if s.reachable {
-			if loaded := hm.queryOllamaPS(s.addr); loaded != nil {
+			if loaded := hm.queryLoadedModels(s.psAddr, s.kind, s.addr); loaded != nil {
 				entry["models_loaded"] = loaded
 			}
 		}
 		panel = append(panel, entry)
 	}
 	return panel
+}
+
+// queryLoadedModels returns the models currently loaded on a remote host.
+// Nativ: GET {nativAddr}/health → loaded_model. Ollama: GET {psAddr}/api/ps.
+func (hm *HostMonitor) queryLoadedModels(psAddr, kind, nativAddr string) []string {
+	if kind == "nativ" {
+		return hm.queryNativLoaded(nativAddr)
+	}
+	return hm.queryOllamaPS(psAddr)
+}
+
+func (hm *HostMonitor) queryNativLoaded(addr string) []string {
+	req, err := http.NewRequest(http.MethodGet, addr+"/health", nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := hm.httpClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Debug("close nativ health response", "error", err)
+		}
+	}()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil
+	}
+	var body struct {
+		LoadedModel  string `json:"loaded_model"`
+		LoadedModels struct {
+			TextGeneration string `json:"text_generation"`
+		} `json:"loaded_models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil
+	}
+	names := make([]string, 0, 2)
+	if body.LoadedModel != "" {
+		names = append(names, body.LoadedModel)
+	} else if body.LoadedModels.TextGeneration != "" {
+		names = append(names, body.LoadedModels.TextGeneration)
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
 }
 
 // queryOllamaPS asks a host's ollama which models are currently loaded

@@ -338,3 +338,27 @@ func TestSaveModelConfigConcurrentWritesRemainValid(t *testing.T) {
 		}
 	}
 }
+
+func TestHostConfigNativHelpers(t *testing.T) {
+	h := HostConfig{Addr: "http://10.0.0.42:8080", Kind: "nativ", OllamaAddr: "http://10.0.0.42:11434", BudgetGB: 96}
+	if !h.IsNativ() {
+		t.Fatalf("expected nativ")
+	}
+	if h.KindOrDefault() != "nativ" {
+		t.Fatalf("kind %q", h.KindOrDefault())
+	}
+	if h.OllamaBase() != "http://10.0.0.42:11434" {
+		t.Fatalf("ollama base %q", h.OllamaBase())
+	}
+	legacy := HostConfig{Addr: "http://10.0.0.42:11434", Kind: "mlx"}
+	if legacy.IsNativ() {
+		t.Fatalf("legacy should not be nativ")
+	}
+	if legacy.OllamaBase() != legacy.Addr {
+		t.Fatalf("legacy ollama base should equal addr")
+	}
+	empty := HostConfig{}
+	if empty.KindOrDefault() != "mlx" {
+		t.Fatalf("empty kind default = %q", empty.KindOrDefault())
+	}
+}
