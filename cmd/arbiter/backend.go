@@ -505,6 +505,13 @@ func validateEmbedTexts(value any) ([]string, error) {
 // forces the remote model tag, strips streaming flags (buffer-replay handles
 // streaming locally), and injects a generous max_tokens when the caller omitted
 // it (reasoning-model gotcha — see remoteMaxTokensDefault).
+//
+// Nativ (mlx-vlm-server) rejects some OpenAI fields mid-generation with a hard
+// 500 ("packed token mask must be int32 with one complete row per token"). The
+// confirmed offender is response_format={"type":"json_object"} — even when the
+// system prompt already asks for JSON and the same payload succeeds without
+// that field. Strip it for nativ so JSON-mode callers still get an answer
+// instead of tripping the inference circuit-breaker and wedging the model.
 func (b *RemoteHTTPBackend) buildChatRequest(params json.RawMessage) []byte {
 	var m map[string]any
 	if err := json.Unmarshal(params, &m); err != nil || m == nil {
@@ -513,6 +520,9 @@ func (b *RemoteHTTPBackend) buildChatRequest(params json.RawMessage) []byte {
 	m["model"] = b.modelTag
 	m["stream"] = false
 	delete(m, "stream_options")
+	if b.kind == "nativ" {
+		delete(m, "response_format")
+	}
 	if _, ok := m["max_tokens"]; !ok {
 		if _, ok := m["n_predict"]; !ok {
 			m["max_tokens"] = remoteMaxTokensDefault

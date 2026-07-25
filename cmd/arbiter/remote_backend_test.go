@@ -124,6 +124,65 @@ func TestBuildEmbedRequestMatchesLocalTaskContract(t *testing.T) {
 	}
 }
 
+func TestBuildChatRequestStripsNativJSONResponseFormat(t *testing.T) {
+	// Observed 2026-07-25: every failed llm:qwen3.6-35b job on boringstack nativ
+	// carried response_format={"type":"json_object"} and died with
+	// "packed token mask must be int32...". Same payload without the field
+	// succeeds against the same nativ endpoint.
+	nativ := &RemoteHTTPBackend{modelTag: "mlx-community/Qwen3.6-35B-A3B-4bit", kind: "nativ"}
+	body := nativ.buildChatRequest(json.RawMessage(`{
+		"model":"qwen3.6-35b",
+		"messages":[{"role":"user","content":"hi"}],
+		"max_tokens":32,
+		"temperature":0,
+		"reasoning_effort":"none",
+		"response_format":{"type":"json_object"},
+		"stream":true,
+		"stream_options":{"include_usage":true}
+	}`))
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got["model"] != nativ.modelTag {
+		t.Fatalf("model=%v, want remote tag", got["model"])
+	}
+	if got["stream"] != false {
+		t.Fatalf("stream=%v, want false", got["stream"])
+	}
+	if _, ok := got["stream_options"]; ok {
+		t.Fatalf("stream_options should be stripped: %v", got["stream_options"])
+	}
+	if _, ok := got["response_format"]; ok {
+		t.Fatalf("nativ response_format should be stripped: %v", got["response_format"])
+	}
+	if got["reasoning_effort"] != "none" {
+		t.Fatalf("reasoning_effort should pass through: %v", got["reasoning_effort"])
+	}
+	if got["max_tokens"] != float64(32) {
+		t.Fatalf("max_tokens=%v, want 32", got["max_tokens"])
+	}
+}
+
+func TestBuildChatRequestKeepsJSONResponseFormatForMLX(t *testing.T) {
+	// Legacy ollama/MLX path is not known to 500 on response_format; leave it
+	// alone so a host that understands JSON mode still gets the hint.
+	mlx := &RemoteHTTPBackend{modelTag: "qwen3.6:35b-a3b", kind: "mlx"}
+	body := mlx.buildChatRequest(json.RawMessage(`{
+		"model":"qwen3.6-35b",
+		"messages":[{"role":"user","content":"hi"}],
+		"response_format":{"type":"json_object"}
+	}`))
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	rf, ok := got["response_format"].(map[string]any)
+	if !ok || rf["type"] != "json_object" {
+		t.Fatalf("mlx response_format should be preserved: %v", got["response_format"])
+	}
+}
+
 func TestMapEmbedBodyToResultValidatesAndMatchesLocalShape(t *testing.T) {
 	first := testEmbedding(0.25)
 	second := testEmbedding(-0.5)
