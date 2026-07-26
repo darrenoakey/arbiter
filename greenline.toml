@@ -1,0 +1,26 @@
+# greenline gate configuration — committed to the repo.
+# See docs/greenline.md and DOCTRINE.md (installed by `greenline setup`) for the
+# workflow and invariants. main == deployed == green, always.
+contract_version = 1
+main_branch = "master"
+
+# Verdict command. cwd = the worktree being gated. Build + vet + full Go test
+# suite (serial — the remote integration tests share inference resources).
+# PRECONDITION: SSH forwards localhost:11434->boringstack:11434 (via spark) and
+# localhost:11435->macmini:11435 must be up, or the TestRemote* integration
+# tests fail with connection refused.
+check = "./run check"
+
+# Deploy command. cwd = the canonical checkout. Drain-gated redeploy to spark;
+# idempotent. NEVER use DEPLOY_FORCE=1 (it skips the drain and can kill in-flight
+# work). DEPLOY_DRAIN_TIMEOUT is generous because a denoise chunk can run ~13min.
+deploy = "./run deploy"
+
+# Optional health-only probe. Empty = re-run `deploy` as the health probe.
+health = ""
+
+# Informational: the auto/service name this repo deploys (on spark).
+service = "arbiter"
+
+# Persistent worktree base for this repo (gate lives at <base>/gate).
+worktree_base = "~/src/.greenline-worktrees/arbiter"

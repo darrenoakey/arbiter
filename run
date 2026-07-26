@@ -27,6 +27,19 @@ case "$CMD" in
         export PATH="$PATH:/usr/local/go/bin"
         exec go build -o "$SCRIPT_DIR/arbiter-go" ./cmd/arbiter/
         ;;
+    check)
+        # greenline gate: build + vet + full Go test suite (serial; the remote
+        # integration tests share inference resources). SSH forwards
+        # localhost:11434->boringstack and :11435->macmini must be up.
+        export PATH="$PATH:/usr/local/go/bin"
+        go build ./cmd/arbiter/ && go vet ./cmd/arbiter/ && go test ./cmd/arbiter/ -count=1 -p 1
+        ;;
+    deploy)
+        # greenline deploy: drain-gated redeploy to spark. NEVER DEPLOY_FORCE=1.
+        # DEPLOY_DRAIN_TIMEOUT is generous because a denoise chunk can run ~13min.
+        export PATH="$PATH:/usr/local/go/bin"
+        exec env DEPLOY_DRAIN_TIMEOUT="${DEPLOY_DRAIN_TIMEOUT:-9000}" ./deploy-to-spark.sh
+        ;;
     test)
         exec python -m pytest tests/ "$@"
         ;;
