@@ -273,6 +273,7 @@ var JobTypeToModel = map[string]string{
 	"demucs":                  "demucs",
 	"rvc-train":               "rvc-train",
 	"rvc-convert":             "rvc-convert",
+	"voice-fit":               "voice-fit",
 }
 
 func LoadConfig(projectRoot string) (*Config, error) {

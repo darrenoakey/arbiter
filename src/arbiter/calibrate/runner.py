@@ -247,5 +247,16 @@ def _get_test_params(model_name: str) -> dict:
         "sonic": {"image": img, "audio": audio},
         "ltx2": {"images": [img], "audio": audio, "resolution": "small"},
         "aesthetic-scorer": {"image": img},
+        # voice-fit: a full fit is a training run, so calibration uses a tiny
+        # 3-step probe against the on-spark Leo targets (machine state; adjust
+        # the path if absent) — it measures load VRAM + per-step peak, which is
+        # what the memory_gb declaration needs.
+        "voice-fit": {
+            "name": "calibration-probe",
+            "targets_dir": "/home/darren/src/voxsmith/targets/leo",
+            "seed_voice": "bm_lewis",
+            "steps": 3,
+            "eval_every": 3,
+        },
     }
     return defaults.get(model_name, {})

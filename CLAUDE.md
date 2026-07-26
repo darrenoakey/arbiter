@@ -22,6 +22,10 @@ On the GB10 there is NO discrete VRAM: GPU memory IS the 119.5GB unified system 
 
 The fix (commit `8429f62`): the Go server (`cmd/arbiter/proc.go`) passes `ARBITER_MEMORY_GB=<inst.memoryGB>` to every worker; `src/arbiter/worker_main.py` `_apply_cuda_memory_cap()` calls `torch.cuda.set_per_process_memory_fraction(declared*1.15/total, ceil 0.92)` at startup. An overshoot then raises a catchable `CUDA out of memory` (job fails, caller retries) instead of wedging the host. The cap derives from each model's declared `memory_gb` — so an inaccurate declaration produces an inaccurate cap. If a model legitimately CUDA-OOMs under its cap, raise its `memory_gb` in `local/config.json` (vllm/llm workers are separate binaries that self-bound via `--gpu-memory-utilization` and are unaffected). Host backstops (not in this repo): SBSA hardware watchdog (`RuntimeWatchdogSec=10s` → auto-reboot on livelock) and `vm.swappiness=10`.
 
+### ⛔ NEVER run CUDA work on spark outside arbiter — never ever ever ever ever ever do that again
+
+**No direct `ssh` python/torch/CUDA training or inference jobs on spark. No exceptions.** The memory cap above is applied by `worker_main.py` inside arbiter-managed workers ONLY. A CUDA process started by hand (ssh + `python train.py`, a nohup'd fit, a "quick" GPU probe) has **no cap**, and on the GB10's unified memory it can exhaust all 119.5GB of system RAM while showing a tiny RSS — the OOM killer cannot see it, the host livelocks, and recovery needs a physical reset. Every GPU job — training included (rvc-train, voice-fit, lora-train) — MUST go through the arbiter queue (`POST /v1/jobs`), where the worker gets its `ARBITER_MEMORY_GB` cap. If a GPU capability you need has no adapter yet, **add an adapter** (see "How to Add a New Model") — do not improvise a side-channel run. This rule exists because we livelocked the host doing exactly this (voxsmith fit run directly over ssh, 2026-07). Local CPU work on other machines is unaffected; this rule is about CUDA on spark.
+
 ## How to Run
 
 ```bash

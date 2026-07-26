@@ -30,6 +30,7 @@ _ADAPTER_MODULES = (
     "embed_text",
     "demucs_sep",
     "rvc",
+    "voice_fit",
 )
 
 for _module_name in _ADAPTER_MODULES:

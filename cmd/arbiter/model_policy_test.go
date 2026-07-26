@@ -117,6 +117,7 @@ func TestWorkerPolicyAllowsDocumentedWorkerIdentities(t *testing.T) {
 		{modelID: "demucs", config: pythonWorkerConfig(root, "demucs", "demucs")},
 		{modelID: "rvc-train", config: pythonWorkerConfig(root, "rvc", "rvc-train")},
 		{modelID: "rvc-convert", config: pythonWorkerConfig(root, "rvc", "rvc-convert")},
+		{modelID: "voice-fit", config: pythonWorkerConfig(root, "voxsmith", "voice-fit")},
 		{modelID: "llm:llama", config: repositoryWorkerConfig(root, "llm-worker", "llamacpp")},
 		{modelID: "llm:qwen", config: repositoryWorkerConfig(root, "vllm-chat-worker", "vllm")},
 		{modelID: "tts-voxtral", config: repositoryWorkerConfig(root, "vllm-worker", "")},
