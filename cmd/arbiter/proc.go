@@ -1241,7 +1241,29 @@ const (
 func (m *InstanceManager) PickInstanceForJobWithReason(job *Job, remoteEnabled bool) (*Instance, string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	return m.pickInstanceWalkLocked(job, remoteEnabled, nil)
+}
 
+// PickInstanceRelaxedForJob is the placement backstop (Fix 3): identical to
+// PickInstanceForJobWithReason except it IGNORES excluded_hosts entries that
+// isStaleHost reports as stale (absent or aged past staleExclusionMinAge),
+// while still enforcing reachability, the per-model remote kill-switch, and
+// capacity. It lets a job escape a permanently-poisoned state where every
+// placement was excluded by a long-since-recovered transient flap, without
+// re-routing into a host that is actively flapping right now (those exclusions
+// are fresh and honoured). Caller supplies isStaleHost with store access.
+func (m *InstanceManager) PickInstanceRelaxedForJob(job *Job, remoteEnabled bool, isStaleHost func(host string) bool) (*Instance, string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.pickInstanceWalkLocked(job, remoteEnabled, isStaleHost)
+}
+
+// pickInstanceWalkLocked walks the model's placement chain in declared order,
+// skipping excluded / remote-disabled / unreachable / incapable hosts. When
+// relaxStale is non-nil, an otherwise-excluded host is still considered if
+// relaxStale(host) returns true — its exclusion records only a PAST absence.
+// Caller holds m.mu.
+func (m *InstanceManager) pickInstanceWalkLocked(job *Job, remoteEnabled bool, relaxStale func(host string) bool) (*Instance, string) {
 	mc, ok := m.config.Models[job.ModelID]
 	if !ok {
 		// Unknown model: fall back to the flat pool (back-compat).
@@ -1251,7 +1273,7 @@ func (m *InstanceManager) PickInstanceForJobWithReason(job *Job, remoteEnabled b
 
 	skippedHigher := false // a more-preferred host was passed over
 	for idx, host := range placements {
-		if job.HostExcluded(host) {
+		if job.HostExcluded(host) && (relaxStale == nil || !relaxStale(host)) {
 			skippedHigher = true
 			continue
 		}
@@ -1286,6 +1308,9 @@ func (m *InstanceManager) PickInstanceForJobWithReason(job *Job, remoteEnabled b
 				reason = reasonFallback
 			} else if skippedHigher {
 				reason = reasonSpill
+			}
+			if relaxStale != nil && job.HostExcluded(host) {
+				reason = "exclusion_relaxed" // surfaced in model.placed + /v1/ps
 			}
 			return picked, reason
 		}
@@ -1410,6 +1435,9 @@ func (m *InstanceManager) reclaimableIdleGBLocked(excludeModelID string) float64
 	for _, inst := range m.instances {
 		if inst.ModelID == excludeModelID {
 			continue
+		}
+		if inst.isRemote() {
+			continue // remote residency holds zero audited spark VRAM; never reclaimable
 		}
 		if inst.State() != "loaded" || inst.ActiveJobs() > 0 {
 			continue
@@ -1825,7 +1853,7 @@ func (m *InstanceManager) EvictForGB(needed float64) error {
 	// Count loaded instances per model
 	modelLoaded := make(map[string]int)
 	for _, inst := range m.instances {
-		if inst.State() == "loaded" {
+		if inst.State() == "loaded" && !inst.isRemote() {
 			modelLoaded[inst.ModelID]++
 		}
 	}
@@ -1838,6 +1866,9 @@ func (m *InstanceManager) EvictForGB(needed float64) error {
 
 	var candidates []candidate
 	for _, inst := range m.instances {
+		if inst.isRemote() {
+			continue // remote instances hold zero spark VRAM; evicting frees 0 GB and destroys warm remote state
+		}
 		st := inst.State()
 		active := inst.ActiveJobs()
 		if st != "loaded" || active > 0 {
@@ -1942,6 +1973,9 @@ func (m *InstanceManager) EvictForGBWithQueueInfo(needed float64, queuedJobs map
 	}
 	var candidates []candidate
 	for _, inst := range m.instances {
+		if inst.isRemote() {
+			continue // remote instances hold zero spark VRAM; evicting frees 0 GB and destroys warm remote state
+		}
 		st := inst.State()
 		active := inst.ActiveJobs()
 		if st != "loaded" || active > 0 {
@@ -2037,6 +2071,11 @@ func (m *InstanceManager) EvictIdleNoQueueModels(queuedJobs map[string]int) (int
 	}
 	var candidates []candidate
 	for _, inst := range m.instances {
+		if inst.isRemote() {
+			continue // INVARIANT: remote instances are not spark VRAM citizens. Any eviction,
+			// reclaimable-GB accounting, or "make room for local work" path MUST skip
+			// inst.isRemote(). Local backlog MUST NOT cool a remote-warm model.
+		}
 		if queuedJobs[inst.ModelID] > 0 {
 			continue
 		}
@@ -2163,13 +2202,16 @@ func (m *InstanceManager) EvictForReservation(needed float64, keepAliveSecs map[
 	// Count loaded instances per model
 	modelLoaded := make(map[string]int)
 	for _, inst := range m.instances {
-		if inst.State() == "loaded" {
+		if inst.State() == "loaded" && !inst.isRemote() {
 			modelLoaded[inst.ModelID]++
 		}
 	}
 
 	var candidates []candidate
 	for _, inst := range m.instances {
+		if inst.isRemote() {
+			continue // remote instances hold zero spark VRAM; evicting frees 0 GB and destroys warm remote state
+		}
 		st := inst.State()
 		active := inst.ActiveJobs()
 		if st != "loaded" || active > 0 {
@@ -2352,7 +2394,16 @@ func (m *InstanceManager) Snapshot() map[string]any {
 		}
 
 		if totalMem == 0 && len(g.instances) > 0 {
-			entry["memory_gb"] = g.instances[0].memoryGB
+			// Fix 6/R7: an unloaded model has no resident VRAM to report — show the
+			// LIVE config value (the authoritative surface GET /v1/models/:id and the
+			// scheduler read), not a frozen instance-snapshot that diverges after a
+			// config PATCH while the model stays loaded on a remote host (the R7
+			// divergence class).
+			if cfg, ok := m.config.Models[modelID]; ok {
+				entry["memory_gb"] = cfg.MemoryGB
+			} else {
+				entry["memory_gb"] = g.instances[0].memoryGB
+			}
 		}
 
 		// Idle time
@@ -2447,6 +2498,11 @@ func (m *InstanceManager) Snapshot() map[string]any {
 			entry["memory_gb"] = totalVRAMActual
 		}
 
+		// Fix 6/R7: always surface the live-config max_concurrent so /v1/ps agrees
+		// with GET /v1/models/:id (the authoritative scheduler-visible surface).
+		if cfg, ok := m.config.Models[modelID]; ok {
+			entry["max_concurrent"] = cfg.MaxConcurrent
+		}
 		models = append(models, entry)
 	}
 

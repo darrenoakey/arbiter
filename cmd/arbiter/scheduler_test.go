@@ -389,7 +389,7 @@ func TestInFlightGuardAndIdempotentRelease(t *testing.T) {
 	})
 	inst := mgr.GetModelInstances("m")[0]
 
-	if !sched.markInFlight("job1", inst, 1.0) {
+	if !sched.markInFlight("job1", inst, 1.0, false) {
 		t.Fatal("first markInFlight should succeed")
 	}
 	if got := inst.ActiveJobs(); got != 1 {
@@ -400,7 +400,7 @@ func TestInFlightGuardAndIdempotentRelease(t *testing.T) {
 	}
 
 	// Double-dispatch guard: the same job must not reserve again.
-	if sched.markInFlight("job1", inst, 1.0) {
+	if sched.markInFlight("job1", inst, 1.0, false) {
 		t.Fatal("second markInFlight for the same job must return false")
 	}
 	if got := inst.ActiveJobs(); got != 1 {
@@ -439,7 +439,7 @@ func TestReconcilerHealsStrandedInFlight(t *testing.T) {
 
 	// Dispatch reserved the slot, then stranded — store goes terminal while the
 	// reservation is still held (the defer never ran).
-	if !sched.markInFlight(job.ID, inst, 1.0) {
+	if !sched.markInFlight(job.ID, inst, 1.0, false) {
 		t.Fatal("markInFlight failed")
 	}
 	if err := store.UpdateState(job.ID, "completed", WithFinishedAt(nowTS())); err != nil {
@@ -483,7 +483,7 @@ func TestScheduledWatchdogSkipsInFlightJobs(t *testing.T) {
 		t.Fatalf("schedule orphan job: %v", err)
 	}
 	// live has an active dispatch goroutine (e.g. its model is still loading).
-	sched.markInFlight(live.ID, inst, 1.0)
+	sched.markInFlight(live.ID, inst, 1.0, false)
 
 	stuck, err := store.ListStuckScheduled(15)
 	if err != nil {
