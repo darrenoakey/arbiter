@@ -1272,6 +1272,8 @@ func (m *InstanceManager) pickInstanceWalkLocked(job *Job, remoteEnabled bool, r
 	placements := mc.PlacementsOrDefault()
 
 	skippedHigher := false // a more-preferred host was passed over
+	reachableRemoteFull := false
+	noRemoteSpill := mc.NoRemoteSpillOrDefault()
 	for idx, host := range placements {
 		if job.HostExcluded(host) && (relaxStale == nil || !relaxStale(host)) {
 			skippedHigher = true
@@ -1286,6 +1288,13 @@ func (m *InstanceManager) pickInstanceWalkLocked(job *Job, remoteEnabled bool, r
 			skippedHigher = true
 			continue // liveness poll confirmed this host absent — skip, don't dispatch into the dark
 		}
+		if !isLocal && reachableRemoteFull && noRemoteSpill {
+			// A higher-preference remote host is reachable but has no capacity.
+			// Don't spill the model to a less-preferred remote box; wait for the
+			// preferred host or fall through to the local final link.
+			skippedHigher = true
+			continue
+		}
 		inst := m.instanceForHostLocked(job.ModelID, host)
 		if inst == nil {
 			skippedHigher = true
@@ -1296,6 +1305,9 @@ func (m *InstanceManager) pickInstanceWalkLocked(job *Job, remoteEnabled bool, r
 			continue
 		}
 		if !m.instanceCanAcceptPlacementLocked(job.ModelID, inst) {
+			if !isLocal {
+				reachableRemoteFull = true
+			}
 			skippedHigher = true
 			continue
 		}
@@ -1313,6 +1325,9 @@ func (m *InstanceManager) pickInstanceWalkLocked(job *Job, remoteEnabled bool, r
 				reason = "exclusion_relaxed" // surfaced in model.placed + /v1/ps
 			}
 			return picked, reason
+		}
+		if !isLocal {
+			reachableRemoteFull = true
 		}
 		skippedHigher = true
 	}

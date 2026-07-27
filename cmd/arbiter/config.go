@@ -56,6 +56,12 @@ type ModelConfig struct {
 	// enabled (the default). When false, the model is pinned to local hosts
 	// regardless of its Placements. Phase 1 only stores the flag.
 	RemoteEnabled *bool `json:"remote_enabled,omitempty"`
+	// NoRemoteSpill, when true, prevents jobs from spilling to a lower-preference
+	// remote host when a higher-preference remote host is reachable but has no
+	// capacity. The job waits for the preferred host instead. Failover to a lower-
+	// preference remote host still happens when the preferred host is unreachable.
+	// spark (LocalHost) remains the final fallback when no remote host is usable.
+	NoRemoteSpill *bool `json:"no_remote_spill,omitempty"`
 }
 
 // PlacementsOrDefault returns the model's ordered host placements, defaulting
@@ -73,6 +79,13 @@ func (m ModelConfig) PlacementsOrDefault() []string {
 // model. Defaults to true (nil pointer).
 func (m ModelConfig) RemoteEnabledOrDefault() bool {
 	return m.RemoteEnabled == nil || *m.RemoteEnabled
+}
+
+// NoRemoteSpillOrDefault reports whether remote capacity spill is disabled for
+// this model. Defaults to false (nil pointer), preserving the historical spill
+// behavior.
+func (m ModelConfig) NoRemoteSpillOrDefault() bool {
+	return m.NoRemoteSpill != nil && *m.NoRemoteSpill
 }
 
 // LocalHost is the implicit host id for spark's local CUDA backend. A model

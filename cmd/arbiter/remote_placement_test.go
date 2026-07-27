@@ -2,6 +2,7 @@ package main
 
 import (
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -329,6 +330,77 @@ func TestRelaxedPassNeverTerminallyFails(t *testing.T) {
 	}
 	if sched.relaxedArmed(job.ID) {
 		t.Fatalf("relaxed pass still armed immediately after disarming; cooldown must hold")
+	}
+}
+
+// T12 — NoRemoteSpill: a reachable but full higher-preference remote host does
+// NOT cause a spill to a lower-preference remote host. The job waits instead.
+func TestNoRemoteSpillSkipsLowerPreferenceRemoteWhenHigherIsFull(t *testing.T) {
+	cfg := remotePlacementConfig()
+	one := 1
+	noSpill := true
+	cfg.Models["m"] = ModelConfig{
+		MemoryGB: 10, MaxConcurrent: 1, MaxInstances: &one,
+		PressureIndex: pi(), Placements: []string{"h1", "h2"},
+		NoRemoteSpill: &noSpill,
+	}
+	mgr := NewInstanceManager(cfg, "python3", t.TempDir())
+	setupInstances(cfg, mgr, "python3", t.TempDir())
+	mgr.SetReachabilityFunc(func(string) bool { return true })
+
+	// h1 is loaded and busy (max_concurrent exhausted).
+	h1 := mgr.GetModelInstances("m")[0]
+	if h1.host != "h1" {
+		t.Fatalf("expected first instance on h1, got %s", h1.host)
+	}
+	markLoaded(t, mgr, "m")
+	if h1.State() != "loaded" {
+		t.Fatalf("h1 not loaded: %s", h1.State())
+	}
+	// Simulate h1 at capacity by starting one job and advancing it to in-progress.
+	store, cleanup := newStoreForPlacementTest(t)
+	defer cleanup()
+	job, err := store.CreateJob("m", "t", nil, 0)
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	job.State = "in-progress"
+	atomic.StoreInt32(&h1.activeJobs, 1)
+
+	// A second job must not spill to h2 while h1 is reachable but full.
+	job2 := &Job{ID: "j2", ModelID: "m", State: "queued"}
+	if inst := mgr.PickInstanceForJob(job2, true); inst != nil {
+		t.Fatalf("NoRemoteSpill=true: picked %s when h1 is reachable but full; want nil", hostOf(inst))
+	}
+}
+
+// T13 — NoRemoteSpill still allows failover to a lower-preference remote host
+// when the higher-preference remote host is UNREACHABLE.
+func TestNoRemoteSpillAllowsRemoteFailoverWhenHigherIsAbsent(t *testing.T) {
+	cfg := remotePlacementConfig()
+	one := 1
+	noSpill := true
+	cfg.Models["m"] = ModelConfig{
+		MemoryGB: 10, MaxConcurrent: 1, MaxInstances: &one,
+		PressureIndex: pi(), Placements: []string{"h1", "h2"},
+		NoRemoteSpill: &noSpill,
+	}
+	mgr := NewInstanceManager(cfg, "python3", t.TempDir())
+	setupInstances(cfg, mgr, "python3", t.TempDir())
+	// h1 is reachable=false, h2 is reachable=true.
+	mgr.SetReachabilityFunc(func(host string) bool { return host != "h1" })
+	markLoaded(t, mgr, "m")
+
+	job := &Job{ID: "j1", ModelID: "m", State: "queued"}
+	inst, reason := mgr.PickInstanceForJobWithReason(job, true)
+	if inst == nil {
+		t.Fatalf("NoRemoteSpill=true: picked nil when h1 is absent; want h2")
+	}
+	if inst.host != "h2" {
+		t.Fatalf("NoRemoteSpill=true: picked %s when h1 is absent; want h2", inst.host)
+	}
+	if reason != reasonSpill {
+		t.Fatalf("reason=%q, want %q (absence failover is still spill)", reason, reasonSpill)
 	}
 }
 
