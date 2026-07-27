@@ -23,6 +23,7 @@ func TestChatCompletionCacheHitNoBackend(t *testing.T) {
 	// Register the model so the handler passes the "registered" gate, but never
 	// start a scheduler or any instance.
 	api.config.Models[llmModelID("qwen-test")] = ModelConfig{MemoryGB: 1, MaxConcurrent: 1}
+	api.refreshAliasModels()
 
 	body := []byte(`{"model":"qwen-test","messages":[{"role":"user","content":"2+2?"}],"temperature":0}`)
 
@@ -69,6 +70,7 @@ func TestChatCompletionStreamCacheHitNoBackend(t *testing.T) {
 	defer cleanup()
 
 	api.config.Models[llmModelID("qwen-test")] = ModelConfig{MemoryGB: 1, MaxConcurrent: 1}
+	api.refreshAliasModels()
 
 	// Seed the cache using the NON-streamed body.
 	plain := []byte(`{"model":"qwen-test","messages":[{"role":"user","content":"hi"}]}`)
@@ -108,6 +110,7 @@ func TestAsyncChatCompletionCacheHitNoBackend(t *testing.T) {
 	defer cleanup()
 
 	api.config.Models[llmModelID("qwen-test")] = ModelConfig{MemoryGB: 1, MaxConcurrent: 1}
+	api.refreshAliasModels()
 
 	params := []byte(`{"model":"qwen-test","messages":[{"role":"user","content":"async?"}]}`)
 	key, _ := api.llmCache.Key(params)

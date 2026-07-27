@@ -40,6 +40,7 @@ var trustedPythonAdapters = map[string]string{
 	"moondream":               "moondream",
 	"rvc-convert":             "rvc",
 	"rvc-train":               "rvc",
+	"voice-fit":               "voxsmith",
 	"sadtalker":               "",
 	"sonic":                   "",
 	"tts-clone":               "qwentts",

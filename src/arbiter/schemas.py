@@ -33,6 +33,7 @@ class JobType(str, Enum):
     DEMUCS = "demucs"
     RVC_TRAIN = "rvc-train"
     RVC_CONVERT = "rvc-convert"
+    VOICE_FIT = "voice-fit"
 
 
 # Maps job type to model_id
@@ -58,6 +59,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "demucs": "demucs",
     "rvc-train": "rvc-train",
     "rvc-convert": "rvc-convert",
+    "voice-fit": "voice-fit",
 }
 
 
@@ -301,6 +303,20 @@ class RvcTrainParams(BaseModel):
     f0_method: str = "rmvpe"
 
 
+class VoiceFitParams(BaseModel):
+    name: str  # voice id -> /home/darren/voice-models/<name>.pt
+    targets_dir: Optional[str] = None  # spark-local dir of *.wav + sibling *.txt
+    targets_file: Optional[str] = None  # staged zip (or dir) of the same layout
+    seed_voice: str = "auto"  # stock voice name, or "auto" embedding search
+    exclude: Optional[str] = None  # comma-separated voices excluded from auto seed
+    init_pack: Optional[str] = None  # prior fit name under voice-models/, or abs .pt path
+    steps: int = 300
+    lr: float = 0.05
+    w_self: float = 0.5
+    w_reg: float = 1.0
+    eval_every: int = 10
+
+
 class RvcConvertParams(BaseModel):
     model: str  # trained model id or absolute .pth path
     audio: Optional[str] = None  # base64
@@ -335,5 +351,6 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "embed-text": EmbedTextParams,
     "demucs": DemucsParams,
     "rvc-train": RvcTrainParams,
+    "voice-fit": VoiceFitParams,
     "rvc-convert": RvcConvertParams,
 }

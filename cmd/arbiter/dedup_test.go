@@ -49,7 +49,7 @@ func TestReconcileFollowingJobs(t *testing.T) {
 	if err := store.UpdateState(cancelledOrig.ID, "cancelled", WithFinishedAt(nowTS())); err != nil {
 		t.Fatalf("cancel original: %v", err)
 	}
-	cancelledHash := computeJobHash(cancelledOrig.JobType, cancelledOrig.Payload)
+	cancelledHash := computeJobHash(cancelledOrig.JobType, cancelledOrig.ModelID, cancelledOrig.Payload)
 	store.DedupRegister(cancelledHash, cancelledOrig.ID)
 	cancelledFollowerA, _ := store.CreateFollowerJob("tts-clone", "tts-clone", cancelledPayload, cancelledOrig.ID)
 	cancelledFollowerB, _ := store.CreateFollowerJob("tts-clone", "tts-clone", cancelledPayload, cancelledOrig.ID)
@@ -146,6 +146,30 @@ func TestDedupRecoveredJobsCancelsPlainDuplicates(t *testing.T) {
 	if secondAfter.State != "cancelled" || secondAfter.Error != "dedup: duplicate of "+first.ID {
 		t.Fatalf("second job = state %s error %q, want cancelled/dedup of %s",
 			secondAfter.State, secondAfter.Error, first.ID)
+	}
+}
+
+func TestComputeJobHashIncludesCanonicalModel(t *testing.T) {
+	payload := json.RawMessage(`{"messages":[{"role":"user","content":"same"}]}`)
+	first := computeJobHash("chat-completion", "llm:qwen", payload)
+	second := computeJobHash("chat-completion", "llm:gemma", payload)
+	if first == second {
+		t.Fatal("different concrete models shared one dedup identity")
+	}
+}
+
+func TestComputeJobHashUsesCanonicalizedChatPayload(t *testing.T) {
+	aliasPayload, err := canonicalizeChatParams(
+		json.RawMessage(`{"model":"local-chat","messages":[{"role":"user","content":"same"}]}`),
+		"llm:qwen",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	concretePayload := json.RawMessage(`{"model":"qwen","messages":[{"role":"user","content":"same"}]}`)
+	if computeJobHash("chat-completion", "llm:qwen", aliasPayload) !=
+		computeJobHash("chat-completion", "llm:qwen", concretePayload) {
+		t.Fatal("alias was hashed before canonicalization")
 	}
 }
 

@@ -56,6 +56,11 @@ type hostState struct {
 	failStreak  int
 	lastChecked time.Time
 	lastOK      time.Time
+	// probed is set on the first successful poll. A monitor (re)start resets
+	// reachable=true but loses flap history, so the first CONFIRMED-reachable
+	// probe — distinct from an absent→reachable recovery — is the moment to
+	// forgive stale excluded_hosts entries left over from before the restart.
+	probed bool
 }
 
 // NewHostMonitor builds a monitor over the remote hosts in cfg. Local (spark)
@@ -217,8 +222,13 @@ func (hm *HostMonitor) applyResult(hostID string, ok bool) {
 	st.lastChecked = time.Now()
 
 	var becameAbsent, recovered bool
+	firstProbe := false
 	if ok {
 		st.lastOK = time.Now()
+		if !st.probed {
+			st.probed = true
+			firstProbe = true
+		}
 		if !st.reachable {
 			st.reachable = true
 			recovered = true
@@ -258,8 +268,22 @@ func (hm *HostMonitor) applyResult(hostID string, ok bool) {
 		if hm.logger != nil {
 			hm.logger.Log("host.recovered", map[string]any{"host_id": hostID})
 		}
+		fallthrough
+	case firstProbe:
+		// Host is confirmed reachable (recovered, or first successful probe
+		// after a monitor restart). Forgive stale excluded_hosts entries so a
+		// transient flap doesn't strand jobs forever; dampened by minAge so an
+		// active flap isn't re-forgiven at the liveness cadence.
 		if hm.sched != nil {
-			hm.sched.Wake() // a parked/queued model may now drain to this host
+			if healed, err := hm.sched.ClearStaleExclusionsForHost(hostID, staleExclusionMinAge); err != nil {
+				slog.Warn("host liveness: clear stale exclusions failed", "host", hostID, "error", err)
+			} else if healed > 0 {
+				slog.Info("host liveness: forgave stale excluded host for active jobs", "host", hostID, "healed", healed)
+				if hm.logger != nil {
+					hm.logger.Log("host.exclusion_cleared", map[string]any{"host_id": hostID, "healed": healed})
+				}
+			}
+			hm.sched.Wake() // a parked/queued model may now place on / drain to this host
 		}
 	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -59,6 +60,29 @@ func TestLLMCacheKeyDeterministicAndCanonical(t *testing.T) {
 	kd, _ := c.Key([]byte(`{"model":"qwen","messages":[{"role":"user","content":"hi"}],"temperature":0.9,"max_tokens":50}`))
 	if kd == ka {
 		t.Fatal("different temperature must produce different key")
+	}
+}
+
+func TestLLMCacheConcreteNameKeyStableAfterAdmissionCanonicalization(t *testing.T) {
+	cache := NewLLMCache(t.TempDir(), 32*time.Hour)
+	body := []byte("{ \"model\": \"qwen\", \"messages\": [{\"role\":\"user\",\"content\":\"stable\"}] }\n")
+	before, err := cache.Key(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := canonicalizeChatBody(body, "llm:qwen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, canonical) {
+		t.Fatalf("concrete-name canonicalization changed bytes: %q", canonical)
+	}
+	after, err := cache.Key(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("concrete cache key changed: %s != %s", before, after)
 	}
 }
 

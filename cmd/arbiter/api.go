@@ -29,6 +29,12 @@ type API struct {
 	outputDir   string
 	projectRoot string
 	startTime   time.Time
+	// configMutationMu serializes alias and model mutations. Alias readers take
+	// the read side so admission cannot observe a model deletion before the
+	// matching immutable alias/model snapshot has been published.
+	configMutationMu sync.RWMutex
+	aliasMu          sync.RWMutex
+	aliasModels      map[string]struct{}
 	// hostMonitor is the Phase-3 per-host liveness monitor. /v1/ps consults it
 	// for the SEPARATE remote_hosts panel. nil when no remote hosts are
 	// configured (single-host arbiter) — the panel is simply omitted then.
@@ -125,6 +131,10 @@ type llmRegisterRequest struct {
 }
 
 func NewAPI(cfg *Config, store *Store, mgr *InstanceManager, sched *Scheduler, logger *EventLogger, outputDir, projectRoot string) *API {
+	cfg.LLMAliases = maps.Clone(cfg.LLMAliases)
+	if cfg.LLMAliases == nil {
+		cfg.LLMAliases = map[string]string{}
+	}
 	a := &API{
 		config:      cfg,
 		store:       store,
@@ -134,6 +144,7 @@ func NewAPI(cfg *Config, store *Store, mgr *InstanceManager, sched *Scheduler, l
 		outputDir:   outputDir,
 		projectRoot: projectRoot,
 		startTime:   time.Now(),
+		aliasModels: configuredModelIDs(cfg.Models),
 	}
 	if cfg.LLMCacheEnabledOrDefault() {
 		a.llmCache = NewLLMCache(
@@ -180,6 +191,9 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/llm/models", a.registerLLM)
 	mux.HandleFunc("GET /v1/llm/models", a.listLLMs)
 	mux.HandleFunc("DELETE /v1/llm/models/{name}", a.deregisterLLM)
+	mux.HandleFunc("GET /v1/llm/aliases", a.listAliases)
+	mux.HandleFunc("PUT /v1/llm/aliases/{alias}", a.putAlias)
+	mux.HandleFunc("DELETE /v1/llm/aliases/{alias}", a.deleteAlias)
 	mux.HandleFunc("POST /v1/chat/completions", a.chatCompletion)
 	mux.HandleFunc("PATCH /v1/remote", a.setGlobalRemote)
 	mux.HandleFunc("GET /v1/remote", a.getGlobalRemote)
@@ -273,6 +287,9 @@ func (a *API) updatePSCache() {
 	if models, ok := snap["models"].([]map[string]any); ok {
 		for _, m := range models {
 			if id, ok := m["id"].(string); ok {
+				if aliases := a.aliasesTargeting(id); len(aliases) > 0 {
+					m["aliases"] = aliases
+				}
 				m["queued_jobs"] = perModelCounts[id]["queued"]
 				st := perModelStats[id]
 				m["completed_jobs"] = st.Count
@@ -370,48 +387,52 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// If explicit model provided and configured, use it; otherwise fall back to type mapping
+	// Resolve the requested model to a canonical model id. Top-level model is
+	// always routing. Nested model is routing only for job schemas that explicitly
+	// support it; for chat-completion an explicit nested model that resolves to
+	// nothing is a hard 404 (no silent fallback to the type default).
 	var modelID string
+	var requestedModel string
+	var aliasUsed string
 	var ok bool
 	if req.Model != "" {
-		if _, exists := a.config.Models[req.Model]; exists {
-			modelID = req.Model
-			ok = true
-		} else {
-			writeError(w, 404, fmt.Sprintf("model not configured: %s", req.Model))
+		canonical, resolvedAlias, resolved := a.resolveLLMModelID(req.Model)
+		if !resolved {
+			writeError(w, 404, fmt.Sprintf("model not registered: %s (register via POST /v1/llm/models, or define an alias via PUT /v1/llm/aliases/{alias)}", req.Model))
 			return
 		}
+		modelID = canonical
+		requestedModel = req.Model
+		aliasUsed = resolvedAlias
+		ok = true
 	} else {
 		modelID, ok = JobTypeToModel[req.Type]
-		// Also check for a configured model inside params. Job-specific model
-		// fields (for example rvc-convert's trained voice) are otherwise left to
-		// the adapter and do not become routing overrides.
 		if ok && nestedModelRoutesJob(req.Type) {
 			if paramsModel.Model != "" {
-				if _, exists := a.config.Models[paramsModel.Model]; exists {
-					modelID = paramsModel.Model
+				canonical, resolvedAlias, resolved := a.resolveLLMModelID(paramsModel.Model)
+				if !resolved {
+					writeError(w, 404, fmt.Sprintf("model not registered: %s", paramsModel.Model))
+					return
 				}
+				modelID = canonical
+				requestedModel = paramsModel.Model
+				aliasUsed = resolvedAlias
 			}
 		}
 	}
 	if !ok && req.Type == "chat-completion" {
-		// Generic chat-completion: resolve model from params
-		var chatParams struct {
-			Model string `json:"model"`
-		}
-		if err := json.Unmarshal(req.Params, &chatParams); err != nil {
-			writeError(w, 400, "invalid chat-completion params")
-			return
-		}
-		if chatParams.Model == "" {
+		if paramsModel.Model == "" {
 			writeError(w, 400, "chat-completion requires model in params")
 			return
 		}
-		modelID = llmModelID(chatParams.Model)
-		if _, exists := a.config.Models[modelID]; !exists {
-			writeError(w, 404, fmt.Sprintf("LLM not registered: %s", chatParams.Model))
+		canonical, resolvedAlias, resolved := a.resolveLLMModelID(paramsModel.Model)
+		if !resolved {
+			writeError(w, 404, fmt.Sprintf("LLM not registered: %s (register via POST /v1/llm/models, or define an alias via PUT /v1/llm/aliases/{alias)}", paramsModel.Model))
 			return
 		}
+		modelID = canonical
+		requestedModel = paramsModel.Model
+		aliasUsed = resolvedAlias
 		ok = true
 	}
 	if !ok {
@@ -426,9 +447,21 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, fmt.Sprintf("model not configured: %s", modelID))
 		return
 	}
+	setModelIdentityHeaders(w, requestedModel, modelID, aliasUsed)
 
 	if req.Params == nil {
 		req.Params = json.RawMessage("{}")
+	}
+
+	// For chat jobs, canonicalize the body (params) so the worker receives the
+	// bare canonical model name and cache/dedup keys are alias-independent.
+	if req.Type == "chat-completion" || req.Type == "chat-completion-stream" {
+		canonParams, err := canonicalizeChatParams(req.Params, modelID)
+		if err != nil {
+			writeError(w, 400, "invalid chat params")
+			return
+		}
+		req.Params = canonParams
 	}
 
 	// --- Validate staged file paths ---
@@ -478,7 +511,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	if a.llmCache != nil && (req.Type == "chat-completion" || req.Type == "chat-completion-stream") && !jobForceFlag(req.Params) {
 		if key, err := a.llmCache.Key(req.Params); err == nil {
 			if cached, ok := a.llmCache.Get(key); ok {
-				newJob, err := a.store.CreateJob(modelID, req.Type, req.Params, 0)
+				newJob, err := a.store.CreateJobWithRequestedModel(modelID, req.Type, req.Params, 0, requestedModel)
 				if err == nil {
 					if err := a.store.UpdateState(newJob.ID, "completed", WithResult(cached), WithFinishedAt(nowTS())); err != nil {
 						writeError(w, 500, fmt.Sprintf("complete cached job: %s", err))
@@ -487,7 +520,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 					a.logger.Log("llm.cache_hit", map[string]any{"job_id": newJob.ID, "model": modelID, "async": true})
 					writeJSON(w, 200, map[string]any{
 						"job_id": newJob.ID, "status": "completed",
-						"model": modelID, "cached": true,
+						"model": modelID, "requested_model": requestedModel, "cached": true,
 					})
 					return
 				}
@@ -499,7 +532,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	forceNew := jobForceFlag(req.Params)
 	var dedupHash string
 	if !forceNew {
-		dedupHash = computeJobHash(req.Type, req.Params)
+		dedupHash = computeJobHash(req.Type, modelID, req.Params)
 		hash := dedupHash
 		if origID, err := a.store.DedupLookup(hash, 86400); err == nil && origID != "" {
 			origJob, _ := a.store.GetJob(origID)
@@ -520,7 +553,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 					// needed for correctness — and now CountCanonicalReferences
 					// gives output cleanup a way to know "don't delete this
 					// orig dir, N followers depend on it".
-					newJob, err := a.store.CreateJob(modelID, req.Type, req.Params, 0)
+					newJob, err := a.store.CreateJobWithRequestedModel(modelID, req.Type, req.Params, 0, requestedModel)
 					if err == nil {
 						if err := a.store.SetCanonicalJobID(newJob.ID, origID); err != nil {
 							slog.Warn("dedup: failed to set canonical_job_id",
@@ -537,14 +570,14 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 						})
 						writeJSON(w, 200, map[string]any{
 							"job_id": newJob.ID, "status": "completed",
-							"model": modelID, "cached": true,
+							"model": modelID, "requested_model": requestedModel, "cached": true,
 							"original_job_id": origID,
 						})
 						return
 					}
 				case "queued", "scheduled", "running":
 					// In-flight — create follower
-					follower, err := a.store.CreateFollowerJob(modelID, req.Type, req.Params, origID)
+					follower, err := a.store.CreateFollowerJobWithRequestedModel(modelID, req.Type, req.Params, origID, requestedModel)
 					if err == nil {
 						a.logger.Log("job.dedup_hit", map[string]any{
 							"job_id": follower.ID, "original_id": origID, "type": "following",
@@ -552,6 +585,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 						writeJSON(w, 200, map[string]any{
 							"job_id": follower.ID, "status": "following",
 							"model":           modelID,
+							"requested_model": requestedModel,
 							"original_job_id": origID,
 						})
 						return
@@ -564,7 +598,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	priority := a.scheduler.computePriority(modelID)
-	job, err := a.store.CreateJob(modelID, req.Type, req.Params, priority)
+	job, err := a.store.CreateJobWithRequestedModel(modelID, req.Type, req.Params, priority, requestedModel)
 	if err != nil {
 		writeError(w, 500, fmt.Sprintf("create job: %s", err))
 		return
@@ -581,10 +615,13 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.logger.Log("job.submitted", map[string]any{
-		"job_id":   job.ID,
-		"model_id": modelID,
-		"job_type": req.Type,
-		"priority": priority,
+		"job_id":            job.ID,
+		"model_id":          modelID,
+		"job_type":          req.Type,
+		"priority":          priority,
+		"requested_model":   requestedModel,
+		"resolved_model_id": modelID,
+		"alias_used":        aliasUsed,
 	})
 
 	a.scheduler.Wake()
@@ -593,6 +630,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		"job_id":            job.ID,
 		"status":            "queued",
 		"model":             modelID,
+		"requested_model":   requestedModel,
 		"estimated_seconds": estimated / 1000,
 	})
 }
@@ -610,6 +648,10 @@ func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
 		"status":     job.State,
 		"model":      job.ModelID,
 		"created_at": job.CreatedAt,
+	}
+	if job.RequestedModel != "" {
+		resp["requested_model"] = job.RequestedModel
+		setModelIdentityHeaders(w, job.RequestedModel, job.ModelID, aliasForRequest(job.RequestedModel, job.ModelID))
 	}
 	if job.StartedAt != nil {
 		resp["started_at"] = *job.StartedAt
@@ -640,7 +682,7 @@ func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		resp["result"] = result
+		resp["result"] = rewriteChatResultMap(result, job.RequestedModel)
 	}
 
 	writeJSON(w, 200, resp)
@@ -720,6 +762,9 @@ func (a *API) bulkStatus(w http.ResponseWriter, r *http.Request) {
 			"type":       j.JobType,
 			"created_at": j.CreatedAt,
 		}
+		if j.RequestedModel != "" {
+			entry["requested_model"] = j.RequestedModel
+		}
 		if j.StartedAt != nil {
 			entry["started_at"] = *j.StartedAt
 		}
@@ -736,7 +781,7 @@ func (a *API) bulkStatus(w http.ResponseWriter, r *http.Request) {
 			} else {
 				// Include result metadata but NOT file data (use GET /v1/jobs/{id} for that)
 				delete(result, "data")
-				entry["result"] = result
+				entry["result"] = rewriteChatResultMap(result, j.RequestedModel)
 			}
 		}
 		out[i] = entry
@@ -1123,6 +1168,7 @@ func applyModelConfigRequest(cfg ModelConfig, req modelConfigRequest) ModelConfi
 
 func (a *API) applyRegisteredModelRuntime(modelID string, config ModelConfig) (map[string]any, error) {
 	a.config.Models[modelID] = config
+	a.refreshAliasModels()
 	a.mgr.EnsureModel(modelID)
 	result := a.mgr.ScaleModel(modelID, *config.MaxInstances, config)
 	a.mgr.ApplyModelConfig(modelID, config)
@@ -1131,6 +1177,7 @@ func (a *API) applyRegisteredModelRuntime(modelID string, config ModelConfig) (m
 
 func (a *API) rollbackRegisteredModelRuntime(modelID string) error {
 	delete(a.config.Models, modelID)
+	a.refreshAliasModels()
 	return a.mgr.RemoveModelRuntime(modelID)
 }
 
@@ -1197,6 +1244,12 @@ func (a *API) registerModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "model_id is required")
 		return
 	}
+	a.configMutationMu.Lock()
+	defer a.configMutationMu.Unlock()
+	if alias, collision := a.modelAliasCollision(req.ModelID); collision {
+		writeError(w, 409, fmt.Sprintf("model id %q collides with LLM alias %q", req.ModelID, alias))
+		return
+	}
 	candidateCfg := applyModelConfigRequest(ModelConfig{}, req)
 	if err := validateModelWorkerPolicy(a.projectRoot, req.ModelID, candidateCfg, a.config.HasLocalPlacement(candidateCfg)); err != nil {
 		writeError(w, 400, err.Error())
@@ -1255,7 +1308,11 @@ func (a *API) registerModel(w http.ResponseWriter, r *http.Request) {
 func (a *API) listModels(w http.ResponseWriter, r *http.Request) {
 	models := make([]map[string]any, 0, len(a.config.Models))
 	for modelID, cfg := range a.config.Models {
-		models = append(models, serializeModelConfig(modelID, cfg))
+		entry := serializeModelConfig(modelID, cfg)
+		if aliases := a.aliasesTargeting(modelID); len(aliases) > 0 {
+			entry["aliases"] = aliases
+		}
+		models = append(models, entry)
 	}
 	if models == nil {
 		models = []map[string]any{}
@@ -1269,7 +1326,11 @@ func (a *API) getModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
 		return
 	}
-	writeJSON(w, 200, serializeModelConfig(modelID, a.config.Models[modelID]))
+	entry := serializeModelConfig(modelID, a.config.Models[modelID])
+	if aliases := a.aliasesTargeting(modelID); len(aliases) > 0 {
+		entry["aliases"] = aliases
+	}
+	writeJSON(w, 200, entry)
 }
 
 func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
@@ -1546,6 +1607,9 @@ func removeJobTypeMappings(modelID string) []string {
 }
 
 func (a *API) removeModel(w http.ResponseWriter, r *http.Request) {
+	a.configMutationMu.Lock()
+	defer a.configMutationMu.Unlock()
+
 	modelID, ok := a.resolveConfiguredModelID(r.PathValue("model_id"))
 	if !ok {
 		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
@@ -1554,6 +1618,11 @@ func (a *API) removeModel(w http.ResponseWriter, r *http.Request) {
 	cfg := a.config.Models[modelID]
 
 	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
+	dependentAliases := a.aliasesTargeting(modelID)
+	if len(dependentAliases) > 0 && !force {
+		writeError(w, 409, fmt.Sprintf("model has dependent aliases: %s; retry with ?force=1 to remove both", strings.Join(dependentAliases, ", ")))
+		return
+	}
 	counts, err := a.store.CountByState(modelID)
 	if err != nil {
 		writeError(w, 500, err.Error())
@@ -1586,13 +1655,18 @@ func (a *API) removeModel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	killResult := a.mgr.HardKillModel(modelID, false, &cfg)
-	delete(a.config.Models, modelID)
-	removedJobTypes := removeJobTypeMappings(modelID)
-	if err := DeleteModelConfig(a.projectRoot, modelID); err != nil {
+	if err := DeleteModelConfig(a.projectRoot, modelID, dependentAliases...); err != nil {
 		writeError(w, 500, fmt.Sprintf("delete model config: %s", err))
 		return
 	}
+	killResult := a.mgr.HardKillModel(modelID, false, &cfg)
+	delete(a.config.Models, modelID)
+	removedJobTypes := removeJobTypeMappings(modelID)
+	aliases := a.aliasSnapshot()
+	for _, alias := range dependentAliases {
+		delete(aliases, alias)
+	}
+	a.replaceAliases(aliases)
 
 	a.logger.Log("model.removed", map[string]any{
 		"model_id":            modelID,
@@ -1689,6 +1763,12 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	modelID := llmModelID(name)
+	a.configMutationMu.Lock()
+	defer a.configMutationMu.Unlock()
+	if alias, collision := a.modelAliasCollision(modelID); collision {
+		writeError(w, 409, fmt.Sprintf("model id %q collides with LLM alias %q", modelID, alias))
+		return
+	}
 
 	// Check if already registered
 	if _, ok := a.config.Models[modelID]; ok {
@@ -1853,8 +1933,21 @@ func (a *API) listLLMs(w http.ResponseWriter, r *http.Request) {
 		}
 		entry := serializeModelConfig(id, cfg)
 		entry["name"] = strings.TrimPrefix(id, "llm:")
+		if aliases := a.aliasesTargeting(id); len(aliases) > 0 {
+			entry["aliases"] = aliases
+		}
 		llms = append(llms, entry)
 	}
+	for alias, target := range a.aliasSnapshot() {
+		llms = append(llms, map[string]any{
+			"name":      alias,
+			"model_id":  alias,
+			"alias_for": target,
+		})
+	}
+	slices.SortFunc(llms, func(left, right map[string]any) int {
+		return strings.Compare(fmt.Sprint(left["name"]), fmt.Sprint(right["name"]))
+	})
 	if llms == nil {
 		llms = []map[string]any{}
 	}
@@ -1862,6 +1955,9 @@ func (a *API) listLLMs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) deregisterLLM(w http.ResponseWriter, r *http.Request) {
+	a.configMutationMu.Lock()
+	defer a.configMutationMu.Unlock()
+
 	name := r.PathValue("name")
 	modelID := llmModelID(name)
 
@@ -1870,14 +1966,25 @@ func (a *API) deregisterLLM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, fmt.Sprintf("LLM not registered: %s", name))
 		return
 	}
+	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
+	dependentAliases := a.aliasesTargeting(modelID)
+	if len(dependentAliases) > 0 && !force {
+		writeError(w, 409, fmt.Sprintf("model has dependent aliases: %s; retry with ?force=1 to remove both", strings.Join(dependentAliases, ", ")))
+		return
+	}
 
+	if err := DeleteModelConfig(a.projectRoot, modelID, dependentAliases...); err != nil {
+		writeError(w, 500, fmt.Sprintf("delete LLM config: %s", err))
+		return
+	}
 	killResult := a.mgr.HardKillModel(modelID, false, &cfg)
 	delete(a.config.Models, modelID)
 	delete(JobTypeToModel, "chat-completion:"+name)
-
-	if err := DeleteModelConfig(a.projectRoot, modelID); err != nil {
-		slog.Error("failed to delete LLM config", "model_id", modelID, "error", err)
+	aliases := a.aliasSnapshot()
+	for _, alias := range dependentAliases {
+		delete(aliases, alias)
 	}
+	a.replaceAliases(aliases)
 
 	a.logger.Log("llm.deregistered", map[string]any{"model_id": modelID, "name": name, "killed": killResult["killed"]})
 	writeJSON(w, 200, map[string]any{"model_id": modelID, "name": name, "killed_workers": killResult["killed"], "status": "deregistered"})
@@ -1898,15 +2005,30 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	modelID := llmModelID(req.Model)
-	if _, ok := a.config.Models[modelID]; !ok {
-		writeError(w, 404, fmt.Sprintf("LLM not registered: %s (register via POST /v1/llm/models)", req.Model))
+	modelID, aliasUsed, ok := a.resolveLLMModelID(req.Model)
+	if !ok {
+		writeError(w, 404, fmt.Sprintf("LLM not registered: %s (register via POST /v1/llm/models, or define an alias via PUT /v1/llm/aliases/{alias)}", req.Model))
+		return
+	}
+	a.logger.Log("llm.chat_admitted", map[string]any{
+		"requested_model":   req.Model,
+		"resolved_model_id": modelID,
+		"alias_used":        aliasUsed,
+		"stream":            req.Stream,
+	})
+
+	// Canonicalize the body to the bare canonical model name before cache lookup
+	// and before any worker sees it. This makes alias and concrete-name requests
+	// share cache and dedup keys.
+	canonicalBody, err := canonicalizeChatBody(body, modelID)
+	if err != nil {
+		writeError(w, 400, "invalid request body")
 		return
 	}
 
 	// Reject if any declared input files don't exist (no-op for typical
 	// chat payloads; safety net for tool-using flows that reference files).
-	if err := a.scheduler.ValidateJobInputs(json.RawMessage(body)); err != nil {
+	if err := a.scheduler.ValidateJobInputs(json.RawMessage(canonicalBody)); err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
@@ -1917,16 +2039,20 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 	// the cached full completion as SSE. mtime is bumped on hit by Get().
 	cacheKey := ""
 	if a.llmCache != nil {
-		if k, err := a.llmCache.Key(body); err == nil {
+		if k, err := a.llmCache.Key(canonicalBody); err == nil {
 			cacheKey = k
 			if cached, ok := a.llmCache.Get(k); ok {
-				a.logger.Log("llm.cache_hit", map[string]any{"model": modelID, "stream": req.Stream})
+				a.logger.Log("llm.cache_hit", map[string]any{"model": modelID, "stream": req.Stream, "alias": aliasUsed})
 				if req.Stream {
+					setModelIdentityHeaders(w, req.Model, modelID, aliasUsed)
+					w.Header().Set("X-Arbiter-Cache", "hit")
 					replayCachedResultAsSSE(w, extractCachedResponse(cached))
 				} else {
+					rewritten := rewriteOpenAIResponseModel(extractCachedResponse(cached), req.Model)
 					w.Header().Set("Content-Type", "application/json")
 					w.Header().Set("X-Arbiter-Cache", "hit")
-					if _, err := w.Write(extractCachedResponse(cached)); err != nil {
+					setModelIdentityHeaders(w, req.Model, modelID, aliasUsed)
+					if _, err := w.Write(rewritten); err != nil {
 						slog.Warn("write cached chat completion", "error", err)
 					}
 				}
@@ -1937,13 +2063,14 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 
 	// Streaming: proxy directly to llama-server for SSE support
 	if req.Stream {
-		a.chatCompletionStreamCaching(w, r, modelID, body, cacheKey)
+		setModelIdentityHeaders(w, req.Model, modelID, aliasUsed)
+		a.chatCompletionStreamCaching(w, r, modelID, canonicalBody, cacheKey, req.Model, aliasUsed)
 		return
 	}
 
 	// Non-streaming: submit as a regular arbiter job and wait synchronously
 	priority := a.scheduler.computePriority(modelID)
-	job, err := a.store.CreateJob(modelID, "chat-completion", json.RawMessage(body), priority)
+	job, err := a.store.CreateJobWithRequestedModel(modelID, "chat-completion", json.RawMessage(canonicalBody), priority, req.Model)
 	if err != nil {
 		writeError(w, 500, fmt.Sprintf("create job: %s", err))
 		return
@@ -1977,18 +2104,25 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 						writeError(w, 500, "stored chat result is invalid")
 						return
 					}
-					// Return the OpenAI response directly
+					// Return the OpenAI response directly, echoing the requested model.
 					if resp, ok := result["response"]; ok {
 						w.Header().Set("Content-Type", "application/json")
 						w.Header().Set("X-Arbiter-Cache", "miss")
-						if raw, ok := resp.(json.RawMessage); ok {
-							if _, err := w.Write(raw); err != nil {
-								slog.Warn("write chat completion", "error", err)
-							}
+						setModelIdentityHeaders(w, req.Model, modelID, aliasUsed)
+						var raw []byte
+						if rm, ok := resp.(json.RawMessage); ok {
+							raw = rm
 						} else {
-							if err := json.NewEncoder(w).Encode(resp); err != nil {
-								slog.Warn("encode chat completion", "error", err)
+							var err error
+							raw, err = json.Marshal(resp)
+							if err != nil {
+								writeError(w, 500, "encode chat result")
+								return
 							}
+						}
+						raw = rewriteOpenAIResponseModel(raw, req.Model)
+						if _, err := w.Write(raw); err != nil {
+							slog.Warn("write chat completion", "error", err)
 						}
 						return
 					}
@@ -2015,8 +2149,12 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 // signals completion. There is one queue and one MaxConcurrent — streaming
 // and non-streaming jobs share it.
 func (a *API) chatCompletionStream(w http.ResponseWriter, r *http.Request, modelID string, body []byte) {
+	a.chatCompletionStreamRequested(w, r, modelID, body, bareModelName(modelID))
+}
+
+func (a *API) chatCompletionStreamRequested(w http.ResponseWriter, r *http.Request, modelID string, body []byte, requestedModel string) {
 	priority := a.scheduler.computePriority(modelID)
-	job, err := a.store.CreateJob(modelID, "chat-completion-stream", json.RawMessage(body), priority)
+	job, err := a.store.CreateJobWithRequestedModel(modelID, "chat-completion-stream", json.RawMessage(body), priority, requestedModel)
 	if err != nil {
 		writeError(w, 500, fmt.Sprintf("create job: %s", err))
 		return
@@ -2316,9 +2454,10 @@ func (a *API) storeChatResultIfCacheable(key string, result json.RawMessage) {
 // it to the client as SSE. This makes streamed and non-streamed identical
 // requests share ONE cache entry (the stream flag is not part of the key). If
 // caching is disabled (empty key) it falls back to the live SSE proxy.
-func (a *API) chatCompletionStreamCaching(w http.ResponseWriter, r *http.Request, modelID string, body []byte, cacheKey string) {
+func (a *API) chatCompletionStreamCaching(w http.ResponseWriter, r *http.Request, modelID string, body []byte, cacheKey string, requestedModel, aliasUsed string) {
 	if a.llmCache == nil || cacheKey == "" {
-		a.chatCompletionStream(w, r, modelID, body)
+		setModelIdentityHeaders(w, requestedModel, modelID, aliasUsed)
+		a.chatCompletionStreamRequested(w, r, modelID, body, requestedModel)
 		return
 	}
 
@@ -2326,12 +2465,14 @@ func (a *API) chatCompletionStreamCaching(w http.ResponseWriter, r *http.Request
 	// full completion to cache, then replay it as SSE.
 	nonStreamBody := stripStreamFlag(body)
 	priority := a.scheduler.computePriority(modelID)
-	job, err := a.store.CreateJob(modelID, "chat-completion", json.RawMessage(nonStreamBody), priority)
+	job, err := a.store.CreateJobWithRequestedModel(modelID, "chat-completion", json.RawMessage(nonStreamBody), priority, requestedModel)
 	if err != nil {
 		writeError(w, 500, fmt.Sprintf("create job: %s", err))
 		return
 	}
 	a.scheduler.Wake()
+
+	setModelIdentityHeaders(w, requestedModel, modelID, aliasUsed)
 
 	timeout := time.After(15 * time.Minute)
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -2352,6 +2493,7 @@ func (a *API) chatCompletionStreamCaching(w http.ResponseWriter, r *http.Request
 			case "completed":
 				if j.Result != nil {
 					a.storeChatResultIfCacheable(cacheKey, *j.Result)
+					w.Header().Set("X-Arbiter-Cache", "miss")
 					replayCachedResultAsSSE2(w, extractCachedResponse(*j.Result))
 					return
 				}

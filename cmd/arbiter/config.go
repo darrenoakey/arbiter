@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -205,6 +207,11 @@ type Config struct {
 	// LLMCacheTTLHours is the age (by mtime, refreshed on every hit) past which
 	// a cache entry is swept. 0 = default 32h. Negative is treated as default.
 	LLMCacheTTLHours float64 `json:"llm_cache_ttl_hours,omitempty"`
+	// LLMAliases maps semantic category names (e.g. "local-chat") to canonical
+	// llm:* model ids. Resolution is admission-time only: each request is resolved
+	// to a concrete model before scheduling, so aliases create no extra queues,
+	// instances, or caches. See API.md for precedence and management.
+	LLMAliases map[string]string `json:"llm_aliases,omitempty"`
 }
 
 type configFileSnapshot struct {
@@ -273,6 +280,7 @@ var JobTypeToModel = map[string]string{
 	"demucs":                  "demucs",
 	"rvc-train":               "rvc-train",
 	"rvc-convert":             "rvc-convert",
+	"voice-fit":               "voice-fit",
 }
 
 func LoadConfig(projectRoot string) (*Config, error) {
@@ -284,6 +292,9 @@ func LoadConfig(projectRoot string) (*Config, error) {
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
+	}
+	if err := rejectDuplicateLLMAliasNames(data); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
 	cfg := &Config{
@@ -374,8 +385,55 @@ func LoadConfig(projectRoot string) (*Config, error) {
 			return nil, fmt.Errorf("model %q: %w", id, err)
 		}
 	}
+	if cfg.LLMAliases == nil {
+		cfg.LLMAliases = map[string]string{}
+	}
+	if err := validateLLMAliases(cfg.LLMAliases, cfg.Models); err != nil {
+		return nil, fmt.Errorf("llm_aliases: %w", err)
+	}
 
 	return cfg, nil
+}
+
+func rejectDuplicateLLMAliasNames(data []byte) error {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return err
+	}
+	raw, exists := envelope["llm_aliases"]
+	if !exists || string(raw) == "null" {
+		return nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return fmt.Errorf("llm_aliases must be an object")
+	}
+	seen := make(map[string]bool)
+	for decoder.More() {
+		nameToken, tokenErr := decoder.Token()
+		if tokenErr != nil {
+			return tokenErr
+		}
+		name, ok := nameToken.(string)
+		if !ok {
+			return fmt.Errorf("llm_aliases contains a non-string name")
+		}
+		normalized := strings.ToLower(strings.TrimSpace(name))
+		if seen[normalized] {
+			return fmt.Errorf("duplicate normalized llm alias name %q", name)
+		}
+		seen[normalized] = true
+		var target json.RawMessage
+		if err := decoder.Decode(&target); err != nil {
+			return err
+		}
+	}
+	_, err = decoder.Token()
+	return err
 }
 
 func loadMutableConfigData(projectRoot string) (map[string]any, error) {
@@ -747,7 +805,25 @@ func PatchRemoteDisabled(projectRoot string, disabled bool) error {
 	return writeConfigData(projectRoot, data)
 }
 
-func DeleteModelConfig(projectRoot, modelID string) error {
+// SaveLLMAliases atomically replaces the persisted alias map while preserving
+// every unrelated mutable configuration key.
+func SaveLLMAliases(projectRoot string, aliases map[string]string) error {
+	mutableConfigMu.Lock()
+	defer mutableConfigMu.Unlock()
+	data, err := loadMutableConfigData(projectRoot)
+	if err != nil {
+		return err
+	}
+	if aliases == nil {
+		aliases = map[string]string{}
+	}
+	data["llm_aliases"] = aliases
+	return writeConfigData(projectRoot, data)
+}
+
+// DeleteModelConfig removes a model and any supplied dependent aliases in one
+// atomic configuration-file replacement.
+func DeleteModelConfig(projectRoot, modelID string, aliasesToDrop ...string) error {
 	mutableConfigMu.Lock()
 	defer mutableConfigMu.Unlock()
 	data, err := loadMutableConfigData(projectRoot)
@@ -757,6 +833,14 @@ func DeleteModelConfig(projectRoot, modelID string) error {
 	models, ok := data["models"].(map[string]any)
 	if ok {
 		delete(models, modelID)
+	}
+	if len(aliasesToDrop) > 0 {
+		rawAliases, ok := data["llm_aliases"].(map[string]any)
+		if ok {
+			for _, alias := range aliasesToDrop {
+				delete(rawAliases, alias)
+			}
+		}
 	}
 	return writeConfigData(projectRoot, data)
 }

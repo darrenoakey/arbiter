@@ -95,11 +95,29 @@ type Scheduler struct {
 	// forever; once exceeded the job fails terminal. Reset on terminal state.
 	failoverMu       sync.Mutex
 	failoverAttempts map[string]int
+	// Relaxed-placement backstop (Fix 3): when honouring every excluded_hosts
+	// leaves no reachable host, stale exclusions are relaxed so a job is never
+	// permanently unplaceable. Relaxed dispatches are tagged on the in-flight
+	// entry (inFlightJob.relaxed) so their failures route to relaxedFailures —
+	// a SEPARATE bounded budget that can NEVER push a waiting job into terminal
+	// failure (unlike failoverAttempts). On exhausting the bound the relaxed
+	// pass disarms for relaxedExclusionCooldown, then re-arms.
+	relaxedMu       sync.Mutex
+	relaxedFailures map[string]int
+	relaxedDisarmed map[string]time.Time
+	// placementBackoff (Fix 4) suppresses re-scanning a job that just failed to
+	// place for placementScanBackoff, so the bounded FIFO scan doesn't retry it
+	// every 100ms tick.
+	placementBackoffMu sync.Mutex
+	placementBackoff   map[string]time.Time
 }
 
 type inFlightJob struct {
 	inst     *Instance
 	pressure float64
+	// relaxed is true when this dispatch placed via the stale-exclusion backstop
+	// (Fix 3). Its failures route to relaxedFailures, not failoverAttempts.
+	relaxed bool
 }
 
 type streamHandoff struct {
@@ -116,6 +134,116 @@ const maxLoadAttempts = 3
 // holds because spark (always reachable) is the final link, so a healthy fleet
 // never approaches this cap.
 const maxFailoverAttempts = 8
+
+// staleExclusionMinAge is the minimum age an excluded_hosts entry must reach
+// before it is forgiven — by ClearExcludedHostForActiveJobs (host RECOVERED /
+// first successful probe) and by the relaxed-placement backstop. A just-written
+// exclusion from an active flap is honoured; an older one records only a PAST
+// absence and must not strand a job permanently. max(30s, 2× the 4s liveness
+// interval) = 30s.
+const staleExclusionMinAge = 30 * time.Second
+
+// Relaxed-placement backstop (Fix 3): when honouring every exclusion leaves no
+// reachable host, stale exclusions are relaxed so a job is never permanently
+// unplaceable. Failures of relaxed placements use a SEPARATE bounded budget so
+// they can never push a waiting job into terminal failure; on exhaustion the
+// job returns to normal waiting and the relaxed pass re-arms after a cooldown.
+const (
+	relaxedExclusionMaxFailures = 3
+	relaxedExclusionCooldown    = 5 * time.Minute
+)
+
+// placementScanLimit bounds the per-tick FIFO scan over a model's queued jobs
+// so the dispatcher can step past one job no host can currently accept instead
+// of head-of-line blocking every sibling behind it. placementScanBackoff
+// prevents re-scanning an unplaceable job every 100ms tick.
+const (
+	placementScanLimit   = 8
+	placementScanBackoff = 5 * time.Second
+)
+
+// ClearStaleExclusionsForHost delegates to the store, used by the host monitor
+// on RECOVERED and first successful probe. Returns the count of jobs healed.
+func (s *Scheduler) ClearStaleExclusionsForHost(hostID string, minAge time.Duration) (int, error) {
+	return s.store.ClearExcludedHostForActiveJobs(hostID, minAge)
+}
+
+// relaxedArmed reports whether the stale-exclusion backstop may fire for a job.
+// It is armed while failures are under the bound, and re-arms (with a fresh
+// budget) once the cooldown elapses after the bound was hit.
+func (s *Scheduler) relaxedArmed(jobID string) bool {
+	s.relaxedMu.Lock()
+	defer s.relaxedMu.Unlock()
+	if s.relaxedFailures[jobID] < relaxedExclusionMaxFailures {
+		return true
+	}
+	until, ok := s.relaxedDisarmed[jobID]
+	if !ok || time.Now().After(until) {
+		// cooldown expired (or never set) → re-arm with a fresh budget
+		delete(s.relaxedFailures, jobID)
+		delete(s.relaxedDisarmed, jobID)
+		return true
+	}
+	return false
+}
+
+// relaxedDispatched reports whether the job's CURRENT in-flight dispatch placed
+// via the stale-exclusion backstop. Used by tryFailover to route that dispatch's
+// failures to the separate relaxed budget instead of failoverAttempts.
+func (s *Scheduler) relaxedDispatched(jobID string) bool {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	e, ok := s.inFlight[jobID]
+	return ok && e.relaxed
+}
+
+// recordRelaxedFailure bumps the per-job relaxed-failure budget and disarms the
+// backstop for the cooldown once the bound is hit. Returns true when disarmed.
+func (s *Scheduler) recordRelaxedFailure(jobID string) (disarmed bool) {
+	s.relaxedMu.Lock()
+	defer s.relaxedMu.Unlock()
+	s.relaxedFailures[jobID]++
+	if s.relaxedFailures[jobID] >= relaxedExclusionMaxFailures {
+		s.relaxedDisarmed[jobID] = time.Now().Add(relaxedExclusionCooldown)
+		return true
+	}
+	return false
+}
+
+// routeRelaxedFailure handles a failure of a relaxed-placement dispatch (Fix 3).
+// It NEVER terminal-fails the job: the failure counts against the separate
+// bounded relaxed budget, the failed host's exclusion is refreshed (TouchExclusion)
+// so it isn't immediately re-relaxed, and the job returns to queued for normal
+// waiting. A non-failover-eligible failure (genuine job/model error, or a local
+// instance) is NOT a relaxed concern and returns false so the normal terminal
+// path applies — same as any job.
+func (s *Scheduler) routeRelaxedFailure(job *Job, inst *Instance, cause error) bool {
+	if inst == nil || !inst.isRemote() || !isRemoteAbsence(cause) {
+		return false
+	}
+	disarmed := s.recordRelaxedFailure(job.ID)
+	// Refresh the exclusion so the just-failed host is honoured as freshly
+	// excluded for the next minAge window (not immediately re-relaxed).
+	s.store.TouchExclusion(job.ID, inst.host)
+	if hb := s.mgr.RemoteHostBudget(inst.host); hb != nil {
+		hb.SetUsedGB(0)
+	}
+	inst.setState("error")
+	if _, err := s.store.AddExcludedHost(job.ID, inst.host); err != nil {
+		slog.Warn("relaxed failover: could not persist excluded host", "job", job.ID, "host", inst.host, "error", err)
+	}
+	if err := s.store.UpdateState(job.ID, "queued", WithClearStartedAt()); err != nil {
+		slog.Warn("relaxed failover: could not requeue job", "job", job.ID, "error", err)
+		return false
+	}
+	s.logger.Log("job.relaxed_failover", map[string]any{
+		"job_id": job.ID, "model_id": job.ModelID, "from_host": inst.host,
+		"reason": cause.Error(), "disarmed": disarmed,
+	})
+	slog.Info("relaxed-placement failover: requeued off failed host (never terminal)",
+		"job", job.ID, "from_host", inst.host, "disarmed", disarmed)
+	return true
+}
 
 type insufficientMemoryError struct {
 	instanceID string
@@ -152,6 +280,9 @@ func NewScheduler(cfg *Config, store *Store, mgr *InstanceManager, logger *Event
 		inFlight:                 make(map[string]inFlightJob),
 		starvedSince:             make(map[string]time.Time),
 		failoverAttempts:         make(map[string]int),
+		placementBackoff:         make(map[string]time.Time),
+		relaxedFailures:          make(map[string]int),
+		relaxedDisarmed:          make(map[string]time.Time),
 	}
 }
 
@@ -188,13 +319,13 @@ func (s *Scheduler) cacheChatResult(job *Job, result json.RawMessage) {
 // Returns false if the job already has a live dispatch — the double-dispatch
 // guard. Increment of activeJobs + currentPressure is paired here so the only
 // way to reserve is through the registry.
-func (s *Scheduler) markInFlight(jobID string, inst *Instance, pressure float64) bool {
+func (s *Scheduler) markInFlight(jobID string, inst *Instance, pressure float64, relaxed bool) bool {
 	s.inFlightMu.Lock()
 	if _, exists := s.inFlight[jobID]; exists {
 		s.inFlightMu.Unlock()
 		return false
 	}
-	s.inFlight[jobID] = inFlightJob{inst: inst, pressure: pressure}
+	s.inFlight[jobID] = inFlightJob{inst: inst, pressure: pressure, relaxed: relaxed}
 	s.inFlightMu.Unlock()
 
 	atomic.AddInt32(&inst.activeJobs, 1)
@@ -252,6 +383,12 @@ func (s *Scheduler) releaseInFlight(jobID string) (*Instance, bool) {
 // false when the job should fail terminal: it's not remote/not INFRA, the
 // instance has no eligible failover target left, or the attempt cap is hit.
 func (s *Scheduler) tryFailover(job *Job, inst *Instance, cause error) bool {
+	// Fix 3: a failure of a relaxed-placement dispatch routes to the separate
+	// bounded relaxed budget — never failoverAttempts — so the backstop can
+	// never convert a waiting job into a terminal failure.
+	if s.relaxedDispatched(job.ID) {
+		return s.routeRelaxedFailure(job, inst, cause)
+	}
 	if inst == nil || !inst.isRemote() {
 		return false
 	}
@@ -930,6 +1067,16 @@ func (s *Scheduler) getFullModels(bestModel string) map[string]bool {
 				continue
 			}
 		}
+		// Fix 5 (admission): a model with a reachable remote placement that has
+		// capacity will dispatch off-box (zero spark GPU), so spark's local GPU
+		// pressure must not gate it out of admission. remoteServable already
+		// requires a reachable remote instance WITH capacity (not just the remote
+		// kill-switch flag). The VRAM feasibility gate above still applies; if
+		// placement ultimately falls back to spark, markInFlight charges full
+		// pressure for that actual dispatch.
+		if remoteServable {
+			pressureIndex = 0
+		}
 		// Age the budget by the oldest queued job's wait time. A model with
 		// queued work that's been sitting for a while gets more allowance,
 		// guaranteeing eventual dispatch even under sustained low-pressure
@@ -1063,6 +1210,9 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 					}
 					if inst2.ActiveJobs() > 0 {
 						continue
+					}
+					if inst2.isRemote() {
+						continue // remote holds zero spark VRAM; draining it frees nothing
 					}
 					if !s.canEvictForSwap(candidateModelID, inst.ModelID) {
 						continue
@@ -1514,9 +1664,37 @@ func (s *Scheduler) dispatchStreamHandoff(job *Job, inst *Instance) {
 // flowing while the blocking condition clears; a host recovery wakes the
 // scheduler explicitly, so added latency on recovery stays near zero.
 func (s *Scheduler) requeueNoInstance(job *Job) {
+	// Fix 6: capture WHY placement failed in ONE log line so the next incident
+	// isn't an hour of log archaeology — exclusions (with which are stale /
+	// relaxable), the placement chain, and spark's free/reclaimable VRAM at the
+	// moment of failure. Also emit a structured event for alerting.
+	mc, mcOK := s.config.Models[job.ModelID]
+	placements := "unknown"
+	if mcOK {
+		placements = fmt.Sprint(mc.PlacementsOrDefault())
+	}
+	stale := make([]string, 0, len(job.ExcludedHosts))
+	for _, h := range job.ExcludedHosts {
+		if s.store.ExclusionIsStale(job.ID, h, staleExclusionMinAge) {
+			stale = append(stale, h)
+		}
+	}
+	freeGB := s.mgr.FreeGB()
+	reclaimGB := s.mgr.ReclaimableIdleGB(job.ModelID)
 	slog.Info("scheduler.requeue: no instance available",
 		"job", job.ID, "model", job.ModelID,
-		"reason", "PickInstanceForJob returned nil — all eligible hosts at max_concurrent, excluded, or absent")
+		"placements", placements,
+		"excluded_hosts", job.ExcludedHosts,
+		"stale_exclusions", stale,
+		"remote_enabled", s.config.RemoteAllowedFor(job.ModelID),
+		"free_gb", freeGB, "reclaimable_idle_gb", reclaimGB,
+		"reason", "all eligible hosts at max_concurrent, excluded, or absent")
+	s.logger.Log("scheduler.job_placement_blocked", map[string]any{
+		"job_id": job.ID, "model_id": job.ModelID,
+		"placements": placements, "excluded_hosts": job.ExcludedHosts,
+		"stale_exclusions": stale, "remote_enabled": s.config.RemoteAllowedFor(job.ModelID),
+		"free_gb": freeGB, "reclaimable_idle_gb": reclaimGB,
+	})
 	s.updateJobState(job.ID, "queued", WithClearStartedAt())
 	s.cooldownMu.Lock()
 	s.cooldownUntil[job.ModelID] = time.Now().Add(3 * time.Second)
@@ -1565,6 +1743,13 @@ func (s *Scheduler) tryPreload() {
 		// confirmed-absent host — the load fails instantly (connection refused)
 		// and the health watchdog then churns the instance error→reset forever.
 		if inst.isRemote() && !s.mgr.hostReachable(inst.host) {
+			continue
+		}
+		// Fix 7: never speculatively warm a spark-LOCAL instance of a model that
+		// has a reachable remote placement with capacity — the remote will serve
+		// the queued work off-box, and a speculative local load only burns spark
+		// VRAM (and may evict a real local workload to make room for it).
+		if !inst.isRemote() && s.config.RemoteAllowedFor(modelID) && s.mgr.ModelHasReachableRemoteCapacity(modelID) {
 			continue
 		}
 		state := inst.State()
@@ -1637,90 +1822,153 @@ func (s *Scheduler) Run(ctx context.Context) {
 		// hard constraint (cooldown, circuit-breaker, capacity) or if no model
 		// was selected. The full set has bestModel exempted from the pressure
 		// check, but it can still be excluded by the hard constraints above.
-		var job *Job
-		var err error
+		// Fix 4: bounded FIFO scan for the best model. Dispatch the first job that
+		// places, STEPPING PAST an unplaceable one (all-hosts-excluded, cooldown,
+		// no capacity) so a single poisoned job can no longer head-of-line block
+		// its siblings — the 24-job/66-min freeze. Falls through to FCFS only if
+		// nothing in the best model places this tick.
 		if bestModel != "" && !full[bestModel] {
-			job, err = s.store.PickOldestQueuedJobForModel(bestModel)
-			if err != nil {
-				slog.Warn("scheduler.pick_for_model error", "model", bestModel, "error", err)
+			if s.dispatchOneForModel(bestModel) {
 				continue
 			}
 		}
-		if job == nil {
-			job, err = s.store.PickNextJob(full)
-			if err != nil {
-				slog.Warn("scheduler.pick_next_job error", "error", err)
-				continue
-			}
+
+		// FCFS fallback across the remaining (non-full) models.
+		job, err := s.store.PickNextJob(full)
+		if err != nil {
+			slog.Warn("scheduler.pick_next_job error", "error", err)
+			continue
 		}
 		if job == nil {
 			s.logIdleSkipIfBacklogged(full)
 			continue
 		}
-		slog.Info("scheduler.picked_job",
-			"job_id", job.ID, "model", job.ModelID, "type", job.JobType, "priority", job.Priority)
-
-		// Double-dispatch guard. If a live dispatch goroutine already owns this
-		// job — e.g. the scheduled-watchdog requeued it while its instance was
-		// still loading (denoise model loads take minutes; the watchdog fires
-		// at 15s) — do NOT dispatch it again. Re-marking it scheduled keeps
-		// PickNextJob from returning it while the existing dispatch finishes.
-		// Re-dispatching is exactly what stranded duplicate goroutines and
-		// leaked activeJobs + pressure.
 		if s.isInFlight(job.ID) {
 			s.updateJobState(job.ID, "scheduled", WithStartedAt(nowTS()))
 			continue
 		}
-
-		// Mark scheduled so it won't be re-picked. Stamp the dispatch time so a
-		// watchdog can recover orphaned scheduled jobs if the dispatch path wedges.
-		s.updateJobState(job.ID, "scheduled", WithStartedAt(nowTS()))
-
-		// Pick instance NOW (synchronous) so concurrent goroutines
-		// don't race to pick the same instance. Host-aware: walks the model's
-		// placement chain in order, skips hosts in the job's excluded set (set
-		// by transparent failover), honors the per-model remote kill-switch, and
-		// never returns an instance lacking capacity. spark is always the
-		// reachable final link.
-		inst, placeReason := s.mgr.PickInstanceForJobWithReason(job, s.config.RemoteAllowedFor(job.ModelID))
-		if inst == nil {
+		if !s.tryDispatchJob(job) {
 			s.requeueNoInstance(job)
-			continue
 		}
-		inst.setPlacementReason(placeReason)
-		s.logger.Log("model.placed", map[string]any{
-			"job_id":           job.ID,
-			"model_id":         job.ModelID,
-			"host":             inst.host,
-			"instance_id":      inst.InstanceID,
-			"placement_reason": placeReason,
-		})
-		slog.Info("scheduler.dispatch",
-			"job", job.ID, "model", job.ModelID,
-			"instance", inst.InstanceID, "instance_state", inst.State(),
-			"active_jobs_before", inst.ActiveJobs())
-		slog.Info("picked instance for job", "job", job.ID, "model", job.ModelID,
-			"instance", inst.InstanceID, "state", inst.State(), "active_jobs", inst.ActiveJobs())
-
-		// Reserve the slot + pressure through the in-flight registry (single
-		// source of truth). markInFlight returns false only if the job is
-		// somehow already in-flight — leave it scheduled rather than reserving
-		// a second time.
-		pressure := *s.config.Models[job.ModelID].PressureIndex
-		if !s.markInFlight(job.ID, inst, pressure) {
-			s.updateJobState(job.ID, "scheduled", WithStartedAt(nowTS()))
-			continue
-		}
-		slog.Info("pressure reserved", "model", job.ModelID, "pressure", pressure, "total", s.currentPressure)
-
-		go func(j *Job, inst *Instance, pressure float64) {
-			s.dispatchJobToInstance(j, inst, pressure)
-			s.Wake()
-		}(job, inst, pressure)
-
-		// Preload next instance in background
-		s.tryPreload()
 	}
+}
+
+// tryDispatchJob attempts to place and dispatch a single already-picked job:
+// mark scheduled, pick an instance (normal chain, then the Fix 3 stale-exclusion
+// backstop), reserve the slot + pressure (Fix 5: remote dispatches charge zero),
+// and launch the dispatch goroutine. Returns true when dispatched; false when no
+// instance could be found (caller applies backoff / model cooldown) or the slot
+// was already held (a dispatch race). Extracted from Run so the bounded scan
+// (Fix 4) and tests (T6) can drive one placement attempt directly.
+func (s *Scheduler) tryDispatchJob(job *Job) bool {
+	slog.Info("scheduler.picked_job",
+		"job_id", job.ID, "model", job.ModelID, "type", job.JobType, "priority", job.Priority)
+
+	// Mark scheduled so it won't be re-picked. Stamp the dispatch time so a
+	// watchdog can recover orphaned scheduled jobs if the dispatch path wedges.
+	s.updateJobState(job.ID, "scheduled", WithStartedAt(nowTS()))
+
+	inst, placeReason := s.mgr.PickInstanceForJobWithReason(job, s.config.RemoteAllowedFor(job.ModelID))
+	relaxedDispatch := false
+	if inst == nil && s.relaxedArmed(job.ID) {
+		// Fix 3 backstop: relax STALE exclusions so the job is never permanently
+		// unplaceable. Fresh exclusions (active flap) are honoured; relaxed
+		// failures use a separate bounded budget and never terminally fail.
+		isStale := func(host string) bool { return s.store.ExclusionIsStale(job.ID, host, staleExclusionMinAge) }
+		if rInst, rReason := s.mgr.PickInstanceRelaxedForJob(job, s.config.RemoteAllowedFor(job.ModelID), isStale); rInst != nil {
+			inst = rInst
+			placeReason = rReason
+			relaxedDispatch = true
+		}
+	}
+	if inst == nil {
+		return false
+	}
+	inst.setPlacementReason(placeReason)
+	s.logger.Log("model.placed", map[string]any{
+		"job_id":           job.ID,
+		"model_id":         job.ModelID,
+		"host":             inst.host,
+		"instance_id":      inst.InstanceID,
+		"placement_reason": placeReason,
+	})
+	slog.Info("scheduler.dispatch",
+		"job", job.ID, "model", job.ModelID,
+		"instance", inst.InstanceID, "instance_state", inst.State(),
+		"active_jobs_before", inst.ActiveJobs())
+
+	pressure := *s.config.Models[job.ModelID].PressureIndex
+	if inst.isRemote() {
+		pressure = 0 // Fix 5: a dispatch landing on a remote instance contends for zero spark GPU
+	}
+	if !s.markInFlight(job.ID, inst, pressure, relaxedDispatch) {
+		s.updateJobState(job.ID, "scheduled", WithStartedAt(nowTS()))
+		return false
+	}
+	slog.Info("pressure reserved", "model", job.ModelID, "pressure", pressure, "total", s.currentPressure)
+
+	go func(j *Job, inst *Instance, pressure float64) {
+		s.dispatchJobToInstance(j, inst, pressure)
+		s.Wake()
+	}(job, inst, pressure)
+
+	s.tryPreload()
+	return true
+}
+
+// dispatchOneForModel scans up to placementScanLimit of the model's queued jobs
+// in FIFO order and dispatches the first that places, stepping PAST an
+// unplaceable job instead of head-of-line blocking every sibling behind it
+// (Fix 4). Per-job backoff (placementScanBackoff) keeps an unplaceable job from
+// being re-scanned every 100ms tick. Returns true if a job was dispatched. When
+// NO candidate places, the oldest is requeued via requeueNoInstance so the
+// model cooldown applies as before — but only then, so a placeable sibling is
+// never made to wait behind a poisoned one.
+func (s *Scheduler) dispatchOneForModel(modelID string) bool {
+	candidates, err := s.store.PickQueuedJobsForModel(modelID, placementScanLimit)
+	if err != nil {
+		slog.Warn("scheduler.scan_for_model error", "model", modelID, "error", err)
+		return false
+	}
+	now := time.Now()
+	for _, job := range candidates {
+		if s.isInFlight(job.ID) {
+			continue // a live dispatch already owns it — skip without backoff
+		}
+		if s.inPlacementBackoff(job.ID, now) {
+			continue // recently failed to place — let it rest one tick
+		}
+		if s.tryDispatchJob(job) {
+			return true // a sibling placed — model healthy, NO model cooldown applied
+		}
+		// Couldn't place: put it back WITHOUT a model cooldown (a later sibling
+		// in this same scan may place) and back off so it isn't rescanned every tick.
+		s.updateJobState(job.ID, "queued", WithClearStartedAt())
+		s.setPlacementBackoff(job.ID, now)
+	}
+	if len(candidates) > 0 {
+		// Nothing in the window placed this tick — oldest drives the model
+		// cooldown so the rest of the fleet keeps flowing while it clears.
+		s.requeueNoInstance(candidates[0])
+	}
+	return false
+}
+
+// inPlacementBackoff reports whether a job is resting after a recent placement
+// failure (Fix 4), so the bounded scan doesn't retry it every 100ms tick.
+func (s *Scheduler) inPlacementBackoff(jobID string, now time.Time) bool {
+	s.placementBackoffMu.Lock()
+	defer s.placementBackoffMu.Unlock()
+	until, ok := s.placementBackoff[jobID]
+	return ok && now.Before(until)
+}
+
+// setPlacementBackoff records that a job just failed to place and should not be
+// re-scanned for placementScanBackoff.
+func (s *Scheduler) setPlacementBackoff(jobID string, now time.Time) {
+	s.placementBackoffMu.Lock()
+	defer s.placementBackoffMu.Unlock()
+	s.placementBackoff[jobID] = now.Add(placementScanBackoff)
 }
 
 // autoWakeCheckInterval rate-limits the parked-model scan (it queries the

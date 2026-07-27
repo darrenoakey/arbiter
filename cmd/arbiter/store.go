@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,11 @@ type Job struct {
 	// box. Persisted as a JSON array in the excluded_hosts column so it survives
 	// a crash/restart mid-failover. Empty/nil for the common case.
 	ExcludedHosts []string `json:"excluded_hosts,omitempty"`
+	// RequestedModel is the caller's original model string (e.g. "local-chat"
+	// or "qwen3.6-35b"). It is used at serve time to echo the requested string
+	// in response.model and in job results, even when the canonical target or a
+	// cached/deduped result carries a different model field.
+	RequestedModel string `json:"requested_model,omitempty"`
 }
 
 // HostExcluded reports whether the given host id is in the job's excluded set.
@@ -64,7 +70,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     started_at REAL,
     finished_at REAL,
     canonical_job_id TEXT,
-    excluded_hosts TEXT
+    excluded_hosts TEXT,
+    requested_model TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_priority ON jobs(priority) WHERE state = 'queued';
@@ -118,9 +125,28 @@ func migrateAddExcludedHosts(db *sql.DB) {
 	_ = err
 }
 
+// migrateAddRequestedModel adds the requested_model column to databases that
+// pre-date the LLM alias layer. Idempotent.
+func migrateAddRequestedModel(db *sql.DB) error {
+	_, err := db.Exec(`ALTER TABLE jobs ADD COLUMN requested_model TEXT`)
+	if err == nil || strings.Contains(err.Error(), "duplicate column") ||
+		strings.Contains(err.Error(), "no such table") {
+		return nil
+	}
+	return fmt.Errorf("add requested_model column: %w", err)
+}
+
 type Store struct {
 	db *sql.DB
 	mu sync.RWMutex
+	// excludedAt tracks the write-time of each (job, host) exclusion so
+	// ClearExcludedHostForActiveJobs can dampen with a min-age: an exclusion
+	// written seconds ago by an active host flap is NOT forgiven even when the
+	// host reports RECOVERED, preventing clear→fail→exclude→recover→clear
+	// churn at the liveness cadence. Absent entries (pre-existing rows, or any
+	// exclusion present across a restart) are treated as old and ARE clearable.
+	// Bounded by the number of distinct jobs that ever failover; cleared on restart.
+	excludedAt map[string]map[string]time.Time
 }
 
 func NewStore(dbPath string) (*Store, error) {
@@ -134,10 +160,14 @@ func NewStore(dbPath string) (*Store, error) {
 	// existing jobs table that was created without it.
 	migrateAddCanonicalJobID(db)
 	migrateAddExcludedHosts(db)
+	if err := migrateAddRequestedModel(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, excludedAt: map[string]map[string]time.Time{}}, nil
 }
 
 func genID() string {
@@ -151,13 +181,19 @@ func nowTS() float64 {
 }
 
 func (s *Store) CreateJob(modelID, jobType string, payload json.RawMessage, priority float64) (*Job, error) {
+	return s.CreateJobWithRequestedModel(modelID, jobType, payload, priority, "")
+}
+
+// CreateJobWithRequestedModel persists both canonical routing identity and the
+// caller's original model string for response-time provenance.
+func (s *Store) CreateJobWithRequestedModel(modelID, jobType string, payload json.RawMessage, priority float64, requestedModel string) (*Job, error) {
 	id := genID()
 	now := nowTS()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
-		"INSERT INTO jobs (id, model_id, job_type, state, priority, payload, created_at) VALUES (?,?,?,'queued',?,?,?)",
-		id, modelID, jobType, priority, string(payload), now,
+		"INSERT INTO jobs (id, model_id, job_type, state, priority, payload, created_at, requested_model) VALUES (?,?,?,'queued',?,?,?,?)",
+		id, modelID, jobType, priority, string(payload), now, nullableRequestedModel(requestedModel),
 	)
 	if err != nil {
 		return nil, err
@@ -165,7 +201,12 @@ func (s *Store) CreateJob(modelID, jobType string, payload json.RawMessage, prio
 	return &Job{
 		ID: id, ModelID: modelID, JobType: jobType,
 		State: "queued", Priority: priority, Payload: payload, CreatedAt: now,
+		RequestedModel: requestedModel,
 	}, nil
+}
+
+func nullableRequestedModel(requestedModel string) sql.NullString {
+	return sql.NullString{String: requestedModel, Valid: requestedModel != ""}
 }
 
 func (s *Store) GetJob(id string) (*Job, error) {
@@ -176,20 +217,20 @@ func (s *Store) GetJob(id string) (*Job, error) {
 
 func (s *Store) scanJob(row *sql.Row) (*Job, error) {
 	var j Job
-	var payload, result, errStr, canonical, excluded sql.NullString
+	var payload, result, errStr, canonical, excluded, requested sql.NullString
 	var startedAt, finishedAt sql.NullFloat64
 	err := row.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
-		&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt, &canonical, &excluded)
+		&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt, &canonical, &excluded, &requested)
 	if err != nil {
 		return nil, err
 	}
-	fillJobNullable(&j, payload, result, errStr, canonical, excluded, startedAt, finishedAt)
+	fillJobNullable(&j, payload, result, errStr, canonical, excluded, requested, startedAt, finishedAt)
 	return &j, nil
 }
 
 // fillJobNullable is the shared decode of the nullable job columns so scanJob
 // (QueryRow) and scanJobFromRows (Rows) stay in lockstep when columns change.
-func fillJobNullable(j *Job, payload, result, errStr, canonical, excluded sql.NullString, startedAt, finishedAt sql.NullFloat64) {
+func fillJobNullable(j *Job, payload, result, errStr, canonical, excluded, requested sql.NullString, startedAt, finishedAt sql.NullFloat64) {
 	if payload.Valid {
 		j.Payload = json.RawMessage(payload.String)
 	}
@@ -208,6 +249,9 @@ func fillJobNullable(j *Job, payload, result, errStr, canonical, excluded sql.Nu
 	}
 	if canonical.Valid {
 		j.CanonicalJobID = canonical.String
+	}
+	if requested.Valid && requested.String != "" {
+		j.RequestedModel = requested.String
 	}
 	if excluded.Valid && excluded.String != "" {
 		// Stored as a JSON array; ignore malformed values (treat as none).
@@ -255,11 +299,128 @@ func (s *Store) AddExcludedHost(jobID, hostID string) ([]string, error) {
 		}
 	}
 	hosts = append(hosts, hostID)
+	if s.excludedAt[jobID] == nil {
+		s.excludedAt[jobID] = make(map[string]time.Time)
+	}
+	if _, ok := s.excludedAt[jobID][hostID]; !ok {
+		s.excludedAt[jobID][hostID] = time.Now() // first-write time; drives the min-age dampener
+	}
 	encoded, _ := json.Marshal(hosts)
 	if _, err := s.db.Exec("UPDATE jobs SET excluded_hosts = ? WHERE id = ?", string(encoded), jobID); err != nil {
 		return nil, err
 	}
 	return hosts, nil
+}
+
+// ClearExcludedHostForActiveJobs removes hostID from the excluded set of every
+// non-terminal job, EXCEPT exclusions younger than minAge: a just-written
+// exclusion from an actively flapping host must age before it is forgiven, or
+// clear→fail→exclude→recover→clear churns at the liveness cadence. Exclusions
+// with no recorded write-time (pre-existing rows, or any exclusion present
+// across a restart) are treated as old and ARE cleared. Returns the count
+// healed. Called from the host monitor on RECOVERED and on the first
+// successful probe after (re)start.
+func (s *Store) ClearExcludedHostForActiveJobs(hostID string, minAge time.Duration) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT id, excluded_hosts FROM jobs WHERE state IN ('queued','scheduled','running','following') AND excluded_hosts IS NOT NULL AND excluded_hosts != ''`)
+	if err != nil {
+		return 0, err
+	}
+	type pending struct {
+		id    string
+		hosts []string
+	}
+	var toUpdate []pending
+	healed := 0
+	now := time.Now()
+	for rows.Next() {
+		var id, raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			continue
+		}
+		var hosts []string
+		if err := json.Unmarshal([]byte(raw), &hosts); err != nil {
+			continue
+		}
+		found := false
+		for _, h := range hosts {
+			if h == hostID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			continue
+		}
+		// Dampener: honour a fresh exclusion from an active flap.
+		if jobTimes, ok := s.excludedAt[id]; ok {
+			if wt, ok := jobTimes[hostID]; ok && now.Sub(wt) < minAge {
+				continue
+			}
+		}
+		filtered := make([]string, 0, len(hosts))
+		for _, h := range hosts {
+			if h != hostID {
+				filtered = append(filtered, h)
+			}
+		}
+		toUpdate = append(toUpdate, pending{id, filtered})
+		healed++
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return healed, err
+	}
+	_ = rows.Close()
+	for _, p := range toUpdate {
+		var enc string
+		if len(p.hosts) > 0 {
+			b, _ := json.Marshal(p.hosts)
+			enc = string(b)
+		}
+		if _, err := s.db.Exec("UPDATE jobs SET excluded_hosts = ? WHERE id = ?", enc, p.id); err != nil {
+			slog.Warn("clear excluded host: update failed", "job", p.id, "error", err)
+			continue
+		}
+		if jt, ok := s.excludedAt[p.id]; ok {
+			delete(jt, hostID)
+			if len(jt) == 0 {
+				delete(s.excludedAt, p.id)
+			}
+		}
+	}
+	return healed, nil
+}
+
+// ExclusionIsStale reports whether the (jobID, hostID) exclusion is old enough
+// to forgive (>= minAge), OR has no recorded write-time (pre-existing row, or
+// present across a restart). Used by the relaxed-placement backstop to ignore
+// only exclusions recording a PAST absence while honouring fresh ones from an
+// active flap.
+func (s *Store) ExclusionIsStale(jobID, hostID string, minAge time.Duration) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if jt, ok := s.excludedAt[jobID]; ok {
+		if wt, ok := jt[hostID]; ok {
+			return time.Since(wt) >= minAge
+		}
+	}
+	return true // no recorded write-time → treat as old (forgive)
+}
+
+// TouchExclusion refreshes the write-time of an existing (jobID, hostID)
+// exclusion to now, so a host that just failed a relaxed placement is honoured
+// as freshly excluded for the next minAge window (not immediately re-relaxed).
+// No-op if the exclusion is not recorded.
+func (s *Store) TouchExclusion(jobID, hostID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if jt, ok := s.excludedAt[jobID]; ok {
+		if _, ok := jt[hostID]; ok {
+			jt[hostID] = time.Now()
+		}
+	}
 }
 
 // CountCanonicalReferences returns how many jobs point at origID via
@@ -316,13 +477,13 @@ func (s *Store) ListJobs(state, modelID string, limit int) ([]*Job, error) {
 // list changes.
 func scanJobFromRows(rows *sql.Rows) (*Job, error) {
 	var j Job
-	var payload, result, errStr, canonical, excluded sql.NullString
+	var payload, result, errStr, canonical, excluded, requested sql.NullString
 	var startedAt, finishedAt sql.NullFloat64
 	if err := rows.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
-		&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt, &canonical, &excluded); err != nil {
+		&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt, &canonical, &excluded, &requested); err != nil {
 		return nil, err
 	}
-	fillJobNullable(&j, payload, result, errStr, canonical, excluded, startedAt, finishedAt)
+	fillJobNullable(&j, payload, result, errStr, canonical, excluded, requested, startedAt, finishedAt)
 	return &j, nil
 }
 
@@ -537,6 +698,53 @@ func (s *Store) PickOldestQueuedJobForModel(modelID string) (*Job, error) {
 		return nil, nil
 	}
 	return j, err
+}
+
+// PickQueuedJobsForModel returns up to `limit` oldest queued jobs for the model
+// in FIFO (created_at ASC) order, so the dispatcher can scan PAST a job no host
+// can currently accept instead of head-of-line blocking every sibling behind it
+// (Fix 4: the 24-job/66-min freeze).
+func (s *Store) PickQueuedJobsForModel(modelID string, limit int) ([]*Job, error) {
+	if limit < 1 {
+		limit = 1
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(
+		"SELECT * FROM jobs WHERE state = 'queued' AND model_id = ? ORDER BY created_at ASC LIMIT ?",
+		modelID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var jobs []*Job
+	for rows.Next() {
+		var j Job
+		var payload, result, errStr, canonical, excluded, requested sql.NullString
+		var startedAt, finishedAt sql.NullFloat64
+		if err := rows.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
+			&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt, &canonical, &excluded, &requested); err != nil {
+			return nil, err
+		}
+		fillJobNullable(&j, payload, result, errStr, canonical, excluded, requested, startedAt, finishedAt)
+		jobs = append(jobs, &j)
+	}
+	return jobs, rows.Err()
+}
+
+// CountRequestedModelSince returns how many jobs used the given requested_model
+// string (typically an alias) at or after the given timestamp. Used by the
+// guarded DELETE /v1/llm/aliases/{alias} endpoint.
+func (s *Store) CountRequestedModelSince(requestedModel string, since float64) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var n int
+	err := s.db.QueryRow(
+		"SELECT COUNT(*) FROM jobs WHERE requested_model = ? AND created_at >= ?",
+		requestedModel, since,
+	).Scan(&n)
+	return n, err
 }
 
 func (s *Store) CountActive(modelID string) (int, error) {
@@ -933,7 +1141,7 @@ func (s *Store) GetRunningJobs() ([]*Job, error) {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(
-		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at, canonical_job_id, excluded_hosts FROM jobs WHERE state = 'running'",
+		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at, canonical_job_id, excluded_hosts, requested_model FROM jobs WHERE state = 'running'",
 	)
 	if err != nil {
 		return nil, err
@@ -957,7 +1165,7 @@ func (s *Store) GetActiveJobs() ([]*Job, error) {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(
-		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at, canonical_job_id, excluded_hosts FROM jobs WHERE state IN ('queued','scheduled','running','following')",
+		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at, canonical_job_id, excluded_hosts, requested_model FROM jobs WHERE state IN ('queued','scheduled','running','following')",
 	)
 	if err != nil {
 		return nil, err

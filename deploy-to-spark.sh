@@ -18,7 +18,15 @@ REMOTE=/home/darren/src/arbiter
 cd "$(dirname "$0")"
 
 echo "==> Running Go tests..."
-go test ./cmd/arbiter/ -count=1 >/dev/null
+# ARBITER_GO_TEST_SKIP: optional regex of environment-dependent tests to skip
+# (some remote-host tests require live local ollama / remote Macs on the LAN).
+# Default (unset) runs the FULL suite — do not set it to dodge real failures.
+if [ -n "${ARBITER_GO_TEST_SKIP:-}" ]; then
+    echo "    skipping env-dependent tests matching: $ARBITER_GO_TEST_SKIP"
+    go test ./cmd/arbiter/ -count=1 -skip "$ARBITER_GO_TEST_SKIP" >/dev/null
+else
+    go test ./cmd/arbiter/ -count=1 >/dev/null
+fi
 echo "    go tests passed"
 
 echo "==> Smoke-testing Python adapter package on spark..."

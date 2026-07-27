@@ -842,6 +842,10 @@ func TestChatCompletionStreamReservesInstanceWhileStreaming(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for stream handler to finish")
 	}
+	streamJobs, err := api.store.ListJobs("", "llm:test-stream", 10)
+	if err != nil || len(streamJobs) != 1 || streamJobs[0].RequestedModel != "test-stream" {
+		t.Fatalf("stream requested_model persistence: jobs=%+v error=%v", streamJobs, err)
+	}
 
 	// Wait briefly for the scheduler's dispatch goroutine to run its deferred
 	// ReleaseAndCheck (decrementing activeJobs).

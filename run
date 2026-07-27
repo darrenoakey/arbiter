@@ -32,6 +32,12 @@ case "$CMD" in
         # integration tests share inference resources). SSH forwards
         # localhost:11434->boringstack and :11435->macmini must be up.
         export PATH="$PATH:/usr/local/go/bin"
+        unformatted="$(gofmt -l .)"
+        if [ -n "$unformatted" ]; then
+            echo "Unformatted Go files:" >&2
+            echo "$unformatted" >&2
+            exit 1
+        fi
         go build ./cmd/arbiter/ && go vet ./cmd/arbiter/ && go test ./cmd/arbiter/ -count=1 -p 1
         ;;
     deploy)
@@ -75,6 +81,9 @@ Usage: ./run <command> [args...]
 
 Commands:
   server              Start the Arbiter API server
+  build               Build the Arbiter Go server
+  check               Run the full Go quality gate
+  deploy              Drain-gated deploy to spark
   test                Run fast tests (unit + integration, no calibration)
   test-all            Run all tests except calibration
   adapter-test <model> Test an adapter lifecycle (load/infer/verify/unload)

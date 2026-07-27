@@ -33,11 +33,15 @@ func jobForceFlag(params json.RawMessage) bool {
 	return f.Force
 }
 
-// computeJobHash produces a SHA256 hash of the job type + canonical params.
-// For *_file params, hashes file contents instead of the path.
-func computeJobHash(jobType string, params json.RawMessage) string {
+// computeJobHash produces a SHA256 hash of the job type + canonical model id +
+// canonical params. For *_file params, hashes file contents instead of the path.
+// Including the resolved model id fixes a pre-existing bug where two jobs with
+// the same params but different top-level models collided and shared output.
+func computeJobHash(jobType string, modelID string, params json.RawMessage) string {
 	h := sha256.New()
 	h.Write([]byte(jobType))
+	h.Write([]byte{0}) // separator
+	h.Write([]byte(modelID))
 	h.Write([]byte{0}) // separator
 
 	// Parse params to handle file content hashing
@@ -229,13 +233,19 @@ func (s *Store) GetFollowers(originalJobID string) ([]string, error) {
 
 // CreateFollowerJob creates a job in "following" state linked to the original.
 func (s *Store) CreateFollowerJob(modelID, jobType string, payload json.RawMessage, originalJobID string) (*Job, error) {
+	return s.CreateFollowerJobWithRequestedModel(modelID, jobType, payload, originalJobID, "")
+}
+
+// CreateFollowerJobWithRequestedModel retains subscriber-specific request
+// identity while coalescing execution under a canonical job.
+func (s *Store) CreateFollowerJobWithRequestedModel(modelID, jobType string, payload json.RawMessage, originalJobID, requestedModel string) (*Job, error) {
 	id := genID()
 	now := nowTS()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
-		"INSERT INTO jobs (id, model_id, job_type, state, priority, payload, created_at, error) VALUES (?,?,?,'following',0,?,?,?)",
-		id, modelID, jobType, string(payload), now, "following:"+originalJobID,
+		"INSERT INTO jobs (id, model_id, job_type, state, priority, payload, created_at, error, requested_model) VALUES (?,?,?,'following',0,?,?,?,?)",
+		id, modelID, jobType, string(payload), now, "following:"+originalJobID, nullableRequestedModel(requestedModel),
 	)
 	if err != nil {
 		return nil, err
@@ -243,7 +253,8 @@ func (s *Store) CreateFollowerJob(modelID, jobType string, payload json.RawMessa
 	return &Job{
 		ID: id, ModelID: modelID, JobType: jobType,
 		State: "following", Payload: payload, CreatedAt: now,
-		Error: "following:" + originalJobID,
+		Error:          "following:" + originalJobID,
+		RequestedModel: requestedModel,
 	}, nil
 }
 
@@ -306,7 +317,7 @@ func (s *Store) ResolveFollowers(originalJobID string, originalState string, res
 		s.mu.Unlock()
 
 		if promotedJob, err := s.GetJob(promotedID); err == nil && promotedJob != nil {
-			hash := computeJobHash(promotedJob.JobType, promotedJob.Payload)
+			hash := computeJobHash(promotedJob.JobType, promotedJob.ModelID, promotedJob.Payload)
 			s.DedupRegister(hash, promotedID)
 		}
 	}
@@ -359,7 +370,7 @@ func (s *Store) ReconcileFollowingJobs(outputDir string) int {
 func (s *Store) DedupRecoveredJobs() int {
 	s.mu.Lock()
 	rows, err := s.db.Query(
-		"SELECT id, job_type, payload FROM jobs WHERE state = 'queued' ORDER BY created_at ASC",
+		"SELECT id, job_type, model_id, payload FROM jobs WHERE state = 'queued' ORDER BY created_at ASC",
 	)
 	s.mu.Unlock()
 	if err != nil {
@@ -374,13 +385,14 @@ func (s *Store) DedupRecoveredJobs() int {
 	type queuedJob struct {
 		id      string
 		jobType string
+		modelID string
 		payload json.RawMessage
 	}
 	var jobs []queuedJob
 	for rows.Next() {
 		var j queuedJob
 		var payload string
-		if err := rows.Scan(&j.id, &j.jobType, &payload); err != nil {
+		if err := rows.Scan(&j.id, &j.jobType, &j.modelID, &payload); err != nil {
 			slog.Error("scan recovered job", "error", err)
 			continue
 		}
@@ -402,7 +414,7 @@ func (s *Store) DedupRecoveredJobs() int {
 		if jobForceFlag(j.payload) {
 			continue
 		}
-		hash := computeJobHash(j.jobType, j.payload)
+		hash := computeJobHash(j.jobType, j.modelID, j.payload)
 		if firstID, exists := seen[hash]; exists {
 			// Duplicate — cancel it
 			s.mu.Lock()

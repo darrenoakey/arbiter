@@ -54,6 +54,7 @@ func TestSubmitJobPreservesBiRefNetAndLTX2Variants(t *testing.T) {
 			MemoryGB: 1, MaxConcurrent: 1, MaxInstances: intPtr(1), PressureIndex: &pressure,
 		}
 	}
+	api.refreshAliasModels()
 
 	for name, body := range map[string]string{
 		"birefnet":         `{"type":"background-remove","params":{"image":"eA=="}}`,
@@ -75,6 +76,7 @@ func TestSubmitJobRejectsIncompatibleNonImageOverride(t *testing.T) {
 	api, cleanup := newTestAPI(t)
 	defer cleanup()
 	api.config.Models["birefnet"] = ModelConfig{MemoryGB: 1, MaxConcurrent: 1, MaxInstances: intPtr(1)}
+	api.refreshAliasModels()
 	rec := postJob(t, api, `{"type":"video-generate","model":"birefnet","params":{}}`)
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "not compatible") {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())

@@ -518,6 +518,95 @@ GET /v1/health
 
 ---
 
+### LLM categories (aliases)
+
+LLM aliases are stable, operator-controlled category names such as
+`local-chat` and `local-extract`. They route to registered concrete `llm:*`
+models without creating another scheduler queue, model instance, or adapter.
+Names must match `^local-[a-z0-9][a-z0-9-]*$`; targets must be existing
+canonical `llm:*` IDs. Chains, wildcards, duplicate normalized names, and
+model/alias shadowing are rejected.
+
+Resolution precedence at admission is:
+
+1. exact configured model ID;
+2. configured bare LLM name (`qwen` resolves to `llm:qwen`);
+3. exact alias;
+4. `404 Not Found`.
+
+Resolution happens once. Queued and running jobs retain the concrete target
+chosen when admitted; requests admitted after a successful remap use the new
+target. Workers receive the canonical bare model name. Management paths under
+`/v1/models/{model_id}` do not resolve aliases.
+
+Every non-stream chat response echoes the caller's original string in
+`response.model`, including fresh, cache-hit, async-result, and deduplicated
+subscriber responses. `X-Arbiter-Requested-Model` carries that string and
+`X-Arbiter-Resolved-Model` carries the canonical ID;
+`X-Arbiter-Alias` is present when an alias was used. Streaming is deliberately
+raw: SSE chunks retain the worker's canonical model value and are not rewritten.
+Stream callers must use the three pre-body headers for identity.
+
+#### GET /v1/llm/aliases
+
+Returns a name-sorted object. Each value contains `target`, `resolved`, and
+`target_configured`.
+
+```json
+{
+  "local-chat": {
+    "target": "llm:qwen",
+    "resolved": "llm:qwen",
+    "target_configured": true
+  }
+}
+```
+
+#### PUT /v1/llm/aliases/{alias}
+
+Creates or remaps one alias using `{"target":"llm:qwen"}`. Arbiter validates
+the complete proposed map, atomically persists it, then swaps the live map.
+Concurrent updates serialize; a persistence failure leaves the live map
+unchanged. The response includes `old_target`, `new_target`, and `resolved`,
+and Arbiter emits `llm.alias_updated`.
+
+#### DELETE /v1/llm/aliases/{alias}
+
+Deletes an unused alias. Arbiter returns `409 Conflict` if the alias admitted
+traffic during the previous 24 hours. `?force=1` overrides the guard.
+
+> **Warning:** deletion is fleet-affecting and immediately makes every caller
+> on that lane receive 404. Retarget with `PUT`; never delete and recreate.
+
+Concrete model deletion also returns 409 while aliases depend on it.
+`DELETE /v1/models/{id}?force=1` atomically removes the model and all dependent
+aliases from configuration.
+
+#### Operator cheat sheet
+
+```bash
+# List categories
+curl -s http://10.0.0.254:8400/v1/llm/aliases | jq .
+
+# Swap every coder-lane caller without client deploys
+curl -sS -X PUT http://10.0.0.254:8400/v1/llm/aliases/local-coder \
+  -H 'content-type: application/json' \
+  -d '{"target":"llm:SOME-NEW-MODEL"}'
+
+# Smoke a category
+curl -sS http://10.0.0.254:8400/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"local-chat","messages":[{"role":"user","content":"ping"}],"max_tokens":16}'
+
+# Roll back a bad remap in one operation
+curl -sS -X PUT http://10.0.0.254:8400/v1/llm/aliases/local-coder \
+  -H 'content-type: application/json' -d '{"target":"llm:PREVIOUS-MODEL"}'
+```
+
+New clients should request `local-chat`, `local-summariser`, `local-extract`,
+`local-coder`, or `local-vision`. Durable provenance must record the resolved
+canonical ID from the response header or job fields, never the category.
+
 ### POST /v1/jobs/status -- Bulk Poll Job Status
 
 Poll up to 1000 jobs in a single request. Returns statuses in request order with `null` for unknown IDs. Result metadata is included but file data is not (use `GET /v1/jobs/{id}` to fetch file data for individual completed jobs).

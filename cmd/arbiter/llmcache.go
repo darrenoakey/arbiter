@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -103,9 +104,11 @@ func sortValue(v any) any {
 // Key computes the content-addressed cache key (sha256 hex) for a raw chat
 // request body. It decodes the body, strips non-semantic fields, canonicalizes
 // the remainder deterministically, and hashes. The model name is part of the
-// body ("model" field) so it is folded into the key automatically. Returns an
-// error only if the body is not valid JSON (such a request would never be
-// cached).
+// body ("model" field) so it is folded into the key automatically. A "llm:"
+// prefix on the model field is normalized to the bare name before hashing so
+// canonical and prefixed forms share a key. Callers resolving aliases must
+// rewrite the body to the canonical bare name before calling Key; this
+// function only normalizes the prefix.
 func (c *LLMCache) Key(body []byte) (string, error) {
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -113,6 +116,9 @@ func (c *LLMCache) Key(body []byte) (string, error) {
 	}
 	for f := range nonSemanticFields {
 		delete(req, f)
+	}
+	if model, ok := req["model"].(string); ok {
+		req["model"] = strings.TrimPrefix(model, "llm:")
 	}
 	canon, err := canonicalJSON(req)
 	if err != nil {

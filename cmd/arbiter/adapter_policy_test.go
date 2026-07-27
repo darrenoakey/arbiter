@@ -106,6 +106,21 @@ func TestAdapterParamsRejectVllmCompatibilityNearNeighbors(t *testing.T) {
 	}
 }
 
+func TestLLMAliasesDoNotCreateAdapterPolicyModels(t *testing.T) {
+	aliases := []string{
+		"local-chat", "local-summariser", "local-extract", "local-coder", "local-vision",
+	}
+	for _, alias := range aliases {
+		if _, exists := vllmLegacyTuningByModel["llm:"+alias]; exists {
+			t.Fatalf("alias %q became an adapter-policy model", alias)
+		}
+	}
+	expected := `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager`
+	if got := vllmLegacyTuningByModel["llm:qwen3.6-35b"]; got != expected {
+		t.Fatalf("qwen adapter exception changed: %q", got)
+	}
+}
+
 func TestAdapterParamsRejectVoxtralLlmBackendSelector(t *testing.T) {
 	root := t.TempDir()
 	config := repositoryWorkerConfig(root, "vllm-worker", "vllm")

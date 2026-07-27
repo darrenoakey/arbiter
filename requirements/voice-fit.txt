@@ -1,0 +1,24 @@
+# voice-fit worker venv (spark: /home/darren/src/arbiter/venvs/voxsmith)
+#
+# Recreate on a fresh spark:
+#   cd /home/darren/src/arbiter
+#   python3.12 -m venv venvs/voxsmith
+#   venvs/voxsmith/bin/pip install --upgrade pip wheel
+#   venvs/voxsmith/bin/pip install torch==2.11.0 torchaudio==2.11.0 \
+#       --index-url https://download.pytorch.org/whl/cu130
+#   venvs/voxsmith/bin/pip install -r requirements/voice-fit.txt
+#   venvs/voxsmith/bin/pip install /home/darren/src/voxsmith   # the voxsmith package
+#   echo /home/darren/src/arbiter/src > venvs/voxsmith/lib/python3.12/site-packages/arbiter.pth
+#
+# NOTE: torch is pinned to the cu130 aarch64 pair (2.11.0) installed from the
+# PyTorch index above — torchaudio 2.12.x has no aarch64 cu130 wheel, and the
+# GB10 (sm_121, CUDA 13) cannot use PyPI's CPU-only aarch64 builds. Do NOT let
+# pip resolve torch from PyPI in this venv.
+# NOTE: kokoro's misaki G2P needs espeak-ng (system package, already installed).
+
+kokoro==0.9.4
+misaki[en]==0.9.4
+speechbrain==1.1.0
+soundfile==0.14.0
+numpy==2.5.1
+scipy==1.18.0
