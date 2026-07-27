@@ -101,6 +101,10 @@ type modelConfigRequest struct {
 	// working even if the remote host is unreachable. The handler also drains any
 	// in-flight remote job for the model back to spark.
 	RemoteEnabled *bool `json:"remote_enabled"`
+	// NoRemoteSpill prevents spilling to a lower-preference remote host when a
+	// higher-preference remote host is reachable but full. Failover on absence is
+	// still allowed.
+	NoRemoteSpill *bool `json:"no_remote_spill"`
 	ReloadWorkers bool  `json:"reload_workers"`
 }
 
@@ -1091,6 +1095,7 @@ func serializeModelConfig(modelID string, cfg ModelConfig) map[string]any {
 		"pressure_index":      cfg.PressureIndex,
 		"max_runtime_seconds": cfg.MaxRuntimeSec,
 		"remote_enabled":      cfg.RemoteEnabledOrDefault(),
+		"no_remote_spill":     cfg.NoRemoteSpillOrDefault(),
 	}
 	if len(cfg.Placements) > 0 {
 		resp["placements"] = cfg.Placements
@@ -1162,6 +1167,10 @@ func applyModelConfigRequest(cfg ModelConfig, req modelConfigRequest) ModelConfi
 	if req.RemoteEnabled != nil {
 		v := *req.RemoteEnabled
 		cfg.RemoteEnabled = &v
+	}
+	if req.NoRemoteSpill != nil {
+		v := *req.NoRemoteSpill
+		cfg.NoRemoteSpill = &v
 	}
 	return cfg
 }

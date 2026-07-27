@@ -240,6 +240,82 @@ func TestLLMLiveConfigMutationAndReload(t *testing.T) {
 	}
 }
 
+func TestLLMModelConfigPatchNoRemoteSpillRoundTrip(t *testing.T) {
+	api, cleanup := newTestAPI(t)
+	defer cleanup()
+
+	workerPath := filepath.Join(api.projectRoot, "llm-worker")
+	capturePath := filepath.Join(t.TempDir(), "capture.jsonl")
+	writeProtocolWorker(t, workerPath, capturePath)
+	llamaServerPath := filepath.Join(api.projectRoot, "local", "bin", "llama-server")
+	if err := os.MkdirAll(filepath.Dir(llamaServerPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(llamaServerPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	registerBody := map[string]any{
+		"name":             "no-spill-llm",
+		"hf_model":         "example/no-spill-llm-GGUF",
+		"hf_file":          "model.gguf",
+		"worker_cmd":       []string{workerPath},
+		"llama_server_bin": llamaServerPath,
+		"placements":       []string{"spark"},
+	}
+	raw, _ := json.Marshal(registerBody)
+	req := httptest.NewRequest(http.MethodPost, "/v1/llm/models", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("register LLM status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	modelID := llmModelID("no-spill-llm")
+
+	// Initially NoRemoteSpill should be false.
+	getReq := httptest.NewRequest(http.MethodGet, "/v1/models/no-spill-llm", nil)
+	getRec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("get model status = %d, body = %s", getRec.Code, getRec.Body.String())
+	}
+	var getResp map[string]any
+	if err := json.Unmarshal(getRec.Body.Bytes(), &getResp); err != nil {
+		t.Fatalf("unmarshal get response: %v", err)
+	}
+	if got, ok := getResp["no_remote_spill"].(bool); !ok || got {
+		t.Fatalf("initial no_remote_spill = %v, want false", getResp["no_remote_spill"])
+	}
+
+	// Patch no_remote_spill to true.
+	patchBody := map[string]any{"no_remote_spill": true}
+	raw, _ = json.Marshal(patchBody)
+	patchReq := httptest.NewRequest(http.MethodPatch, "/v1/models/no-spill-llm", bytes.NewReader(raw))
+	patchReq.Header.Set("Content-Type", "application/json")
+	patchRec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(patchRec, patchReq)
+	if patchRec.Code != http.StatusOK {
+		t.Fatalf("patch no_remote_spill status = %d, body = %s", patchRec.Code, patchRec.Body.String())
+	}
+
+	// Verify GET reflects the change and the live config has it.
+	getRec = httptest.NewRecorder()
+	api.Handler().ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("get model after patch status = %d, body = %s", getRec.Code, getRec.Body.String())
+	}
+	if err := json.Unmarshal(getRec.Body.Bytes(), &getResp); err != nil {
+		t.Fatalf("unmarshal get response after patch: %v", err)
+	}
+	if got, ok := getResp["no_remote_spill"].(bool); !ok || !got {
+		t.Fatalf("patched no_remote_spill = %v, want true", getResp["no_remote_spill"])
+	}
+	if !api.config.Models[modelID].NoRemoteSpillOrDefault() {
+		t.Fatalf("live config NoRemoteSpill=false, want true")
+	}
+}
+
 func TestLLMRegistrationRejectsInjectedAndNestedAdapterParamsBeforePersistence(t *testing.T) {
 	api, cleanup := newTestAPI(t)
 	defer cleanup()
