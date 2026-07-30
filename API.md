@@ -777,6 +777,7 @@ rejected. `VLLM_EXTRA_ARGS` is accepted only for these exact model/value pairs:
 llm:gemma4-26b       = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}
 llm:gemma4-26b-mtp   = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}
 llm:gemma4-26b-plain = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager
+llm:qwen3.6-35b      = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager
 llm:qwen3.6-35b      = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager
 llm:qwen3.6-35b      = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager
 llm:qwen3.6-35b      = --max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager
@@ -787,22 +788,30 @@ missing argument, alternate spelling or JSON layout, duplicate or extra
 argument, and cross-model vector is rejected. A sanctioned vector is also
 rejected when combined with either overlapping structured key
 `VLLM_MAX_MODEL_LEN` or `VLLM_GPU_MEMORY_UTILIZATION`; non-overlapping
-structured keys remain permitted. The three qwen vectors form a rollback-safe
-transition, with `0.25` remaining the persisted primary setting in phase A.
+structured keys remain permitted. The four qwen vectors form a rollback-safe
+transition. The combined `0.50` plus `8G` vector is the policy primary; the
+three previously deployed vectors remain accepted for persisted-config
+rollback.
 A measured Spark load proved `0.50` unsafe: vLLM allocated 21.88 GiB of model
 weights plus 55.19 GiB of KV cache (2,565,266 tokens, or 78.29 concurrent
 32,768-token requests), reaching a 78.676 GiB process snapshot against
 Arbiter's 59.0953125 GiB reservation before the memory guardian killed it at
 7.53 GiB `MemAvailable`.
 
-vLLM 0.20 documents that `--kv-cache-memory-bytes` explicitly overrides and
-ignores `--gpu-memory-utilization`. The exact `8G` vector targets approximately
-29.9 GiB for weights and KV cache before runtime overhead while retaining more
-than four full 32,768-token requests of capacity (one measured request used
-approximately 0.7 GiB). After phase A is deployed, production can migrate to
-the explicit vector and safely roll back to this release; a pre-phase-A binary
-must not be restored after that migration. The utilization vectors can be
-removed only in a later cleanup after phase A leaves the rollback window.
+vLLM 0.20 uses `--kv-cache-memory-bytes` instead of
+`--gpu-memory-utilization` when sizing KV, but utilization still controls its
+startup memory-admission check. With the explicit-only `8G` vector, vLLM parsed
+the requested 8 GiB cache yet applied its default `0.92` admission threshold:
+75.68 GiB was free against 109.98 GiB desired, so startup failed before model
+load. The combined vector supplies `0.50` for admission and `8G` for KV sizing.
+The cache target retains more than four full 32,768-token requests of capacity
+(one measured request used approximately 0.7 GiB) while targeting 21.88 GiB of
+weights plus 8 GiB of KV before runtime overhead.
+
+After this release is deployed, production can migrate to the combined vector
+and safely roll back to this release; a pre-combined-vector binary must not be
+restored after that migration. The previous vectors can be removed only in a
+later cleanup after this release leaves the rollback window.
 
 **Response (200)**
 

@@ -71,9 +71,10 @@ func TestAdapterParamsAllowObservedProductionVllmCompatibilityValues(t *testing.
 func TestQwenMemoryBudgetTransitionAcceptsOnlySanctionedExactVectors(t *testing.T) {
 	root := t.TempDir()
 	accepted := map[string]string{
-		"legacy_0.25": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager",
-		"unsafe_0.50": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager",
-		"explicit_8G": "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager",
+		"combined_0.50_8G": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager",
+		"legacy_0.25":      "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager",
+		"unsafe_0.50":      "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager",
+		"explicit_8G":      "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager",
 	}
 	for name, vector := range accepted {
 		t.Run(name, func(t *testing.T) {
@@ -85,14 +86,23 @@ func TestQwenMemoryBudgetTransitionAcceptsOnlySanctionedExactVectors(t *testing.
 		})
 	}
 	rejected := map[string]string{
-		"alternate_decimal": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.5 --enforce-eager",
-		"utilization_0.49":  "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.49 --enforce-eager",
-		"utilization_0.51":  "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.51 --enforce-eager",
-		"kv_reordered":      "--max-num-batched-tokens 32768 --max-model-len 32768 --kv-cache-memory-bytes 8G --enforce-eager",
-		"kv_7G":             "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 7G --enforce-eager",
-		"kv_9G":             "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 9G --enforce-eager",
-		"kv_alt_spelling":   "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8GiB --enforce-eager",
-		"kv_extra_flag":     "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager --served-model-name injected",
+		"alternate_decimal":   "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.5 --enforce-eager",
+		"utilization_0.49":    "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.49 --enforce-eager",
+		"utilization_0.51":    "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.51 --enforce-eager",
+		"kv_reordered":        "--max-num-batched-tokens 32768 --max-model-len 32768 --kv-cache-memory-bytes 8G --enforce-eager",
+		"kv_7G":               "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 7G --enforce-eager",
+		"kv_9G":               "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 9G --enforce-eager",
+		"kv_alt_spelling":     "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8GiB --enforce-eager",
+		"kv_extra_flag":       "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager --served-model-name injected",
+		"combined_reordered":  "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --gpu-memory-utilization 0.50 --enforce-eager",
+		"combined_gpu_0.49":   "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.49 --kv-cache-memory-bytes 8G --enforce-eager",
+		"combined_gpu_0.51":   "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.51 --kv-cache-memory-bytes 8G --enforce-eager",
+		"combined_kv_7G":      "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 7G --enforce-eager",
+		"combined_kv_9G":      "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 9G --enforce-eager",
+		"combined_no_eager":   "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G",
+		"combined_no_batch":   "--max-model-len 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager",
+		"combined_no_context": "--max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager",
+		"combined_extra":      "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager --served-model-name injected",
 	}
 	for name, vector := range rejected {
 		t.Run(name, func(t *testing.T) {
@@ -152,7 +162,7 @@ func TestLLMAliasesDoNotCreateAdapterPolicyModels(t *testing.T) {
 			t.Fatalf("alias %q became an adapter-policy model", alias)
 		}
 	}
-	expected := `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager`
+	expected := `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager`
 	if got := vllmLegacyTuningByModel["llm:qwen3.6-35b"]; got != expected {
 		t.Fatalf("qwen adapter exception changed: %q", got)
 	}

@@ -181,9 +181,10 @@ func TestLoadConfigAllowsMinimizedObservedProductionConfig(t *testing.T) {
 
 func TestLoadConfigAcceptsQwenMemoryBudgetTransitionVectors(t *testing.T) {
 	vectors := map[string]string{
-		"legacy_0.25": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager",
-		"unsafe_0.50": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager",
-		"explicit_8G": "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager",
+		"combined_0.50_8G": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager",
+		"legacy_0.25":      "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager",
+		"unsafe_0.50":      "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager",
+		"explicit_8G":      "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager",
 	}
 	for name, vector := range vectors {
 		t.Run(name, func(t *testing.T) {

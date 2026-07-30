@@ -52,16 +52,16 @@ var vllmLegacyTuningByModel = map[string]string{
 	"llm:gemma4-26b":       `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}`,
 	"llm:gemma4-26b-mtp":   `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}`,
 	"llm:gemma4-26b-plain": `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager`,
-	"llm:qwen3.6-35b":      `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager`,
+	"llm:qwen3.6-35b":      `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager`,
 }
 
-// The qwen memory-budget transition deliberately leaves the persisted/primary
-// vector above unchanged while accepting both deployed rollback vectors and
-// the explicit 8G KV-cache vector. After this release is deployed,
-// local/config.json can move to the explicit vector without making a rollback
-// to this release reject the authoritative config.
+// The qwen memory-budget transition promotes the combined admission/KV limit
+// while preserving every deployed vector for rollback. This policy change
+// does not edit local/config.json; production can migrate its authoritative
+// config only after this release is deployed.
 var vllmLegacyTuningAlternatesByModel = map[string][]string{
 	"llm:qwen3.6-35b": {
+		`--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager`,
 		`--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager`,
 		`--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager`,
 	},
