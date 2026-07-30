@@ -179,6 +179,31 @@ func TestLoadConfigAllowsMinimizedObservedProductionConfig(t *testing.T) {
 	}
 }
 
+func TestLoadConfigAcceptsBothQwenMemoryBudgetTransitionVectors(t *testing.T) {
+	for _, utilization := range []string{"0.25", "0.50"} {
+		t.Run(utilization, func(t *testing.T) {
+			root := t.TempDir()
+			models := map[string]ModelConfig{
+				"llm:qwen3.6-35b": productionRepositoryConfig(root, "vllm-chat-worker", map[string]string{
+					"LLM_BACKEND":  "vllm",
+					"LLM_CTX_SIZE": "32768",
+					"VLLM_MODEL":   "RedHatAI/Qwen3.6-35B-A3B-NVFP4",
+					"VLLM_EXTRA_ARGS": "--max-model-len 32768 --max-num-batched-tokens 32768 " +
+						"--gpu-memory-utilization " + utilization + " --enforce-eager",
+				}),
+			}
+			writeModelConfigFixture(t, root, models)
+			config, err := LoadConfig(root)
+			if err != nil {
+				t.Fatalf("load qwen transition config %s: %v", utilization, err)
+			}
+			if _, ok := config.Models["llm:qwen3.6-35b"]; !ok {
+				t.Fatalf("qwen transition config %s was omitted by startup policy", utilization)
+			}
+		})
+	}
+}
+
 func TestWorkerPolicyRejectsAdversarialCommands(t *testing.T) {
 	root := t.TempDir()
 	cases := []struct {

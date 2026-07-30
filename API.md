@@ -778,6 +778,7 @@ llm:gemma4-26b       = --max-model-len 32768 --max-num-batched-tokens 32768 --gp
 llm:gemma4-26b-mtp   = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}
 llm:gemma4-26b-plain = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager
 llm:qwen3.6-35b      = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager
+llm:qwen3.6-35b      = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager
 ```
 
 Matching is byte-for-byte and model-specific. Every other model, reordered or
@@ -785,7 +786,11 @@ missing argument, alternate spelling or JSON layout, duplicate or extra
 argument, and cross-model vector is rejected. A sanctioned vector is also
 rejected when combined with either overlapping structured key
 `VLLM_MAX_MODEL_LEN` or `VLLM_GPU_MEMORY_UTILIZATION`; non-overlapping
-structured keys remain permitted.
+structured keys remain permitted. The two qwen vectors are a rollback-safe
+transition: `0.25` remains the persisted production setting in phase 1, while
+`0.50` aligns vLLM's approximately 64 GB executor cap with Arbiter's audited
+59.0953125 GB scheduler reservation. After phase 1 is deployed, production can
+migrate to `0.50` without making this release reject the updated config.
 
 **Response (200)**
 

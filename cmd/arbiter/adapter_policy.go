@@ -55,6 +55,16 @@ var vllmLegacyTuningByModel = map[string]string{
 	"llm:qwen3.6-35b":      `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager`,
 }
 
+// Phase 1 of the qwen memory-budget correction deliberately leaves the
+// persisted/primary vector above unchanged while accepting the corrected
+// vector. After this release is deployed, local/config.json can move to 0.50
+// without making a rollback to this release reject the authoritative config.
+var vllmLegacyTuningAlternatesByModel = map[string][]string{
+	"llm:qwen3.6-35b": {
+		`--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager`,
+	},
+}
+
 var vllmLegacyOverlappingParams = []string{"VLLM_MAX_MODEL_LEN", "VLLM_GPU_MEMORY_UTILIZATION"}
 
 var inheritedWorkerEnvironment = []string{
@@ -116,7 +126,8 @@ func adapterParamPolicy(modelID string, config ModelConfig) map[string]adapterVa
 		case "vllm-chat-worker":
 			allowed := maps.Clone(vllmAdapterParams)
 			if legacy, ok := vllmLegacyTuningByModel[modelID]; ok {
-				allowed["VLLM_EXTRA_ARGS"] = exactAdapterValue(legacy)
+				values := append([]string{legacy}, vllmLegacyTuningAlternatesByModel[modelID]...)
+				allowed["VLLM_EXTRA_ARGS"] = exactAdapterValues(values...)
 			}
 			return allowed
 		case "vllm-worker":
@@ -144,12 +155,14 @@ func validateVllmLegacyTuningOverlap(config ModelConfig) error {
 	return nil
 }
 
-func exactAdapterValue(expected string) adapterValueValidator {
+func exactAdapterValues(expected ...string) adapterValueValidator {
 	return func(_ string, value string) error {
-		if value != expected {
-			return fmt.Errorf("value must exactly match the sanctioned production vector")
+		for _, candidate := range expected {
+			if value == candidate {
+				return nil
+			}
 		}
-		return nil
+		return fmt.Errorf("value must exactly match a sanctioned production vector")
 	}
 }
 

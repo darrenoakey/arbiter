@@ -68,6 +68,30 @@ func TestAdapterParamsAllowObservedProductionVllmCompatibilityValues(t *testing.
 	}
 }
 
+func TestQwenMemoryBudgetTransitionAcceptsOnlyExactOldAndCorrectedVectors(t *testing.T) {
+	root := t.TempDir()
+	prefix := "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization "
+	suffix := " --enforce-eager"
+	for _, utilization := range []string{"0.25", "0.50"} {
+		t.Run(utilization, func(t *testing.T) {
+			chat := repositoryWorkerConfig(root, "vllm-chat-worker", "vllm")
+			chat.AdapterParams["VLLM_EXTRA_ARGS"] = prefix + utilization + suffix
+			if err := validateAdapterParams(root, "llm:qwen3.6-35b", chat); err != nil {
+				t.Fatalf("qwen transition vector %s rejected: %v", utilization, err)
+			}
+		})
+	}
+	for _, utilization := range []string{"0.5", "0.49", "0.51"} {
+		t.Run("reject_"+utilization, func(t *testing.T) {
+			chat := repositoryWorkerConfig(root, "vllm-chat-worker", "vllm")
+			chat.AdapterParams["VLLM_EXTRA_ARGS"] = prefix + utilization + suffix
+			if err := validateAdapterParams(root, "llm:qwen3.6-35b", chat); err == nil {
+				t.Fatalf("unsanctioned qwen transition vector %s accepted", utilization)
+			}
+		})
+	}
+}
+
 func TestAdapterParamsRejectVllmCompatibilityNearNeighbors(t *testing.T) {
 	root := t.TempDir()
 	gemmaMTP := `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}`
@@ -90,7 +114,7 @@ func TestAdapterParamsRejectVllmCompatibilityNearNeighbors(t *testing.T) {
 		{name: "alternate speculative model", modelID: "llm:gemma4-26b", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: strings.Replace(gemmaMTP, "google/gemma-4-26B-A4B-it-assistant", "org/model", 1)},
 		{name: "alternate speculative count", modelID: "llm:gemma4-26b-mtp", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: strings.Replace(gemmaMTP, `"num_speculative_tokens":4`, `"num_speculative_tokens":5`, 1)},
 		{name: "extra flag", modelID: "llm:gemma4-26b-plain", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: gemmaPlain + " --served-model-name injected"},
-		{name: "gemma values on qwen", modelID: "llm:qwen3.6-35b", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: gemmaPlain},
+		{name: "unsanctioned qwen utilization", modelID: "llm:qwen3.6-35b", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: strings.Replace(gemmaPlain, "0.50", "0.51", 1)},
 		{name: "speculation on plain", modelID: "llm:gemma4-26b-plain", worker: "vllm-chat-worker", key: "VLLM_EXTRA_ARGS", value: gemmaMTP},
 		{name: "chat mode on TTS", modelID: "tts-voxtral", worker: "vllm-worker", key: "VLLM_MODE", value: "chat"},
 		{name: "mode on chat worker", modelID: "llm:gemma4-26b", worker: "vllm-chat-worker", key: "VLLM_MODE", value: "tts"},
