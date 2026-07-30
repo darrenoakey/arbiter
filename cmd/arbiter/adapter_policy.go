@@ -55,13 +55,15 @@ var vllmLegacyTuningByModel = map[string]string{
 	"llm:qwen3.6-35b":      `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager`,
 }
 
-// Phase 1 of the qwen memory-budget correction deliberately leaves the
-// persisted/primary vector above unchanged while accepting the corrected
-// vector. After this release is deployed, local/config.json can move to 0.50
-// without making a rollback to this release reject the authoritative config.
+// The qwen memory-budget transition deliberately leaves the persisted/primary
+// vector above unchanged while accepting both deployed rollback vectors and
+// the explicit 8G KV-cache vector. After this release is deployed,
+// local/config.json can move to the explicit vector without making a rollback
+// to this release reject the authoritative config.
 var vllmLegacyTuningAlternatesByModel = map[string][]string{
 	"llm:qwen3.6-35b": {
 		`--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager`,
+		`--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager`,
 	},
 }
 

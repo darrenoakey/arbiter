@@ -68,25 +68,38 @@ func TestAdapterParamsAllowObservedProductionVllmCompatibilityValues(t *testing.
 	}
 }
 
-func TestQwenMemoryBudgetTransitionAcceptsOnlyExactOldAndCorrectedVectors(t *testing.T) {
+func TestQwenMemoryBudgetTransitionAcceptsOnlySanctionedExactVectors(t *testing.T) {
 	root := t.TempDir()
-	prefix := "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization "
-	suffix := " --enforce-eager"
-	for _, utilization := range []string{"0.25", "0.50"} {
-		t.Run(utilization, func(t *testing.T) {
+	accepted := map[string]string{
+		"legacy_0.25": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager",
+		"unsafe_0.50": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager",
+		"explicit_8G": "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager",
+	}
+	for name, vector := range accepted {
+		t.Run(name, func(t *testing.T) {
 			chat := repositoryWorkerConfig(root, "vllm-chat-worker", "vllm")
-			chat.AdapterParams["VLLM_EXTRA_ARGS"] = prefix + utilization + suffix
+			chat.AdapterParams["VLLM_EXTRA_ARGS"] = vector
 			if err := validateAdapterParams(root, "llm:qwen3.6-35b", chat); err != nil {
-				t.Fatalf("qwen transition vector %s rejected: %v", utilization, err)
+				t.Fatalf("qwen transition vector rejected: %v", err)
 			}
 		})
 	}
-	for _, utilization := range []string{"0.5", "0.49", "0.51"} {
-		t.Run("reject_"+utilization, func(t *testing.T) {
+	rejected := map[string]string{
+		"alternate_decimal": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.5 --enforce-eager",
+		"utilization_0.49":  "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.49 --enforce-eager",
+		"utilization_0.51":  "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.51 --enforce-eager",
+		"kv_reordered":      "--max-num-batched-tokens 32768 --max-model-len 32768 --kv-cache-memory-bytes 8G --enforce-eager",
+		"kv_7G":             "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 7G --enforce-eager",
+		"kv_9G":             "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 9G --enforce-eager",
+		"kv_alt_spelling":   "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8GiB --enforce-eager",
+		"kv_extra_flag":     "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager --served-model-name injected",
+	}
+	for name, vector := range rejected {
+		t.Run(name, func(t *testing.T) {
 			chat := repositoryWorkerConfig(root, "vllm-chat-worker", "vllm")
-			chat.AdapterParams["VLLM_EXTRA_ARGS"] = prefix + utilization + suffix
+			chat.AdapterParams["VLLM_EXTRA_ARGS"] = vector
 			if err := validateAdapterParams(root, "llm:qwen3.6-35b", chat); err == nil {
-				t.Fatalf("unsanctioned qwen transition vector %s accepted", utilization)
+				t.Fatalf("unsanctioned qwen transition vector accepted: %q", vector)
 			}
 		})
 	}

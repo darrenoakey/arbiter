@@ -779,6 +779,7 @@ llm:gemma4-26b-mtp   = --max-model-len 32768 --max-num-batched-tokens 32768 --gp
 llm:gemma4-26b-plain = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager
 llm:qwen3.6-35b      = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager
 llm:qwen3.6-35b      = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager
+llm:qwen3.6-35b      = --max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager
 ```
 
 Matching is byte-for-byte and model-specific. Every other model, reordered or
@@ -786,11 +787,22 @@ missing argument, alternate spelling or JSON layout, duplicate or extra
 argument, and cross-model vector is rejected. A sanctioned vector is also
 rejected when combined with either overlapping structured key
 `VLLM_MAX_MODEL_LEN` or `VLLM_GPU_MEMORY_UTILIZATION`; non-overlapping
-structured keys remain permitted. The two qwen vectors are a rollback-safe
-transition: `0.25` remains the persisted production setting in phase 1, while
-`0.50` aligns vLLM's approximately 64 GB executor cap with Arbiter's audited
-59.0953125 GB scheduler reservation. After phase 1 is deployed, production can
-migrate to `0.50` without making this release reject the updated config.
+structured keys remain permitted. The three qwen vectors form a rollback-safe
+transition, with `0.25` remaining the persisted primary setting in phase A.
+A measured Spark load proved `0.50` unsafe: vLLM allocated 21.88 GiB of model
+weights plus 55.19 GiB of KV cache (2,565,266 tokens, or 78.29 concurrent
+32,768-token requests), reaching a 78.676 GiB process snapshot against
+Arbiter's 59.0953125 GiB reservation before the memory guardian killed it at
+7.53 GiB `MemAvailable`.
+
+vLLM 0.20 documents that `--kv-cache-memory-bytes` explicitly overrides and
+ignores `--gpu-memory-utilization`. The exact `8G` vector targets approximately
+29.9 GiB for weights and KV cache before runtime overhead while retaining more
+than four full 32,768-token requests of capacity (one measured request used
+approximately 0.7 GiB). After phase A is deployed, production can migrate to
+the explicit vector and safely roll back to this release; a pre-phase-A binary
+must not be restored after that migration. The utilization vectors can be
+removed only in a later cleanup after phase A leaves the rollback window.
 
 **Response (200)**
 

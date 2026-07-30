@@ -179,26 +179,30 @@ func TestLoadConfigAllowsMinimizedObservedProductionConfig(t *testing.T) {
 	}
 }
 
-func TestLoadConfigAcceptsBothQwenMemoryBudgetTransitionVectors(t *testing.T) {
-	for _, utilization := range []string{"0.25", "0.50"} {
-		t.Run(utilization, func(t *testing.T) {
+func TestLoadConfigAcceptsQwenMemoryBudgetTransitionVectors(t *testing.T) {
+	vectors := map[string]string{
+		"legacy_0.25": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager",
+		"unsafe_0.50": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager",
+		"explicit_8G": "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager",
+	}
+	for name, vector := range vectors {
+		t.Run(name, func(t *testing.T) {
 			root := t.TempDir()
 			models := map[string]ModelConfig{
 				"llm:qwen3.6-35b": productionRepositoryConfig(root, "vllm-chat-worker", map[string]string{
-					"LLM_BACKEND":  "vllm",
-					"LLM_CTX_SIZE": "32768",
-					"VLLM_MODEL":   "RedHatAI/Qwen3.6-35B-A3B-NVFP4",
-					"VLLM_EXTRA_ARGS": "--max-model-len 32768 --max-num-batched-tokens 32768 " +
-						"--gpu-memory-utilization " + utilization + " --enforce-eager",
+					"LLM_BACKEND":     "vllm",
+					"LLM_CTX_SIZE":    "32768",
+					"VLLM_MODEL":      "RedHatAI/Qwen3.6-35B-A3B-NVFP4",
+					"VLLM_EXTRA_ARGS": vector,
 				}),
 			}
 			writeModelConfigFixture(t, root, models)
 			config, err := LoadConfig(root)
 			if err != nil {
-				t.Fatalf("load qwen transition config %s: %v", utilization, err)
+				t.Fatalf("load qwen transition config: %v", err)
 			}
 			if _, ok := config.Models["llm:qwen3.6-35b"]; !ok {
-				t.Fatalf("qwen transition config %s was omitted by startup policy", utilization)
+				t.Fatal("qwen transition config was omitted by startup policy")
 			}
 		})
 	}
