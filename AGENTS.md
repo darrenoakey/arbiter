@@ -26,3 +26,13 @@ greenline never discards commits on `master`.
 
 Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
 <!-- <<< greenline <<< -->
+
+## Production job-store maintenance
+
+- The production `jobs` table is tens of gigabytes. Background retention work
+  must perform at most one bounded batch per scheduled pass and then yield. An
+  unbounded batch loop repeatedly scans the table, interacts with the Store's
+  writer-preferring `RWMutex`, and can starve ordinary `GET /v1/jobs/{id}` reads
+  even while `/health` and the memory-backed `/ps` endpoint remain fast.
+- Do not build a new jobs-table index during `NewStore` or daemon startup. Plan
+  large index builds as explicit maintenance after active work drains.
