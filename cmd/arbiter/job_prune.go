@@ -31,29 +31,21 @@ func pruneCutoff(retention time.Duration) float64 {
 	return nowTS() - retention.Seconds()
 }
 
-// PruneOldJobs deletes terminal jobs older than retention and removes their
-// on-disk output dirs when no remaining row still references them via
-// canonical_job_id. Active jobs (queued/scheduled/running/following) are never
-// touched. A terminal original still referenced by a live follower is skipped
-// so ReconcileFollowingJobs can resolve it first. Work is batched so a huge
-// backlog cannot lock the DB for long. Returns the number of job rows deleted.
+// PruneOldJobs deletes at most one bounded batch of terminal jobs older than
+// retention, then removes their on-disk output dirs when no remaining row still
+// references them via canonical_job_id. Active jobs (queued/scheduled/running/
+// following) are never touched. A terminal original still referenced by a live
+// follower is skipped
+// so ReconcileFollowingJobs can resolve it first. Each invocation performs
+// exactly one batch: an old multi-batch loop kept rescanning the 40GB database
+// for hours and starved ordinary job reads. Returns the number of rows deleted.
 //
 // Query plan uses idx_jobs_state (state=?) then filters by age. No expression
 // index is created at startup — building one over a 40GB jobs table blocks
 // ListenAndServe for many minutes and fails the deploy health window.
 func (s *Store) PruneOldJobs(retention time.Duration, outputDir string) (int, error) {
 	cutoff := pruneCutoff(retention)
-	total := 0
-	for {
-		n, err := s.pruneOldJobsBatch(cutoff, outputDir)
-		if err != nil {
-			return total, err
-		}
-		total += n
-		if n < pruneBatchSize {
-			return total, nil
-		}
-	}
+	return s.pruneOldJobsBatch(cutoff, outputDir)
 }
 
 func (s *Store) pruneOldJobsBatch(cutoff float64, outputDir string) (int, error) {
