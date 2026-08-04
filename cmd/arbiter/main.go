@@ -234,6 +234,11 @@ func main() {
 		}
 	}()
 
+	// Terminal job prune (hourly, plus one pass at startup): drop completed/
+	// failed/cancelled rows older than 10 days so /v1/ps stats scans stay fast
+	// and arbiter.db cannot grow without bound.
+	go RunJobPruner(ctx.Done(), store, outputDir, time.Hour)
+
 	done := make(chan struct{})
 	go func() {
 		<-ctx.Done()
