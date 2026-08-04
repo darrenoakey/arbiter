@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -244,5 +245,70 @@ func TestPruneOldJobsRemovesAllOldTerminal(t *testing.T) {
 	}
 	if left != 0 {
 		t.Fatalf("jobs left = %d, want 0", left)
+	}
+}
+
+func TestPruneOldJobsStopsAfterOneBoundedBatch(t *testing.T) {
+	store, outputDir := newTestStore(t)
+	old := nowTS() - (11 * 24 * time.Hour).Seconds()
+
+	store.mu.Lock()
+	tx, err := store.db.Begin()
+	if err != nil {
+		store.mu.Unlock()
+		t.Fatalf("begin seed tx: %v", err)
+	}
+	stmt, err := tx.Prepare(`
+INSERT INTO jobs (id, model_id, job_type, state, priority, payload, created_at, finished_at)
+VALUES (?, 'm', 't', 'completed', 1, '{}', ?, ?)`)
+	if err != nil {
+		_ = tx.Rollback()
+		store.mu.Unlock()
+		t.Fatalf("prepare seed: %v", err)
+	}
+	for i := range pruneBatchSize + 1 {
+		if _, err := stmt.Exec(fmt.Sprintf("old-%06d", i), old-1, old); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			store.mu.Unlock()
+			t.Fatalf("seed job %d: %v", i, err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		_ = tx.Rollback()
+		store.mu.Unlock()
+		t.Fatalf("close seed statement: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		store.mu.Unlock()
+		t.Fatalf("commit seed: %v", err)
+	}
+	store.mu.Unlock()
+
+	removed, err := store.PruneOldJobs(jobRetention, outputDir)
+	if err != nil {
+		t.Fatalf("first prune: %v", err)
+	}
+	if removed != pruneBatchSize {
+		t.Fatalf("first prune removed = %d, want one batch (%d)", removed, pruneBatchSize)
+	}
+
+	var left int
+	store.mu.RLock()
+	err = store.db.QueryRow(`SELECT COUNT(*) FROM jobs`).Scan(&left)
+	store.mu.RUnlock()
+	if err != nil {
+		t.Fatalf("count after first prune: %v", err)
+	}
+	if left != 1 {
+		t.Fatalf("jobs left after first prune = %d, want 1", left)
+	}
+
+	removed, err = store.PruneOldJobs(jobRetention, outputDir)
+	if err != nil {
+		t.Fatalf("second prune: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("second prune removed = %d, want 1", removed)
 	}
 }

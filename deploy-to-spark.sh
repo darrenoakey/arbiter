@@ -83,6 +83,26 @@ fi
 echo "==> Stopping arbiter on spark..."
 ssh "$SPARK" "/home/darren/local/auto/run stop arbiter" 2>&1 | tail -1 || true
 
+# A terminated arbiter can remain in uninterruptible SQLite/filesystem I/O for
+# longer than auto's ten-second port-reclaim window. Starting immediately then
+# fails even though the old listener has already received SIGKILL. Wait for the
+# kernel to finish releasing that exact listening socket before replacing the
+# binary. Do not kill anything else here: auto already targeted the service and
+# production may host unrelated Arbiter instances on other ports.
+echo "==> Waiting for the stopped arbiter to release port 8400..."
+if ! ssh "$SPARK" 'deadline=$(( $(date +%s) + 300 ))
+while lsof -nP -iTCP:8400 -sTCP:LISTEN >/dev/null 2>&1; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "    FAILED — terminated arbiter still owns port 8400 after 300s"
+        lsof -nP -iTCP:8400 -sTCP:LISTEN 2>&1 || true
+        exit 1
+    fi
+    sleep 1
+done'; then
+    exit 1
+fi
+echo "    port 8400 released"
+
 echo "==> Ensuring .venv python is a real binary (not a symlink)..."
 # resolveTrustedPythonExecutable collapses the interpreter via EvalSymlinks to
 # block symlink-swap TOCTOU. If .venv/bin/python is a symlink to
