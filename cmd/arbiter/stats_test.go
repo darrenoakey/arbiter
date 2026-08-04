@@ -3,6 +3,7 @@ package main
 import (
 	"math"
 	"testing"
+	"time"
 )
 
 // seedStatsJobs inserts a fixed mix of jobs across two models and several
@@ -157,5 +158,55 @@ func TestCompletedJobStatsGroupedMatchesPerModel(t *testing.T) {
 			t.Errorf("%s stats: got {%d %g %g} want {%d %g %g}",
 				model, got.Count, got.AvgTotal, got.AvgExec, c, tot, exec)
 		}
+	}
+}
+
+// TestStoreAllowsConcurrentReaders documents the WAL pool size that keeps
+// /v1/jobs lookups free while CompletedJobStatsGrouped scans a large DB.
+// MaxOpenConns(1) is the historical starvation bug: one long stats query held
+// the only handle and every job lookup blocked behind it.
+func TestStoreAllowsConcurrentReaders(t *testing.T) {
+	store, _ := newTestStore(t)
+	stats := store.db.Stats()
+	if stats.MaxOpenConnections != 8 {
+		t.Fatalf("MaxOpenConnections=%d, want 8 so stats scans cannot starve job lookups", stats.MaxOpenConnections)
+	}
+}
+
+// TestRefreshStatsIsNonBlocking verifies updatePSCache returns immediately
+// even when aggregates are stale, and that the background pass still fills
+// the cache. A blocking refresh reintroduced the multi-minute /v1/ps hang.
+func TestRefreshStatsIsNonBlocking(t *testing.T) {
+	api, cleanup := newTestAPI(t)
+	defer cleanup()
+	seedStatsJobs(t, api.store)
+
+	api.statsMu.Lock()
+	api.statsAt = time.Time{}
+	api.statsRefreshing = false
+	api.statsMu.Unlock()
+
+	started := time.Now()
+	api.updatePSCache()
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		t.Fatalf("updatePSCache blocked for %s; refreshStats must be asynchronous", elapsed)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		api.statsMu.Lock()
+		ready := !api.statsAt.IsZero() && !api.statsRefreshing && api.statsGlobal.Count > 0
+		count := api.statsGlobal.Count
+		api.statsMu.Unlock()
+		if ready {
+			if count < 5 {
+				t.Fatalf("statsGlobal.Count=%d, want seeded completed jobs", count)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("async stats refresh never populated the cache")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

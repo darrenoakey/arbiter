@@ -154,7 +154,11 @@ func NewStore(dbPath string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
-	db.SetMaxOpenConns(1) // SQLite doesn't support concurrent writers
+	// WAL mode allows concurrent readers. Writers still serialize via
+	// Store.mu; a single connection starves /v1/jobs lookups whenever the
+	// completed-stats scan holds the only handle for minutes on a large DB.
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(8)
 	// Migrate BEFORE the schema block runs — the schema's CREATE INDEX on
 	// canonical_job_id will fail if the column doesn't exist on a pre-
 	// existing jobs table that was created without it.

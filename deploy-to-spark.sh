@@ -99,10 +99,24 @@ echo "==> Syncing Python adapters..."
 rsync -az --delete src/arbiter/ "$SPARK:$REMOTE/src/arbiter/"
 
 echo "==> Uploading binaries..."
-scp -q arbiter-linux-arm64 "$SPARK:$REMOTE/arbiter-go"
-scp -q llm-worker-linux-arm64 "$SPARK:$REMOTE/llm-worker"
-scp -q vllm-chat-worker-linux-arm64 "$SPARK:$REMOTE/vllm-chat-worker"
-ssh "$SPARK" "chmod +x $REMOTE/arbiter-go $REMOTE/llm-worker $REMOTE/vllm-chat-worker"
+# Upload to a temporary name, then rename into place. A plain scp onto the live
+# path fails with ETXTBSY — reported by scp as `dest open "...": Failure` —
+# whenever any process still holds the old binary as its executable text. That
+# includes a stopped-but-unreaped process whose threads are wedged in
+# uninterruptible I/O (seen 2026-08-04: arbiter-go left as a zombie with live
+# threads stuck in CIFS path lookup after the //10.0.0.46/arbiter-data mount
+# wedged). rename(2) never opens the destination, so it swaps the directory
+# entry regardless and the old inode stays alive for whatever still references
+# it. Without this, the deploy stops arbiter, fails to upload, and cannot even
+# roll back — leaving production down until the host is power-cycled.
+scp -q arbiter-linux-arm64 "$SPARK:$REMOTE/arbiter-go.new"
+scp -q llm-worker-linux-arm64 "$SPARK:$REMOTE/llm-worker.new"
+scp -q vllm-chat-worker-linux-arm64 "$SPARK:$REMOTE/vllm-chat-worker.new"
+ssh "$SPARK" "set -e
+chmod +x $REMOTE/arbiter-go.new $REMOTE/llm-worker.new $REMOTE/vllm-chat-worker.new
+mv -f $REMOTE/arbiter-go.new $REMOTE/arbiter-go
+mv -f $REMOTE/llm-worker.new $REMOTE/llm-worker
+mv -f $REMOTE/vllm-chat-worker.new $REMOTE/vllm-chat-worker"
 
 echo "==> Starting arbiter on spark..."
 ssh "$SPARK" "/home/darren/local/auto/run start arbiter" 2>&1 | tail -1
@@ -117,5 +131,14 @@ for i in $(seq 1 20); do
     fi
     sleep 1
 done
+# "not responding" is only the symptom. Arbiter exits outright when it cannot
+# load its config — e.g. a security-policy rejection drops a model, which makes
+# an llm_alias target unresolvable — and reporting a bare timeout hides that
+# cause behind a rollback. Print whether the process is alive plus the tail of
+# its own log so the real reason is in the deploy log.
 echo "    FAILED — arbiter not responding after 20s"
+echo "    process check:"
+ssh "$SPARK" "pgrep -af '$REMOTE/arbiter-go' || echo '      arbiter-go is NOT running — it exited after start'" 2>&1 | sed 's/^/      /'
+echo "    last arbiter log lines:"
+ssh "$SPARK" "L=\$(ls -t /home/darren/local/auto/output/logs/arbiter/*/*/*.log 2>/dev/null | head -1); [ -n \"\$L\" ] && tail -15 \"\$L\"" 2>&1 | sed 's/^/      /'
 exit 1

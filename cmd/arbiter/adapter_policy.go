@@ -52,18 +52,27 @@ var vllmLegacyTuningByModel = map[string]string{
 	"llm:gemma4-26b":       `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}`,
 	"llm:gemma4-26b-mtp":   `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}`,
 	"llm:gemma4-26b-plain": `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager`,
-	"llm:qwen3.6-35b":      `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager`,
+	"llm:qwen3.6-35b":      `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager --enable-auto-tool-choice --tool-call-parser hermes`,
 }
 
 // The qwen memory-budget transition promotes the combined admission/KV limit
 // while preserving every deployed vector for rollback. This policy change
 // does not edit local/config.json; production can migrate its authoritative
 // config only after this release is deployed.
+//
+// The primary vector additionally carries vLLM's native OpenAI tool-calling
+// flags, because production's authoritative config adopted them on 2026-08-03.
+// Sanctioning them is load-bearing, not cosmetic: an unsanctioned value drops
+// the model from the runnable config, which in turn makes the `local-vision`
+// alias unresolvable and aborts config load, so arbiter refuses to start at
+// all. Keep the pre-tool-calling vector below so a rollback release still
+// validates the same config.
 var vllmLegacyTuningAlternatesByModel = map[string][]string{
 	"llm:qwen3.6-35b": {
 		`--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager`,
 		`--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager`,
 		`--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager`,
+		`--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager`,
 	},
 }
 

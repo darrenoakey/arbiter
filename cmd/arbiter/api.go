@@ -47,13 +47,14 @@ type API struct {
 	// (O(rows), and rows only grow), so they are refreshed on a slow cadence
 	// rather than every tick — recomputing all-time averages 65 times a second
 	// (global + per-model) pinned a CPU core indefinitely.
-	statsMu       sync.Mutex
-	statsAt       time.Time
-	statsCounts   map[string]map[string]int // model_id -> state -> count
-	statsGlobalCt map[string]int            // state -> count (global)
-	statsModel    map[string]JobStats       // model_id -> completed stats
-	statsGlobal   JobStats                  // global completed stats
-	statsAvg      map[string]float64        // model_id -> persisted rolling avg seconds/action
+	statsMu         sync.Mutex
+	statsAt         time.Time
+	statsRefreshing bool
+	statsCounts     map[string]map[string]int // model_id -> state -> count
+	statsGlobalCt   map[string]int            // state -> count (global)
+	statsModel      map[string]JobStats       // model_id -> completed stats
+	statsGlobal     JobStats                  // global completed stats
+	statsAvg        map[string]float64        // model_id -> persisted rolling avg seconds/action
 
 	// requestShutdown triggers a graceful process shutdown. Set by main once
 	// the HTTP server exists. Invoked by the drain monitor when shutdown_when_idle
@@ -226,18 +227,34 @@ func (a *API) RunPSCache(done <-chan struct{}) {
 // counts + completed-job stats) are recomputed. They aggregate over all job
 // history, so per-second recomputation is pure waste; a status dashboard
 // polling every few seconds does not need fresher-than-this historical data.
-const psStatsInterval = 5 * time.Second
+// Keep this well above the multi-minute full-table scan cost on a large DB so
+// a slow refresh cannot re-enter every tick.
+const psStatsInterval = 60 * time.Second
 
 // refreshStats recomputes the DB-derived /v1/ps aggregates if the cached copy
-// is older than psStatsInterval, in two grouped scans (one for counts, one for
-// completed stats) covering every model at once. On query error it keeps the
-// last good values rather than blanking the dashboard.
+// is older than psStatsInterval. The heavy scans run in a background
+// goroutine so the 1s /v1/ps ticker and /v1/jobs lookups never block on a
+// multi-minute completed-stats scan. On query error it keeps the last good
+// values rather than blanking the dashboard.
 func (a *API) refreshStats() {
 	a.statsMu.Lock()
-	defer a.statsMu.Unlock()
-	if !a.statsAt.IsZero() && time.Since(a.statsAt) < psStatsInterval {
+	if (!a.statsAt.IsZero() && time.Since(a.statsAt) < psStatsInterval) || a.statsRefreshing {
+		a.statsMu.Unlock()
 		return
 	}
+	a.statsRefreshing = true
+	a.statsMu.Unlock()
+
+	go a.refreshStatsAsync()
+}
+
+func (a *API) refreshStatsAsync() {
+	defer func() {
+		a.statsMu.Lock()
+		a.statsRefreshing = false
+		a.statsMu.Unlock()
+	}()
+
 	perModelCounts, globalCounts, err := a.store.CountByStateGrouped()
 	if err != nil {
 		return
@@ -248,7 +265,11 @@ func (a *API) refreshStats() {
 	}
 	// Persisted rolling averages (model_stats) feed the dashboard ETA. On query
 	// error keep the last good map rather than blanking ETAs.
-	if avg, err := a.store.ModelActionAverages(); err == nil {
+	avg, avgErr := a.store.ModelActionAverages()
+
+	a.statsMu.Lock()
+	defer a.statsMu.Unlock()
+	if avgErr == nil {
 		a.statsAvg = avg
 	}
 	a.statsCounts = perModelCounts

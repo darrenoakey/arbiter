@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -71,10 +72,11 @@ func TestAdapterParamsAllowObservedProductionVllmCompatibilityValues(t *testing.
 func TestQwenMemoryBudgetTransitionAcceptsOnlySanctionedExactVectors(t *testing.T) {
 	root := t.TempDir()
 	accepted := map[string]string{
-		"combined_0.50_8G": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager",
-		"legacy_0.25":      "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager",
-		"unsafe_0.50":      "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager",
-		"explicit_8G":      "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager",
+		"combined_0.50_8G_tools": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager --enable-auto-tool-choice --tool-call-parser hermes",
+		"combined_0.50_8G":       "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager",
+		"legacy_0.25":            "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager",
+		"unsafe_0.50":            "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager",
+		"explicit_8G":            "--max-model-len 32768 --max-num-batched-tokens 32768 --kv-cache-memory-bytes 8G --enforce-eager",
 	}
 	for name, vector := range accepted {
 		t.Run(name, func(t *testing.T) {
@@ -103,6 +105,10 @@ func TestQwenMemoryBudgetTransitionAcceptsOnlySanctionedExactVectors(t *testing.
 		"combined_no_batch":   "--max-model-len 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager",
 		"combined_no_context": "--max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager",
 		"combined_extra":      "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager --served-model-name injected",
+		"tools_other_parser":  "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager --enable-auto-tool-choice --tool-call-parser mistral",
+		"tools_no_auto":       "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager --tool-call-parser hermes",
+		"tools_reordered":     "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager --tool-call-parser hermes --enable-auto-tool-choice",
+		"tools_extra_flag":    "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager --enable-auto-tool-choice --tool-call-parser hermes --served-model-name injected",
 	}
 	for name, vector := range rejected {
 		t.Run(name, func(t *testing.T) {
@@ -162,9 +168,15 @@ func TestLLMAliasesDoNotCreateAdapterPolicyModels(t *testing.T) {
 			t.Fatalf("alias %q became an adapter-policy model", alias)
 		}
 	}
-	expected := `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager`
+	expected := `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager --enable-auto-tool-choice --tool-call-parser hermes`
 	if got := vllmLegacyTuningByModel["llm:qwen3.6-35b"]; got != expected {
 		t.Fatalf("qwen adapter exception changed: %q", got)
+	}
+	// Rollback safety is part of the same contract: the pre-tool-calling vector
+	// must stay sanctioned so an older release still validates production's config.
+	priorPrimary := `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager`
+	if !slices.Contains(vllmLegacyTuningAlternatesByModel["llm:qwen3.6-35b"], priorPrimary) {
+		t.Fatalf("prior qwen primary dropped from alternates: %q", vllmLegacyTuningAlternatesByModel["llm:qwen3.6-35b"])
 	}
 }
 

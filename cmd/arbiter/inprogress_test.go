@@ -22,6 +22,23 @@ func buildPSCacheModels(t *testing.T, api *API) map[string]map[string]any {
 	api.statsAt = time.Time{}
 	api.statsMu.Unlock()
 	api.updatePSCache()
+	// refreshStats runs the heavy scans asynchronously so the 1s ticker never
+	// blocks on them. Wait for that pass, then rebuild the cache once the
+	// aggregates are populated so assertions see stable queue/completed stats.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		api.statsMu.Lock()
+		ready := !api.statsAt.IsZero() && !api.statsRefreshing
+		api.statsMu.Unlock()
+		if ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for async stats refresh")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	api.updatePSCache()
 
 	raw, _ := api.psCache.Load().([]byte)
 	var snap map[string]any
