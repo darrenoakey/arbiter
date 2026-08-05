@@ -37,6 +37,10 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   `/health` and the memory-backed `/ps` endpoint remain fast.
 - Do not build a new jobs-table index during `NewStore` or daemon startup. Plan
   large index builds as explicit maintenance after active work drains.
+- All-history dashboard queries (`CountByStateGrouped` and
+  `CompletedJobStatsGrouped`) must not hold the operational Store `RWMutex`.
+  SQLite WAL and the read pool provide isolation; holding the Go read lock lets
+  one queued writer starve every new primary-key job lookup for the full scan.
 - A stopped Arbiter can retain port 8400 briefly while a thread finishes
   uninterruptible database/filesystem I/O. The Spark deploy must wait for the
   old listener to disappear after `auto stop`; auto's ten-second reclaim window
