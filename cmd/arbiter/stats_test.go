@@ -173,6 +173,50 @@ func TestStoreAllowsConcurrentReaders(t *testing.T) {
 	}
 }
 
+func TestHistoricalStatsDoNotTakeOperationalStoreMutex(t *testing.T) {
+	store, _ := newTestStore(t)
+	seedStatsJobs(t, store)
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "state counts",
+			run: func() error {
+				_, _, err := store.CountByStateGrouped()
+				return err
+			},
+		},
+		{
+			name: "completed stats",
+			run: func() error {
+				_, _, err := store.CompletedJobStatsGrouped()
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store.mu.Lock()
+			done := make(chan error, 1)
+			go func() { done <- test.run() }()
+			select {
+			case err := <-done:
+				store.mu.Unlock()
+				if err != nil {
+					t.Fatalf("historical stats query: %v", err)
+				}
+			case <-time.After(500 * time.Millisecond):
+				store.mu.Unlock()
+				<-done
+				t.Fatal("historical stats query blocked on the operational Store mutex")
+			}
+		})
+	}
+}
+
 // TestRefreshStatsIsNonBlocking verifies updatePSCache returns immediately
 // even when aggregates are stale, and that the background pass still fills
 // the cache. A blocking refresh reintroduced the multi-minute /v1/ps hang.

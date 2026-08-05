@@ -962,9 +962,10 @@ type JobStats struct {
 // CountByState once globally and once per model (an N+1 full scan every
 // second); this collapses that into a single GROUP BY.
 func (s *Store) CountByStateGrouped() (perModel map[string]map[string]int, global map[string]int, err error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+	// This all-history query can take minutes on the production database. Do
+	// not hold the operational Store mutex: sql.DB is concurrency-safe and WAL
+	// readers can coexist, while a queued writer on sync.RWMutex would otherwise
+	// block every new GetJob reader until this scan completes.
 	rows, err := s.db.Query("SELECT model_id, state, COUNT(*) FROM jobs GROUP BY model_id, state")
 	if err != nil {
 		return nil, nil, err
@@ -994,9 +995,9 @@ func (s *Store) CountByStateGrouped() (perModel map[string]map[string]int, globa
 // per model, every second). Averages are computed from per-model SUM/COUNT so
 // the global figure matches a single AVG over all completed jobs exactly.
 func (s *Store) CompletedJobStatsGrouped() (perModel map[string]JobStats, global JobStats, err error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+	// Keep the all-history scan outside the operational Store mutex for the same
+	// reason as CountByStateGrouped: SQLite WAL supplies read isolation without
+	// starving primary-key job polling behind Go's writer-preferring RWMutex.
 	rows, err := s.db.Query(`
 SELECT
 	model_id,
