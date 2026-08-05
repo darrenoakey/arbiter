@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -310,5 +311,38 @@ VALUES (?, 'm', 't', 'completed', 1, '{}', ?, ?)`)
 	}
 	if removed != 1 {
 		t.Fatalf("second prune removed = %d, want 1", removed)
+	}
+}
+
+func TestCompletedPruneCandidatesUseRetentionIndex(t *testing.T) {
+	store, _ := newTestStore(t)
+	store.mu.RLock()
+	rows, err := store.db.Query(
+		"EXPLAIN QUERY PLAN "+completedPruneCandidatesSQL,
+		pruneCutoff(jobRetention), pruneBatchSize,
+	)
+	store.mu.RUnlock()
+	if err != nil {
+		t.Fatalf("explain completed prune query: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatalf("scan query plan: %v", err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("query plan rows: %v", err)
+	}
+	joined := strings.Join(plan, "\n")
+	if !strings.Contains(joined, "idx_jobs_completed_stats") {
+		t.Fatalf("completed prune query did not use retention index:\n%s", joined)
+	}
+	if strings.Contains(joined, "TEMP B-TREE") {
+		t.Fatalf("completed prune query requires a temp sort:\n%s", joined)
 	}
 }
