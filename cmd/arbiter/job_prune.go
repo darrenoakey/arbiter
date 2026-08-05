@@ -13,15 +13,31 @@ import (
 // scans multi-minute and the arbiter.db grew past 37GB.
 const jobRetention = 10 * 24 * time.Hour
 
-// pruneBatchSize bounds each DELETE so a multi-million-row backlog cannot hold
-// the writer lock for minutes and starve the scheduler.
-const pruneBatchSize = 5000
+// pruneBatchSize bounds each DELETE so retention work releases the Store writer
+// lock quickly enough for job polling and scheduler state updates.
+const pruneBatchSize = 100
 
 // pruneStartupDelay keeps the first prune pass off the critical path so a
 // multi-GB DB cannot delay ListenAndServe past the deploy health window.
 const pruneStartupDelay = 2 * time.Minute
 
 const pruneTerminalStates = `state IN ('completed','failed','cancelled')`
+
+const completedPruneCandidatesSQL = `
+SELECT id FROM jobs INDEXED BY idx_jobs_completed_stats
+WHERE state = 'completed'
+  AND finished_at IS NOT NULL
+  AND finished_at < ?
+ORDER BY finished_at ASC
+LIMIT ?`
+
+var remainingPruneCandidateQueries = []string{
+	`SELECT id FROM jobs INDEXED BY idx_jobs_state WHERE state = 'failed' AND finished_at IS NOT NULL AND finished_at < ? ORDER BY finished_at ASC LIMIT ?`,
+	`SELECT id FROM jobs INDEXED BY idx_jobs_state WHERE state = 'cancelled' AND finished_at IS NOT NULL AND finished_at < ? ORDER BY finished_at ASC LIMIT ?`,
+	`SELECT id FROM jobs INDEXED BY idx_jobs_created_at WHERE state = 'completed' AND finished_at IS NULL AND created_at < ? ORDER BY created_at ASC LIMIT ?`,
+	`SELECT id FROM jobs INDEXED BY idx_jobs_created_at WHERE state = 'failed' AND finished_at IS NULL AND created_at < ? ORDER BY created_at ASC LIMIT ?`,
+	`SELECT id FROM jobs INDEXED BY idx_jobs_created_at WHERE state = 'cancelled' AND finished_at IS NULL AND created_at < ? ORDER BY created_at ASC LIMIT ?`,
+}
 
 // pruneCutoff returns the unix-seconds cutoff for retention.
 func pruneCutoff(retention time.Duration) float64 {
@@ -40,8 +56,9 @@ func pruneCutoff(retention time.Duration) float64 {
 // exactly one batch: an old multi-batch loop kept rescanning the 40GB database
 // for hours and starved ordinary job reads. Returns the number of rows deleted.
 //
-// Query plan uses idx_jobs_state (state=?) then filters by age. No expression
-// index is created at startup — building one over a 40GB jobs table blocks
+// Completed jobs use the existing idx_jobs_completed_stats retention index.
+// Less-common terminal shapes are considered only after that backlog is empty.
+// No index is created at startup: building one over a 40GB jobs table blocks
 // ListenAndServe for many minutes and fails the deploy health window.
 func (s *Store) PruneOldJobs(retention time.Duration, outputDir string) (int, error) {
 	cutoff := pruneCutoff(retention)
@@ -66,34 +83,70 @@ func (s *Store) pruneOldJobsBatch(cutoff float64, outputDir string) (int, error)
 func (s *Store) selectPruneCandidates(cutoff float64) ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	// Prefer finished_at when present; fall back to created_at for terminal
-	// rows that never recorded a finish time. Skip originals still named by a
-	// live follower (error = following:<id>) so ReconcileFollowingJobs can
-	// resolve them first.
-	rows, err := s.db.Query(`
-SELECT id FROM jobs
-WHERE `+pruneTerminalStates+`
-  AND COALESCE(finished_at, created_at) < ?
-  AND NOT EXISTS (
-    SELECT 1 FROM jobs AS followers
-    WHERE followers.state = 'following'
-      AND followers.error = 'following:' || jobs.id
-  )
-ORDER BY COALESCE(finished_at, created_at) ASC
-LIMIT ?`, cutoff, pruneBatchSize)
+
+	liveOriginals, err := s.liveFollowerOriginalsLocked()
+	if err != nil {
+		return nil, err
+	}
+	selected := make([]string, 0, pruneBatchSize)
+	queries := append([]string{completedPruneCandidatesSQL}, remainingPruneCandidateQueries...)
+	for _, query := range queries {
+		remaining := pruneBatchSize - len(selected)
+		ids, err := s.selectPruneCandidateQueryLocked(query, cutoff, remaining+len(liveOriginals), remaining, liveOriginals)
+		if err != nil {
+			return nil, err
+		}
+		selected = append(selected, ids...)
+		if len(selected) == pruneBatchSize {
+			break
+		}
+	}
+	return selected, nil
+}
+
+func (s *Store) liveFollowerOriginalsLocked() (map[string]struct{}, error) {
+	rows, err := s.db.Query(`SELECT error FROM jobs WHERE state = 'following' AND error LIKE 'following:%'`)
+	if err != nil {
+		return nil, fmt.Errorf("select live prune followers: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	originals := make(map[string]struct{})
+	for rows.Next() {
+		var reference string
+		if err := rows.Scan(&reference); err != nil {
+			return nil, err
+		}
+		if id := followerOriginalJobID(reference); id != "" {
+			originals[id] = struct{}{}
+		}
+	}
+	return originals, rows.Err()
+}
+
+func (s *Store) selectPruneCandidateQueryLocked(query string, cutoff float64, queryLimit int, resultLimit int, liveOriginals map[string]struct{}) ([]string, error) {
+	rows, err := s.db.Query(query, cutoff, queryLimit)
 	if err != nil {
 		return nil, fmt.Errorf("select prune candidates: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var ids []string
+	ids := make([]string, 0, resultLimit)
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			return nil, err
 		}
+		if _, blocked := liveOriginals[id]; blocked {
+			continue
+		}
 		ids = append(ids, id)
+		if len(ids) == resultLimit {
+			break
+		}
 	}
-	return ids, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 func (s *Store) deleteJobsByID(ids []string) error {
@@ -154,7 +207,7 @@ func (s *Store) removePrunedJobDirs(ids []string, outputDir string) {
 // the deploy health window; subsequent passes run every `every`.
 func RunJobPruner(ctxDone <-chan struct{}, store *Store, outputDir string, every time.Duration) {
 	if every <= 0 {
-		every = time.Hour
+		every = time.Minute
 	}
 	runOnce := func() {
 		n, err := store.PruneOldJobs(jobRetention, outputDir)
