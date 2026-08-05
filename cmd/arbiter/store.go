@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -150,7 +151,7 @@ type Store struct {
 }
 
 func NewStore(dbPath string) (*Store, error) {
-	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000")
+	db, err := sql.Open("sqlite", sqliteStoreDSN(dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
@@ -172,6 +173,23 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
 	return &Store{db: db, excludedAt: map[string]map[string]time.Time{}}, nil
+}
+
+// sqliteStoreDSN uses the pragma syntax implemented by modernc.org/sqlite.
+// The similarly named _journal_mode/_synchronous/_busy_timeout parameters are
+// mattn/go-sqlite3 options and modernc silently ignores them. That left the
+// production store in DELETE journal mode with a zero busy timeout: retention
+// deletes on the 40GB database then blocked reads and made job submissions fail
+// immediately with SQLITE_BUSY. These pragmas are applied to every connection
+// opened by database/sql, while WAL itself persists in the database header.
+func sqliteStoreDSN(dbPath string) string {
+	u := &url.URL{Scheme: "file", Path: dbPath}
+	q := u.Query()
+	q.Add("_pragma", "busy_timeout(30000)")
+	q.Add("_pragma", "journal_mode(WAL)")
+	q.Add("_pragma", "synchronous(NORMAL)")
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func genID() string {
