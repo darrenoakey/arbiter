@@ -138,6 +138,24 @@ mv -f $REMOTE/arbiter-go.new $REMOTE/arbiter-go
 mv -f $REMOTE/llm-worker.new $REMOTE/llm-worker
 mv -f $REMOTE/vllm-chat-worker.new $REMOTE/vllm-chat-worker"
 
+echo "==> Installing arbiter firewall guard..."
+# This guard is a host-level backstop, not an arbiter process, but it protects
+# the exact LAN path that spark-view and clients use to reach arbiter. Refresh it
+# on every deploy so a hand-fixed version on spark is never lost by a later
+# binary-only deploy. The guard runs every minute via cron and removes any
+# REJECT/DROP rule on port 8400 (e.g. left behind by a modulith-g0 measurement
+# window or an experiment). See scripts/spark-host/README.md for details.
+scp -q scripts/spark-host/arbiter-firewall-guard "$SPARK:/home/darren/bin/arbiter-firewall-guard.new"
+ssh "$SPARK" "set -e
+chmod +x /home/darren/bin/arbiter-firewall-guard.new
+mv -f /home/darren/bin/arbiter-firewall-guard.new /home/darren/bin/arbiter-firewall-guard
+# Ensure exactly one crontab entry exists for this path; preserve all other lines.
+( crontab -l 2>/dev/null | grep -v '/home/darren/bin/arbiter-firewall-guard' || true ) > /tmp/cron.base
+echo '* * * * * /home/darren/bin/arbiter-firewall-guard' >> /tmp/cron.base
+crontab /tmp/cron.base
+rm -f /tmp/cron.base
+"
+
 echo "==> Starting arbiter on spark..."
 ssh "$SPARK" "/home/darren/local/auto/run start arbiter" 2>&1 | tail -1
 

@@ -1,0 +1,55 @@
+#!/bin/bash
+# arbiter-firewall-guard
+#
+# Keeps the arbiter (port 8400) reachable from the LAN by removing any iptables
+# REJECT/DROP rule that targets the arbiter port. The arbiter's documented design
+# is LAN-open (arbiter/CLAUDE.md: "hit http://10.0.0.254:8400 directly from the
+# laptop"), which spark-view relies on (src/pkg/arbiter/client.go DefaultURL).
+#
+# A 2026-08-11 spark-view outage was caused by non-persistent hand-added rules
+# (INPUT !127.0.0.1 REJECT + a --string "resume" deep-packet OUTPUT match) left
+# behind by a modulith-g0 measurement run. This guard removes such rules if they
+# ever reappear, and logs every removal.
+#
+# Deletion uses LINE NUMBERS (iptables -D CHAIN N), not spec-based -D, because
+# complex match modules (--string, --uid-owner) can fail spec-based deletion when
+# iptables -S emits quoted values that the unquoted -D reparse mismatches.
+#
+# Safe on this host: INPUT policy is ACCEPT and no legitimate service REJECTs the
+# arbiter port. Needs passwordless sudo for iptables (darren has it).
+set -u
+LOG=/home/darren/local/auto/output/logs/arbiter/firewall-guard.log
+mkdir -p "$(dirname "$LOG")"
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+removed=0
+for chain in INPUT OUTPUT; do
+    # Collect line numbers of offending rules, highest first so deletion
+    # does not shift the remaining rules below them.
+    # NOTE: iptables -S does not support --line-numbers on this host (nf_tables
+    # iptables 1.8.10 rejects it), so we use -L --line-numbers which prints the
+    # target (REJECT/DROP) in the 2nd column and the dport as "dpt:8400".
+    mapfile -t LINES < <(
+        sudo -n iptables -L "$chain" -n --line-numbers 2>/dev/null \
+          | awk '/dpt:8400|--dport 8400/ && $2 ~ /^(REJECT|DROP)$/ {print $1}' \
+          | sort -rn
+    )
+    for num in "${LINES[@]}"; do
+        # Capture the full -S spec for the log (iptables -S CHAIN NUM works).
+        spec=$(sudo -n iptables -S "$chain" "$num" 2>/dev/null | sed 's/^[0-9]* //')
+        if sudo -n iptables -D "$chain" "$num" 2>/dev/null; then
+            removed=$((removed + 1))
+            echo "$(ts) removed: $spec" >> "$LOG"
+        fi
+    done
+done
+# Heartbeat once per hour when clean (so the log proves the guard is alive)
+if [ "$removed" -eq 0 ]; then
+    stamp=/tmp/arbiter-fw-guard-stamp
+    now=$(date +%s)
+    last=$(cat "$stamp" 2>/dev/null || echo 0)
+    if [ $((now - last)) -ge 3600 ]; then
+        echo "$(ts) ok: no REJECT/DROP rules on dport 8400" >> "$LOG"
+        echo "$now" > "$stamp"
+    fi
+fi
+exit 0
