@@ -597,7 +597,7 @@ func (s *Scheduler) shouldRequeueForShutdown(err error, resp *WorkerResponse) bo
 }
 
 func (s *Scheduler) computePriority(modelID string) float64 {
-	cfg, ok := s.config.Models[modelID]
+	cfg, ok := s.config.GetModel(modelID)
 	if !ok {
 		return 1e9
 	}
@@ -618,7 +618,7 @@ func (s *Scheduler) computePriority(modelID string) float64 {
 // L_m is load time in seconds (0 if already loaded), and q_m is queued count.
 // Lower score = schedule first.
 func (s *Scheduler) scoreModel(modelID string) float64 {
-	cfg, ok := s.config.Models[modelID]
+	cfg, ok := s.config.GetModel(modelID)
 	if !ok {
 		return 1e9
 	}
@@ -651,7 +651,7 @@ func (s *Scheduler) selectModelMinMeanFlow(exclude map[string]bool) string {
 	bestScore := 0.0
 	bestAge := 0.0
 
-	for modelID := range s.config.Models {
+	for _, modelID := range s.config.ModelIDs() {
 		if exclude[modelID] {
 			continue
 		}
@@ -725,7 +725,7 @@ func (s *Scheduler) canEvictForSwap(victimModelID, challengerModelID string) boo
 		return true
 	}
 	victimLoadSec := 60.0 // conservative floor when load_ms is unconfigured
-	if cfg, ok := s.config.Models[victimModelID]; ok && cfg.LoadMs > 0 {
+	if cfg, ok := s.config.GetModel(victimModelID); ok && cfg.LoadMs > 0 {
 		victimLoadSec = cfg.LoadMs / 1000.0
 	}
 	threshold := victimLoadSec * patience
@@ -765,7 +765,7 @@ func (s *Scheduler) rescoreModel(modelID string) {
 }
 
 func (s *Scheduler) rescoreAll() {
-	for modelID := range s.config.Models {
+	for _, modelID := range s.config.ModelIDs() {
 		s.rescoreModel(modelID)
 	}
 }
@@ -933,7 +933,7 @@ const pressureAgeRate = 0.01
 //     work (queued/scheduled/running), so lower-priority members wait until it
 //     fully drains.
 func (s *Scheduler) conflictGroupHolds(modelID string, cfg ModelConfig) bool {
-	for otherID, otherCfg := range s.config.Models {
+	for otherID, otherCfg := range s.config.CloneModels() {
 		if otherID == modelID || otherCfg.ConflictGroup != cfg.ConflictGroup {
 			continue
 		}
@@ -979,7 +979,7 @@ func (s *Scheduler) getFullModels(bestModel string) map[string]bool {
 	// long-waiting job earns more allowance.
 	ages, _ := s.store.OldestQueuedAgeByModel()
 
-	for modelID, cfg := range s.config.Models {
+	for modelID, cfg := range s.config.CloneModels() {
 		if full[modelID] {
 			continue
 		}
@@ -1191,7 +1191,7 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 			// Running jobs are protected by the ActiveJobs() == 0 guard so we
 			// never preempt in-flight work.
 			wantedScore := s.scoreModel(inst.ModelID)
-			for candidateModelID := range s.config.Models {
+			for _, candidateModelID := range s.config.ModelIDs() {
 				if candidateModelID == inst.ModelID {
 					continue
 				}
@@ -1245,7 +1245,7 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 			deficit := needed - s.mgr.FreeGB()
 			if deficit > 0 {
 				queuedJobs := make(map[string]int)
-				for modelID := range s.config.Models {
+				for _, modelID := range s.config.ModelIDs() {
 					counts, err := s.store.CountByState(modelID)
 					if err != nil {
 						continue
@@ -1443,7 +1443,8 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 	// is driven by CONFIRMED absence (dial errors / Phase-3 liveness poll firing
 	// Cancel), never by a runtime timeout. A slow remote call is allowed to
 	// drain on its detached context.
-	if runtimeSec := s.config.Models[job.ModelID].MaxRuntimeSec; runtimeSec > 0 && !inst.isRemote() {
+	jobCfg, _ := s.config.GetModel(job.ModelID)
+	if runtimeSec := jobCfg.MaxRuntimeSec; runtimeSec > 0 && !inst.isRemote() {
 		killTimer := time.AfterFunc(time.Duration(runtimeSec)*time.Second, func() {
 			slog.Warn("inference timeout — killing worker",
 				"job", job.ID, "model", job.ModelID,
@@ -1668,7 +1669,7 @@ func (s *Scheduler) requeueNoInstance(job *Job) {
 	// isn't an hour of log archaeology — exclusions (with which are stale /
 	// relaxable), the placement chain, and spark's free/reclaimable VRAM at the
 	// moment of failure. Also emit a structured event for alerting.
-	mc, mcOK := s.config.Models[job.ModelID]
+	mc, mcOK := s.config.GetModel(job.ModelID)
 	placements := "unknown"
 	if mcOK {
 		placements = fmt.Sprint(mc.PlacementsOrDefault())
@@ -1897,7 +1898,8 @@ func (s *Scheduler) tryDispatchJob(job *Job) bool {
 		"instance", inst.InstanceID, "instance_state", inst.State(),
 		"active_jobs_before", inst.ActiveJobs())
 
-	pressure := *s.config.Models[job.ModelID].PressureIndex
+	jobCfg, _ := s.config.GetModel(job.ModelID)
+	pressure := *jobCfg.PressureIndex
 	if inst.isRemote() {
 		pressure = 0 // Fix 5: a dispatch landing on a remote instance contends for zero spark GPU
 	}
@@ -2009,7 +2011,7 @@ func (s *Scheduler) autoWakeParkedModels() {
 
 	// Forget models that gained instances or drained their queue.
 	for id := range s.starvedSince {
-		cfg, ok := s.config.Models[id]
+		cfg, ok := s.config.GetModel(id)
 		if !ok || pending[id] == 0 || cfg.MaxInstances == nil || *cfg.MaxInstances != 0 {
 			delete(s.starvedSince, id)
 		}
@@ -2019,7 +2021,7 @@ func (s *Scheduler) autoWakeParkedModels() {
 		if n == 0 {
 			continue
 		}
-		cfg, ok := s.config.Models[id]
+		cfg, ok := s.config.GetModel(id)
 		if !ok || cfg.MaxInstances == nil || *cfg.MaxInstances != 0 {
 			continue
 		}
@@ -2045,12 +2047,12 @@ func (s *Scheduler) autoWakeParkedModels() {
 		cfg.MaxInstances = &one
 		var scaleResult map[string]any
 		err := persistModelConfigTransaction(s.mgr.projectRoot, id, cfg, s.config.VRAMBudgetGB, func() error {
-			s.config.Models[id] = cfg
+			s.config.SetModel(id, cfg)
 			scaleResult = s.mgr.ScaleModel(id, 1, cfg)
 			s.mgr.ApplyModelConfig(id, cfg)
 			return verifyModelRuntime(s.config, s.mgr, id, cfg, 1)
 		}, func() error {
-			s.config.Models[id] = current
+			s.config.SetModel(id, current)
 			s.mgr.ScaleModel(id, 0, current)
 			s.mgr.ApplyModelConfig(id, current)
 			return verifyModelRuntime(s.config, s.mgr, id, current, 0)
@@ -2245,7 +2247,7 @@ func (s *Scheduler) RunKeepalive(ctx context.Context) {
 		}
 
 		now := time.Now()
-		for modelID, cfg := range s.config.Models {
+		for modelID, cfg := range s.config.CloneModels() {
 			// Skip if a circuit-breaker is currently holding dispatch back —
 			// the model only looks idle because we stopped feeding it.
 			if paused, until := s.IsModelPaused(modelID); paused {
@@ -2333,7 +2335,7 @@ func (s *Scheduler) RunJobWatchdog(ctx context.Context) {
 				continue
 			}
 
-			cfg, ok := s.config.Models[job.ModelID]
+			cfg, ok := s.config.GetModel(job.ModelID)
 			if !ok {
 				continue
 			}
@@ -2379,7 +2381,7 @@ func (s *Scheduler) RunModelHealthWatchdog(ctx context.Context) {
 		case <-ticker.C:
 		}
 
-		for modelID, modelCfg := range s.config.Models {
+		for modelID, modelCfg := range s.config.CloneModels() {
 			for _, inst := range s.mgr.GetModelInstances(modelID) {
 				state := inst.State()
 
@@ -2520,7 +2522,7 @@ func (s *Scheduler) RunVRAMWatchdog(ctx context.Context) {
 		// the next is picked) and be evicted in favour of a model with zero
 		// pending work.
 		queuedJobs := make(map[string]int)
-		for modelID := range s.config.Models {
+		for _, modelID := range s.config.ModelIDs() {
 			counts, err := s.store.CountByState(modelID)
 			if err != nil {
 				continue

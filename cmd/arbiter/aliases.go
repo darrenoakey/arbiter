@@ -245,7 +245,7 @@ func (a *API) putAlias(w http.ResponseWriter, r *http.Request) {
 	oldTarget := newAliases[alias]
 	newAliases[alias] = req.Target
 
-	if err := validateLLMAliases(newAliases, a.config.Models); err != nil {
+	if err := validateLLMAliases(newAliases, a.config.CloneModels()); err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
@@ -344,13 +344,13 @@ func (a *API) replaceAliases(aliases map[string]string) {
 	a.aliasMu.Lock()
 	defer a.aliasMu.Unlock()
 	a.config.LLMAliases = maps.Clone(aliases)
-	a.aliasModels = configuredModelIDs(a.config.Models)
+	a.aliasModels = configuredModelIDs(a.config.CloneModels())
 }
 
 func (a *API) refreshAliasModels() {
 	a.aliasMu.Lock()
 	defer a.aliasMu.Unlock()
-	a.aliasModels = configuredModelIDs(a.config.Models)
+	a.aliasModels = configuredModelIDs(a.config.CloneModels())
 }
 
 func (a *API) modelAliasCollision(modelID string) (string, bool) {

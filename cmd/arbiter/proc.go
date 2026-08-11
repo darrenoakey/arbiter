@@ -1264,7 +1264,7 @@ func (m *InstanceManager) PickInstanceRelaxedForJob(job *Job, remoteEnabled bool
 // relaxStale(host) returns true — its exclusion records only a PAST absence.
 // Caller holds m.mu.
 func (m *InstanceManager) pickInstanceWalkLocked(job *Job, remoteEnabled bool, relaxStale func(host string) bool) (*Instance, string) {
-	mc, ok := m.config.Models[job.ModelID]
+	mc, ok := m.config.GetModel(job.ModelID)
 	if !ok {
 		// Unknown model: fall back to the flat pool (back-compat).
 		return m.pickFromModelLocked(job.ModelID), reasonPreferred
@@ -1361,7 +1361,7 @@ func (m *InstanceManager) jobHasPickableRemotePlacementLocked(job *Job, remoteEn
 	if !remoteEnabled {
 		return false
 	}
-	mc, ok := m.config.Models[job.ModelID]
+	mc, ok := m.config.GetModel(job.ModelID)
 	if !ok {
 		return false
 	}
@@ -1552,9 +1552,10 @@ func (m *InstanceManager) snapshotInstanceMemory(pidVRAM map[int]int64) []instan
 		inst.mu.Unlock()
 	}
 	configuredByModel := make(map[string]float64)
-	for id, mc := range m.config.Models {
+	m.config.RangeModels(func(id string, mc ModelConfig) bool {
 		configuredByModel[id] = mc.MemoryGB
-	}
+		return true
+	})
 	m.mu.RUnlock()
 
 	out := make([]instanceMemSnapshot, 0, len(pendings))
@@ -1577,12 +1578,12 @@ func (m *InstanceManager) snapshotInstanceMemory(pidVRAM map[int]int64) []instan
 func (m *InstanceManager) UpdateModelMemoryGB(modelID string, newGB float64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	mc, ok := m.config.Models[modelID]
+	mc, ok := m.config.GetModel(modelID)
 	if !ok {
 		return
 	}
 	mc.MemoryGB = newGB
-	m.config.Models[modelID] = mc
+	m.config.SetModel(modelID, mc)
 }
 
 // ActualVRAMGB returns the total actual VRAM in GB used by all known worker
@@ -2414,7 +2415,7 @@ func (m *InstanceManager) Snapshot() map[string]any {
 			// scheduler read), not a frozen instance-snapshot that diverges after a
 			// config PATCH while the model stays loaded on a remote host (the R7
 			// divergence class).
-			if cfg, ok := m.config.Models[modelID]; ok {
+			if cfg, ok := m.config.GetModel(modelID); ok {
 				entry["memory_gb"] = cfg.MemoryGB
 			} else {
 				entry["memory_gb"] = g.instances[0].memoryGB
@@ -2515,7 +2516,7 @@ func (m *InstanceManager) Snapshot() map[string]any {
 
 		// Fix 6/R7: always surface the live-config max_concurrent so /v1/ps agrees
 		// with GET /v1/models/:id (the authoritative scheduler-visible surface).
-		if cfg, ok := m.config.Models[modelID]; ok {
+		if cfg, ok := m.config.GetModel(modelID); ok {
 			entry["max_concurrent"] = cfg.MaxConcurrent
 		}
 		models = append(models, entry)

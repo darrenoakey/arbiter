@@ -295,9 +295,10 @@ func (m *InstanceManager) snapshotKillableInstances(pidVRAM map[int]int64) []ins
 		inst.mu.Unlock()
 	}
 	configuredByModel := make(map[string]float64)
-	for id, mc := range m.config.Models {
+	m.config.RangeModels(func(id string, mc ModelConfig) bool {
 		configuredByModel[id] = mc.MemoryGB
-	}
+		return true
+	})
 	m.mu.RUnlock()
 
 	out := make([]instanceMemSnapshot, 0, len(pendings))

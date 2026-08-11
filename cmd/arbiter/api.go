@@ -321,7 +321,7 @@ func (a *API) updatePSCache() {
 				m["avg_total_seconds"] = st.AvgTotal
 				m["avg_execution_seconds"] = st.AvgExec
 				m["avg_waiting_seconds"] = math.Max(st.AvgTotal-st.AvgExec, 0)
-				if cfg, ok := a.config.Models[id]; ok {
+				if cfg, ok := a.config.GetModel(id); ok {
 					m["max_instances"] = *cfg.MaxInstances
 					m["max_concurrent"] = cfg.MaxConcurrent
 				}
@@ -468,7 +468,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
-	if _, ok := a.config.Models[modelID]; !ok {
+	if _, ok := a.config.GetModel(modelID); !ok {
 		writeError(w, 400, fmt.Sprintf("model not configured: %s", modelID))
 		return
 	}
@@ -629,7 +629,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := a.config.Models[modelID]
+	cfg, _ := a.config.GetModel(modelID)
 	estimated := cfg.AvgInferenceMs
 	if !a.mgr.IsLoaded(modelID) {
 		estimated += cfg.LoadMs
@@ -1006,7 +1006,7 @@ func (a *API) createReservation(w http.ResponseWriter, r *http.Request) {
 
 	// Build keepalive map from config for smart eviction
 	keepAliveSecs := make(map[string]int)
-	for id, cfg := range a.config.Models {
+	for id, cfg := range a.config.CloneModels() {
 		keepAliveSecs[id] = cfg.KeepAliveSec
 	}
 
@@ -1090,11 +1090,11 @@ func validateModelConfigRequest(modelID string, req modelConfigRequest) error {
 }
 
 func (a *API) resolveConfiguredModelID(id string) (string, bool) {
-	if _, ok := a.config.Models[id]; ok {
+	if _, ok := a.config.GetModel(id); ok {
 		return id, true
 	}
 	llmID := llmModelID(id)
-	if _, ok := a.config.Models[llmID]; ok {
+	if _, ok := a.config.GetModel(llmID); ok {
 		return llmID, true
 	}
 	return "", false
@@ -1197,7 +1197,7 @@ func applyModelConfigRequest(cfg ModelConfig, req modelConfigRequest) ModelConfi
 }
 
 func (a *API) applyRegisteredModelRuntime(modelID string, config ModelConfig) (map[string]any, error) {
-	a.config.Models[modelID] = config
+	a.config.SetModel(modelID, config)
 	a.refreshAliasModels()
 	a.mgr.EnsureModel(modelID)
 	result := a.mgr.ScaleModel(modelID, *config.MaxInstances, config)
@@ -1206,13 +1206,13 @@ func (a *API) applyRegisteredModelRuntime(modelID string, config ModelConfig) (m
 }
 
 func (a *API) rollbackRegisteredModelRuntime(modelID string) error {
-	delete(a.config.Models, modelID)
+	a.config.DeleteModel(modelID)
 	a.refreshAliasModels()
 	return a.mgr.RemoveModelRuntime(modelID)
 }
 
 func (a *API) applyUpdatedModelRuntime(modelID string, current, updated ModelConfig, reload bool) (map[string]any, error) {
-	a.config.Models[modelID] = updated
+	a.config.SetModel(modelID, updated)
 	a.mgr.ApplyModelConfig(modelID, updated)
 	var result map[string]any
 	if reload {
@@ -1224,7 +1224,7 @@ func (a *API) applyUpdatedModelRuntime(modelID string, current, updated ModelCon
 }
 
 func (a *API) rollbackUpdatedModelRuntime(modelID string, current ModelConfig, reload bool) error {
-	a.config.Models[modelID] = current
+	a.config.SetModel(modelID, current)
 	if reload {
 		a.mgr.ReloadModel(modelID, *current.MaxInstances, current)
 	} else {
@@ -1285,7 +1285,7 @@ func (a *API) registerModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
-	if _, exists := a.config.Models[req.ModelID]; exists {
+	if _, exists := a.config.GetModel(req.ModelID); exists {
 		writeError(w, 409, fmt.Sprintf("model already configured: %s", req.ModelID))
 		return
 	}
@@ -1336,8 +1336,9 @@ func (a *API) registerModel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listModels(w http.ResponseWriter, r *http.Request) {
-	models := make([]map[string]any, 0, len(a.config.Models))
-	for modelID, cfg := range a.config.Models {
+	snapshot := a.config.CloneModels()
+	models := make([]map[string]any, 0, len(snapshot))
+	for modelID, cfg := range snapshot {
 		entry := serializeModelConfig(modelID, cfg)
 		if aliases := a.aliasesTargeting(modelID); len(aliases) > 0 {
 			entry["aliases"] = aliases
@@ -1356,7 +1357,8 @@ func (a *API) getModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
 		return
 	}
-	entry := serializeModelConfig(modelID, a.config.Models[modelID])
+	mc, _ := a.config.GetModel(modelID)
+	entry := serializeModelConfig(modelID, mc)
 	if aliases := a.aliasesTargeting(modelID); len(aliases) > 0 {
 		entry["aliases"] = aliases
 	}
@@ -1369,7 +1371,7 @@ func (a *API) updateModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
 		return
 	}
-	current := a.config.Models[modelID]
+	current, _ := a.config.GetModel(modelID)
 	if disabledStillImageConfig(modelID, current) {
 		writeError(w, 400, stillImageDisabledMessage)
 		return
@@ -1485,7 +1487,7 @@ func (a *API) reloadModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
 		return
 	}
-	cfg := a.config.Models[modelID]
+	cfg, _ := a.config.GetModel(modelID)
 	if err := validateModelWorkerPolicy(a.projectRoot, modelID, cfg, a.config.HasLocalPlacement(cfg)); err != nil {
 		writeError(w, 400, err.Error())
 		return
@@ -1545,7 +1547,7 @@ func (a *API) hardKillModelWorkers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
 		return
 	}
-	cfg := a.config.Models[modelID]
+	cfg, _ := a.config.GetModel(modelID)
 
 	cancelledQueued, err := a.store.CancelQueuedForModel(modelID)
 	if err != nil {
@@ -1645,7 +1647,7 @@ func (a *API) removeModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, fmt.Sprintf("model not configured: %s", r.PathValue("model_id")))
 		return
 	}
-	cfg := a.config.Models[modelID]
+	cfg, _ := a.config.GetModel(modelID)
 
 	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
 	dependentAliases := a.aliasesTargeting(modelID)
@@ -1690,7 +1692,7 @@ func (a *API) removeModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	killResult := a.mgr.HardKillModel(modelID, false, &cfg)
-	delete(a.config.Models, modelID)
+	a.config.DeleteModel(modelID)
 	removedJobTypes := removeJobTypeMappings(modelID)
 	aliases := a.aliasSnapshot()
 	for _, alias := range dependentAliases {
@@ -1801,7 +1803,7 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if already registered
-	if _, ok := a.config.Models[modelID]; ok {
+	if _, ok := a.config.GetModel(modelID); ok {
 		writeJSON(w, 200, map[string]any{
 			"model_id": modelID,
 			"name":     name,
@@ -1957,7 +1959,7 @@ func (a *API) registerLLM(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) listLLMs(w http.ResponseWriter, r *http.Request) {
 	var llms []map[string]any
-	for id, cfg := range a.config.Models {
+	for id, cfg := range a.config.CloneModels() {
 		if !strings.HasPrefix(id, "llm:") {
 			continue
 		}
@@ -1991,7 +1993,7 @@ func (a *API) deregisterLLM(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	modelID := llmModelID(name)
 
-	cfg, ok := a.config.Models[modelID]
+	cfg, ok := a.config.GetModel(modelID)
 	if !ok {
 		writeError(w, 404, fmt.Sprintf("LLM not registered: %s", name))
 		return
@@ -2008,7 +2010,7 @@ func (a *API) deregisterLLM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	killResult := a.mgr.HardKillModel(modelID, false, &cfg)
-	delete(a.config.Models, modelID)
+	a.config.DeleteModel(modelID)
 	delete(JobTypeToModel, "chat-completion:"+name)
 	aliases := a.aliasSnapshot()
 	for _, alias := range dependentAliases {
@@ -2599,7 +2601,7 @@ func (a *API) setGlobalRemote(w http.ResponseWriter, r *http.Request) {
 	drained := 0
 	if disabled {
 		// Drain in-flight remote work across EVERY model to spark.
-		for modelID := range a.config.Models {
+		for _, modelID := range a.config.ModelIDs() {
 			drained += a.scheduler.DrainRemoteJobsForModel(modelID)
 		}
 	}
@@ -2687,15 +2689,12 @@ func (a *API) startDrainShutdownMonitor() {
 
 func (a *API) adminUnloadAll(w http.ResponseWriter, r *http.Request) {
 	totalKilled := 0
-	models := make([]string, 0, len(a.config.Models))
-	for id := range a.config.Models {
-		models = append(models, id)
-	}
+	models := a.config.ModelIDs()
 	// recreate=true preserves the instance shells (so subsequent preload still
 	// finds an instance to load into) but kills the running workers and frees
 	// VRAM/RSS — exactly the "clean baseline" benchmark mode wants.
 	for _, id := range models {
-		cfg := a.config.Models[id]
+		cfg, _ := a.config.GetModel(id)
 		res := a.mgr.HardKillModel(id, true, &cfg)
 		if k, ok := res["killed"].(int); ok {
 			totalKilled += k
@@ -2716,7 +2715,7 @@ func (a *API) adminPreload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "model_id required")
 		return
 	}
-	if _, ok := a.config.Models[body.ModelID]; !ok {
+	if _, ok := a.config.GetModel(body.ModelID); !ok {
 		writeError(w, 404, "unknown model: "+body.ModelID)
 		return
 	}

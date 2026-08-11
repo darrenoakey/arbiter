@@ -143,7 +143,7 @@ func (h HostConfig) IsNativ() bool {
 // A remote-only model (e.g. an ollama-served LLM placed on fleet hosts) must
 // never get a local subprocess: there is no Python adapter for it, so a local
 // worker would just crash-loop.
-func (c Config) HasLocalPlacement(mc ModelConfig) bool {
+func (c *Config) HasLocalPlacement(mc ModelConfig) bool {
 	for _, host := range mc.PlacementsOrDefault() {
 		if c.HostIsLocal(host) {
 			return true
@@ -153,7 +153,7 @@ func (c Config) HasLocalPlacement(mc ModelConfig) bool {
 }
 
 // IsLocal reports whether a host id refers to spark's local CUDA backend.
-func (c Config) HostIsLocal(hostID string) bool {
+func (c *Config) HostIsLocal(hostID string) bool {
 	if hostID == "" || hostID == LocalHost {
 		return true
 	}
@@ -200,6 +200,15 @@ type Config struct {
 	// it. 0 = default (300s); negative = guard disabled.
 	AutoWakeSeconds int                    `json:"auto_wake_seconds"`
 	Models          map[string]ModelConfig `json:"models"`
+	// mu guards Models. The arbiter shares one *Config across the HTTP
+	// handlers, the scheduler goroutine, the /v1/ps cache goroutine, and the
+	// emergency guardian goroutine. Every Models read/write MUST go through
+	// the GetModel/SetModel/DeleteModel/RangeModels accessors below — a bare
+	// map access races with the per-second Snapshot and aborts the process
+	// with "concurrent map read and map write" (the 2026-08-11 arbiter
+	// crash). Unexported so json.Unmarshal skips it (a zero sync.RWMutex is
+	// ready to use).
+	mu sync.RWMutex
 	// Hosts is the fleet of executors keyed by host id. The implicit host
 	// "spark" (LocalHost) is always local CUDA and need not appear here. When
 	// absent/empty, arbiter behaves exactly as today: a single local host.
@@ -254,11 +263,69 @@ func (c *Config) RemoteAllowedFor(modelID string) bool {
 	if c.RemoteDisabled {
 		return false
 	}
-	mc, ok := c.Models[modelID]
+	mc, ok := c.GetModel(modelID)
 	if !ok {
 		return true
 	}
 	return mc.RemoteEnabledOrDefault()
+}
+
+// GetModel returns the config for one model under the read lock.
+func (c *Config) GetModel(id string) (ModelConfig, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	m, ok := c.Models[id]
+	return m, ok
+}
+
+// SetModel stores or replaces a model config under the write lock.
+func (c *Config) SetModel(id string, m ModelConfig) {
+	c.mu.Lock()
+	c.Models[id] = m
+	c.mu.Unlock()
+}
+
+// DeleteModel removes a model config under the write lock.
+func (c *Config) DeleteModel(id string) {
+	c.mu.Lock()
+	delete(c.Models, id)
+	c.mu.Unlock()
+}
+
+// RangeModels calls f for each model while holding the read lock. f must not
+// block or mutate config. Callers that need a stable snapshot for offline
+// work should use CloneModels.
+func (c *Config) RangeModels(f func(id string, m ModelConfig) bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for id, m := range c.Models {
+		if !f(id, m) {
+			return
+		}
+	}
+}
+
+// CloneModels returns a shallow copy of the model map. Use when a caller
+// needs a consistent snapshot it can iterate without holding the lock.
+func (c *Config) CloneModels() map[string]ModelConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]ModelConfig, len(c.Models))
+	for id, m := range c.Models {
+		out[id] = m
+	}
+	return out
+}
+
+// ModelIDs returns a snapshot of the model ids in arbitrary order.
+func (c *Config) ModelIDs() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ids := make([]string, 0, len(c.Models))
+	for id := range c.Models {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 var mutableConfigMu sync.Mutex
