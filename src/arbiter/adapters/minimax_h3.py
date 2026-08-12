@@ -3,17 +3,22 @@
 Generates short video clips (5–15s) with MiniMax H3 through the diffusers
 modular pipeline, running natively on the GB10's unified 128 GB pool.
 
-Why int8 rather than the Unsloth FP8 checkpoint: that export is a Comfy-Org
-*pruned* transformer whose AdaLN modulation is a precomputed curve table
+Why not the Unsloth FP8 checkpoint: that export is a Comfy-Org *pruned*
+transformer whose AdaLN modulation is a precomputed curve table
 (`adaln_proj.linear` of shape [96768, 8] fed by `time_embedder.table`
 [1025, 8]). diffusers' `MiniMaxH3Transformer3DModel` implements the full
 modulation projection ([96768, 2688]), so the FP8 state dict cannot be loaded
-into it — 51 tensors mismatch on shape. This adapter therefore follows the
-documented consumer-card recipe instead: load the bfloat16 checkpoint with
-torchao int8 weight-only quantization applied as it loads, then stream the
-transformer's blocks from host memory. Both large components (61.7 GB
-transformer, 62.1 GB Qwen3-VL conditioner) come down to roughly 75 GB of
-resident weights, which fits the GB10 pool with room for activations.
+into it — 51 tensors mismatch on shape. This adapter therefore loads the
+official bfloat16 checkpoint and quantizes at load time.
+
+Why NVFP4 rather than int8: int8 brought the two large components down to
+~80 GB of resident weights, which only ever completed a frame on an otherwise
+empty box. With moondream/insightface/aesthetic-scorer resident (~27 GB), every
+inference start was force-killed at MemAvailable 1.7–1.9 GB. NVFP4
+(Blackwell-native FP4 weight-only via torchao) targets ~35 GB of weights so H3
+can co-reside inside the armed 90 GB budget with real activation headroom. The
+same official checkpoint is used; only the torchao config changes.
+
 
 Expected params dict:
     prompt              : str  — text conditioning
@@ -109,27 +114,31 @@ def snap_canvas(width: int, height: int) -> tuple[int, int]:
     return width, height
 
 
-def _int8_config(modules_to_not_convert: list[str], transformers_flavour: bool = False):
-    """Build a torchao int8 weight-only quantization config.
+def _nvfp4_config(modules_to_not_convert: list[str], transformers_flavour: bool = False):
+    """Build a torchao NVFP4 weight-only quantization config.
 
-    `version=2` matters: only v2 int8 tensors are pinnable, and streamed group
-    offloading needs pinned host memory to overlap its copies with compute.
+    NVFP4WeightOnlyConfig lives in torchao's prototype mx_formats workflow and
+    requires last-2 weight dims divisible by 16 (H3's 2688/5376/96768 all are).
+    `modules_to_not_convert` is enforced by the HuggingFace/diffusers
+    TorchAoConfig wrapper, not by the torchao config itself — same seam the
+    previous int8 path used.
     """
-    from torchao.quantization import Int8WeightOnlyConfig
+    from torchao.prototype.mx_formats.inference_workflow import NVFP4WeightOnlyConfig
 
     if transformers_flavour:
         from transformers import TorchAoConfig as Config
     else:
         from diffusers import TorchAoConfig as Config
     return Config(
-        Int8WeightOnlyConfig(version=2),
+        NVFP4WeightOnlyConfig(use_dynamic_per_tensor_scale=True),
         modules_to_not_convert=list(modules_to_not_convert),
     )
 
 
+
 @register
 class MinimaxH3Adapter(GroupAdapter):
-    """MiniMax H3 video generation with an int8-quantized denoiser on GB10."""
+    """MiniMax H3 video generation with an NVFP4-quantized denoiser on GB10."""
 
     model_id = "minimax-h3-local"
 
@@ -142,16 +151,15 @@ class MinimaxH3Adapter(GroupAdapter):
     # ------------------------------------------------------------------
 
     def load(self, device: str = "cuda") -> None:
-        """Load the fl2va component set with both large components at int8."""
+        """Load the fl2va component set with both large components at NVFP4."""
         import torch
         from diffusers import MiniMaxH3Transformer3DModel, ModularPipeline
-        from diffusers.hooks import apply_group_offloading
         from transformers import Qwen3VLForConditionalGeneration
 
         self._device = device
         try:
             self._pipe = ModularPipeline.from_pretrained(H3_BASE_REPO)
-            log.info("H3: quantizing transformer and conditioner to int8")
+            log.info("H3: quantizing transformer and conditioner to NVFP4")
             self._pipe.update_components(
                 # The published recipe passes low_cpu_mem_usage=False; the
                 # installed diffusers rejects that outright when a
@@ -161,13 +169,13 @@ class MinimaxH3Adapter(GroupAdapter):
                     H3_BASE_REPO,
                     subfolder="transformer",
                     dtype=torch.bfloat16,
-                    quantization_config=_int8_config(H3_TRANSFORMER_FP_MODULES),
+                    quantization_config=_nvfp4_config(H3_TRANSFORMER_FP_MODULES),
                 ),
                 text_encoder=Qwen3VLForConditionalGeneration.from_pretrained(
                     H3_BASE_REPO,
                     subfolder="text_encoder",
                     dtype=torch.bfloat16,
-                    quantization_config=_int8_config(
+                    quantization_config=_nvfp4_config(
                         H3_TEXT_ENCODER_FP_MODULES, transformers_flavour=True
                     ),
                 ),
@@ -178,24 +186,16 @@ class MinimaxH3Adapter(GroupAdapter):
                 workflow=H3_WORKFLOW, dtype=torch.bfloat16
             )
             # Freezing removes the one autograd path quantized tensors cannot
-            # serve, and is what makes their host buffers pinnable.
+            # serve. Keep both large components resident on device: NVFP4 is
+            # small enough that group-offload's pin/stream path is unnecessary
+            # and NVFP4Tensor pin behaviour is still prototype-grade.
             self._pipe.transformer.requires_grad_(False)
             self._pipe.text_encoder.requires_grad_(False)
-
-            offload = dict(
-                onload_device=torch.device(device),
-                offload_device=torch.device("cpu"),
-                use_stream=True,
-            )
-            self._pipe.transformer.enable_group_offload(
-                offload_type="block_level", num_blocks_per_group=1, **offload
-            )
-            apply_group_offloading(
-                self._pipe.text_encoder.model, offload_type="leaf_level", **offload
-            )
+            self._pipe.transformer.to(device)
+            self._pipe.text_encoder.to(device)
             self._pipe.vae.to(device)
             self._pipe.audio_vae.to(device)
-            log.info("MiniMax H3 pipeline loaded (int8, group offload)")
+            log.info("MiniMax H3 pipeline loaded (NVFP4, on-device)")
         except LoadError:
             self.unload()
             raise
