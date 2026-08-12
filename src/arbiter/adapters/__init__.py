@@ -31,6 +31,7 @@ _ADAPTER_MODULES = (
     "demucs_sep",
     "rvc",
     "voice_fit",
+    "minimax_h3",
 )
 
 for _module_name in _ADAPTER_MODULES:

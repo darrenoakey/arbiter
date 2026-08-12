@@ -37,6 +37,7 @@ var trustedPythonAdapters = map[string]string{
 	"ltx2-dev-denoise1":       "",
 	"ltx2-dev-denoise2":       "",
 	"ltx2-encode":             "",
+	"minimax-h3-local":        "minimax-h3",
 	"moondream":               "moondream",
 	"rvc-convert":             "rvc",
 	"rvc-train":               "rvc",
@@ -109,7 +110,7 @@ func hasPolicyToken(normalized, token string) bool {
 func nestedModelRoutesJob(jobType string) bool {
 	switch jobType {
 	case "background-remove", "caption", "query", "detect", "point", "transcribe",
-		"talking-head", "talking-head-sadtalker", "lipsync", "video-generate", "video-encode",
+		"talking-head", "talking-head-sadtalker", "lipsync", "video-generate", "video-generate-h3", "video-encode",
 		"video-denoise1", "video-denoise2", "face-restore", "face-restore-codeformer",
 		"face-embed", "aesthetic-score", "composite", "demucs", "chat-completion",
 		"chat-completion-stream":

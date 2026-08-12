@@ -51,3 +51,22 @@ def test_voice_param_schema_shapes():
     # rvc-convert requires a model reference; transpose defaults to 0.
     c = RvcConvertParams(model="leo-laporte", audio_file="/in.wav")
     assert c.transpose == 0 and c.f0_method == "rmvpe"
+
+
+def test_minimax_h3_local_job_type_registered():
+    from arbiter.schemas import VideoGenerateH3Params
+
+    assert JOB_TYPE_TO_MODEL["video-generate-h3"] == "minimax-h3-local"
+    params = VideoGenerateH3Params(
+        prompt="A singer performs beneath falling snow",
+        first_image_file="/shared/first.jpg",
+        last_image_file="/shared/last.jpg",
+        duration=5,
+        width=960,
+        height=544,
+        seed=42,
+        num_inference_steps=8,
+    )
+    assert params.duration == 5
+    assert params.first_image_file == "/shared/first.jpg"
+    assert params.last_image_file == "/shared/last.jpg"

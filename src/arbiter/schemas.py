@@ -26,6 +26,7 @@ class JobType(str, Enum):
     TALKING_HEAD_SADTALKER = "talking-head-sadtalker"
     LIPSYNC = "lipsync"
     VIDEO_GENERATE = "video-generate"
+    VIDEO_GENERATE_H3 = "video-generate-h3"
     AESTHETIC_SCORE = "aesthetic-score"
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
@@ -52,6 +53,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "talking-head-sadtalker": "sadtalker",
     "lipsync": "latentsync",
     "video-generate": "ltx2",
+    "video-generate-h3": "minimax-h3-local",
     "aesthetic-score": "aesthetic-scorer",
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
@@ -245,6 +247,19 @@ class VideoGenerateParams(BaseModel):
     chunk_frames: int = 121
 
 
+class VideoGenerateH3Params(BaseModel):
+    prompt: str = ""
+    first_image_b64: str = ""
+    last_image_b64: str = ""
+    first_image_file: Optional[str] = None
+    last_image_file: Optional[str] = None
+    duration: int = 6
+    width: int = 960
+    height: int = 544
+    seed: int = 42
+    num_inference_steps: int = 8
+
+
 class AestheticScoreParams(BaseModel):
     image: Optional[str] = None
     image_file: Optional[str] = None
@@ -347,6 +362,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "video-generate": VideoGenerateParams,
     "aesthetic-score": AestheticScoreParams,
     "tts-voxtral": TTSVoxtralParams,
+    "video-generate-h3": VideoGenerateH3Params,
     "lora-train": LoraTrainParams,
     "embed-text": EmbedTextParams,
     "demucs": DemucsParams,

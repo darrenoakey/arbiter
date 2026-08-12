@@ -45,11 +45,11 @@ func TestSubmitJobRejectsDisabledStillImageTypesAndOverrides(t *testing.T) {
 	}
 }
 
-func TestSubmitJobPreservesBiRefNetAndLTX2Variants(t *testing.T) {
+func TestSubmitJobPreservesBiRefNetAndVideoVariants(t *testing.T) {
 	api, cleanup := newTestAPI(t)
 	defer cleanup()
 	pressure := 1.0
-	for _, id := range []string{"birefnet", "birefnet-v2", "ltx2", "ltx2-dev", "ltx2-dev-denoise2"} {
+	for _, id := range []string{"birefnet", "birefnet-v2", "ltx2", "ltx2-dev", "ltx2-dev-denoise2", "minimax-h3-local"} {
 		api.config.Models[id] = ModelConfig{
 			MemoryGB: 1, MaxConcurrent: 1, MaxInstances: intPtr(1), PressureIndex: &pressure,
 		}
@@ -62,6 +62,7 @@ func TestSubmitJobPreservesBiRefNetAndLTX2Variants(t *testing.T) {
 		"ltx2":             `{"type":"video-generate","model":"ltx2","params":{}}`,
 		"ltx2 variant":     `{"type":"video-generate","model":"ltx2-dev","params":{}}`,
 		"ltx2 dev denoise": `{"type":"video-denoise2","model":"ltx2-dev-denoise2","params":{}}`,
+		"minimax h3 local": `{"type":"video-generate-h3","params":{"prompt":"test","duration":5}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			rec := postJob(t, api, body)
