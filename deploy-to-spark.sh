@@ -42,6 +42,11 @@ if ! ssh "$SPARK" "cd /tmp/arbiter-smoke-test && PYTHONPATH=/tmp/arbiter-smoke-t
 fi
 echo "    python smoke test passed"
 
+# Install while the current service is still healthy. A package-index failure
+# must abort before drain/stop rather than create avoidable production downtime.
+echo "==> Installing MiniMax H3 adapter dependency..."
+ssh "$SPARK" "$REMOTE/.venv/bin/python -m pip install -q 'daz-secrets>=0.1.0a1'"
+
 echo "==> Cross-compiling binaries..."
 GOOS=linux GOARCH=arm64 go build -o arbiter-linux-arm64 ./cmd/arbiter/
 GOOS=linux GOARCH=arm64 go build -o llm-worker-linux-arm64 ./cmd/llm-worker/
@@ -117,6 +122,11 @@ ssh "$SPARK" "test -L '$REMOTE/.venv/bin/python' && cp --remove-destination /usr
 
 echo "==> Syncing Python adapters..."
 rsync -az --delete src/arbiter/ "$SPARK:$REMOTE/src/arbiter/"
+
+echo "==> Installing MiniMax H3 model config..."
+ssh "$SPARK" "mkdir -p '$REMOTE/config/spark'"
+rsync -az config/spark/minimax-h3.model.json "$SPARK:$REMOTE/config/spark/minimax-h3.model.json"
+ssh "$SPARK" "$REMOTE/.venv/bin/python -c 'import json, os, pathlib; root=pathlib.Path(\"$REMOTE\"); path=root/\"local/config.json\"; data=json.loads(path.read_text()); model=json.loads((root/\"config/spark/minimax-h3.model.json\").read_text()); data.setdefault(\"models\", {})[\"minimax-h3\"]=model; temporary=path.with_name(\".config.minimax-h3.tmp\"); handle=temporary.open(\"w\"); json.dump(data, handle, indent=2); handle.write(\"\\n\"); handle.flush(); os.fsync(handle.fileno()); handle.close(); os.replace(temporary, path); descriptor=os.open(path.parent, os.O_RDONLY); os.fsync(descriptor); os.close(descriptor)'"
 
 echo "==> Uploading binaries..."
 # Upload to a temporary name, then rename into place. A plain scp onto the live

@@ -380,13 +380,14 @@ func (a *API) updatePSCache() {
 }
 
 func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Type   string          `json:"type"`
-		Model  string          `json:"model"`
-		Params json.RawMessage `json:"params"`
-	}
+	var req submitJobRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
+		return
+	}
+	idempotencyKey, hasIdempotencyKey, err := validateIdempotencyKey(req.IdempotencyKey)
+	if err != nil {
+		writeError(w, 400, err.Error())
 		return
 	}
 	var paramsModel struct {
@@ -397,6 +398,10 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "invalid job params")
 			return
 		}
+	}
+	if req.Type == "video-generate" && paramsModel.Model != "" {
+		writeError(w, 400, "video-generate model selection must use the top-level model field")
+		return
 	}
 	// Top-level model is always routing. Nested model is routing only for job
 	// schemas that explicitly support it; voice/model fields owned by RVC, TTS,
@@ -494,7 +499,8 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	// or point to a path inside ARBITER_INBOX_PATH (the shared NFS/SMB inbox).
 	// Direct SCP to spark's local /tmp is not permitted — all files must be staged
 	// via the arbiter-client service (which writes to the shared inbox mount).
-	if inboxDir := strings.TrimRight(os.Getenv("ARBITER_INBOX_PATH"), "/"); inboxDir != "" {
+	inboxDir := strings.TrimRight(os.Getenv("ARBITER_INBOX_PATH"), "/")
+	if inboxDir != "" {
 		var params map[string]json.RawMessage
 		if err := json.Unmarshal(req.Params, &params); err == nil {
 			for key, raw := range params {
@@ -518,6 +524,10 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if err := a.validateMiniMaxFramePaths(req.Type, modelID, req.Params, inboxDir); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
 
 	// --- Reject jobs whose declared input files don't exist ---
 	// Bad paths must never reach the queue: a queued job with missing inputs
@@ -526,6 +536,10 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	// other job in the same model's queue. Reject at the door instead.
 	if err := a.scheduler.ValidateJobInputs(req.Params); err != nil {
 		writeError(w, 400, err.Error())
+		return
+	}
+	if hasIdempotencyKey {
+		a.submitKeyedJob(w, req, modelID, requestedModel, aliasUsed, idempotencyKey)
 		return
 	}
 
@@ -657,6 +671,50 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		"model":             modelID,
 		"requested_model":   requestedModel,
 		"estimated_seconds": estimated / 1000,
+	})
+}
+
+func (a *API) submitKeyedJob(w http.ResponseWriter, req submitJobRequest, modelID, requestedModel, aliasUsed, idempotencyKey string) {
+	requestHash, err := normalizedJobRequestHash(req.Type, modelID, req.Params)
+	if err != nil {
+		writeError(w, 400, "invalid job params")
+		return
+	}
+	priority := a.scheduler.computePriority(modelID)
+	job, created, conflict, err := a.store.CreateIdempotentJob(
+		modelID, req.Type, req.Params, priority, requestedModel, idempotencyKey, requestHash,
+	)
+	if err != nil {
+		writeError(w, 500, fmt.Sprintf("create idempotent job: %s", err))
+		return
+	}
+	if conflict {
+		writeError(w, http.StatusConflict, "idempotency_key was already used for a different request")
+		return
+	}
+	if created {
+		a.logSubmittedJob(job, requestedModel, aliasUsed)
+		a.scheduler.Wake()
+	}
+	a.writeSubmittedJob(w, job, job.RequestedModel)
+}
+
+func (a *API) logSubmittedJob(job *Job, requestedModel, aliasUsed string) {
+	a.logger.Log("job.submitted", map[string]any{
+		"job_id": job.ID, "model_id": job.ModelID, "job_type": job.JobType,
+		"priority": job.Priority, "requested_model": requestedModel,
+		"resolved_model_id": job.ModelID, "alias_used": aliasUsed,
+	})
+}
+
+func (a *API) writeSubmittedJob(w http.ResponseWriter, job *Job, requestedModel string) {
+	estimated := a.config.Models[job.ModelID].AvgInferenceMs
+	if !a.mgr.IsLoaded(job.ModelID) {
+		estimated += a.config.Models[job.ModelID].LoadMs
+	}
+	writeJSON(w, 200, map[string]any{
+		"job_id": job.ID, "status": job.State, "model": job.ModelID,
+		"requested_model": requestedModel, "estimated_seconds": estimated / 1000,
 	})
 }
 

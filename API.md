@@ -67,10 +67,12 @@ POST /v1/jobs
 Content-Type: application/json
 ```
 
-| Field    | Type   | Required | Description                                      |
-|----------|--------|----------|--------------------------------------------------|
-| `type`   | string | Yes      | One of the 12 job type strings (see Section 3)   |
-| `params` | object | No       | Parameters specific to the job type (default `{}`) |
+| Field             | Type   | Required | Description                                      |
+|-------------------|--------|----------|--------------------------------------------------|
+| `type`            | string | Yes      | One of the job type strings (see Section 3)      |
+| `model`           | string | No       | Explicit top-level routing model                 |
+| `params`          | object | No       | Parameters specific to the job type (default `{}`) |
+| `idempotency_key` | string | No       | Non-empty key (maximum 256 UTF-8 bytes). Identical normalized retries return the existing job; conflicting reuse returns HTTP 409. |
 
 **Request Body Example**
 
@@ -1941,7 +1943,10 @@ All values are from calibration on NVIDIA Grace Blackwell (128 GB VRAM, 100 GB b
 | `tts-clone`     | 4         | 43 s      | 4 s            | 1              | 300 s      | tts-clone                            |
 | `tts-design`    | 4         | 43 s      | 5 s            | 1              | 300 s      | tts-design                           |
 | `sonic`         | 5         | 11 s      | 45 s           | 1              | 600 s      | talking-head                         |
-| `ltx2`          | 55        | 30 s      | 120 s          | 1              | 600 s      | video-generate                       |
+|| `ltx2`          | 55        | 30 s      | 120 s          | 1              | 600 s      | video-generate                       |
+|| `minimax-h3`    | 0*        | 0 s       | ~2–8 m*        | 1              | 0 s        | video-generate (cloud API)           |
+
+\* `minimax-h3` runs remotely against the MiniMax API; no local VRAM is consumed and load/keep-alive are not applicable.
 
 ### SJF Scheduling
 

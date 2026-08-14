@@ -20,11 +20,62 @@ func TestStillImageModelClassification(t *testing.T) {
 	}
 	for _, id := range []string{
 		"birefnet", "ltx2", "ltx2-denoise2", "ltx2-dev-denoise1-lora", "lora-train",
-		"moondream", "sonic", "whisper-large", "llm:qwen3.6-35b", "flora", "floral-voice",
+		"minimax-h3", "moondream", "sonic", "whisper-large", "llm:qwen3.6-35b", "flora", "floral-voice",
 	} {
 		if isDisabledStillImageModel(id) {
 			t.Errorf("%q was incorrectly classified as a still-image model", id)
 		}
+	}
+}
+
+func TestMiniMaxH3VideoAdmissionIsExactAndTopLevel(t *testing.T) {
+	if err := validateJobModelCompatibility("video-generate", "minimax-h3"); err != nil {
+		t.Fatalf("exact MiniMax H3 model rejected: %v", err)
+	}
+	for _, modelID := range []string{"minimax-h3-pro", "minimax-h3-copy", "minimax", "MiniMax-H3"} {
+		if err := validateJobModelCompatibility("video-generate", modelID); err == nil {
+			t.Fatalf("near-neighbor MiniMax model %q accepted", modelID)
+		}
+	}
+	if nestedModelRoutesJob("video-generate") {
+		t.Fatal("video-generate still routes params.model; MiniMax selection must be top-level")
+	}
+	if got := JobTypeToModel["video-generate"]; got != "ltx2" {
+		t.Fatalf("omitted-model default changed: got %q want ltx2", got)
+	}
+}
+
+func TestMiniMaxH3TopLevelSubmissionAndLTX2Default(t *testing.T) {
+	api, cleanup := newTestAPI(t)
+	defer cleanup()
+	api.config.Models["minimax-h3"] = ModelConfig{}
+	api.config.Models["ltx2"] = ModelConfig{}
+	api.refreshAliasModels()
+
+	explicit := performRequest(api, "POST", "/v1/jobs",
+		`{"type":"video-generate","model":"minimax-h3","params":{"prompt":"shot","duration":4,"resolution":"768P"}}`)
+	if explicit.Code != 200 {
+		t.Fatalf("explicit MiniMax submission status=%d body=%s", explicit.Code, explicit.Body.String())
+	}
+	explicitJob, err := api.store.GetJob(decodeObject(t, explicit.Body.Bytes())["job_id"].(string))
+	if err != nil || explicitJob.ModelID != "minimax-h3" {
+		t.Fatalf("explicit MiniMax job=%+v error=%v", explicitJob, err)
+	}
+
+	defaulted := performRequest(api, "POST", "/v1/jobs",
+		`{"type":"video-generate","params":{"segments":[],"audio_b64":""}}`)
+	if defaulted.Code != 200 {
+		t.Fatalf("default LTX2 submission status=%d body=%s", defaulted.Code, defaulted.Body.String())
+	}
+	defaultJob, err := api.store.GetJob(decodeObject(t, defaulted.Body.Bytes())["job_id"].(string))
+	if err != nil || defaultJob.ModelID != "ltx2" {
+		t.Fatalf("default LTX2 job=%+v error=%v", defaultJob, err)
+	}
+
+	nested := performRequest(api, "POST", "/v1/jobs",
+		`{"type":"video-generate","params":{"model":"minimax-h3","prompt":"shot","duration":4,"resolution":"768P"}}`)
+	if nested.Code != 400 {
+		t.Fatalf("nested MiniMax selector status=%d body=%s", nested.Code, nested.Body.String())
 	}
 }
 

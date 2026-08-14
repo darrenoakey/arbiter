@@ -45,6 +45,11 @@ type Job struct {
 	// in response.model and in job results, even when the canonical target or a
 	// cached/deduped result carries a different model field.
 	RequestedModel string `json:"requested_model,omitempty"`
+	// IdempotencyKey and RequestHash are persisted admission metadata. They are
+	// intentionally excluded from public job JSON and logs: callers only need
+	// the stable job identity, while the hash is an internal conflict guard.
+	IdempotencyKey string `json:"-"`
+	RequestHash    string `json:"-"`
 }
 
 // HostExcluded reports whether the given host id is in the job's excluded set.
@@ -172,6 +177,10 @@ func NewStore(dbPath string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
+	if err := applyStoreMigrations(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate store: %w", err)
+	}
 	return &Store{db: db, excludedAt: map[string]map[string]time.Time{}}, nil
 }
 
@@ -227,6 +236,86 @@ func (s *Store) CreateJobWithRequestedModel(modelID, jobType string, payload jso
 	}, nil
 }
 
+// CreateIdempotentJob transactionally creates a keyed job or returns the
+// existing job for an identical request. A reused key with another immutable
+// request hash reports conflict without mutating either job.
+func (s *Store) CreateIdempotentJob(modelID, jobType string, payload json.RawMessage, priority float64, requestedModel, key, requestHash string) (*Job, bool, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, false, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	job := newQueuedJob(modelID, jobType, payload, priority, requestedModel, key, requestHash)
+	created, err := insertIdempotentJob(tx, job)
+	if err != nil {
+		return nil, false, false, err
+	}
+	if !created {
+		return existingIdempotentJob(tx, key, requestHash)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, false, err
+	}
+	return job, true, false, nil
+}
+
+func insertIdempotentJob(tx *sql.Tx, job *Job) (bool, error) {
+	_, err := tx.Exec(
+		"INSERT INTO jobs (id, model_id, job_type, state, priority, payload, created_at, requested_model) VALUES (?,?,?,'queued',?,?,?,?)",
+		job.ID, job.ModelID, job.JobType, job.Priority, string(job.Payload), job.CreatedAt, nullableRequestedModel(job.RequestedModel),
+	)
+	if err != nil {
+		return false, err
+	}
+	result, err := tx.Exec(
+		"INSERT INTO job_idempotency (idempotency_key, job_id, request_hash) VALUES (?,?,?) ON CONFLICT DO NOTHING",
+		job.IdempotencyKey, job.ID, job.RequestHash,
+	)
+	if err != nil {
+		return false, err
+	}
+	return insertedRow(result)
+}
+
+func existingIdempotentJob(tx *sql.Tx, key, requestHash string) (*Job, bool, bool, error) {
+	job, err := idempotentJobInTransaction(tx, key)
+	if err != nil {
+		return nil, false, false, err
+	}
+	return job, false, job.RequestHash != requestHash, nil
+}
+
+func idempotentJobInTransaction(tx *sql.Tx, key string) (*Job, error) {
+	var jobID, requestHash string
+	if err := tx.QueryRow(
+		"SELECT job_id, request_hash FROM job_idempotency WHERE idempotency_key = ?", key,
+	).Scan(&jobID, &requestHash); err != nil {
+		return nil, err
+	}
+	job, err := scanJobFromRow(tx.QueryRow("SELECT * FROM jobs WHERE id = ?", jobID))
+	if err != nil {
+		return nil, err
+	}
+	job.IdempotencyKey = key
+	job.RequestHash = requestHash
+	return job, nil
+}
+
+func newQueuedJob(modelID, jobType string, payload json.RawMessage, priority float64, requestedModel, key, requestHash string) *Job {
+	return &Job{
+		ID: genID(), ModelID: modelID, JobType: jobType, State: "queued",
+		Priority: priority, Payload: payload, CreatedAt: nowTS(), RequestedModel: requestedModel,
+		IdempotencyKey: key, RequestHash: requestHash,
+	}
+}
+
+func insertedRow(result sql.Result) (bool, error) {
+	rows, err := result.RowsAffected()
+	return rows == 1, err
+}
+
 func nullableRequestedModel(requestedModel string) sql.NullString {
 	return sql.NullString{String: requestedModel, Valid: requestedModel != ""}
 }
@@ -238,6 +327,14 @@ func (s *Store) GetJob(id string) (*Job, error) {
 }
 
 func (s *Store) scanJob(row *sql.Row) (*Job, error) {
+	return scanJobFromRow(row)
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanJobFromRow(row rowScanner) (*Job, error) {
 	var j Job
 	var payload, result, errStr, canonical, excluded, requested sql.NullString
 	var startedAt, finishedAt sql.NullFloat64
@@ -498,15 +595,7 @@ func (s *Store) ListJobs(state, modelID string, limit int) ([]*Job, error) {
 // open-coded scans in 4 places drift apart immediately when the column
 // list changes.
 func scanJobFromRows(rows *sql.Rows) (*Job, error) {
-	var j Job
-	var payload, result, errStr, canonical, excluded, requested sql.NullString
-	var startedAt, finishedAt sql.NullFloat64
-	if err := rows.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
-		&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt, &canonical, &excluded, &requested); err != nil {
-		return nil, err
-	}
-	fillJobNullable(&j, payload, result, errStr, canonical, excluded, requested, startedAt, finishedAt)
-	return &j, nil
+	return scanJobFromRow(rows)
 }
 
 func (s *Store) PickNextJob(excludeModels map[string]bool) (*Job, error) {
@@ -742,15 +831,11 @@ func (s *Store) PickQueuedJobsForModel(modelID string, limit int) ([]*Job, error
 	defer func() { _ = rows.Close() }()
 	var jobs []*Job
 	for rows.Next() {
-		var j Job
-		var payload, result, errStr, canonical, excluded, requested sql.NullString
-		var startedAt, finishedAt sql.NullFloat64
-		if err := rows.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
-			&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt, &canonical, &excluded, &requested); err != nil {
+		job, err := scanJobFromRow(rows)
+		if err != nil {
 			return nil, err
 		}
-		fillJobNullable(&j, payload, result, errStr, canonical, excluded, requested, startedAt, finishedAt)
-		jobs = append(jobs, &j)
+		jobs = append(jobs, job)
 	}
 	return jobs, rows.Err()
 }
@@ -1164,7 +1249,7 @@ func (s *Store) GetRunningJobs() ([]*Job, error) {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(
-		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at, canonical_job_id, excluded_hosts, requested_model FROM jobs WHERE state = 'running'",
+		"SELECT * FROM jobs WHERE state = 'running'",
 	)
 	if err != nil {
 		return nil, err
@@ -1188,7 +1273,7 @@ func (s *Store) GetActiveJobs() ([]*Job, error) {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(
-		"SELECT id, model_id, job_type, state, priority, payload, result, error, created_at, started_at, finished_at, canonical_job_id, excluded_hosts, requested_model FROM jobs WHERE state IN ('queued','scheduled','running','following')",
+		"SELECT * FROM jobs WHERE state IN ('queued','scheduled','running','following')",
 	)
 	if err != nil {
 		return nil, err

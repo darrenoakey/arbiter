@@ -39,6 +39,7 @@ var trustedPythonAdapters = map[string]string{
 	"ltx2-encode":             "",
 	"minimax-h3-local":        "minimax-h3",
 	"moondream":               "moondream",
+	"minimax-h3":              "",
 	"rvc-convert":             "rvc",
 	"rvc-train":               "rvc",
 	"voice-fit":               "voxsmith",
@@ -110,7 +111,7 @@ func hasPolicyToken(normalized, token string) bool {
 func nestedModelRoutesJob(jobType string) bool {
 	switch jobType {
 	case "background-remove", "caption", "query", "detect", "point", "transcribe",
-		"talking-head", "talking-head-sadtalker", "lipsync", "video-generate", "video-generate-h3", "video-encode",
+		"talking-head", "talking-head-sadtalker", "lipsync", "video-generate-h3", "video-encode",
 		"video-denoise1", "video-denoise2", "face-restore", "face-restore-codeformer",
 		"face-embed", "aesthetic-score", "composite", "demucs", "chat-completion",
 		"chat-completion-stream":
@@ -252,7 +253,7 @@ func validateJobModelCompatibility(jobType, modelID string) error {
 		compatible = modelID == "sonic" || modelID == "echomimic" || modelID == "wan-s2v"
 	case "video-generate":
 		normalized := normalizedPolicyText(modelID)
-		compatible = strings.HasPrefix(normalized, "ltx2") &&
+		compatible = modelID == "minimax-h3" || strings.HasPrefix(normalized, "ltx2") &&
 			!strings.Contains(normalized, "denoise") && !strings.Contains(normalized, "encode")
 	case "video-encode":
 		normalized := normalizedPolicyText(modelID)

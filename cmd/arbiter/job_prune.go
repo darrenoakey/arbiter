@@ -167,9 +167,24 @@ func (s *Store) deleteJobsByID(ids []string) error {
 		return fmt.Errorf("prepare dedup delete: %w", err)
 	}
 	defer func() { _ = dedupStmt.Close() }()
+	idempotencyStmt, err := tx.Prepare(`DELETE FROM job_idempotency WHERE job_id = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare idempotency delete: %w", err)
+	}
+	defer func() { _ = idempotencyStmt.Close() }()
 	for _, id := range ids {
-		if _, err := jobStmt.Exec(id); err != nil {
+		result, err := jobStmt.Exec(id)
+		if err != nil {
 			return fmt.Errorf("delete job %s: %w", id, err)
+		}
+		deleted, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("count deleted job %s: %w", id, err)
+		}
+		if deleted == 1 {
+			if _, err := idempotencyStmt.Exec(id); err != nil {
+				return fmt.Errorf("delete idempotency for %s: %w", id, err)
+			}
 		}
 		if _, err := dedupStmt.Exec(id); err != nil {
 			return fmt.Errorf("delete dedup for %s: %w", id, err)
