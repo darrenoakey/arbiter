@@ -230,6 +230,33 @@ func TestLoadConfigAllowsMinimizedObservedProductionConfig(t *testing.T) {
 	}
 }
 
+func TestLoadConfigAllowsLaptopQwenDense27b38(t *testing.T) {
+	root := t.TempDir()
+	models := map[string]ModelConfig{
+		"llm:qwen3.6-27b": {
+			MemoryGB:      20,
+			MaxRuntimeSec: 3600,
+			KeepAliveSec:  3600,
+			Placements:    []string{"boringstack"},
+			AdapterParams: map[string]string{
+				"remote_model_tag": "mlx-community/Qwen3.8-27B-4bit",
+			},
+		},
+	}
+	writeModelConfigFixture(t, root, models)
+	config, err := LoadConfig(root)
+	if err != nil {
+		t.Fatalf("load laptop qwen 27b 3.8 config: %v", err)
+	}
+	model, ok := config.Models["llm:qwen3.6-27b"]
+	if !ok {
+		t.Fatal("laptop qwen 27b 3.8 config was omitted by startup policy")
+	}
+	if got := model.AdapterParams["remote_model_tag"]; got != "mlx-community/Qwen3.8-27B-4bit" {
+		t.Fatalf("remote_model_tag = %s, want mlx-community/Qwen3.8-27B-4bit", got)
+	}
+}
+
 func TestLoadConfigAcceptsQwenMemoryBudgetTransitionVectors(t *testing.T) {
 	vectors := map[string]string{
 		"combined_0.50_8G": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager",

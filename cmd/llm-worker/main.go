@@ -10,8 +10,9 @@
 //
 // Environment:
 //
-//	LLM_HF_REPO     — HuggingFace repo for GGUF model (e.g., "unsloth/qwen3.6-27b-GGUF")
-//	LLM_HF_FILE     — specific GGUF file in the repo (e.g., "qwen3.6-27b-Q8_0.gguf")
+// LLM_HF_REPO   - HuggingFace repo for GGUF model (e.g., "unsloth/Qwen3.8-27B-GGUF")
+// LLM_HF_FILE   - specific GGUF file in the repo (e.g., "Qwen3.8-27B-Q8_0.gguf")
+//
 //	LLM_MODEL_PATH  — local path to GGUF file (alternative to HF download)
 //	LLM_GPU_LAYERS  — number of GPU layers (-1 = all, default)
 //	LLM_CTX_SIZE    — context size (default: 8192)
