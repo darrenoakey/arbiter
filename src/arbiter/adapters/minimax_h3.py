@@ -4,16 +4,30 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
 import json
 import os
 import threading
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
-
-import httpx
 
 from arbiter.adapters.base import InferenceError, ModelAdapter
 from arbiter.adapters.registry import register
+
+
+def _httpx() -> Any:
+    """Import httpx on demand.
+
+    The registry imports EVERY adapter module inside EVERY per-model venv, so a
+    module-level third-party import here is an outage for unrelated models: the
+    whisper venv has no httpx, and this import killed the whisper-large worker
+    at startup ("load failed: subprocess died"), taking transcription — and any
+    pipeline that verifies vocals — down with it. Only MiniMax code paths need
+    httpx, and they only ever run in a venv that has it.
+    """
+    return importlib.import_module("httpx")
+
 
 _API_BASE = "https://api.minimax.io"
 _PROVIDER_MODEL = "MiniMax-H3"
@@ -264,6 +278,7 @@ def _load_api_key(cancel_flag: threading.Event) -> str:
 
 
 def _submit_task(api_key: str, payload: dict) -> str:
+    httpx = _httpx()
     try:
         response = httpx.post(
             f"{_API_BASE}/v2/video_generation",
@@ -286,6 +301,7 @@ def _submit_task(api_key: str, payload: dict) -> str:
 
 
 def _query_task(api_key: str, task_id: str) -> tuple[str, str | None]:
+    httpx = _httpx()
     try:
         response = httpx.get(
             f"{_API_BASE}/v2/query/video_generation/{task_id}",
@@ -312,6 +328,7 @@ def _download_result(url: str, destination: Path) -> None:
     if parsed.scheme != "https" or not parsed.netloc:
         raise _fail("provider returned an invalid result location")
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    httpx = _httpx()
     try:
         with httpx.stream("GET", url, timeout=600.0, follow_redirects=True) as response:
             if response.status_code >= 400:

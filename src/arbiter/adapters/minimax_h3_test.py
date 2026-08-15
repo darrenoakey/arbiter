@@ -1,4 +1,8 @@
 import json
+import os
+import subprocess
+import sys
+import textwrap
 import threading
 from pathlib import Path
 
@@ -211,3 +215,46 @@ def test_terminal_provider_state_recovers_and_publishes_durable_result(tmp_path)
         "file": "result.mp4",
         "provider_model": "MiniMax-H3",
     }
+
+
+def test_registry_imports_in_a_venv_without_httpx():
+    """The registry imports every adapter module inside every per-model venv.
+
+    whisper-large runs in its own venv with no httpx, so a module-level
+    `import httpx` here killed that worker at startup ("load failed: subprocess
+    died") and took transcription down with it. Reproduce the venv by hiding
+    httpx from the import system in a child interpreter.
+    """
+    source_root = Path(arbiter.adapters.__file__).resolve().parents[2]
+    child = textwrap.dedent(
+        """
+        import sys
+        from importlib.abc import MetaPathFinder
+
+        class BlockHttpx(MetaPathFinder):
+            def find_spec(self, name, path=None, target=None):
+                if name == "httpx" or name.startswith("httpx."):
+                    raise ModuleNotFoundError("No module named 'httpx'")
+                return None
+
+        sys.meta_path.insert(0, BlockHttpx())
+        for cached in [n for n in sys.modules if n == "httpx" or n.startswith("httpx.")]:
+            del sys.modules[cached]
+
+        import arbiter.adapters
+        from arbiter.adapters.registry import list_registered
+
+        assert "minimax-h3" in list_registered(), list_registered()
+        print("registry-ok")
+        """
+    )
+    environment = dict(os.environ, PYTHONPATH=str(source_root))
+    completed = subprocess.run(
+        [sys.executable, "-c", child],
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "registry-ok" in completed.stdout
