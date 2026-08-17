@@ -151,7 +151,9 @@ def test_text_only_payload_preserves_every_h3_contract_field():
 
 
 def test_adapter_and_deploy_config_are_discoverable():
-    assert "minimax-h3" in list_registered()
+    registered = list_registered()
+    assert "minimax-h3" in registered
+    assert "minimax-h3-local" in registered
     root = Path(__file__).parents[3]
     config = json.loads((root / "config/spark/minimax-h3.model.json").read_text())
     assert config["max_concurrent"] == 1
@@ -245,6 +247,7 @@ def test_registry_imports_in_a_venv_without_httpx():
         from arbiter.adapters.registry import list_registered
 
         assert "minimax-h3" in list_registered(), list_registered()
+        assert "minimax-h3-local" in list_registered(), list_registered()
         print("registry-ok")
         """
     )

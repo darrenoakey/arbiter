@@ -17,6 +17,7 @@ _ADAPTER_MODULES = (
     "sonic",
     "ltx2",
     "minimax_h3",
+    "minimax_h3_local",
     "ltx2_encode",
     "ltx2_denoise1",
     "ltx2_denoise2",
@@ -32,7 +33,6 @@ _ADAPTER_MODULES = (
     "demucs_sep",
     "rvc",
     "voice_fit",
-    "minimax_h3",
 )
 
 for _module_name in _ADAPTER_MODULES:

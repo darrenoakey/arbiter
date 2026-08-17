@@ -1,0 +1,11 @@
+{
+  "memory_gb": 80,
+  "max_concurrent": 1,
+  "max_instances": 1,
+  "keep_alive_seconds": 1800,
+  "max_runtime_seconds": 7200,
+  "avg_inference_ms": 300000,
+  "load_ms": 600000,
+  "pressure_index": 1,
+  "group": true
+}

@@ -45,6 +45,14 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   uninterruptible database/filesystem I/O. The Spark deploy must wait for the
   old listener to disappear after `auto stop`; auto's ten-second reclaim window
   is shorter than this observed kernel cleanup and an immediate start can fail.
+- MiniMax H3 cloud and local are different adapters. Restoring the cloud
+  client (`minimax_h3.py`, `model_id="minimax-h3"`) over the local GPU
+  module made workers started as `minimax-h3-local` die with `Unknown model`
+  and trip the load circuit-breaker. Keep `minimax_h3.py` and
+  `minimax_h3_local.py` as separate registrations, keep both
+  `config/spark/minimax-h3*.model.json` files, and merge the local config
+  without dropping a live `worker_cmd`. Registry tests must assert both ids
+  stay registered after a cloud restore.
 
 ## Live model registration
 
