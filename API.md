@@ -697,6 +697,21 @@ Use only the adapter's job-compatible model:
 {"type": "background-remove", "model": "birefnet", "params": {"image_file": "..."}}
 ```
 
+Remote-only LLM (no spark worker, no restart). `placements` is required; omitting it defaults the model to local spark and the worker-policy check returns 400 for an unknown `llm:*` adapter. PATCH `/v1/models/{id}` accepts the same field and heals missing remote instances.
+
+```json
+{
+  "model_id": "llm:nemotron-30b-a3b",
+  "memory_gb": 40,
+  "max_concurrent": 2,
+  "max_instances": 1,
+  "placements": ["boringstack"],
+  "adapter_params": {
+    "remote_model_tag": "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit"
+  }
+}
+```
+
 ---
 
 ### GET /v1/models -- List Live Model Config

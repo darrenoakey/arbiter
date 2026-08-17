@@ -106,7 +106,11 @@ type modelConfigRequest struct {
 	// higher-preference remote host is reachable but full. Failover on absence is
 	// still allowed.
 	NoRemoteSpill *bool `json:"no_remote_spill"`
-	ReloadWorkers bool  `json:"reload_workers"`
+	// Placements is the ordered host chain. Required to register a remote-only
+	// llm:* model: without it the request defaults to local spark and is
+	// rejected as an unknown adapter.
+	Placements    *[]string `json:"placements"`
+	ReloadWorkers bool      `json:"reload_workers"`
 }
 
 type llmRegisterRequest struct {
@@ -1251,6 +1255,9 @@ func applyModelConfigRequest(cfg ModelConfig, req modelConfigRequest) ModelConfi
 		v := *req.NoRemoteSpill
 		cfg.NoRemoteSpill = &v
 	}
+	if req.Placements != nil {
+		cfg.Placements = cloneStrings(*req.Placements)
+	}
 	return cfg
 }
 
@@ -1275,7 +1282,7 @@ func (a *API) applyUpdatedModelRuntime(modelID string, current, updated ModelCon
 	var result map[string]any
 	if reload {
 		result = a.mgr.ReloadModel(modelID, *updated.MaxInstances, updated)
-	} else if *updated.MaxInstances != *current.MaxInstances {
+	} else if *updated.MaxInstances != *current.MaxInstances || !slices.Equal(current.Placements, updated.Placements) {
 		result = a.mgr.ScaleModel(modelID, *updated.MaxInstances, updated)
 	}
 	return result, a.verifyModelRuntime(modelID, updated, *updated.MaxInstances)
