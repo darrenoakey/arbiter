@@ -233,6 +233,12 @@ class MinimaxH3LocalAdapter(GroupAdapter):
             self._pipe.text_encoder.to(device)
             self._pipe.vae.to(device)
             self._pipe.audio_vae.to(device)
+            # Release any allocator-cached staging from the load path (the
+            # one-time NVFP4 quantize materializes BF16 shards on device
+            # before freeing them). Without this the worker holds ~30 GB of
+            # cache that VRAM-budget accounting sees as resident, blocking
+            # co-residency with every other model for the instance's life.
+            torch.cuda.empty_cache()
             log.info("MiniMax H3 pipeline loaded (NVFP4, on-device)")
         except LoadError:
             self.unload()
