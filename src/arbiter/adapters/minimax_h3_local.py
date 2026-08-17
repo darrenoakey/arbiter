@@ -44,6 +44,7 @@ import gc
 import io
 import logging
 import math
+import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -74,6 +75,18 @@ H3_BASE_REPO = "MiniMaxAI/MiniMax-H3"
 # no keyframe is supplied, so this workflow covers every request this adapter
 # accepts.
 H3_WORKFLOW = "fl2va"
+# Consumption-form snapshot of the two quantized components, written once by
+# the first successful load (see _write_nvfp4_snapshot) and read by every load
+# after. On-the-fly NVFP4 quantization from the 145 GB BF16 repo costs a 2x
+# host-memory peak plus a full-repo page-cache flood at EVERY load — on 128 GB
+# unified memory that outruns the emergency guardian's cache drops (2026-08-17:
+# three recovered drops, loader killed 3-9 s later, every time). The snapshot
+# is ~1/4 the bytes and GB10-native FP4: loading it is a single-pass
+# mmap->CUDA copy with no staging clone. Lives on the attached T9 SSD
+# (/mnt/t9) with the other local models — never the internal nvme, which is
+# >90% full — and outside the HF cache so a `huggingface-cli delete-cache`
+# pass can never silently destroy it.
+H3_SNAPSHOT_DIR = Path("/mnt/t9/models/h3-nvfp4-fl2va")
 
 # Modules torchao must leave at bfloat16. These are the small projections and
 # embedders either side of the block stack; quantizing them costs almost no
@@ -138,6 +151,12 @@ def _nvfp4_config(modules_to_not_convert: list[str], transformers_flavour: bool 
         modules_to_not_convert=list(modules_to_not_convert),
     )
 
+def _h3_snapshot_ready() -> bool:
+    """True when both quantized components exist on disk."""
+    return (H3_SNAPSHOT_DIR / "transformer").is_dir() and (
+        H3_SNAPSHOT_DIR / "text_encoder"
+    ).is_dir()
+
 
 @register
 class MinimaxH3LocalAdapter(GroupAdapter):
@@ -162,26 +181,42 @@ class MinimaxH3LocalAdapter(GroupAdapter):
         self._device = device
         try:
             self._pipe = ModularPipeline.from_pretrained(H3_BASE_REPO)
-            log.info("H3: quantizing transformer and conditioner to NVFP4")
-            self._pipe.update_components(
-                # The published recipe passes low_cpu_mem_usage=False; the
-                # installed diffusers rejects that outright when a
-                # quantization_config is present, so the default meta-device
-                # path (which quantizes shard by shard) is used instead.
-                transformer=MiniMaxH3Transformer3DModel.from_pretrained(
+            if _h3_snapshot_ready():
+                log.info("H3: loading NVFP4 snapshot from %s", H3_SNAPSHOT_DIR)
+                transformer = MiniMaxH3Transformer3DModel.from_pretrained(
+                    H3_SNAPSHOT_DIR / "transformer",
+                    dtype=torch.bfloat16,
+                )
+                text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+                    H3_SNAPSHOT_DIR / "text_encoder",
+                    dtype=torch.bfloat16,
+                )
+            else:
+                log.info("H3: quantizing transformer and conditioner to NVFP4")
+                transformer = MiniMaxH3Transformer3DModel.from_pretrained(
                     H3_BASE_REPO,
                     subfolder="transformer",
                     dtype=torch.bfloat16,
+                    # The published recipe passes low_cpu_mem_usage=False; the
+                    # installed diffusers rejects that outright when a
+                    # quantization_config is present, so the default meta-device
+                    # path (which quantizes shard by shard) is used instead.
                     quantization_config=_nvfp4_config(H3_TRANSFORMER_FP_MODULES),
-                ),
-                text_encoder=Qwen3VLForConditionalGeneration.from_pretrained(
+                )
+                text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
                     H3_BASE_REPO,
                     subfolder="text_encoder",
                     dtype=torch.bfloat16,
                     quantization_config=_nvfp4_config(
                         H3_TEXT_ENCODER_FP_MODULES, transformers_flavour=True
                     ),
-                ),
+                )
+                # Quantize-once, consume-many: persist the quantized weights in
+                # consumption form so no future load repeats this 145 GB pass.
+                self._write_nvfp4_snapshot(transformer, text_encoder)
+            self._pipe.update_components(
+                transformer=transformer,
+                text_encoder=text_encoder,
             )
             # fl2va is the first/last-keyframe partition; loading it by name
             # keeps the omni-reference transformer partition off the box.
@@ -205,6 +240,39 @@ class MinimaxH3LocalAdapter(GroupAdapter):
         except Exception as e:
             self.unload()
             raise LoadError(f"Failed to load H3 pipeline: {e}") from e
+
+    def _write_nvfp4_snapshot(self, transformer, text_encoder) -> None:
+        """Write the quantized components to H3_SNAPSHOT_DIR (best effort).
+
+        Runs before .to(device): the quantized weights are still on CPU and
+        save_pretrained streams them out shard by shard without a staging
+        clone. Each component lands via a .tmp dir + atomic rename, and a
+        partial snapshot (one component present) is not consumed by loads —
+        the next legacy load re-quantizes and fills in the missing half. A
+        write failure must not kill an otherwise-successful load: the
+        in-memory pipeline is already correct, so log loudly and let the next
+        load retry the write.
+        """
+        try:
+            for name, model in (
+                ("transformer", transformer),
+                ("text_encoder", text_encoder),
+            ):
+                dest = H3_SNAPSHOT_DIR / name
+                if dest.exists():
+                    continue
+                tmp = dest.with_name(dest.name + ".tmp")
+                if tmp.exists():
+                    shutil.rmtree(tmp)
+                log.info("H3: writing NVFP4 snapshot component %s", name)
+                model.save_pretrained(tmp)
+                tmp.rename(dest)
+            log.info("H3: NVFP4 snapshot complete at %s", H3_SNAPSHOT_DIR)
+        except Exception:
+            log.exception(
+                "H3: NVFP4 snapshot write failed; next load will retry "
+                "on-the-fly quantization"
+            )
 
     def unload(self) -> None:
         """Release the pipeline and its share of the unified memory pool."""

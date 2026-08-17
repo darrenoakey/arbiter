@@ -80,3 +80,67 @@ def test_local_deploy_config_is_discoverable() -> None:
     assert config["max_instances"] == 1
     assert config["memory_gb"] >= 35
     assert config["load_ms"] >= 60_000
+
+
+class _FakeSavable:
+    """Stand-in for a quantized HF model: save_pretrained writes files."""
+
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.saved_to = []
+
+    def save_pretrained(self, dest):
+        if self.fail:
+            raise OSError("disk full")
+        path = Path(dest)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "model.safetensors").write_bytes(b"weights")
+        self.saved_to.append(path)
+
+
+def test_snapshot_ready_requires_both_components(tmp_path, monkeypatch) -> None:
+    """A partial snapshot must never be consumed — one component alone would
+    mix a quantized loader path with a BF16 quantize path."""
+    from arbiter.adapters import minimax_h3_local as h3
+
+    monkeypatch.setattr(h3, "H3_SNAPSHOT_DIR", tmp_path)
+    assert not h3._h3_snapshot_ready()
+
+    (tmp_path / "transformer").mkdir()
+    assert not h3._h3_snapshot_ready()
+
+    (tmp_path / "text_encoder").mkdir()
+    assert h3._h3_snapshot_ready()
+
+
+def test_write_nvfp4_snapshot_atomic_and_idempotent(tmp_path, monkeypatch) -> None:
+    """Components land via .tmp+rename (never a half-written dir consumers can
+    see), an existing component is skipped, and a write failure must not
+    propagate into load()."""
+    from arbiter.adapters import minimax_h3_local as h3
+
+    monkeypatch.setattr(h3, "H3_SNAPSHOT_DIR", tmp_path)
+    adapter = MinimaxH3LocalAdapter()
+    transformer, text_encoder = _FakeSavable(), _FakeSavable()
+
+    adapter._write_nvfp4_snapshot(transformer, text_encoder)
+    assert h3._h3_snapshot_ready()
+    # Wrote to the tmp dir and renamed it into place — no .tmp leftovers.
+    assert not (tmp_path / "transformer.tmp").exists()
+    assert (tmp_path / "transformer" / "model.safetensors").read_bytes() == b"weights"
+
+    # Idempotent: an already-present component is not rewritten.
+    fresh = _FakeSavable()
+    adapter._write_nvfp4_snapshot(fresh, fresh)
+    assert fresh.saved_to == []
+
+
+def test_write_nvfp4_snapshot_failure_does_not_raise(tmp_path, monkeypatch) -> None:
+    """A failed snapshot write must not kill an otherwise-successful load."""
+    from arbiter.adapters import minimax_h3_local as h3
+
+    monkeypatch.setattr(h3, "H3_SNAPSHOT_DIR", tmp_path)
+    adapter = MinimaxH3LocalAdapter()
+
+    adapter._write_nvfp4_snapshot(_FakeSavable(fail=True), _FakeSavable())
+    assert not h3._h3_snapshot_ready()  # partial/failed write not consumed

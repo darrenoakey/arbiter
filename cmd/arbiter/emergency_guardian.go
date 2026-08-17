@@ -62,6 +62,11 @@ type EmergencyGuardian struct {
 
 	lastKill time.Time
 	lastDrop time.Time
+	// lastDropRecovered records whether the most recent cache drop lifted
+	// MemFree back over its floor. A floor re-trip while this is true (and
+	// cache is still large) is proven-benign refill — e.g. a loader streaming
+	// a 145 GB BF16 repo — so the guardian re-drops instead of killing.
+	lastDropRecovered bool
 }
 
 // meminfoGB is the slice of /proc/meminfo the guardian needs, in GB.
@@ -92,6 +97,11 @@ const (
 	// — try that before shooting a model (also covers a dead gpu-mem-governor).
 	emergencyCacheSlackGB = 16.0
 	emergencyDropCooldown = 60 * time.Second
+	// Minimum gap between cache drops when the previous drop recovered. The
+	// drop call is synchronous inside tick(), so this only bounds how often
+	// sudo drop_caches runs — it must stay well under emergencyDropCooldown so
+	// refill racing a recovered drop never falls through to the kill path.
+	emergencyReDropCooldown = 5 * time.Second
 )
 
 func NewEmergencyGuardian(cfg *Config, mgr *InstanceManager, logger *EventLogger) *EmergencyGuardian {
@@ -146,23 +156,35 @@ func (g *EmergencyGuardian) tick() {
 		// MemAvailable looks fine but MemFree is critical — the cache-inflated
 		// blind spot. If there is real cache to reclaim, drop it first: that is
 		// the benign remedy and also covers a dead gpu-mem-governor.
-		if mi.CachedGB > emergencyCacheSlackGB && time.Since(g.lastDrop) > emergencyDropCooldown {
-			g.lastDrop = time.Now()
-			dropErr := g.dropCaches()
-			recovered := false
-			if dropErr == nil {
-				if after, err2 := g.readMeminfo(); err2 == nil && after.FreeGB >= g.memFreeFloorGB {
-					recovered = true
+		if mi.CachedGB > emergencyCacheSlackGB {
+			since := time.Since(g.lastDrop)
+			if since > emergencyDropCooldown ||
+				(g.lastDropRecovered && since > emergencyReDropCooldown) {
+				g.lastDrop = time.Now()
+				dropErr := g.dropCaches()
+				recovered := false
+				if dropErr == nil {
+					if after, err2 := g.readMeminfo(); err2 == nil && after.FreeGB >= g.memFreeFloorGB {
+						recovered = true
+					}
 				}
-			}
-			g.logger.Log("system.emergency_cache_drop", map[string]any{
-				"mem_free_gb": mi.FreeGB,
-				"cached_gb":   mi.CachedGB,
-				"floor_gb":    g.memFreeFloorGB,
-				"drop_failed": dropErr != nil,
-				"recovered":   recovered,
-			})
-			if recovered {
+				g.lastDropRecovered = recovered
+				g.logger.Log("system.emergency_cache_drop", map[string]any{
+					"mem_free_gb": mi.FreeGB,
+					"cached_gb":   mi.CachedGB,
+					"floor_gb":    g.memFreeFloorGB,
+					"drop_failed": dropErr != nil,
+					"recovered":   recovered,
+				})
+				if recovered {
+					return
+				}
+			} else if g.lastDropRecovered {
+				// Too soon to re-drop, but the previous drop proved this cache
+				// is reclaimable: the re-trip is refill racing our own recovery
+				// window, not the 2026-06-10 hazard. Hold fire this tick; the
+				// next tick re-drops. (Historically this fell through to kill,
+				// which shot H3 loaders 3–9 s after successful drops.)
 				return
 			}
 		}

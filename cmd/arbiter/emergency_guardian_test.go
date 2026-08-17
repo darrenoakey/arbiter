@@ -231,3 +231,82 @@ func TestEmergencyGuardianMemFreeTriggerDisabled(t *testing.T) {
 		t.Fatal("no event path should fire when co-trigger disabled and MemAvailable healthy")
 	}
 }
+
+// TestEmergencyGuardianCacheRefillReDrop covers the 2026-08-17 H3 loader
+// kills: a loader streaming a 145 GB BF16 repo refills page cache faster than
+// the guardian can drop it, so the MemFree floor re-trips INSIDE the drop
+// cooldown. When the previous drop recovered — cache proven reclaimable — a
+// re-trip must re-drop (or hold fire for the re-drop gap) instead of falling
+// through to kill. A drop that failed to recover keeps the kill path.
+func TestEmergencyGuardianCacheRefillReDrop(t *testing.T) {
+	cfg := &Config{
+		EmergencyFloorGB:        8,
+		EmergencyMemFreeFloorGB: 4,
+		Models:                  map[string]ModelConfig{},
+	}
+	mgr := NewInstanceManager(cfg, "python3", t.TempDir())
+	logger := NewEventLogger(t.TempDir())
+	g := NewEmergencyGuardian(cfg, mgr, logger)
+
+	mem := meminfoGB{AvailableGB: 40, FreeGB: 3, CachedGB: 77}
+	g.readMeminfo = func() (meminfoGB, error) { return mem, nil }
+	drops := 0
+	g.dropCaches = func() error {
+		drops++
+		mem.FreeGB = 30 // drop reclaims the refill into MemFree
+		mem.CachedGB = 5
+		return nil
+	}
+	var killed []string
+	g.killInstance = func(v instanceMemSnapshot) bool {
+		killed = append(killed, v.InstanceID)
+		return true
+	}
+
+	// 1. First trip: drop fires and recovers; nothing dies.
+	g.tick()
+	if drops != 1 || len(killed) != 0 {
+		t.Fatalf("first trip: drops=%d killed=%v", drops, killed)
+	}
+	if !g.lastDropRecovered {
+		t.Fatal("recovered drop must set lastDropRecovered")
+	}
+
+	// 2. Refill re-trips the floor inside the re-drop gap: hold fire — no
+	// kill, no redundant sudo drop.
+	mem = meminfoGB{AvailableGB: 40, FreeGB: 3, CachedGB: 77}
+	g.tick()
+	if drops != 1 || len(killed) != 0 {
+		t.Fatalf("re-trip inside re-drop gap: drops=%d killed=%v", drops, killed)
+	}
+	if !g.lastKill.IsZero() {
+		t.Fatal("benign refill inside the re-drop gap must not arm the kill throttle")
+	}
+
+	// 3. Past the re-drop gap (still inside the 60 s drop cooldown): the
+	// guardian re-drops instead of killing, and the drop recovers again.
+	g.lastDrop = time.Now().Add(-emergencyReDropCooldown - time.Second)
+	mem = meminfoGB{AvailableGB: 40, FreeGB: 3, CachedGB: 77}
+	g.tick()
+	if drops != 2 || len(killed) != 0 {
+		t.Fatalf("re-trip past re-drop gap: drops=%d killed=%v", drops, killed)
+	}
+
+	// 4. Contrast: a re-trip during cooldown when the last drop did NOT
+	// recover keeps today's behaviour — straight to the shed path (here the
+	// external-pressure event, since no instances exist).
+	g.lastDropRecovered = false
+	g.lastKill = time.Time{}
+	g.lastDrop = time.Now().Add(-emergencyReDropCooldown - time.Second)
+	mem = meminfoGB{AvailableGB: 40, FreeGB: 3, CachedGB: 77}
+	g.tick()
+	if drops != 2 {
+		t.Fatalf("non-recovering drop during cooldown must not re-drop: drops=%d", drops)
+	}
+	if g.lastKill.IsZero() {
+		t.Fatal("non-recovering drop during cooldown must reach the shed path")
+	}
+	if len(killed) != 0 {
+		t.Fatalf("no instances exist, so nothing to kill: killed=%v", killed)
+	}
+}
