@@ -45,3 +45,13 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   uninterruptible database/filesystem I/O. The Spark deploy must wait for the
   old listener to disappear after `auto stop`; auto's ten-second reclaim window
   is shorter than this observed kernel cleanup and an immediate start can fail.
+
+## Live model registration
+
+- `POST /v1/models` is the no-restart path. Built-in adapters register as-is.
+  A remote-only `llm:*` model MUST send `placements` (e.g. `["boringstack"]`).
+  Omitting it defaults the model to local spark and worker policy returns 400
+  (`no trusted built-in adapter`). PATCH accepts the same field and heals
+  missing remotes. New local adapter *code* still needs a deploy; after that,
+  reload that one model. Do not restart Arbiter just to add a remote LLM.
+
