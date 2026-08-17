@@ -2659,7 +2659,7 @@ func (m *InstanceManager) ScaleModel(modelID string, newCount int, cfg ModelConf
 	result := map[string]any{"added": 0, "removed": 0, "condemned": 0}
 
 	if newCount == currentCount {
-		return result
+		return addMissingRemotePlacements(result, m, modelID, cfg)
 	}
 
 	if newCount > currentCount {
@@ -2669,10 +2669,10 @@ func (m *InstanceManager) ScaleModel(modelID string, newCount int, cfg ModelConf
 		// LLM) would spawn a Python adapter with no implementation for the
 		// model, which just crash-loops "Unknown model" against the registry.
 		if !m.config.HasLocalPlacement(cfg) {
-			return result
+			return addMissingRemotePlacements(result, m, modelID, cfg)
 		}
 		nextIdx := m.nextInstanceIndex(modelID)
-		for i := 0; i < newCount-currentCount; i++ {
+		for i := range newCount - currentCount {
 			idx := nextIdx + i
 			instanceID := fmt.Sprintf("%s#%d", modelID, idx)
 			inst := m.newInstance(modelID, instanceID, cfg)
@@ -2680,19 +2680,23 @@ func (m *InstanceManager) ScaleModel(modelID string, newCount int, cfg ModelConf
 			result["added"] = result["added"].(int) + 1
 			slog.Info("instance added", "model", modelID, "instance", instanceID)
 		}
-		return result
+		return addMissingRemotePlacements(result, m, modelID, cfg)
 	}
 
 	// Scale down: remove from the end
 	toRemove := currentIDs[newCount:]
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	for _, iid := range toRemove {
 		m.retireInstanceLocked(modelID, iid, result)
 	}
+	m.mu.Unlock()
 
+	return addMissingRemotePlacements(result, m, modelID, cfg)
+}
+
+func addMissingRemotePlacements(result map[string]any, m *InstanceManager, modelID string, cfg ModelConfig) map[string]any {
+	result["added"] = result["added"].(int) + m.registerMissingRemotePlacements(modelID, cfg)
 	return result
 }
 

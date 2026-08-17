@@ -257,6 +257,33 @@ func TestLoadConfigAllowsLaptopQwenDense27b38(t *testing.T) {
 	}
 }
 
+func TestLoadConfigAllowsLaptopNemotron30bA3b(t *testing.T) {
+	root := t.TempDir()
+	models := map[string]ModelConfig{
+		"llm:nemotron-30b-a3b": {
+			MemoryGB:      40,
+			MaxRuntimeSec: 3600,
+			KeepAliveSec:  3600,
+			Placements:    []string{"boringstack"},
+			AdapterParams: map[string]string{
+				"remote_model_tag": "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit",
+			},
+		},
+	}
+	writeModelConfigFixture(t, root, models)
+	config, err := LoadConfig(root)
+	if err != nil {
+		t.Fatalf("load laptop nemotron config: %v", err)
+	}
+	model, ok := config.Models["llm:nemotron-30b-a3b"]
+	if !ok {
+		t.Fatal("laptop nemotron config was omitted by startup policy")
+	}
+	if got := model.AdapterParams["remote_model_tag"]; got != "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit" {
+		t.Fatalf("remote_model_tag = %s, want mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit", got)
+	}
+}
+
 func TestLoadConfigAcceptsQwenMemoryBudgetTransitionVectors(t *testing.T) {
 	vectors := map[string]string{
 		"combined_0.50_8G": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager",

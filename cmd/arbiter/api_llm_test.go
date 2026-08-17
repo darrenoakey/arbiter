@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -934,5 +935,174 @@ func TestChatCompletionStreamReservesInstanceWhileStreaming(t *testing.T) {
 	}
 	if got := insts[0].ActiveJobs(); got != 0 {
 		t.Fatalf("active jobs after stream = %d, want 0", got)
+	}
+}
+
+func newTestAPIWithHosts(t *testing.T, hosts map[string]HostConfig) (*API, func()) {
+	t.Helper()
+	projectRoot := t.TempDir()
+	outputDir := filepath.Join(projectRoot, "output")
+	if err := os.MkdirAll(filepath.Join(outputDir, "logs"), 0o755); err != nil {
+		t.Fatalf("mkdir logs: %v", err)
+	}
+	store, err := NewStore(filepath.Join(outputDir, "arbiter.db"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
+	cfg := &Config{
+		VRAMBudgetGB: 100,
+		Host:         "127.0.0.1",
+		Port:         8400,
+		Models:       map[string]ModelConfig{},
+		Hosts:        hosts,
+	}
+	mgr := NewInstanceManager(cfg, "python3", projectRoot)
+	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+	api := NewAPI(cfg, store, mgr, sched, logger, outputDir, projectRoot)
+	cleanup := func() {
+		logger.Close()
+		store.Close()
+		mgr.KillAll()
+	}
+	return api, cleanup
+}
+
+func TestRegisterRemoteOnlyLLMCreatesPlacementsWithoutLocalWorker(t *testing.T) {
+	api, cleanup := newTestAPIWithHosts(t, map[string]HostConfig{
+		"boringstack": {Addr: "http://127.0.0.1:18080", Kind: "nativ", BudgetGB: 20},
+	})
+	defer cleanup()
+
+	raw, err := json.Marshal(map[string]any{
+		"model_id":            "llm:nemotron-30b-a3b",
+		"memory_gb":           40,
+		"max_concurrent":      2,
+		"max_instances":       1,
+		"pressure_index":      0.25,
+		"keep_alive_seconds":  3600,
+		"max_runtime_seconds": 3600,
+		"placements":          []string{"boringstack"},
+		"adapter_params": map[string]string{
+			"remote_model_tag": "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal register body: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/models", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated && rec.Code != http.StatusOK {
+		t.Fatalf("register remote-only status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	cfg, ok := api.config.Models["llm:nemotron-30b-a3b"]
+	if !ok {
+		t.Fatal("registered model missing from live config")
+	}
+	if got := cfg.AdapterParams["remote_model_tag"]; got != "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit" {
+		t.Fatalf("remote_model_tag = %s", got)
+	}
+	if len(cfg.Placements) != 1 || cfg.Placements[0] != "boringstack" {
+		t.Fatalf("placements = %v, want [boringstack]", cfg.Placements)
+	}
+	if api.config.HasLocalPlacement(cfg) {
+		t.Fatal("remote-only register created a local spark placement")
+	}
+
+	insts := api.mgr.GetModelInstances("llm:nemotron-30b-a3b")
+	if len(insts) != 1 {
+		t.Fatalf("instances = %d, want 1 remote", len(insts))
+	}
+	if !insts[0].isRemote() {
+		t.Fatalf("instance %s is local, want remote", insts[0].InstanceID)
+	}
+	if insts[0].InstanceID != "llm:nemotron-30b-a3b@boringstack" {
+		t.Fatalf("instance id = %s", insts[0].InstanceID)
+	}
+}
+
+func TestRegisterUnknownLocalLLMStillRejected(t *testing.T) {
+	api, cleanup := newTestAPI(t)
+	defer cleanup()
+
+	raw, err := json.Marshal(map[string]any{
+		"model_id":  "llm:nemotron-30b-a3b",
+		"memory_gb": 40,
+	})
+	if err != nil {
+		t.Fatalf("marshal register body: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/models", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown local register status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if _, exists := api.config.Models["llm:nemotron-30b-a3b"]; exists {
+		t.Fatal("rejected local register persisted")
+	}
+}
+
+func TestPatchPlacementsHealsMissingRemoteInstances(t *testing.T) {
+	api, cleanup := newTestAPIWithHosts(t, map[string]HostConfig{
+		"boringstack": {Addr: "http://127.0.0.1:18080", Kind: "nativ", BudgetGB: 20},
+		"darrens-mbp": {Addr: "http://127.0.0.1:18081", Kind: "nativ", BudgetGB: 20},
+	})
+	defer cleanup()
+
+	registerBody, err := json.Marshal(map[string]any{
+		"model_id":   "llm:nemotron-30b-a3b",
+		"memory_gb":  40,
+		"placements": []string{"boringstack"},
+		"adapter_params": map[string]string{
+			"remote_model_tag": "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal register body: %v", err)
+	}
+	registerReq := httptest.NewRequest(http.MethodPost, "/v1/models", bytes.NewReader(registerBody))
+	registerReq.Header.Set("Content-Type", "application/json")
+	registerRec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(registerRec, registerReq)
+	if registerRec.Code != http.StatusCreated && registerRec.Code != http.StatusOK {
+		t.Fatalf("register status = %d, body = %s", registerRec.Code, registerRec.Body.String())
+	}
+
+	patchBody, err := json.Marshal(map[string]any{
+		"placements": []string{"boringstack", "darrens-mbp"},
+	})
+	if err != nil {
+		t.Fatalf("marshal patch body: %v", err)
+	}
+	patchReq := httptest.NewRequest(http.MethodPatch, "/v1/models/llm:nemotron-30b-a3b", bytes.NewReader(patchBody))
+	patchReq.Header.Set("Content-Type", "application/json")
+	patchRec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(patchRec, patchReq)
+	if patchRec.Code != http.StatusOK {
+		t.Fatalf("patch placements status = %d, body = %s", patchRec.Code, patchRec.Body.String())
+	}
+
+	cfg, ok := api.config.Models["llm:nemotron-30b-a3b"]
+	if !ok {
+		t.Fatal("patched model missing from live config")
+	}
+	if !slices.Equal(cfg.Placements, []string{"boringstack", "darrens-mbp"}) {
+		t.Fatalf("placements = %v, want [boringstack darrens-mbp]", cfg.Placements)
+	}
+
+	got := map[string]bool{}
+	for _, inst := range api.mgr.GetModelInstances("llm:nemotron-30b-a3b") {
+		if !inst.isRemote() {
+			t.Fatalf("instance %s is local, want remote", inst.InstanceID)
+		}
+		got[inst.InstanceID] = true
+	}
+	if !got["llm:nemotron-30b-a3b@boringstack"] || !got["llm:nemotron-30b-a3b@darrens-mbp"] || len(got) != 2 {
+		t.Fatalf("instances = %v, want both remotes", got)
 	}
 }
