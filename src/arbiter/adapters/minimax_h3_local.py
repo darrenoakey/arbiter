@@ -239,6 +239,7 @@ class MinimaxH3LocalAdapter(GroupAdapter):
             # cache that VRAM-budget accounting sees as resident, blocking
             # co-residency with every other model for the instance's life.
             torch.cuda.empty_cache()
+            self._log_memory(torch, "post-load")
             log.info("MiniMax H3 pipeline loaded (NVFP4, on-device)")
         except LoadError:
             self.unload()
@@ -304,7 +305,16 @@ class MinimaxH3LocalAdapter(GroupAdapter):
 
         if self._pipe is None:
             raise InferenceError("H3 pipeline not loaded — call load() first")
+        self._check_cancel(cancel_flag)
 
+        # Chunk-boundary hygiene: the caching allocator retains the previous
+        # chunk's denoise/decode high-water as resident device memory while
+        # the instance sits idle between chunks, which starves the host
+        # MemFree floors the next chunk's tail needs and inflates the
+        # VRAM-budget accounting. Return it before every chunk.
+        gc.collect()
+        torch.cuda.empty_cache()
+        self._log_memory(torch, "chunk-start")
         self._check_cancel(cancel_flag)
 
         prompt = str(params.get("prompt", "Cinematic music video shot."))[:7000]
@@ -350,6 +360,9 @@ class MinimaxH3LocalAdapter(GroupAdapter):
             # "videos" keeps the audio tensor out of the returned state, since
             # the music-video pipeline muxes the authoritative song itself.
             videos = self._pipe(output="videos", **kwargs)
+            # reserved here is the allocator high-water of the whole
+            # generate+decode — the peak-memory fingerprint per chunk.
+            self._log_memory(torch, "post-generate")
         except Exception as e:
             raise InferenceError(f"H3 generation failed: {e}") from e
 
@@ -358,6 +371,7 @@ class MinimaxH3LocalAdapter(GroupAdapter):
         frames = self._extract_video_frames(videos)
         result_path = output_dir / "result.mp4"
         w, h = self._encode_mp4(frames, str(result_path), H3_FPS)
+        self._log_memory(torch, "post-encode")
 
         log.info("H3 clip done: %d frames, %dx%d, %s", len(frames), w, h, result_path)
 
@@ -380,6 +394,24 @@ class MinimaxH3LocalAdapter(GroupAdapter):
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _log_memory(torch, phase: str) -> None:
+        """Log the CUDA/host memory split at a chunk phase boundary."""
+        try:
+            with open("/proc/meminfo") as f:
+                host_free_kb = next(
+                    line.split()[1] for line in f if line.startswith("MemFree:")
+                )
+        except Exception:
+            host_free_kb = "?"
+        log.info(
+            "H3 mem[%s]: cuda_alloc=%.1fGB cuda_reserved=%.1fGB host_memfree=%s kB",
+            phase,
+            torch.cuda.memory_allocated() / 2**30,
+            torch.cuda.memory_reserved() / 2**30,
+            host_free_kb,
+        )
 
     @staticmethod
     def _decode_keyframe(params: dict, b64_key: str, file_key: str):
