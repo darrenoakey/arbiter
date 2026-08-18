@@ -48,6 +48,17 @@ var vllmAdapterParams = map[string]adapterValueValidator{
 	"VLLM_TENSOR_PARALLEL_SIZE":   integerAdapterValue(1, 128),
 }
 
+// torchWorkerAdapterParams is the sanctioned allocator tuning surface for
+// python adapter workers (sanctioned venv or repo default). The CUDA caching
+// allocator's fixed-size block strategy strands a fragmented high-water far
+// above live tensors; expandable segments let the large transient generation
+// buffers (the h3 video pipeline peaks ~31 GB above its 49 GB of weights)
+// map and unmap instead of pinning the box below the EmergencyGuardian and
+// earlyoom floors mid-render.
+var torchWorkerAdapterParams = map[string]adapterValueValidator{
+	"PYTORCH_CUDA_ALLOC_CONF": exactAdapterValues("expandable_segments:True"),
+}
+
 var vllmLegacyTuningByModel = map[string]string{
 	"llm:gemma4-26b":       `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}`,
 	"llm:gemma4-26b-mtp":   `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}`,
@@ -151,7 +162,7 @@ func adapterParamPolicy(modelID string, config ModelConfig) map[string]adapterVa
 	if strings.HasPrefix(modelID, "llm:") && config.AdapterParams["LLM_BACKEND"] == "llamacpp" {
 		return llamaAdapterParams
 	}
-	return map[string]adapterValueValidator{}
+	return torchWorkerAdapterParams
 }
 
 func validateVllmLegacyTuningOverlap(config ModelConfig) error {

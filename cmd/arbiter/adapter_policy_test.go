@@ -189,6 +189,27 @@ func TestAdapterParamsRejectVoxtralLlmBackendSelector(t *testing.T) {
 	}
 }
 
+func TestPythonWorkerAdapterParamsSanctionExactAllocatorVector(t *testing.T) {
+	root := t.TempDir()
+	config := productionPythonConfig(root, "minimax-h3", "minimax-h3-local")
+	config.AdapterParams = map[string]string{
+		"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+	}
+	if err := validateAdapterParams(root, "minimax-h3-local", config); err != nil {
+		t.Fatalf("sanctioned allocator vector rejected: %v", err)
+	}
+	config.AdapterParams = map[string]string{
+		"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:true",
+	}
+	if err := validateAdapterParams(root, "minimax-h3-local", config); err == nil {
+		t.Fatal("near-neighbour allocator spelling accepted")
+	}
+	config.AdapterParams = map[string]string{"CUDA_VISIBLE_DEVICES": "0"}
+	if err := validateAdapterParams(root, "minimax-h3-local", config); err == nil {
+		t.Fatal("unsanctioned key accepted for python worker")
+	}
+}
+
 func TestAdapterParamsRejectOverlappingStructuredAndLegacyVllmTuning(t *testing.T) {
 	root := t.TempDir()
 	legacy := `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager`
