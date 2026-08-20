@@ -23,6 +23,8 @@ _ADAPTER_MODULES = (
     "ltx2_denoise2",
     "ltx2_dev_denoise1",
     "ltx2_dev_denoise2",
+    "ltx25_encode",
+    "ltx25_denoise1",
     "face_restore",
     "face_restore_codeformer",
     "aesthetic_scorer",

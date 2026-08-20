@@ -37,6 +37,8 @@ var trustedPythonAdapters = map[string]string{
 	"ltx2-dev-denoise1":       "",
 	"ltx2-dev-denoise2":       "",
 	"ltx2-encode":             "",
+	"ltx25-denoise1":          "ltx25",
+	"ltx25-encode":            "ltx25",
 	"minimax-h3-local":        "minimax-h3",
 	"moondream":               "moondream",
 	"minimax-h3":              "",
@@ -79,7 +81,8 @@ func isDisabledStillImageModel(modelID string) bool {
 	if normalized == "" {
 		return false
 	}
-	if normalized == "lora-train" || normalized == "ltx2" || strings.HasPrefix(normalized, "ltx2-") {
+	if normalized == "lora-train" || normalized == "ltx2" || strings.HasPrefix(normalized, "ltx2-") ||
+		normalized == "ltx25" || strings.HasPrefix(normalized, "ltx25-") {
 		return false
 	}
 	return disabledStillImageText(normalized, false)
@@ -125,7 +128,8 @@ func disabledStillImageConfig(modelID string, cfg ModelConfig) bool {
 	if isDisabledStillImageModel(modelID) {
 		return true
 	}
-	videoLora := normalizedPolicyText(modelID) == "ltx2" || strings.HasPrefix(normalizedPolicyText(modelID), "ltx2-")
+	videoLora := normalizedPolicyText(modelID) == "ltx2" || strings.HasPrefix(normalizedPolicyText(modelID), "ltx2-") ||
+		normalizedPolicyText(modelID) == "ltx25" || strings.HasPrefix(normalizedPolicyText(modelID), "ltx25-")
 	values := []string{cfg.AutoDownload, cfg.ModelPath}
 	values = append(values, cfg.WorkerCmd...)
 	for key, value := range cfg.AdapterParams {
