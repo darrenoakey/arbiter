@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -775,5 +778,94 @@ func TestRemoteAbsenceClassification(t *testing.T) {
 		if got := isRemoteAbsence(c.err); got != c.absent {
 			t.Errorf("%s: isRemoteAbsence=%v want %v", c.name, got, c.absent)
 		}
+	}
+}
+
+func TestStripResponseFormatRemovesOnlyThatKey(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[],"response_format":{"type":"json_object"},"max_tokens":8}`)
+	stripped, changed := stripResponseFormat(body)
+	if !changed {
+		t.Fatal("expected response_format to be reported present")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(stripped, &got); err != nil {
+		t.Fatalf("decode stripped body: %v", err)
+	}
+	if _, ok := got["response_format"]; ok {
+		t.Fatalf("response_format survived the strip: %v", got)
+	}
+	if got["model"] != "m" || got["max_tokens"] != float64(8) {
+		t.Fatalf("unrelated fields must survive: %v", got)
+	}
+	same, changed := stripResponseFormat([]byte(`{"model":"m"}`))
+	if changed || string(same) != `{"model":"m"}` {
+		t.Fatalf("body without the key must pass through unchanged: %s changed=%v", same, changed)
+	}
+}
+
+func TestShouldRetryWithoutResponseFormatClassification(t *testing.T) {
+	withFormat := []byte(`{"response_format":{"type":"json_schema"}}`)
+	statusErr := errRemoteHTTPStatus{host: "h", code: 500, body: "packed token mask must be int32"}
+	if !shouldRetryWithoutResponseFormat(statusErr, withFormat) {
+		t.Fatal("status rejection with response_format present must retry")
+	}
+	if shouldRetryWithoutResponseFormat(statusErr, []byte(`{"model":"m"}`)) {
+		t.Fatal("no response_format in the request — nothing to degrade")
+	}
+	if shouldRetryWithoutResponseFormat(fmt.Errorf("dial tcp: connect refused"), withFormat) {
+		t.Fatal("transport errors must not trigger the degrade retry")
+	}
+}
+
+func TestInferRawRetriesOnceWithoutResponseFormatOnStatusRejection(t *testing.T) {
+	// The state-dependent Nativ failure: a request carrying response_format
+	// 500s mid-generation ("packed token mask must be int32...") while the
+	// identical payload without the field succeeds. InferRaw must degrade to a
+	// single format-free retry instead of failing the job.
+	var requests [][]byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests = append(requests, body)
+		if bytes.Contains(body, []byte(`"response_format"`)) {
+			w.WriteHeader(500)
+			if _, err := w.Write([]byte(`{"detail":"Generation failed: packed token mask must be int32 with one complete row per token"}`)); err != nil {
+				t.Errorf("write 500 body: %v", err)
+			}
+			return
+		}
+		if _, err := w.Write([]byte(`{"choices":[{"message":{"content":"{\"ok\":true}","role":"assistant"},"finish_reason":"stop"}],"usage":{"completion_tokens":3}}`)); err != nil {
+			t.Errorf("write completion: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	backend := &RemoteHTTPBackend{modelTag: "mlx-community/Qwen3.6-35B-A3B-4bit", kind: "nativ", host: "test", addr: server.URL}
+	response, err := backend.InferRaw("job-1", "chat-completion", json.RawMessage(`{
+		"model":"local-extract",
+		"messages":[{"role":"user","content":"hi"}],
+		"max_tokens":32,
+		"response_format":{"type":"json_schema","json_schema":{"name":"x","strict":true,"schema":{"type":"object"}}}
+	}`), "")
+	if err != nil {
+		t.Fatalf("InferRaw should succeed via the degrade retry: %v", err)
+	}
+	if response.Status != "ok" {
+		t.Fatalf("status=%q, want ok", response.Status)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("expected exactly 2 upstream requests (rejected + degraded), got %d", len(requests))
+	}
+	if !bytes.Contains(requests[0], []byte(`"response_format"`)) {
+		t.Fatal("first request must carry response_format")
+	}
+	if bytes.Contains(requests[1], []byte(`"response_format"`)) {
+		t.Fatal("retry must not carry response_format")
+	}
+	var result map[string]any
+	if err := json.Unmarshal(response.Result, &result); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if result["text"] != `{"ok":true}` {
+		t.Fatalf("degraded completion text=%v", result["text"])
 	}
 }

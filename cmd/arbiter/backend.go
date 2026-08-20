@@ -327,6 +327,13 @@ func (b *RemoteHTTPBackend) InferRaw(jobID, jobType string, params json.RawMessa
 	resCh := make(chan chatResult, 1)
 	go func() {
 		body, err := b.doChat(ctx, reqBody)
+		if err != nil && shouldRetryWithoutResponseFormat(err, reqBody) {
+			if stripped, changed := stripResponseFormat(reqBody); changed {
+				slog.Warn("remote chat rejected with response_format present — retrying once without it",
+					"host", b.host, "job", jobID, "model", b.modelTag, "error", err)
+				body, err = b.doChat(ctx, stripped)
+			}
+		}
 		resCh <- chatResult{body, err}
 	}()
 
@@ -568,10 +575,59 @@ func (b *RemoteHTTPBackend) doChat(ctx context.Context, body []byte) ([]byte, er
 	}
 	if resp.StatusCode != http.StatusOK {
 		// A 4xx/5xx with a body is a JOB error (bad model tag, bad params) — NOT
-		// host absence. Return a plain error so the scheduler fails it terminal.
-		return nil, fmt.Errorf("remote %s returned %d: %s", b.host, resp.StatusCode, string(respBody))
+		// host absence. Return a typed error so the scheduler fails it terminal
+		// and InferRaw can recognize a status rejection for the
+		// response_format degrade retry.
+		return nil, errRemoteHTTPStatus{host: b.host, code: resp.StatusCode, body: string(respBody)}
 	}
 	return respBody, nil
+}
+
+// errRemoteHTTPStatus is a non-2xx reply from a live remote host. It renders
+// exactly like the previous plain error so log grep and scheduler
+// classification are unchanged.
+type errRemoteHTTPStatus struct {
+	host string
+	code int
+	body string
+}
+
+func (e errRemoteHTTPStatus) Error() string {
+	return fmt.Sprintf("remote %s returned %d: %s", e.host, e.code, e.body)
+}
+
+// stripResponseFormat returns body without its response_format key, and
+// whether the key was present at all.
+func stripResponseFormat(body []byte) ([]byte, bool) {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil || m == nil {
+		return body, false
+	}
+	if _, ok := m["response_format"]; !ok {
+		return body, false
+	}
+	delete(m, "response_format")
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+// shouldRetryWithoutResponseFormat reports whether a failed chat call should
+// be retried once with response_format removed: the host answered (an HTTP
+// status rejection, not a transport failure) and the request actually carried
+// the field. Some Nativ builds 500 mid-generation on grammar-constrained
+// output ("packed token mask must be int32...") — state-dependently, under
+// batch load — while the same payload without the field succeeds. The degrade
+// keeps the job alive; callers that demanded JSON still get the system-prompt
+// contract plus their own robust parsing.
+func shouldRetryWithoutResponseFormat(err error, requestBody []byte) bool {
+	var status errRemoteHTTPStatus
+	if !errors.As(err, &status) {
+		return false
+	}
+	return bytes.Contains(requestBody, []byte(`"response_format"`))
 }
 
 func (b *RemoteHTTPBackend) doEmbed(ctx context.Context, body []byte) ([]byte, error) {
