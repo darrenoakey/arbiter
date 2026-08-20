@@ -350,6 +350,8 @@ var JobTypeToModel = map[string]string{
 	"video-encode":            "ltx2-encode",
 	"video-denoise1":          "ltx2-denoise1",
 	"video-denoise2":          "ltx2-denoise2",
+	"ltx25-encode":            "ltx25-encode",
+	"ltx25-denoise1":          "ltx25-denoise1",
 	"face-restore":            "face-restore",
 	"face-restore-codeformer": "face-restore-codeformer",
 	"face-embed":              "insightface",
