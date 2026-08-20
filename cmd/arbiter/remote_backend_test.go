@@ -124,11 +124,12 @@ func TestBuildEmbedRequestMatchesLocalTaskContract(t *testing.T) {
 	}
 }
 
-func TestBuildChatRequestStripsNativJSONResponseFormat(t *testing.T) {
-	// Observed 2026-07-25: every failed llm:qwen3.6-35b job on boringstack nativ
-	// carried response_format={"type":"json_object"} and died with
-	// "packed token mask must be int32...". Same payload without the field
-	// succeeds against the same nativ endpoint.
+func TestBuildChatRequestKeepsResponseFormatForNativ(t *testing.T) {
+	// The current NativServerKit generation (nativ_server on :8480) enforces
+	// response_format natively — verified 2026-08-21 with a json_schema that
+	// forced schema-conformant output against a contrary prompt, server
+	// healthy afterwards. The old strip protected the pre-8480 server, which
+	// hard-500'd on the field; see buildChatRequest doc comment.
 	nativ := &RemoteHTTPBackend{modelTag: "mlx-community/Qwen3.6-35B-A3B-4bit", kind: "nativ"}
 	body := nativ.buildChatRequest(json.RawMessage(`{
 		"model":"qwen3.6-35b",
@@ -136,7 +137,7 @@ func TestBuildChatRequestStripsNativJSONResponseFormat(t *testing.T) {
 		"max_tokens":32,
 		"temperature":0,
 		"reasoning_effort":"none",
-		"response_format":{"type":"json_object"},
+		"response_format":{"type":"json_schema","json_schema":{"name":"x","strict":true,"schema":{"type":"object"}}},
 		"stream":true,
 		"stream_options":{"include_usage":true}
 	}`))
@@ -153,8 +154,13 @@ func TestBuildChatRequestStripsNativJSONResponseFormat(t *testing.T) {
 	if _, ok := got["stream_options"]; ok {
 		t.Fatalf("stream_options should be stripped: %v", got["stream_options"])
 	}
-	if _, ok := got["response_format"]; ok {
-		t.Fatalf("nativ response_format should be stripped: %v", got["response_format"])
+	rf, ok := got["response_format"].(map[string]any)
+	if !ok || rf["type"] != "json_schema" {
+		t.Fatalf("nativ response_format should be preserved: %v", got["response_format"])
+	}
+	schema, ok := rf["json_schema"].(map[string]any)
+	if !ok || schema["name"] != "x" {
+		t.Fatalf("json_schema payload should ride through untouched: %v", rf["json_schema"])
 	}
 	if got["reasoning_effort"] != "none" {
 		t.Fatalf("reasoning_effort should pass through: %v", got["reasoning_effort"])

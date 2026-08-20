@@ -6,8 +6,9 @@ main_branch = "master"
 
 # Verdict command. cwd = the worktree being gated. Build + vet + full Go test
 # suite (serial — the remote integration tests share inference resources).
-# PRECONDITION: SSH forwards localhost:11434->boringstack:11434 (via spark) and
-# localhost:11435->macmini:11435 must be up, or the TestRemote* integration
+# PRECONDITION: the macmini-ollama-tunnel auto service (localhost:11434 and
+# localhost:11435 -> macmini:11434, the mnemnos ollama with llama3.2:3b +
+# nomic-embed-text) must be up, or the TestRemote* integration
 # tests fail with connection refused.
 check = "./run check"
 

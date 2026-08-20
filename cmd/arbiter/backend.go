@@ -506,12 +506,17 @@ func validateEmbedTexts(value any) ([]string, error) {
 // streaming locally), and injects a generous max_tokens when the caller omitted
 // it (reasoning-model gotcha — see remoteMaxTokensDefault).
 //
-// Nativ (mlx-vlm-server) rejects some OpenAI fields mid-generation with a hard
-// 500 ("packed token mask must be int32 with one complete row per token"). The
-// confirmed offender is response_format={"type":"json_object"} — even when the
-// system prompt already asks for JSON and the same payload succeeds without
-// that field. Strip it for nativ so JSON-mode callers still get an answer
-// instead of tripping the inference circuit-breaker and wedging the model.
+// response_format passes through to EVERY backend kind, nativ included, so a
+// caller-supplied json_object/json_schema constraint is enforced at token
+// generation by the serving engine. History: the pre-8480 Nativ generation
+// (mlx-vlm-server on :8080) hard-500'd mid-generation on response_format
+// ("packed token mask must be int32 with one complete row per token") and the
+// field was stripped for nativ here; on 2026-08-21 that old server crashed
+// outright on an adversarial json_schema request, while the current
+// NativServerKit generation (nativ_server on :8480) was verified to both
+// ENFORCE json_schema (schema-conformant output against a contrary prompt)
+// and survive it. If a nativ host ever regresses to the old server, restore
+// the strip for that host rather than losing schema enforcement everywhere.
 func (b *RemoteHTTPBackend) buildChatRequest(params json.RawMessage) []byte {
 	var m map[string]any
 	if err := json.Unmarshal(params, &m); err != nil || m == nil {
@@ -520,9 +525,6 @@ func (b *RemoteHTTPBackend) buildChatRequest(params json.RawMessage) []byte {
 	m["model"] = b.modelTag
 	m["stream"] = false
 	delete(m, "stream_options")
-	if b.kind == "nativ" {
-		delete(m, "response_format")
-	}
 	if _, ok := m["max_tokens"]; !ok {
 		if _, ok := m["n_predict"]; !ok {
 			m["max_tokens"] = remoteMaxTokensDefault
