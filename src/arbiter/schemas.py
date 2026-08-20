@@ -27,6 +27,8 @@ class JobType(str, Enum):
     LIPSYNC = "lipsync"
     VIDEO_GENERATE = "video-generate"
     VIDEO_GENERATE_H3 = "video-generate-h3"
+    LTX25_ENCODE = "ltx25-encode"
+    LTX25_DENOISE1 = "ltx25-denoise1"
     AESTHETIC_SCORE = "aesthetic-score"
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
@@ -54,6 +56,8 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "lipsync": "latentsync",
     "video-generate": "ltx2",
     "video-generate-h3": "minimax-h3-local",
+    "ltx25-encode": "ltx25-encode",
+    "ltx25-denoise1": "ltx25-denoise1",
     "aesthetic-score": "aesthetic-scorer",
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
@@ -260,6 +264,30 @@ class VideoGenerateH3Params(BaseModel):
     num_inference_steps: int = 8
 
 
+class LTX25EncodeParams(BaseModel):
+    prompt: str = ""
+    description: Optional[str] = None
+    negative_prompt: Optional[str] = None
+    audio_file: str
+    audio_start_time: float = 0.0
+    audio_duration: float
+    image_file: Optional[str] = None
+    num_frames: int
+    height: int = 1088
+    width: int = 1920
+    fps: float = 25.0
+    seed: int = 42
+    chunk_index: int = 0
+
+
+class LTX25Denoise1Params(BaseModel):
+    encoded_file: str
+    audio_file: str
+    start_time: float = 0.0
+    fps: float = 25.0
+    num_inference_steps: int = 30
+
+
 class AestheticScoreParams(BaseModel):
     image: Optional[str] = None
     image_file: Optional[str] = None
@@ -360,6 +388,8 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "talking-head-sadtalker": TalkingHeadSadTalkerParams,
     "lipsync": LipsyncParams,
     "video-generate": VideoGenerateParams,
+    "ltx25-encode": LTX25EncodeParams,
+    "ltx25-denoise1": LTX25Denoise1Params,
     "aesthetic-score": AestheticScoreParams,
     "tts-voxtral": TTSVoxtralParams,
     "video-generate-h3": VideoGenerateH3Params,
