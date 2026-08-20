@@ -16,6 +16,22 @@ greenline submit                     # gate: squash-merge -> check -> ff main ->
 greenline done                       # remove the worktree + branch once merged
 ```
 
+### `greenline submit` is never held inside an agent turn
+
+A submit is minutes of `./run check` (full Go suite, including remote GPU
+integration tests) plus a real drain-gated deploy to spark. An agent that runs
+it in the foreground, or polls it in a loop, burns its whole wall-clock budget
+waiting and gets killed mid-gate. Every agent submit MUST be detached and
+slept on:
+
+1. Launch through the agentd3 gatejob API, which sets `Setpgid` so the job
+   survives both a daemon restart and the deploy's own restarts:
+   `curl -sXPOST 127.0.0.1:8620/v1/greenline/submit -d '{"branch":"gl/<name>","cwd":"<worktree>"}'`
+   The reply must show `pid == pgid`.
+2. Sleep for the expected duration and end the turn. Never foreground-wait.
+3. On wake, read the verdict from `greenline status` (journal + `deployed`) or
+   `local/gatejobs/gate-<id>.log` — never by resubmitting.
+
 Diagnostics (no lock needed):
 
 ```
