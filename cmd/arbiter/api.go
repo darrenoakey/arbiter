@@ -756,10 +756,11 @@ func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Inline result file as base64 if present
+		// Encode adapters write encoded.pt; synthesizing result.{format}
+		// made completed jobs look empty to pollers that only see result.pt.
 		if job.State == "completed" && result != nil {
-			if fmt, ok := result["format"].(string); ok && fmt != "" {
-				resultFile := filepath.Join(resolveJobDir(a.config, a.outputDir, job.ID), "result."+fmt)
+			resultFile := resultArtifactPath(resolveJobDir(a.config, a.outputDir, job.ID), result)
+			if resultFile != "" {
 				result["result_path"] = resultFile
 				skipData := r.URL.Query().Get("no_data") == "1"
 				if !skipData {
@@ -773,6 +774,24 @@ func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, 200, resp)
+}
+
+func resultArtifactPath(jobDir string, result map[string]any) string {
+	if file, ok := result["file"].(string); ok {
+		name := filepath.Base(strings.TrimSpace(file))
+		if name != "" && name != "." && name != string(os.PathSeparator) {
+			return filepath.Join(jobDir, name)
+		}
+	}
+	format, ok := result["format"].(string)
+	if !ok {
+		return ""
+	}
+	format = strings.TrimSpace(format)
+	if format == "" {
+		return ""
+	}
+	return filepath.Join(jobDir, "result."+format)
 }
 
 func (a *API) cancelJob(w http.ResponseWriter, r *http.Request) {

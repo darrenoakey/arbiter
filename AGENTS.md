@@ -63,3 +63,11 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   missing remotes. New local adapter *code* still needs a deploy; after that,
   reload that one model. Do not restart Arbiter just to add a remote LLM.
 
+## Completed GPU result files
+
+- `GET /v1/jobs/{id}` synthesizes `result.result_path` from adapter `result.file`
+  (basename only) when present, otherwise `result.{format}` as `result.<format>`.
+  LTX 2.5 encode writes `encoded.pt`, not `result.pt`. A completed job with no
+  inlined `data` is usually the poller looking at the wrong filename.
+
+
