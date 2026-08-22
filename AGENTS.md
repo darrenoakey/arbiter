@@ -63,6 +63,14 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   missing remotes. New local adapter *code* still needs a deploy; after that,
   reload that one model. Do not restart Arbiter just to add a remote LLM.
 
+## Capabilities
+
+- `GET /v1/capabilities` is the version-negotiation surface. It reports the
+  served API major version, live `JobTypeToModel` keys, and live LLM alias
+  targets. Job types and aliases version independently of `/v1`; additive-minor
+  only. An alias rename requires an overlap window. Register a new job type in
+  `JobTypeToModel` — do not hard-code the list in the handler.
+
 ## Completed GPU result files
 
 - `GET /v1/jobs/{id}` synthesizes `result.result_path` from adapter `result.file`

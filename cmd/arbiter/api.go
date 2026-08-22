@@ -210,6 +210,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/admin/models/unload_all", a.adminUnloadAll)
 	mux.HandleFunc("POST /v1/admin/models/preload", a.adminPreload)
 	mux.HandleFunc("GET /v1/health", a.health)
+	mux.HandleFunc("GET /v1/capabilities", a.capabilities)
 	return withLogging(mux)
 }
 
