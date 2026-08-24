@@ -310,3 +310,106 @@ func TestEmergencyGuardianCacheRefillReDrop(t *testing.T) {
 		t.Fatalf("no instances exist, so nothing to kill: killed=%v", killed)
 	}
 }
+
+// TestShouldDropCacheIsDeficitRelative pins the drop decision to the SHORTFALL
+// rather than an absolute cache threshold. The first case is the exact
+// production reading that force-killed a render worker nine times on
+// 2026-08-23/24: a 0.74GB MemFree deficit with 15.1GB of reclaimable cache. An
+// absolute 16GB gate refused to even attempt the drop and went straight to
+// killing a job that had already burned 28 minutes of GPU time.
+func TestShouldDropCacheIsDeficitRelative(t *testing.T) {
+	const floor = 4.0
+	cases := []struct {
+		name string
+		mi   meminfoGB
+		want bool
+	}{
+		{
+			name: "observed production kill: tiny deficit, ample cache",
+			mi:   meminfoGB{AvailableGB: 13.880844116210938, FreeGB: 3.2564353942871094, CachedGB: 15.124683380126953},
+			want: true,
+		},
+		{
+			name: "observed production kill: lowest cache seen",
+			mi:   meminfoGB{AvailableGB: 11.565895080566406, FreeGB: 3.637237548828125, CachedGB: 13.069778442382812},
+			want: true,
+		},
+		{
+			name: "large deficit, cache cannot cover it",
+			mi:   meminfoGB{AvailableGB: 40, FreeGB: 2, CachedGB: 3},
+			want: false,
+		},
+		{
+			name: "cache below the minimum worth dropping",
+			mi:   meminfoGB{AvailableGB: 40, FreeGB: 3.9, CachedGB: 1.5},
+			want: false,
+		},
+		{
+			name: "no deficit at all",
+			mi:   meminfoGB{AvailableGB: 40, FreeGB: 9, CachedGB: 50},
+			want: false,
+		},
+		{
+			name: "deficit exactly covered at the margin",
+			mi:   meminfoGB{AvailableGB: 40, FreeGB: 2, CachedGB: 4},
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		if got := shouldDropCache(tc.mi, floor); got != tc.want {
+			t.Errorf("%s: shouldDropCache(free=%.3f cached=%.3f, floor=%.1f) = %v, want %v",
+				tc.name, tc.mi.FreeGB, tc.mi.CachedGB, floor, got, tc.want)
+		}
+	}
+}
+
+// TestEmergencyGuardianDropsRatherThanKillsOnModerateCache is the end-to-end
+// regression for the 2026-08-24 render kills. It drives tick() with the real
+// captured meminfo shape — MemAvailable comfortably ABOVE its own floor, so the
+// host was never in danger — and asserts the guardian reclaims cache instead of
+// destroying an active job. Every pre-existing test in this file used 35GB or
+// 77GB of cache, which is exactly why the 13-15GB production band shipped
+// broken: no fixture ever visited it.
+func TestEmergencyGuardianDropsRatherThanKillsOnModerateCache(t *testing.T) {
+	cfg := &Config{
+		EmergencyFloorGB:        8,
+		EmergencyMemFreeFloorGB: 4,
+		Models:                  map[string]ModelConfig{"minimax-h3-local": {MemoryGB: 80}},
+	}
+	mgr := NewInstanceManager(cfg, "python3", t.TempDir())
+	logger := NewEventLogger(t.TempDir())
+	g := NewEmergencyGuardian(cfg, mgr, logger)
+
+	// Exact reading logged immediately before the 02:28:34Z force-kill.
+	mem := meminfoGB{AvailableGB: 13.880844116210938, FreeGB: 3.2564353942871094, CachedGB: 15.124683380126953}
+	g.readMeminfo = func() (meminfoGB, error) { return mem, nil }
+	drops := 0
+	g.dropCaches = func() error {
+		drops++
+		// Measured on spark: dropping ~15GB of clean cache took MemFree from
+		// 3.3GB to ~25GB.
+		mem.FreeGB = 25
+		mem.CachedGB = 1.2
+		return nil
+	}
+	var killed []string
+	g.killInstance = func(v instanceMemSnapshot) bool {
+		killed = append(killed, v.InstanceID)
+		return true
+	}
+
+	g.tick()
+
+	if drops != 1 {
+		t.Fatalf("guardian must attempt the benign cache drop, got %d drops", drops)
+	}
+	if len(killed) != 0 {
+		t.Fatalf("guardian killed %v despite 15GB of reclaimable cache and MemAvailable above its floor", killed)
+	}
+	if !g.lastKill.IsZero() {
+		t.Fatal("a recovered drop must not consume the kill/event throttle")
+	}
+	if !g.lastDropRecovered {
+		t.Fatal("drop recovered MemFree, so lastDropRecovered must be set for the refill path")
+	}
+}

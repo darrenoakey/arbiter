@@ -93,10 +93,24 @@ const (
 	// critically low the box is one allocation burst from livelock no matter
 	// what MemAvailable claims.
 	emergencyDefaultMemFreeFloorGB = 4.0
-	// With more reclaimable cache than this, dropping it is the benign remedy
-	// — try that before shooting a model (also covers a dead gpu-mem-governor).
-	emergencyCacheSlackGB = 16.0
-	emergencyDropCooldown = 60 * time.Second
+	// Dropping page cache is the BENIGN remedy for a MemFree deficit, so the
+	// decision to try it must be relative to the deficit — not an absolute
+	// "lots of cache" threshold. This was an absolute 16GB slack until
+	// 2026-08-24, which created a dead zone that killed jobs for nothing: a
+	// render worker was force-killed 9 times with MemFree ~3.3GB against a 4GB
+	// floor (a 0.7GB deficit) while 13-15GB of reclaimable cache sat there,
+	// because 13-15GB < 16GB meant the drop was never even ATTEMPTED. Every
+	// one of those kills destroyed ~28min of GPU work, and MemAvailable
+	// (11.5-13.9GB) was never below its own 8GB floor — the host was in no
+	// danger at all. Dropping cache in that state recovers ~10GB (measured
+	// 8->25GB), so the only correct question is "would dropping plausibly
+	// cover the shortfall", i.e. cache >= deficit * margin.
+	emergencyDropCacheMargin = 2.0
+	// Never shell out to sudo drop_caches for less reclaimable cache than
+	// this; below it a drop cannot move MemFree meaningfully and the pressure
+	// is real rather than cache-inflated.
+	emergencyMinDropCacheGB = 2.0
+	emergencyDropCooldown   = 60 * time.Second
 	// Minimum gap between cache drops when the previous drop recovered. The
 	// drop call is synchronous inside tick(), so this only bounds how often
 	// sudo drop_caches runs — it must stay well under emergencyDropCooldown so
@@ -143,6 +157,23 @@ func (g *EmergencyGuardian) Run(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// shouldDropCache reports whether dropping page cache is a plausible remedy for
+// the current MemFree deficit. The comparison is deliberately RELATIVE: a 0.7GB
+// shortfall against 15GB of reclaimable cache is the easiest possible recovery,
+// and refusing to try it because 15GB fell under some absolute "lots of cache"
+// bar is how the guardian ended up force-killing long-running jobs while the
+// host was in no danger (see emergencyDropCacheMargin).
+func shouldDropCache(mi meminfoGB, memFreeFloorGB float64) bool {
+	deficit := memFreeFloorGB - mi.FreeGB
+	if deficit <= 0 {
+		return false // not actually short on MemFree
+	}
+	if mi.CachedGB < emergencyMinDropCacheGB {
+		return false // nothing worth reclaiming; the pressure is real
+	}
+	return mi.CachedGB >= deficit*emergencyDropCacheMargin
+}
+
 func (g *EmergencyGuardian) tick() {
 	mi, err := g.readMeminfo()
 	if err != nil {
@@ -156,7 +187,7 @@ func (g *EmergencyGuardian) tick() {
 		// MemAvailable looks fine but MemFree is critical — the cache-inflated
 		// blind spot. If there is real cache to reclaim, drop it first: that is
 		// the benign remedy and also covers a dead gpu-mem-governor.
-		if mi.CachedGB > emergencyCacheSlackGB {
+		if shouldDropCache(mi, g.memFreeFloorGB) {
 			since := time.Since(g.lastDrop)
 			if since > emergencyDropCooldown ||
 				(g.lastDropRecovered && since > emergencyReDropCooldown) {
