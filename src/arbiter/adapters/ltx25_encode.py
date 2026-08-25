@@ -41,6 +41,7 @@ directory, per `FastPipeline.save_encode_output`'s exact-path contract).
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import importlib
 import logging
@@ -75,6 +76,60 @@ def _validate_frame_count(num_frames_raw) -> int:
     if num_frames < 1 or (num_frames - 1) % 8 != 0:
         raise InferenceError(f"num_frames must satisfy 8n+1, got {num_frames}")
     return num_frames
+
+
+# The LTX 2.5 audio VAE's first convolution is stereo: its weight is
+# [128, 2, 3, 3], so a mono mel-spectrogram fails with "expected input
+# [1, 1, N, M] to have 2 channels". Callers legitimately supply mono audio
+# (Kokoro TTS narration is 1-channel), so the encode lane coerces channel
+# count itself rather than hard-failing 10 times and tripping the
+# per-model circuit breaker.
+AUDIO_VAE_CHANNELS = 2
+
+
+def _audio_channel_index(have: int, want: int) -> list[int]:
+    """Channel indices mapping `have` source channels onto exactly `want`.
+
+    Mono is duplicated across every target channel, surplus channels are
+    dropped, and a short multi-channel source cycles. Returned as an index
+    list so the caller's gather works identically on numpy and torch.
+    """
+    if have < 1:
+        raise InferenceError(f"audio has no channels: {have}")
+    if have >= want:
+        return list(range(want))
+    return [index % have for index in range(want)]
+
+
+def _coerce_audio_channels(waveform, want: int = AUDIO_VAE_CHANNELS):
+    """Return `waveform` with exactly `want` channels on its channel axis.
+
+    Waveforms are (batch, channels, samples); the channel axis is -2. A
+    waveform that already matches is returned untouched, so stereo callers
+    pay nothing.
+    """
+    have = int(waveform.shape[-2])
+    if have == want:
+        return waveform
+    return waveform[..., _audio_channel_index(have, want), :]
+
+
+def _stereo_audio(audio):
+    """Return `audio` with a stereo waveform, preserving sampling rate.
+
+    `ltx_core.types.Audio` is a frozen dataclass, so a differing channel
+    count needs a replacement instance. `dataclasses.replace` avoids
+    importing ltx_core, which only exists inside the spark runner tree.
+    """
+    waveform = _coerce_audio_channels(audio.waveform)
+    if waveform is audio.waveform:
+        return audio
+    log.info(
+        "ltx25 encode: coerced %d-channel audio to %d for the audio VAE",
+        audio.waveform.shape[-2],
+        AUDIO_VAE_CHANNELS,
+    )
+    return dataclasses.replace(audio, waveform=waveform)
 
 
 @register
@@ -157,6 +212,7 @@ class LTX25EncodeAdapter(GroupAdapter):
             # negative_prompt, height, width, images/image_file, and
             # chunk_index straight out of `params` itself.
             prep = self._pipeline.load_encode_input(params, audio_path=audio_file, fps=fps)
+            prep["decoded_audio"] = _stereo_audio(prep["decoded_audio"])
             self._check_cancel(cancel_flag)
 
             # PHASE 2 (GPU): Gemma 4 text encoder + Audio VAE forward passes.
