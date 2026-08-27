@@ -37,6 +37,7 @@ class JobType(str, Enum):
     RVC_TRAIN = "rvc-train"
     RVC_CONVERT = "rvc-convert"
     VOICE_FIT = "voice-fit"
+    MUSIC_GENERATE = "music-generate"
 
 
 # Maps job type to model_id
@@ -66,6 +67,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "rvc-train": "rvc-train",
     "rvc-convert": "rvc-convert",
     "voice-fit": "voice-fit",
+    "music-generate": "music-generate",
 }
 
 
@@ -371,6 +373,21 @@ class RvcConvertParams(BaseModel):
     index_path: Optional[str] = None
     return_b64: bool = False
 
+class MusicGenerateParams(BaseModel):
+    prompt: str = ""
+    lyrics: Optional[str] = None
+    audio_duration: float = 30.0
+    num_inference_steps: int = 50
+    guidance_scale: float = 7.0
+    shift: float = 3.0
+    vocal_language: str = "en"
+    bpm: Optional[int] = None
+    keyscale: Optional[str] = None
+    timesignature: Optional[str] = None
+    seed: Optional[int] = None
+    format: str = "wav"
+    model: Optional[str] = None
+
 
 # Maps job type to its parameter validation schema
 JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
@@ -399,4 +416,5 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "rvc-train": RvcTrainParams,
     "voice-fit": VoiceFitParams,
     "rvc-convert": RvcConvertParams,
+    "music-generate": MusicGenerateParams,
 }

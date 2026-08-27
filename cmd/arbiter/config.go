@@ -364,6 +364,7 @@ var JobTypeToModel = map[string]string{
 	"rvc-train":               "rvc-train",
 	"rvc-convert":             "rvc-convert",
 	"voice-fit":               "voice-fit",
+	"music-generate":          "music-generate",
 }
 
 func LoadConfig(projectRoot string) (*Config, error) {

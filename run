@@ -38,7 +38,11 @@ case "$CMD" in
             echo "$unformatted" >&2
             exit 1
         fi
-        go build ./cmd/arbiter/ && go vet ./cmd/arbiter/ && go test ./cmd/arbiter/ -count=1 -p 1
+        if [ -n "${ARBITER_GO_TEST_SKIP:-}" ]; then
+            go build ./cmd/arbiter/ && go vet ./cmd/arbiter/ && go test ./cmd/arbiter/ -count=1 -p 1 -skip "$ARBITER_GO_TEST_SKIP"
+        else
+            go build ./cmd/arbiter/ && go vet ./cmd/arbiter/ && go test ./cmd/arbiter/ -count=1 -p 1
+        fi
         ;;
     deploy)
         # greenline deploy: drain-gated redeploy to spark. NEVER DEPLOY_FORCE=1.

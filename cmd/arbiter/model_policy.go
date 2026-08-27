@@ -45,6 +45,7 @@ var trustedPythonAdapters = map[string]string{
 	"rvc-convert":             "rvc",
 	"rvc-train":               "rvc",
 	"voice-fit":               "voxsmith",
+	"music-generate":          "music-generate",
 	"sadtalker":               "",
 	"sonic":                   "",
 	"tts-clone":               "qwentts",
@@ -117,7 +118,7 @@ func nestedModelRoutesJob(jobType string) bool {
 		"talking-head", "talking-head-sadtalker", "lipsync", "video-generate-h3", "video-encode",
 		"video-denoise1", "video-denoise2", "face-restore", "face-restore-codeformer",
 		"face-embed", "aesthetic-score", "composite", "demucs", "chat-completion",
-		"chat-completion-stream":
+		"chat-completion-stream", "music-generate":
 		return true
 	default:
 		return false

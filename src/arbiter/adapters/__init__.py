@@ -35,6 +35,7 @@ _ADAPTER_MODULES = (
     "demucs_sep",
     "rvc",
     "voice_fit",
+    "music_generate",
 )
 
 for _module_name in _ADAPTER_MODULES:

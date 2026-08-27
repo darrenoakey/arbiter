@@ -20,7 +20,7 @@ func TestStillImageModelClassification(t *testing.T) {
 	}
 	for _, id := range []string{
 		"birefnet", "ltx2", "ltx2-denoise2", "ltx2-dev-denoise1-lora", "lora-train",
-		"minimax-h3", "moondream", "sonic", "whisper-large", "llm:qwen3.6-35b", "flora", "floral-voice",
+		"minimax-h3", "moondream", "sonic", "whisper-large", "music-generate", "llm:qwen3.6-35b", "flora", "floral-voice",
 	} {
 		if isDisabledStillImageModel(id) {
 			t.Errorf("%q was incorrectly classified as a still-image model", id)
@@ -42,6 +42,18 @@ func TestMiniMaxH3VideoAdmissionIsExactAndTopLevel(t *testing.T) {
 	}
 	if got := JobTypeToModel["video-generate"]; got != "ltx2" {
 		t.Fatalf("omitted-model default changed: got %q want ltx2", got)
+	}
+}
+
+func TestMusicGenerateAdmission(t *testing.T) {
+	if err := validateJobModelCompatibility("music-generate", "music-generate"); err != nil {
+		t.Fatalf("exact music-generate model rejected: %v", err)
+	}
+	if got := JobTypeToModel["music-generate"]; got != "music-generate" {
+		t.Fatalf("JobTypeToModel[music-generate] = %q, want music-generate", got)
+	}
+	if venv, ok := trustedPythonAdapters["music-generate"]; !ok || venv != "music-generate" {
+		t.Fatalf("trustedPythonAdapters[music-generate] = %q, want music-generate", venv)
 	}
 }
 

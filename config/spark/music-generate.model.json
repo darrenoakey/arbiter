@@ -1,0 +1,19 @@
+{
+  "auto_download": "ACE-Step/acestep-v15-xl-sft-diffusers",
+  "avg_inference_ms": 30000,
+  "group": false,
+  "keep_alive_seconds": 600,
+  "load_ms": 15000,
+  "max_concurrent": 1,
+  "max_instances": 1,
+  "max_runtime_seconds": 1800,
+  "memory_gb": 28,
+  "model_path": "",
+  "pressure_index": 0.5,
+  "worker_cmd": [
+    "/home/darren/src/arbiter/venvs/music-generate/bin/python",
+    "-m",
+    "arbiter.worker_main",
+    "music-generate"
+  ]
+}

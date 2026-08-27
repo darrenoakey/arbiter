@@ -123,11 +123,10 @@ ssh "$SPARK" "test -L '$REMOTE/.venv/bin/python' && cp --remove-destination /usr
 echo "==> Syncing Python adapters..."
 rsync -az --delete src/arbiter/ "$SPARK:$REMOTE/src/arbiter/"
 
-echo "==> Installing MiniMax H3 model configs..."
+echo "==> Installing model configs..."
 ssh "$SPARK" "mkdir -p '$REMOTE/config/spark'"
-rsync -az config/spark/minimax-h3.model.json "$SPARK:$REMOTE/config/spark/minimax-h3.model.json"
-rsync -az config/spark/minimax-h3-local.model.json "$SPARK:$REMOTE/config/spark/minimax-h3-local.model.json"
-ssh "$SPARK" "$REMOTE/.venv/bin/python -c 'import json, os, pathlib; root=pathlib.Path(\"$REMOTE\"); path=root/\"local/config.json\"; data=json.loads(path.read_text()); models=data.setdefault(\"models\", {}); models[\"minimax-h3\"]=json.loads((root/\"config/spark/minimax-h3.model.json\").read_text()); existing=models.get(\"minimax-h3-local\") or {}; local=json.loads((root/\"config/spark/minimax-h3-local.model.json\").read_text()); worker=existing.get(\"worker_cmd\"); local.update({\"worker_cmd\": worker} if worker else {}); models[\"minimax-h3-local\"]=local; temporary=path.with_name(\".config.minimax-h3.tmp\"); handle=temporary.open(\"w\"); json.dump(data, handle, indent=2); handle.write(\"\\n\"); handle.flush(); os.fsync(handle.fileno()); handle.close(); os.replace(temporary, path); descriptor=os.open(path.parent, os.O_RDONLY); os.fsync(descriptor); os.close(descriptor)'"
+rsync -az config/spark/ "$SPARK:$REMOTE/config/spark/"
+ssh "$SPARK" "$REMOTE/.venv/bin/python -c 'import glob, json, os, pathlib; root=pathlib.Path(\"$REMOTE\"); path=root/\"local/config.json\"; data=json.loads(path.read_text()); models=data.setdefault(\"models\", {}); [models.update({pathlib.Path(f).name.replace(\".model.json\", \"\"): json.loads(pathlib.Path(f).read_text())}) for f in glob.glob(str(root/\"config/spark/*.model.json\")) if \"minimax-h3-local\" not in f]; existing=models.get(\"minimax-h3-local\") or {}; local=json.loads((root/\"config/spark/minimax-h3-local.model.json\").read_text()); worker=existing.get(\"worker_cmd\"); local.update({\"worker_cmd\": worker} if worker else {}); models[\"minimax-h3-local\"]=local; temporary=path.with_name(\".config.spark-models.tmp\"); handle=temporary.open(\"w\"); json.dump(data, handle, indent=2); handle.write(\"\\n\"); handle.flush(); os.fsync(handle.fileno()); handle.close(); os.replace(temporary, path); descriptor=os.open(path.parent, os.O_RDONLY); os.fsync(descriptor); os.close(descriptor)'"
 
 echo "==> Uploading binaries..."
 # Upload to a temporary name, then rename into place. A plain scp onto the live

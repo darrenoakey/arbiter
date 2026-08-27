@@ -70,3 +70,24 @@ def test_minimax_h3_local_job_type_registered():
     assert params.duration == 5
     assert params.first_image_file == "/shared/first.jpg"
     assert params.last_image_file == "/shared/last.jpg"
+
+def test_music_generate_job_type_registered():
+    from arbiter.schemas import MusicGenerateParams
+
+    assert JOB_TYPE_TO_MODEL["music-generate"] == "music-generate"
+    params = MusicGenerateParams(
+        prompt="Epic cinematic orchestral music with soaring brass",
+        lyrics="[verse]\nRise up now\n[chorus]\nFeel the power",
+        audio_duration=60.0,
+        num_inference_steps=50,
+        guidance_scale=7.0,
+        shift=3.0,
+        seed=1234,
+    )
+    assert params.prompt == "Epic cinematic orchestral music with soaring brass"
+    assert params.audio_duration == 60.0
+    assert params.num_inference_steps == 50
+    assert params.guidance_scale == 7.0
+    assert params.shift == 3.0
+    assert params.seed == 1234
+    assert params.format == "wav"

@@ -138,6 +138,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "minimax-h3",
         "minimax-h3-local",
         "moondream",
+        "music-generate",
         "rvc-convert",
         "rvc-train",
         "sadtalker",
