@@ -52,6 +52,7 @@ type hostState struct {
 	healthAddr  string // base used for liveness poll (/health or /api/version)
 	psAddr      string // base used for loaded-model listing
 	kind        string // nativ | mlx
+	apiKey      string // nativ management-endpoint auth, from HostConfig.ApiKey
 	reachable   bool
 	failStreak  int
 	lastChecked time.Time
@@ -96,6 +97,7 @@ func NewHostMonitor(cfg *Config, mgr *InstanceManager, logger *EventLogger, sche
 			healthAddr: healthAddr,
 			psAddr:     psAddr,
 			kind:       kind,
+			apiKey:     h.ApiKey,
 			reachable:  true,
 		}
 	}
@@ -161,29 +163,35 @@ func (hm *HostMonitor) Run(ctx context.Context) {
 func (hm *HostMonitor) pollAll(ctx context.Context) {
 	hm.mu.RLock()
 	type target struct {
-		id, healthAddr, kind string
+		id, healthAddr, kind, apiKey string
 	}
 	targets := make([]target, 0, len(hm.states))
 	for id, st := range hm.states {
-		targets = append(targets, target{id, st.healthAddr, st.kind})
+		targets = append(targets, target{id, st.healthAddr, st.kind, st.apiKey})
 	}
 	hm.mu.RUnlock()
 
 	var wg sync.WaitGroup
 	for _, t := range targets {
 		wg.Add(1)
-		go func(id, healthAddr, kind string) {
+		go func(id, healthAddr, kind, apiKey string) {
 			defer wg.Done()
-			ok := hm.pollOne(ctx, healthAddr, kind)
+			ok := hm.pollOne(ctx, healthAddr, kind, apiKey)
 			hm.applyResult(id, ok)
-		}(t.id, t.healthAddr, t.kind)
+		}(t.id, t.healthAddr, t.kind, t.apiKey)
 	}
 	wg.Wait()
 }
 
 // pollOne hits a cheap health endpoint on the host. Nativ: GET /health.
-// Ollama/MLX: GET /api/version. Reachable == a 2xx response.
-func (hm *HostMonitor) pollOne(ctx context.Context, healthAddr, kind string) bool {
+// Ollama/MLX: GET /api/version. Reachable == a 2xx response. apiKey, when
+// non-empty, is sent as "Authorization: Bearer <apiKey>" — required by a
+// Nativ mlx-vlm-server bound to a non-localhost address, which gates /health
+// (and /metrics, /apc/*, /unload) behind --api-key even though the actual
+// chat completions endpoint stays open. Without this header a key-protected
+// host always 401s and gets permanently flagged absent regardless of whether
+// it can actually serve inference.
+func (hm *HostMonitor) pollOne(ctx context.Context, healthAddr, kind, apiKey string) bool {
 	reqCtx, cancel := context.WithTimeout(ctx, hm.httpClient.Timeout)
 	defer cancel()
 	path := "/api/version"
@@ -193,6 +201,9 @@ func (hm *HostMonitor) pollOne(ctx context.Context, healthAddr, kind string) boo
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, healthAddr+path, nil)
 	if err != nil {
 		return false
+	}
+	if kind == "nativ" && apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	resp, err := hm.httpClient.Do(req)
 	if err != nil {
@@ -314,14 +325,14 @@ func (hm *HostMonitor) cancelHostInstances(hostID string) {
 func (hm *HostMonitor) RemoteHostsPanel() []map[string]any {
 	hm.mu.RLock()
 	type snap struct {
-		id, addr, psAddr, kind string
-		reachable              bool
-		failStreak             int
-		lastOK                 time.Time
+		id, addr, psAddr, kind, apiKey string
+		reachable                      bool
+		failStreak                     int
+		lastOK                         time.Time
 	}
 	snaps := make([]snap, 0, len(hm.states))
 	for _, st := range hm.states {
-		snaps = append(snaps, snap{st.hostID, st.addr, st.psAddr, st.kind, st.reachable, st.failStreak, st.lastOK})
+		snaps = append(snaps, snap{st.hostID, st.addr, st.psAddr, st.kind, st.apiKey, st.reachable, st.failStreak, st.lastOK})
 	}
 	hm.mu.RUnlock()
 
@@ -346,7 +357,7 @@ func (hm *HostMonitor) RemoteHostsPanel() []map[string]any {
 		// Live loaded-model list, best-effort. Only attempt when reachable so a
 		// dead host doesn't add a dial-timeout to the request.
 		if s.reachable {
-			if loaded := hm.queryLoadedModels(s.psAddr, s.kind, s.addr); loaded != nil {
+			if loaded := hm.queryLoadedModels(s.psAddr, s.kind, s.addr, s.apiKey); loaded != nil {
 				entry["models_loaded"] = loaded
 			}
 		}
@@ -357,17 +368,20 @@ func (hm *HostMonitor) RemoteHostsPanel() []map[string]any {
 
 // queryLoadedModels returns the models currently loaded on a remote host.
 // Nativ: GET {nativAddr}/health → loaded_model. Ollama: GET {psAddr}/api/ps.
-func (hm *HostMonitor) queryLoadedModels(psAddr, kind, nativAddr string) []string {
+func (hm *HostMonitor) queryLoadedModels(psAddr, kind, nativAddr, apiKey string) []string {
 	if kind == "nativ" {
-		return hm.queryNativLoaded(nativAddr)
+		return hm.queryNativLoaded(nativAddr, apiKey)
 	}
 	return hm.queryOllamaPS(psAddr)
 }
 
-func (hm *HostMonitor) queryNativLoaded(addr string) []string {
+func (hm *HostMonitor) queryNativLoaded(addr, apiKey string) []string {
 	req, err := http.NewRequest(http.MethodGet, addr+"/health", nil)
 	if err != nil {
 		return nil
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	resp, err := hm.httpClient.Do(req)
 	if err != nil {

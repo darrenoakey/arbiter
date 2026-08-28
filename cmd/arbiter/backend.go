@@ -59,11 +59,13 @@ type Backend interface {
 //     health/ps/embed use ollamaAddr when set (Ollama still owns embeddings).
 //   - "mlx"/"" (default): legacy ollama/MLX on a single base URL.
 func NewRemoteInstance(modelID, instanceID, host, addr, modelTag string, maxConcurrent int, memoryGB float64) *Instance {
-	return NewRemoteInstanceWithKind(modelID, instanceID, host, addr, "", modelTag, "", maxConcurrent, memoryGB)
+	return NewRemoteInstanceWithKind(modelID, instanceID, host, addr, "", modelTag, "", maxConcurrent, memoryGB, "")
 }
 
 // NewRemoteInstanceWithKind is NewRemoteInstance plus explicit kind/ollamaAddr.
-func NewRemoteInstanceWithKind(modelID, instanceID, host, addr, ollamaAddr, modelTag, kind string, maxConcurrent int, memoryGB float64) *Instance {
+// apiKey authenticates nativ management calls (health poll, /unload) — see
+// HostConfig.ApiKey.
+func NewRemoteInstanceWithKind(modelID, instanceID, host, addr, ollamaAddr, modelTag, kind string, maxConcurrent int, memoryGB float64, apiKey string) *Instance {
 	inst := &Instance{
 		ModelID:       modelID,
 		InstanceID:    instanceID,
@@ -83,6 +85,7 @@ func NewRemoteInstanceWithKind(modelID, instanceID, host, addr, ollamaAddr, mode
 		ollamaAddr: ollamaAddr,
 		modelTag:   modelTag,
 		kind:       kind,
+		apiKey:     apiKey,
 	}
 	return inst
 }
@@ -134,6 +137,7 @@ type RemoteHTTPBackend struct {
 	ollamaAddr string    // optional Ollama base for embed/health/ps when chat is nativ
 	modelTag   string    // remote model tag (ollama name or HF id for nativ)
 	kind       string    // "nativ" | "mlx" (default)
+	apiKey     string    // nativ management-endpoint auth (health/unload), from HostConfig.ApiKey
 
 	// loadTimeout / inferTimeout bound the upstream calls. They are generous on
 	// purpose: a slow-but-alive call must DRAIN, not be cancelled (see invariant
@@ -833,6 +837,9 @@ func (b *RemoteHTTPBackend) doNativUnload(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.addr+"/unload", nil)
 	if err != nil {
 		return err
+	}
+	if b.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+b.apiKey)
 	}
 	resp, err := client.Do(req)
 	if err != nil {

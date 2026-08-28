@@ -119,6 +119,100 @@ func TestLivenessPollMarksAbsentThenRecovered(t *testing.T) {
 	}
 }
 
+// TestLivenessPollAuthenticatesNativManagementCalls is the regression test for
+// the 2026-08-29 boringstack incident: a Nativ mlx-vlm-server started with
+// --api-key (required once it binds a non-localhost address) 401s /health for
+// any caller that doesn't send "Authorization: Bearer <key>". Without this
+// header the liveness poll saw 401 forever, permanently flagged the host
+// absent, and every job silently spilled to the fallback host — even though
+// the host (and its unauthenticated chat endpoint) was fully up. Proves: (a)
+// no configured ApiKey → the poll 401s and the host flips absent; (b) the
+// correct ApiKey configured → the poll succeeds and the host stays/becomes
+// reachable and preferred again.
+func TestLivenessPollAuthenticatesNativManagementCalls(t *testing.T) {
+	const key = "s3cr3t-nativ-key"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/health" {
+			w.WriteHeader(404)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+key {
+			w.WriteHeader(401)
+			if _, err := w.Write([]byte(`{"detail":"Invalid API key"}`)); err != nil {
+				t.Errorf("write 401 body: %v", err)
+			}
+			return
+		}
+		w.WriteHeader(200)
+		if _, err := w.Write([]byte(`{"status":"healthy","loaded_model":"test-model"}`)); err != nil {
+			t.Errorf("write health body: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	newMonitor := func(apiKey string) (*HostMonitor, *InstanceManager, *Scheduler) {
+		cfg := &Config{
+			VRAMBudgetGB: 100,
+			Hosts: map[string]HostConfig{
+				"guarded": {Addr: srv.URL, Kind: "nativ", BudgetGB: 64, ApiKey: apiKey},
+			},
+			Models: map[string]ModelConfig{
+				"chat": {
+					MemoryGB: 1, MaxConcurrent: 1, MaxInstances: intPtr(1),
+					MaxRuntimeSec: 7200,
+					PressureIndex: pi(),
+					Placements:    []string{"guarded", "spark"},
+					AdapterParams: map[string]string{"remote_model_tag": localOllamaTag},
+				},
+			},
+		}
+		projectRoot := t.TempDir()
+		outputDir := filepath.Join(projectRoot, "output")
+		logger := NewEventLogger(filepath.Join(outputDir, "logs"))
+		t.Cleanup(logger.Close)
+		mgr := NewInstanceManager(cfg, "python3", projectRoot)
+		setupInstances(cfg, mgr, "python3", projectRoot)
+		store, err := NewStore(filepath.Join(projectRoot, "arbiter.db"))
+		if err != nil {
+			t.Fatalf("store: %v", err)
+		}
+		t.Cleanup(func() { store.Close() })
+		sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+		hm := NewHostMonitor(cfg, mgr, logger, sched)
+		hm.pollInterval = 50 * time.Millisecond
+		hm.failThreshold = 3
+		mgr.SetReachabilityFunc(hm.IsReachable)
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		go hm.Run(ctx)
+		return hm, mgr, sched
+	}
+
+	t.Run("no api key configured — host wrongly flagged absent", func(t *testing.T) {
+		hm, mgr, _ := newMonitor("")
+		if !waitReachable(hm, "guarded", false, 3*time.Second) {
+			t.Fatalf("expected unauthenticated poll to 401 and flip absent")
+		}
+		job := &Job{ID: "j-unauth", ModelID: "chat", State: "queued"}
+		inst, reason := mgr.PickInstanceForJobWithReason(job, true)
+		if inst == nil || inst.host != "spark" || reason != reasonFallback {
+			t.Fatalf("expected fallback to spark while unauthenticated, got host=%v reason=%v", hostOf(inst), reason)
+		}
+	})
+
+	t.Run("correct api key configured — host stays reachable and preferred", func(t *testing.T) {
+		hm, mgr, _ := newMonitor(key)
+		if !waitReachable(hm, "guarded", true, 2*time.Second) {
+			t.Fatalf("expected authenticated poll to succeed and stay reachable")
+		}
+		job := &Job{ID: "j-auth", ModelID: "chat", State: "queued"}
+		inst, reason := mgr.PickInstanceForJobWithReason(job, true)
+		if inst == nil || inst.host != "guarded" || reason != reasonPreferred {
+			t.Fatalf("expected preferred placement on guarded host, got host=%v reason=%v", hostOf(inst), reason)
+		}
+	})
+}
+
 // waitReachable polls the monitor's view until host reachability equals want.
 func waitReachable(hm *HostMonitor, host string, want bool, deadline time.Duration) bool {
 	end := time.Now().Add(deadline)

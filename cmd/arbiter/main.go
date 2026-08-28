@@ -354,7 +354,7 @@ func setupInstances(cfg *Config, mgr *InstanceManager, pythonBin, projectRoot st
 			inst := NewRemoteInstanceWithKind(
 				modelID, fmt.Sprintf("%s@%s", modelID, host),
 				host, hc.Addr, hc.OllamaAddr, modelTag, hc.KindOrDefault(),
-				modelCfg.MaxConcurrent, modelCfg.MemoryGB,
+				modelCfg.MaxConcurrent, modelCfg.MemoryGB, hc.ApiKey,
 			)
 			mgr.Register(inst)
 			slog.Info("registered remote model placement",

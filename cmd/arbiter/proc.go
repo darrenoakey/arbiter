@@ -2810,7 +2810,7 @@ func (m *InstanceManager) registerMissingRemotePlacements(modelID string, cfg Mo
 			continue
 		}
 		inst := NewRemoteInstanceWithKind(modelID, instanceID, host, hc.Addr, hc.OllamaAddr,
-			remoteModelTag(cfg, modelID), hc.KindOrDefault(), cfg.MaxConcurrent, cfg.MemoryGB)
+			remoteModelTag(cfg, modelID), hc.KindOrDefault(), cfg.MaxConcurrent, cfg.MemoryGB, hc.ApiKey)
 		m.Register(inst)
 		added++
 		slog.Info("re-registered remote model placement",
