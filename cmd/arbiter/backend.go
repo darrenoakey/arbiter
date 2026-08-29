@@ -564,6 +564,9 @@ func (b *RemoteHTTPBackend) doChat(ctx context.Context, body []byte) ([]byte, er
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if b.kind == "nativ" && b.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+b.apiKey)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err // transport error (dial refused / no route / timeout)

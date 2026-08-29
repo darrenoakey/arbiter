@@ -112,13 +112,16 @@ type HostConfig struct {
 	// Set this when chat has moved to Nativ but embeddings still run on Ollama
 	// on the same box (different port).
 	OllamaAddr string `json:"ollama_addr,omitempty"`
-	// ApiKey authenticates nativ management calls (GET /health liveness poll,
-	// POST /unload) when the remote Nativ mlx-vlm-server was started with
-	// --api-key (required whenever it binds a non-localhost address; the chat
-	// completions endpoint itself never checks this key, only /health,
-	// /metrics, /apc/*, and /unload do). Sent as "Authorization: Bearer
-	// <ApiKey>". Empty means no auth header is sent (legacy/localhost-only
-	// nativ hosts, and non-nativ kinds).
+	// ApiKey authenticates every nativ call (chat completions, health poll,
+	// unload) when the remote Nativ mlx-vlm-server was started with --api-key
+	// (required whenever it binds a non-localhost address). Sent as
+	// "Authorization: Bearer <ApiKey>" on every request to the host. Empty
+	// means no auth header is sent (legacy/localhost-only nativ hosts, and
+	// non-nativ kinds). NOTE: mlx_vlm's server package only enforces this on
+	// management routes (/health, /metrics, /apc/*, /unload) in some
+	// versions but gates chat completions too in others (confirmed on
+	// boringstack 2026-08-29) — always send it on every call rather than
+	// relying on which routes a given deployed version happens to guard.
 	ApiKey string `json:"api_key,omitempty"`
 }
 

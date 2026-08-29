@@ -186,11 +186,12 @@ func (hm *HostMonitor) pollAll(ctx context.Context) {
 // pollOne hits a cheap health endpoint on the host. Nativ: GET /health.
 // Ollama/MLX: GET /api/version. Reachable == a 2xx response. apiKey, when
 // non-empty, is sent as "Authorization: Bearer <apiKey>" — required by a
-// Nativ mlx-vlm-server bound to a non-localhost address, which gates /health
-// (and /metrics, /apc/*, /unload) behind --api-key even though the actual
-// chat completions endpoint stays open. Without this header a key-protected
-// host always 401s and gets permanently flagged absent regardless of whether
-// it can actually serve inference.
+// Nativ mlx-vlm-server bound to a non-localhost address (--api-key). Some
+// deployed versions gate only /health/-management routes; boringstack's
+// (2026-08-29) gates chat completions too — RemoteHTTPBackend.doChat sends
+// the same header for that reason. Without this header on /health a
+// key-protected host always 401s and gets permanently flagged absent
+// regardless of whether it can actually serve inference.
 func (hm *HostMonitor) pollOne(ctx context.Context, healthAddr, kind, apiKey string) bool {
 	reqCtx, cancel := context.WithTimeout(ctx, hm.httpClient.Timeout)
 	defer cancel()

@@ -869,3 +869,47 @@ func TestInferRawRetriesOnceWithoutResponseFormatOnStatusRejection(t *testing.T)
 		t.Fatalf("degraded completion text=%v", result["text"])
 	}
 }
+
+// TestDoChatSendsApiKeyWhenConfigured is the regression test for the second
+// half of the 2026-08-29 boringstack incident: the FIRST fix only added the
+// Authorization header to health/unload management calls, assuming Nativ
+// chat completions itself never checks the key (true for the mlx_vlm
+// version installed locally, but boringstack's deployed instance gates
+// chat completions too). Without the header on the actual chat request,
+// jobs kept 401ing even after the host was correctly detected as reachable.
+// Proves doChat/InferRaw sends "Authorization: Bearer <key>" on every nativ
+// chat request when RemoteHTTPBackend.apiKey is set.
+func TestDoChatSendsApiKeyWhenConfigured(t *testing.T) {
+	const key = "boringstack-secret"
+	var gotAuth []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		if r.Header.Get("Authorization") != "Bearer "+key {
+			w.WriteHeader(401)
+			if _, err := w.Write([]byte(`{"detail":"Invalid API key"}`)); err != nil {
+				t.Errorf("write 401 body: %v", err)
+			}
+			return
+		}
+		if _, err := w.Write([]byte(`{"choices":[{"message":{"content":"pong","role":"assistant"},"finish_reason":"stop"}],"usage":{"completion_tokens":1}}`)); err != nil {
+			t.Errorf("write completion: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	backend := &RemoteHTTPBackend{modelTag: "mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit", kind: "nativ", host: "boringstack", addr: server.URL, apiKey: key}
+	response, err := backend.InferRaw("job-1", "chat-completion", json.RawMessage(`{
+		"model":"local-chat",
+		"messages":[{"role":"user","content":"ping"}],
+		"max_tokens":8
+	}`), "")
+	if err != nil {
+		t.Fatalf("InferRaw should succeed once the api key is sent: %v", err)
+	}
+	if response.Status != "ok" {
+		t.Fatalf("status=%q, want ok", response.Status)
+	}
+	if len(gotAuth) == 0 || gotAuth[0] != "Bearer "+key {
+		t.Fatalf("expected 'Bearer %s' Authorization header, got %v", key, gotAuth)
+	}
+}
