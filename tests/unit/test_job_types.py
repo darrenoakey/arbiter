@@ -90,4 +90,11 @@ def test_music_generate_job_type_registered():
     assert params.guidance_scale == 7.0
     assert params.shift == 3.0
     assert params.seed == 1234
-    assert params.format == "wav"
+    assert params.format == "mp3"
+
+
+def test_music_generate_format_defaults_to_mp3_but_wav_is_selectable():
+    from arbiter.schemas import MusicGenerateParams
+
+    assert MusicGenerateParams(prompt="test").format == "mp3"
+    assert MusicGenerateParams(prompt="test", format="wav").format == "wav"

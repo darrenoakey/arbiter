@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 import logging
+import shutil
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any
@@ -71,7 +73,9 @@ class MusicGenerateAdapter(ModelAdapter):
         keyscale = params.get("keyscale")
         timesignature = params.get("timesignature")
         seed = params.get("seed")
-        out_format = str(params.get("format", "wav")).lower().strip(".")
+        out_format = str(params.get("format", "mp3")).lower().strip(".")
+        if out_format not in ("wav", "mp3", "flac", "ogg"):
+            out_format = "mp3"
 
         generator = None
         if seed is not None:
@@ -131,9 +135,25 @@ class MusicGenerateAdapter(ModelAdapter):
 
         sample_rate = getattr(self._pipe, "sample_rate", 48000)
 
-        filename = f"result.{out_format}" if out_format in ("wav", "flac", "ogg", "mp3") else "result.wav"
-        out_path = output_dir / filename
-        sf.write(str(out_path), wav, sample_rate)
+        if out_format == "mp3":
+            # libsndfile's built-in MP3 writer defaults to a low bitrate; use
+            # ffmpeg to encode a high-quality 320kbps CBR file instead so the
+            # default output matches the "quality first" generation target.
+            tmp_wav = output_dir / "_result_src.wav"
+            sf.write(str(tmp_wav), wav, sample_rate)
+            filename = "result.mp3"
+            out_path = output_dir / filename
+            ffmpeg_bin = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+            subprocess.run(
+                [ffmpeg_bin, "-y", "-i", str(tmp_wav), "-codec:a", "libmp3lame", "-b:a", "320k", str(out_path)],
+                check=True,
+                capture_output=True,
+            )
+            tmp_wav.unlink(missing_ok=True)
+        else:
+            filename = f"result.{out_format}"
+            out_path = output_dir / filename
+            sf.write(str(out_path), wav, sample_rate)
 
         actual_duration = float(len(wav) / sample_rate) if sample_rate > 0 else audio_duration
 

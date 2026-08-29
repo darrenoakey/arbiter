@@ -385,7 +385,7 @@ class MusicGenerateParams(BaseModel):
     keyscale: Optional[str] = None
     timesignature: Optional[str] = None
     seed: Optional[int] = None
-    format: str = "wav"
+    format: str = "mp3"  # mp3 (320kbps, default) | wav | flac | ogg
     model: Optional[str] = None
 
 
