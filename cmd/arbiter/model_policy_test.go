@@ -251,7 +251,7 @@ func TestLoadConfigAllowsBoringstackOllamaQwenDense27b36(t *testing.T) {
 			KeepAliveSec:  3600,
 			Placements:    []string{"boringstack"},
 			AdapterParams: map[string]string{
-				"remote_model_tag": "qwen3.6:27b-mtp-q8_0",
+				"remote_model_tag": "qwen3.6:27b-q8_0",
 			},
 		},
 	}
@@ -264,8 +264,8 @@ func TestLoadConfigAllowsBoringstackOllamaQwenDense27b36(t *testing.T) {
 	if !ok {
 		t.Fatal("boringstack Ollama qwen 27b 3.6 config was omitted by startup policy")
 	}
-	if got := model.AdapterParams["remote_model_tag"]; got != "qwen3.6:27b-mtp-q8_0" {
-		t.Fatalf("remote_model_tag = %s, want qwen3.6:27b-mtp-q8_0", got)
+	if got := model.AdapterParams["remote_model_tag"]; got != "qwen3.6:27b-q8_0" {
+		t.Fatalf("remote_model_tag = %s, want qwen3.6:27b-q8_0", got)
 	}
 }
 
