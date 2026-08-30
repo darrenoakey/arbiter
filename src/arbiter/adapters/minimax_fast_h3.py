@@ -1,29 +1,29 @@
 """MiniMax FastH3 local video generation adapter — GroupAdapter on the GB10 GPU.
 
-FastH3 is FastVideo's 4-step DMD2 distillation of MiniMax-H3. Same fl2va
-modular pipeline, VAE, tokenizer, and Qwen3-VL text encoder as
-minimax-h3-local; only the denoiser transformer is the distilled student.
+FastH3 is FastVideo's 4-step DMD2 distillation of MiniMax-H3. It reuses the
+base H3 modular pipeline, VAE, tokenizer, and Qwen3-VL text encoder; only the
+denoiser transformer is the distilled student.
 
-The published FastH3 card is T2VA-only; FL2VA is not distilled. This adapter
-still requires both first and last keyframes and runs the shared H3 fl2va
-workflow — music-video clips are unusable without that conditioning. Audio-in
-(driving a clip from an existing soundtrack) is not supported; FastH3 emits
-its own audio and the music-video lane muxes the authoritative Suno track.
+The published preview checkpoint distills the text-to-video-and-audio path
+only. Keyframe conditioning is outside that contract, so the adapter rejects
+first- or last-image parameters instead of silently running an unsupported
+path. Audio-in is also unsupported; FastH3 emits its own audio and callers may
+mux a different soundtrack.
 
-The published FastH3 card is explicit that `num_inference_steps=4` is the
-wrong call: MiniMaxH3SetTimestepsStep then builds a native 4-point sigma
-grid and runs 3 forwards, not the 4 trained jump points. This adapter
-therefore always asks for 4 steps and monkey-patches both schedulers to the
-trained ladder `[0.999, 0.749, 0.500, 0.250, 0.0]` on the shared 1000-step
-clock.
+The student was trained on four integer points of the shared 1000-step clock:
+`[999, 749, 500, 250]`. Diffusers applies each scheduler's own shift and
+appends its terminal zero. Passing normalized sigmas, or including zero in the
+input ladder, changes the trained schedule and adds an invalid model forward.
+This adapter therefore replaces both scheduler calls with those four integer
+timesteps.
 
 The NVFP4 text-encoder snapshot is reused from minimax-h3-local
 (`/mnt/t9/models/h3-nvfp4-fl2va/text_encoder`). The FastH3 transformer is
 quantized once and snapshotted under `/mnt/t9/models/fasth3-nvfp4-fl2va`.
 
-Expected params dict matches VideoGenerateH3Params. `num_inference_steps` is
-accepted then ignored — FastH3 is 4-step only. Missing first or last
-keyframe is an InferenceError.
+Expected params match VideoGenerateH3Params except that keyframe fields are
+rejected. `num_inference_steps` is accepted then ignored: FastH3 is 4-step
+only.
 """
 
 from __future__ import annotations
@@ -56,14 +56,9 @@ FASTH3_STEPS = 4
 FASTH3_DMD_STEPS = (999, 749, 500, 250)
 
 
-def fasth3_video_sigmas() -> list[float]:
-    """Trained FastH3 video ladder on the shared 1000-step clock, plus terminal 0."""
-    return [step / 1000.0 for step in FASTH3_DMD_STEPS] + [0.0]
-
-
-def fasth3_audio_sigmas() -> list[float]:
-    """Audio uses the same 4 trained jump points as the video student grid."""
-    return fasth3_video_sigmas()
+def fasth3_timesteps() -> list[int]:
+    """Return the four trained points on FastH3's shared 1000-step clock."""
+    return list(FASTH3_DMD_STEPS)
 
 
 def fasth3_steps(_params: dict | None = None) -> int:
@@ -78,44 +73,38 @@ def _fasth3_snapshot_ready() -> bool:
     ).is_dir()
 
 
-def _install_trained_sigma_ladder(pipe) -> None:
-    """Force both MiniMax schedulers onto the trained 4-jump sigma ladder.
+def _install_trained_timestep_ladder(pipe) -> None:
+    """Force both MiniMax schedulers onto the trained four-forward ladder.
 
-    MiniMaxH3SetTimestepsStep always calls set_timesteps(num_inference_steps=N)
-    and never accepts explicit sigmas. Wrapping the bound method is the
-    adapter-local seam that keeps the 4 trained forwards without forking
-    the upstream block.
+    The upstream block always calls ``set_timesteps(num_inference_steps=N)``.
+    Passing integer timesteps lets each scheduler apply its configured shift
+    and append its own terminal zero exactly once.
     """
-    import torch
-
-    video = torch.tensor(fasth3_video_sigmas(), dtype=torch.float32)
-    audio = torch.tensor(fasth3_audio_sigmas(), dtype=torch.float32)
+    timesteps = fasth3_timesteps()
     orig_video = pipe.scheduler.set_timesteps
     orig_audio = pipe.audio_scheduler.set_timesteps
 
-    def video_set_timesteps(num_inference_steps=None, device=None, sigmas=None, **kwargs):
-        orig_video(device=device, sigmas=video)
+    def video_set_timesteps(num_inference_steps=None, device=None, **kwargs):
+        orig_video(device=device, timesteps=timesteps)
 
-    def audio_set_timesteps(num_inference_steps=None, device=None, sigmas=None, **kwargs):
-        orig_audio(device=device, sigmas=audio)
+    def audio_set_timesteps(num_inference_steps=None, device=None, **kwargs):
+        orig_audio(device=device, timesteps=timesteps)
 
     pipe.scheduler.set_timesteps = video_set_timesteps
     pipe.audio_scheduler.set_timesteps = audio_set_timesteps
 
 
-def require_first_and_last_keyframes(params: dict) -> None:
-    """Fail closed unless both first and last keyframes are present.
-
-    FastH3 Preview is distilled for T2VA only. The music-video lane still
-    cannot use a clip without first/last conditioning, so this adapter
-    refuses to generate rather than silently dropping to text-only.
-    """
-    first = params.get("first_image_file") or params.get("first_image_b64")
-    last = params.get("last_image_file") or params.get("last_image_b64")
-    if not first or not last:
+def reject_keyframe_conditioning(params: dict) -> None:
+    """Reject image conditioning unsupported by the preview checkpoint."""
+    keyframe_fields = (
+        "first_image_file",
+        "first_image_b64",
+        "last_image_file",
+        "last_image_b64",
+    )
+    if any(params.get(field) for field in keyframe_fields):
         raise InferenceError(
-            "FastH3 requires both first and last keyframes "
-            "(first_image_file/first_image_b64 and last_image_file/last_image_b64)"
+            "FastH3 Preview is T2VA-only and does not support first or last keyframes"
         )
 
 
@@ -178,7 +167,7 @@ class MinimaxFastH3Adapter(MinimaxH3LocalAdapter):
             self._pipe.text_encoder.to(device)
             self._pipe.vae.to(device)
             self._pipe.audio_vae.to(device)
-            _install_trained_sigma_ladder(self._pipe)
+            _install_trained_timestep_ladder(self._pipe)
             torch.cuda.empty_cache()
             self._log_memory(torch, "post-load")
             log.info("MiniMax FastH3 pipeline loaded (NVFP4, 4-step ladder, on-device)")
@@ -211,7 +200,7 @@ class MinimaxFastH3Adapter(MinimaxH3LocalAdapter):
 
     def infer(self, params: dict, output_dir: Path, cancel_flag) -> dict:
         """Generate one clip, always on the trained 4-step ladder."""
-        require_first_and_last_keyframes(params)
+        reject_keyframe_conditioning(params)
         forced = dict(params)
         forced["num_inference_steps"] = fasth3_steps(params)
         return super().infer(forced, output_dir, cancel_flag)

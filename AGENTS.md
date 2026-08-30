@@ -55,9 +55,11 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   Registry tests must assert cloud, local, and FastH3 ids stay registered
   after a cloud restore. FastH3 is 4-step only (`video-generate-fast-h3` /
   `minimax-fast-h3`); it reuses the H3 NVFP4 text encoder and the
-  `minimax-h3` venv. Preview weights are T2VA-only, but this adapter still
-  requires both first and last keyframes and fails closed without them.
-  Audio-in is unsupported; callers mux their own soundtrack.
+  `minimax-h3` venv. Preview weights are T2VA-only. The adapter rejects
+  first- and last-keyframe parameters and installs the exact integer timestep
+  ladder `[999, 749, 500, 250]`; diffusers applies each scheduler's shift and
+  appends its terminal zero. Audio-in is unsupported; callers mux their own
+  soundtrack.
 
 ## Live model registration
 

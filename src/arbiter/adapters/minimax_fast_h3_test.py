@@ -1,4 +1,4 @@
-"""Tests for the FastH3 adapter's output boundary and trained sigma ladder."""
+"""Tests for the FastH3 adapter's output boundary and trained timestep ladder."""
 
 from __future__ import annotations
 
@@ -14,15 +14,11 @@ from arbiter.adapters.minimax_h3_local import MinimaxH3LocalAdapter
 from arbiter.adapters.registry import list_registered
 
 
-def test_fasth3_sigma_ladder_is_four_trained_jumps() -> None:
+def test_fasth3_ladder_is_exactly_four_trained_timesteps() -> None:
     from arbiter.adapters import minimax_fast_h3 as fast
 
-    video = fast.fasth3_video_sigmas()
-    audio = fast.fasth3_audio_sigmas()
-    assert video == [0.999, 0.749, 0.500, 0.250, 0.0]
-    assert audio == video
-    assert video[-1] == 0.0
-    assert all(earlier > later for earlier, later in zip(video, video[1:]))
+    assert fast.fasth3_timesteps() == [999, 749, 500, 250]
+    assert 0 not in fast.fasth3_timesteps()
     assert fast.fasth3_steps({"num_inference_steps": 50}) == 4
     assert fast.fasth3_steps({}) == 4
 
@@ -35,10 +31,35 @@ def test_fasth3_source_uses_nvfp4_and_trained_ladder() -> None:
         __import__("arbiter.adapters.minimax_h3_local", fromlist=["_nvfp4_config"])
     )
     assert "FastVideo/FastVideo-Minimax-FastH3-Preview-v0.2" in src
-    assert "_install_trained_sigma_ladder" in src
+    assert "_install_trained_timestep_ladder" in src
     assert "Int8WeightOnlyConfig" not in src
     assert "enable_group_offload" not in src
     assert fast.FASTH3_STEPS == 4
+
+
+def test_fasth3_installs_integer_timesteps_on_both_schedulers() -> None:
+    from types import SimpleNamespace
+
+    from arbiter.adapters import minimax_fast_h3 as fast
+
+    class Scheduler:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def set_timesteps(self, *args, **kwargs) -> None:
+            self.calls.append((args, kwargs))
+
+    video = Scheduler()
+    audio = Scheduler()
+    pipe = SimpleNamespace(scheduler=video, audio_scheduler=audio)
+    fast._install_trained_timestep_ladder(pipe)
+
+    pipe.scheduler.set_timesteps(num_inference_steps=4, device="cuda")
+    pipe.audio_scheduler.set_timesteps(num_inference_steps=4, device="cuda")
+
+    expected = {"device": "cuda", "timesteps": [999, 749, 500, 250]}
+    assert video.calls == [((), expected)]
+    assert audio.calls == [((), expected)]
 
 
 def test_fasth3_and_h3_adapters_are_both_registered() -> None:
@@ -124,19 +145,16 @@ def test_fasth3_snapshot_failure_does_not_raise(tmp_path, monkeypatch) -> None:
     assert not (tmp_path / "transformer").exists()
 
 
-def test_fasth3_requires_both_first_and_last_keyframes() -> None:
-    from arbiter.adapters.base import InferenceError
+def test_fasth3_accepts_text_only_and_rejects_keyframes() -> None:
     from arbiter.adapters import minimax_fast_h3 as fast
+    from arbiter.adapters.base import InferenceError
 
-    with pytest.raises(InferenceError, match="first and last keyframes"):
-        fast.require_first_and_last_keyframes({"prompt": "x"})
-    with pytest.raises(InferenceError, match="first and last keyframes"):
-        fast.require_first_and_last_keyframes({"first_image_file": "/tmp/a.jpg"})
-    with pytest.raises(InferenceError, match="first and last keyframes"):
-        fast.require_first_and_last_keyframes({"last_image_b64": "xxxx"})
-    fast.require_first_and_last_keyframes(
-        {"first_image_file": "/tmp/a.jpg", "last_image_file": "/tmp/b.jpg"}
-    )
-    fast.require_first_and_last_keyframes(
-        {"first_image_b64": "aaaa", "last_image_b64": "bbbb"}
-    )
+    fast.reject_keyframe_conditioning({"prompt": "x"})
+    for field in (
+        "first_image_file",
+        "first_image_b64",
+        "last_image_file",
+        "last_image_b64",
+    ):
+        with pytest.raises(InferenceError, match="T2VA-only"):
+            fast.reject_keyframe_conditioning({field: "image"})
