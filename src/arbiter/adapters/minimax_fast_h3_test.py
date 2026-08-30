@@ -37,29 +37,17 @@ def test_fasth3_source_uses_nvfp4_and_trained_ladder() -> None:
     assert fast.FASTH3_STEPS == 4
 
 
-def test_fasth3_installs_integer_timesteps_on_both_schedulers() -> None:
-    from types import SimpleNamespace
-
+def test_fasth3_applies_each_scheduler_shift_once() -> None:
     from arbiter.adapters import minimax_fast_h3 as fast
 
-    class Scheduler:
-        def __init__(self) -> None:
-            self.calls = []
-
-        def set_timesteps(self, *args, **kwargs) -> None:
-            self.calls.append((args, kwargs))
-
-    video = Scheduler()
-    audio = Scheduler()
-    pipe = SimpleNamespace(scheduler=video, audio_scheduler=audio)
-    fast._install_trained_timestep_ladder(pipe)
-
-    pipe.scheduler.set_timesteps(num_inference_steps=4, device="cuda")
-    pipe.audio_scheduler.set_timesteps(num_inference_steps=4, device="cuda")
-
-    expected = {"device": "cuda", "timesteps": [999, 749, 500, 250]}
-    assert video.calls == [((), expected)]
-    assert audio.calls == [((), expected)]
+    assert fast.fasth3_shifted_sigmas(12.0) == pytest.approx(
+        [0.9999165902, 0.9728325576, 0.9230769231, 0.8, 0.0]
+    )
+    assert fast.fasth3_shifted_sigmas(3.0) == pytest.approx(
+        [0.9996664443, 0.8995196157, 0.75, 0.5, 0.0]
+    )
+    with pytest.raises(ValueError, match="positive"):
+        fast.fasth3_shifted_sigmas(0.0)
 
 
 def test_fasth3_and_h3_adapters_are_both_registered() -> None:
@@ -145,11 +133,14 @@ def test_fasth3_snapshot_failure_does_not_raise(tmp_path, monkeypatch) -> None:
     assert not (tmp_path / "transformer").exists()
 
 
-def test_fasth3_accepts_text_only_and_rejects_keyframes() -> None:
+def test_fasth3_accepts_only_native_text_only_requests() -> None:
     from arbiter.adapters import minimax_fast_h3 as fast
     from arbiter.adapters.base import InferenceError
 
-    fast.reject_keyframe_conditioning({"prompt": "x"})
+    native = {"prompt": "x", "duration": 5, "width": 1344, "height": 768}
+    fast.reject_keyframe_conditioning(native)
+    fast.validate_fasth3_operating_point(native)
+
     for field in (
         "first_image_file",
         "first_image_b64",
@@ -158,3 +149,11 @@ def test_fasth3_accepts_text_only_and_rejects_keyframes() -> None:
     ):
         with pytest.raises(InferenceError, match="T2VA-only"):
             fast.reject_keyframe_conditioning({field: "image"})
+
+    for override in (
+        {"duration": 6},
+        {"width": 960},
+        {"height": 544},
+    ):
+        with pytest.raises(InferenceError, match="duration=5"):
+            fast.validate_fasth3_operating_point(override)

@@ -11,18 +11,18 @@ path. Audio-in is also unsupported; FastH3 emits its own audio and callers may
 mux a different soundtrack.
 
 The student was trained on four integer points of the shared 1000-step clock:
-`[999, 749, 500, 250]`. Diffusers applies each scheduler's own shift and
-appends its terminal zero. Passing normalized sigmas, or including zero in the
-input ladder, changes the trained schedule and adds an invalid model forward.
-This adapter therefore replaces both scheduler calls with those four integer
-timesteps.
+`[999, 749, 500, 250]`. Each MiniMax scheduler must apply its own shift to
+those points and add the terminal clean boundary. Diffusers' MiniMax scheduler
+accepts only a fully formed sigma schedule, so this adapter derives the exact
+five sigma boundaries separately for video (shift 12) and audio (shift 3).
 
 The NVFP4 text-encoder snapshot is reused from minimax-h3-local
 (`/mnt/t9/models/h3-nvfp4-fl2va/text_encoder`). The FastH3 transformer is
 quantized once and snapshotted under `/mnt/t9/models/fasth3-nvfp4-fl2va`.
 
 Expected params match VideoGenerateH3Params except that keyframe fields are
-rejected. `num_inference_steps` is accepted then ignored: FastH3 is 4-step
+rejected and the preview's exact 5-second, 1344x768 operating point is
+required. `num_inference_steps` is accepted then ignored: FastH3 is 4-step
 only.
 """
 
@@ -36,8 +36,6 @@ from arbiter.adapters.base import InferenceError, LoadError
 from arbiter.adapters.minimax_h3_local import (
     H3_BASE_REPO,
     H3_FPS,
-    H3_MAX_SECONDS,
-    H3_MIN_SECONDS,
     H3_SNAPSHOT_DIR,
     H3_TEXT_ENCODER_FP_MODULES,
     H3_TRANSFORMER_FP_MODULES,
@@ -54,11 +52,23 @@ FASTH3_REPO = "FastVideo/FastVideo-Minimax-FastH3-Preview-v0.2"
 FASTH3_SNAPSHOT_DIR = Path("/mnt/t9/models/fasth3-nvfp4-fl2va")
 FASTH3_STEPS = 4
 FASTH3_DMD_STEPS = (999, 749, 500, 250)
+FASTH3_DURATION_SECONDS = 5
+FASTH3_WIDTH = 1344
+FASTH3_HEIGHT = 768
 
 
 def fasth3_timesteps() -> list[int]:
     """Return the four trained points on FastH3's shared 1000-step clock."""
     return list(FASTH3_DMD_STEPS)
+
+
+def fasth3_shifted_sigmas(shift: float) -> list[float]:
+    """Return the trained ladder after one scheduler-specific RF shift."""
+    if shift <= 0:
+        raise ValueError(f"shift must be positive, got {shift}")
+    base_sigmas = [step / 1000.0 for step in FASTH3_DMD_STEPS]
+    shifted = [shift * sigma / (1.0 + (shift - 1.0) * sigma) for sigma in base_sigmas]
+    return [*shifted, 0.0]
 
 
 def fasth3_steps(_params: dict | None = None) -> int:
@@ -76,19 +86,20 @@ def _fasth3_snapshot_ready() -> bool:
 def _install_trained_timestep_ladder(pipe) -> None:
     """Force both MiniMax schedulers onto the trained four-forward ladder.
 
-    The upstream block always calls ``set_timesteps(num_inference_steps=N)``.
-    Passing integer timesteps lets each scheduler apply its configured shift
-    and append its own terminal zero exactly once.
+    MiniMaxH3Scheduler accepts explicit sigmas verbatim, without applying its
+    configured shift. Derive each fully formed schedule from its public
+    ``config.shift`` so video and audio retain their distinct noise clocks.
     """
-    timesteps = fasth3_timesteps()
     orig_video = pipe.scheduler.set_timesteps
     orig_audio = pipe.audio_scheduler.set_timesteps
+    video_sigmas = fasth3_shifted_sigmas(float(pipe.scheduler.config.shift))
+    audio_sigmas = fasth3_shifted_sigmas(float(pipe.audio_scheduler.config.shift))
 
     def video_set_timesteps(num_inference_steps=None, device=None, **kwargs):
-        orig_video(device=device, timesteps=timesteps)
+        orig_video(device=device, sigmas=video_sigmas)
 
     def audio_set_timesteps(num_inference_steps=None, device=None, **kwargs):
-        orig_audio(device=device, timesteps=timesteps)
+        orig_audio(device=device, sigmas=audio_sigmas)
 
     pipe.scheduler.set_timesteps = video_set_timesteps
     pipe.audio_scheduler.set_timesteps = audio_set_timesteps
@@ -105,6 +116,20 @@ def reject_keyframe_conditioning(params: dict) -> None:
     if any(params.get(field) for field in keyframe_fields):
         raise InferenceError(
             "FastH3 Preview is T2VA-only and does not support first or last keyframes"
+        )
+
+
+def validate_fasth3_operating_point(params: dict) -> None:
+    """Reject requests outside the preview checkpoint's trained shape."""
+    duration = int(params.get("duration", FASTH3_DURATION_SECONDS))
+    width = int(params.get("width", FASTH3_WIDTH))
+    height = int(params.get("height", FASTH3_HEIGHT))
+    actual = (duration, width, height)
+    expected = (FASTH3_DURATION_SECONDS, FASTH3_WIDTH, FASTH3_HEIGHT)
+    if actual != expected:
+        raise InferenceError(
+            "FastH3 Preview requires duration=5, width=1344, and height=768; "
+            f"got duration={duration}, width={width}, height={height}"
         )
 
 
@@ -126,7 +151,9 @@ class MinimaxFastH3Adapter(MinimaxH3LocalAdapter):
             transformer_ready = (FASTH3_SNAPSHOT_DIR / "transformer").is_dir()
             text_encoder_ready = (H3_SNAPSHOT_DIR / "text_encoder").is_dir()
             if transformer_ready:
-                log.info("FastH3: loading NVFP4 transformer from %s", FASTH3_SNAPSHOT_DIR)
+                log.info(
+                    "FastH3: loading NVFP4 transformer from %s", FASTH3_SNAPSHOT_DIR
+                )
                 transformer = MiniMaxH3Transformer3DModel.from_pretrained(
                     FASTH3_SNAPSHOT_DIR / "transformer",
                     dtype=torch.bfloat16,
@@ -140,7 +167,9 @@ class MinimaxFastH3Adapter(MinimaxH3LocalAdapter):
                     quantization_config=_nvfp4_config(H3_TRANSFORMER_FP_MODULES),
                 )
             if text_encoder_ready:
-                log.info("FastH3: reusing H3 NVFP4 text encoder from %s", H3_SNAPSHOT_DIR)
+                log.info(
+                    "FastH3: reusing H3 NVFP4 text encoder from %s", H3_SNAPSHOT_DIR
+                )
                 text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
                     H3_SNAPSHOT_DIR / "text_encoder",
                     dtype=torch.bfloat16,
@@ -199,14 +228,16 @@ class MinimaxFastH3Adapter(MinimaxH3LocalAdapter):
             )
 
     def infer(self, params: dict, output_dir: Path, cancel_flag) -> dict:
-        """Generate one clip, always on the trained 4-step ladder."""
+        """Generate one clip at the preview checkpoint's trained operating point."""
         reject_keyframe_conditioning(params)
+        validate_fasth3_operating_point(params)
         forced = dict(params)
+        forced["duration"] = FASTH3_DURATION_SECONDS
+        forced["width"] = FASTH3_WIDTH
+        forced["height"] = FASTH3_HEIGHT
         forced["num_inference_steps"] = fasth3_steps(params)
         return super().infer(forced, output_dir, cancel_flag)
 
     def estimate_time(self, params: dict) -> float:
-        """4-step distilled denoise is ~2x the local 8-step H3 estimate."""
-        duration = int(params.get("duration", 6))
-        duration = max(H3_MIN_SECONDS, min(H3_MAX_SECONDS, duration))
-        return snap_frames(duration * H3_FPS) * 1000.0
+        """Estimate one native 124-frame, four-forward preview render."""
+        return snap_frames(FASTH3_DURATION_SECONDS * H3_FPS) * 1000.0
