@@ -18,6 +18,7 @@ _ADAPTER_MODULES = (
     "ltx2",
     "minimax_h3",
     "minimax_h3_local",
+    "minimax_fast_h3",
     "ltx2_encode",
     "ltx2_denoise1",
     "ltx2_denoise2",

@@ -135,6 +135,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "ltx2-encode",
         "ltx25-denoise1",
         "ltx25-encode",
+        "minimax-fast-h3",
         "minimax-h3",
         "minimax-h3-local",
         "moondream",

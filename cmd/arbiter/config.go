@@ -358,6 +358,7 @@ var JobTypeToModel = map[string]string{
 	"lipsync":                 "latentsync",
 	"video-generate":          "ltx2",
 	"video-generate-h3":       "minimax-h3-local",
+	"video-generate-fast-h3":  "minimax-fast-h3",
 	"video-encode":            "ltx2-encode",
 	"video-denoise1":          "ltx2-denoise1",
 	"video-denoise2":          "ltx2-denoise2",

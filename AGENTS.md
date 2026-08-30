@@ -45,14 +45,17 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   uninterruptible database/filesystem I/O. The Spark deploy must wait for the
   old listener to disappear after `auto stop`; auto's ten-second reclaim window
   is shorter than this observed kernel cleanup and an immediate start can fail.
-- MiniMax H3 cloud and local are different adapters. Restoring the cloud
-  client (`minimax_h3.py`, `model_id="minimax-h3"`) over the local GPU
-  module made workers started as `minimax-h3-local` die with `Unknown model`
-  and trip the load circuit-breaker. Keep `minimax_h3.py` and
-  `minimax_h3_local.py` as separate registrations, keep both
-  `config/spark/minimax-h3*.model.json` files, and merge the local config
-  without dropping a live `worker_cmd`. Registry tests must assert both ids
-  stay registered after a cloud restore.
+- MiniMax H3 cloud, local, and FastH3 are different adapters. Restoring the
+  cloud client (`minimax_h3.py`, `model_id="minimax-h3"`) over a GPU module
+  made workers started as `minimax-h3-local` die with `Unknown model` and
+  trip the load circuit-breaker. Keep `minimax_h3.py`, `minimax_h3_local.py`,
+  and `minimax_fast_h3.py` as separate registrations, keep the
+  `config/spark/minimax-h3*.model.json` and `minimax-fast-h3.model.json`
+  files, and merge local config without dropping a live `worker_cmd`.
+  Registry tests must assert cloud, local, and FastH3 ids stay registered
+  after a cloud restore. FastH3 is 4-step only (`video-generate-fast-h3` /
+  `minimax-fast-h3`); it reuses the H3 NVFP4 text encoder and the
+  `minimax-h3` venv.
 
 ## Live model registration
 

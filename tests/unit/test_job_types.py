@@ -71,6 +71,21 @@ def test_minimax_h3_local_job_type_registered():
     assert params.first_image_file == "/shared/first.jpg"
     assert params.last_image_file == "/shared/last.jpg"
 
+
+
+def test_minimax_fast_h3_job_type_registered():
+    from arbiter.schemas import VideoGenerateH3Params
+
+    assert JOB_TYPE_TO_MODEL["video-generate-fast-h3"] == "minimax-fast-h3"
+    params = VideoGenerateH3Params(
+        prompt="Corinne and Arlene try pickleball",
+        duration=5,
+        num_inference_steps=4,
+    )
+    assert params.duration == 5
+    assert params.num_inference_steps == 4
+
+
 def test_music_generate_job_type_registered():
     from arbiter.schemas import MusicGenerateParams
 

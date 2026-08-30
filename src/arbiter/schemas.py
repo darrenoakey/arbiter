@@ -27,6 +27,7 @@ class JobType(str, Enum):
     LIPSYNC = "lipsync"
     VIDEO_GENERATE = "video-generate"
     VIDEO_GENERATE_H3 = "video-generate-h3"
+    VIDEO_GENERATE_FAST_H3 = "video-generate-fast-h3"
     LTX25_ENCODE = "ltx25-encode"
     LTX25_DENOISE1 = "ltx25-denoise1"
     AESTHETIC_SCORE = "aesthetic-score"
@@ -57,6 +58,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "lipsync": "latentsync",
     "video-generate": "ltx2",
     "video-generate-h3": "minimax-h3-local",
+    "video-generate-fast-h3": "minimax-fast-h3",
     "ltx25-encode": "ltx25-encode",
     "ltx25-denoise1": "ltx25-denoise1",
     "aesthetic-score": "aesthetic-scorer",
@@ -410,6 +412,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "aesthetic-score": AestheticScoreParams,
     "tts-voxtral": TTSVoxtralParams,
     "video-generate-h3": VideoGenerateH3Params,
+    "video-generate-fast-h3": VideoGenerateH3Params,
     "lora-train": LoraTrainParams,
     "embed-text": EmbedTextParams,
     "demucs": DemucsParams,

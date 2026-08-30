@@ -1,0 +1,17 @@
+{
+  "memory_gb": 80,
+  "max_concurrent": 1,
+  "max_instances": 1,
+  "keep_alive_seconds": 1800,
+  "max_runtime_seconds": 7200,
+  "avg_inference_ms": 120000,
+  "load_ms": 600000,
+  "pressure_index": 1,
+  "group": true,
+  "worker_cmd": [
+    "/home/darren/src/arbiter/venvs/minimax-h3/bin/python",
+    "-m",
+    "arbiter.worker_main",
+    "minimax-fast-h3"
+  ]
+}
