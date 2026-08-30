@@ -242,30 +242,30 @@ func TestLoadConfigAllowsMinimizedObservedProductionConfig(t *testing.T) {
 	}
 }
 
-func TestLoadConfigAllowsLaptopQwenDense27b38(t *testing.T) {
+func TestLoadConfigAllowsBoringstackOllamaQwenDense27b36(t *testing.T) {
 	root := t.TempDir()
 	models := map[string]ModelConfig{
 		"llm:qwen3.6-27b": {
-			MemoryGB:      20,
+			MemoryGB:      30,
 			MaxRuntimeSec: 3600,
 			KeepAliveSec:  3600,
 			Placements:    []string{"boringstack"},
 			AdapterParams: map[string]string{
-				"remote_model_tag": "mlx-community/Qwen3.8-27B-4bit",
+				"remote_model_tag": "qwen3.6:27b-mtp-q8_0",
 			},
 		},
 	}
 	writeModelConfigFixture(t, root, models)
 	config, err := LoadConfig(root)
 	if err != nil {
-		t.Fatalf("load laptop qwen 27b 3.8 config: %v", err)
+		t.Fatalf("load boringstack Ollama qwen 27b 3.6 config: %v", err)
 	}
 	model, ok := config.Models["llm:qwen3.6-27b"]
 	if !ok {
-		t.Fatal("laptop qwen 27b 3.8 config was omitted by startup policy")
+		t.Fatal("boringstack Ollama qwen 27b 3.6 config was omitted by startup policy")
 	}
-	if got := model.AdapterParams["remote_model_tag"]; got != "mlx-community/Qwen3.8-27B-4bit" {
-		t.Fatalf("remote_model_tag = %s, want mlx-community/Qwen3.8-27B-4bit", got)
+	if got := model.AdapterParams["remote_model_tag"]; got != "qwen3.6:27b-mtp-q8_0" {
+		t.Fatalf("remote_model_tag = %s, want qwen3.6:27b-mtp-q8_0", got)
 	}
 }
 

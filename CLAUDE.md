@@ -280,12 +280,12 @@ auto log arbiter           # View logs
 Arbiter can offload a model to a remote executor (Apple Silicon Mac running ollama/MLX) while staying the sole front door. spark remains the only queue/brain; clients always hit spark:8400. Config (top-level `hosts` map + per-model `placements`) lives in `local/config.json`:
 
 ```json
-"hosts": { "boringstack": {"addr":"http://10.0.0.42:8480","kind":"nativ","budget_gb":96} },
-"models": { "llm:gemma4-26b": {
-  "placements": ["boringstack","darrens-mbp","spark"],
+"hosts": { "boringstack": {"addr":"http://10.0.0.42:11435","kind":"mlx","budget_gb":96} },
+"models": { "llm:qwen3.6-27b": {
+  "placements": ["boringstack"],
   "remote_enabled": true,
-  "adapter_params": {"remote_model_tag": "gemma4-26b-32k"},
-  "max_concurrent": 1
+  "adapter_params": {"remote_model_tag": "qwen3.6:27b-mtp-q8_0"},
+  "max_concurrent": 2
 }}
 ```
 
@@ -297,8 +297,8 @@ Arbiter can offload a model to a remote executor (Apple Silicon Mac running olla
 - **Kill-switches (instant, one curl, work even if the host is down).** Per-model `PATCH /v1/models/{id} {"remote_enabled":false}` pins that model to spark + drains in-flight remote jobs; global `PATCH /v1/remote {"enabled":false}` does it fleet-wide. Both persist (`SaveModelConfig`/`PatchRemoteDisabled`).
 - **Remote-servable models are NOT gated by spark-local VRAM/load-CB.** `getFullModels` computes `remoteServable = RemoteAllowedFor(model) && ModelHasReachableRemoteCapacity(model)` and skips BOTH the local VRAM-feasibility gate AND the load circuit-breaker for such a model — otherwise spark GPU pressure (e.g. ltx2 holding 56GB) starves/freezes/fails a model that actually runs on a remote box. A VRAM-insufficiency load failure (incl. the `waitForInProgressLoad` race-loser path via `Instance.lastLoadInsufficientMem`) requeues, never counts toward `maxLoadAttempts`. When the remote is absent or kill-switched, both gates apply normally (job falls back to spark, which must fit).
 - **gemma fallback caveat:** spark gemma declares `memory_gb=90` and cannot load while ltx2 holds the GPU. With both Macs absent + spark ltx2-saturated, a gemma job legitimately QUEUES (not fails) until spark frees up. The intended fast fallback is a second Mac (darrens-mbp). gemma uses plain MLX `gemma4-26b-32k` (NO MTP — benchmarked slower at batch=1) and is a reasoning model: low `max_tokens` → empty `content` + `finish_reason:length`; pass generous `max_tokens` (≥256).
-- **Remote-ONLY models are valid (no spark placement).** `llm:qwen3.6-35b` (added 2026-07-04) has `placements: ["boringstack","darrens-mbp"]` with NO `"spark"` — `setupInstances` only creates instances for listed placements, so no `worker_cmd`/weights are needed on spark. `remote_model_tag: "mlx-community/Qwen3.6-35B-A3B-4bit"` served by Nativ on both Macs, `memory_gb: 24` (advisory-only for remote), `pressure_index: 0` (holds zero spark VRAM/bandwidth). Caveat vs gemma: with both Macs absent there is NO spark fallback — jobs queue until a Mac returns. Like gemma it is a reasoning model: pass generous `max_tokens` (≥256) or reasoning eats the budget and `content` comes back empty.
-- **Nativ hosts are ollama-free (2026-08-21).** Both Mac chat hosts run NativServerKit (`nativ_server`, standard port **8480**) and nothing else: ollama was uninstalled from boringstack (it is either-or with Nativ on a box) and the `ollama_addr` keys were dropped from `hosts`. The current Nativ generation natively enforces `response_format` (json_object AND json_schema) at token level, so `buildChatRequest` passes it through for every backend kind; the pre-8480 generation hard-500'd on the field and needed the (now removed) nativ strip. The macmini `mlx` host (`10.0.0.46:11435`) remains the one ollama chat/embed box.
+- **Remote-ONLY models are valid (no spark placement).** `llm:qwen3.6-27b` has `placements: ["boringstack"]` with NO `"spark"` — `setupInstances` creates only the remote instance, so no `worker_cmd` or weights are needed on spark. `remote_model_tag: "qwen3.6:27b-mtp-q8_0"` is the official Ollama Q8 MTP build on the 128 GB M5 Max, `memory_gb: 30` is advisory-only for the remote host, and `pressure_index: 0` holds zero spark VRAM/bandwidth. If boringstack is absent there is no fallback: jobs queue until it returns. It is a reasoning model, so callers must allow enough completion tokens for reasoning plus final content.
+- **The Mac chat fleet is intentionally mixed (2026-08-30).** Boringstack runs Ollama through the LAN proxy at `10.0.0.42:11435` (`kind: "mlx"`); Nativ and its dedicated model repository were removed from that machine. `darrens-mbp` remains a Nativ host for models whose MLX-community tags have not migrated, and macmini remains the Ollama chat/embed host at `10.0.0.46:11435`. Never place a Nativ-only MLX-community tag on boringstack: Ollama requires an installed Ollama tag. Ollama host liveness uses `/api/version` and loaded-model discovery uses `/api/ps`.
 - **Embeddings must be numerically equivalent across placements.** `embed-text` uses `nomic-embed-text:latest` GGUF F16 on macmini, and `nomic-ai/nomic-embed-text-v1.5` F16 on spark (`placements: ["macmini","spark"]` — boringstack left the embed pool when its ollama was removed). The remote request enforces 8192 context, task prefixes (`search_document`, `search_query`, `classification`, or `clustering`), Ollama mean-pooling/L2 normalization, 768 dimensions, finite values, and exact response ordering. A wrong remote model tag fails as a job error instead of silently mixing vector spaces. Verified same-text remote versus spark cosine similarity: 0.99999924.
 - See memory [[multimachine-arbiter-project]] / [[multimachine-impl-spec]] / [[fleet-topology]] for the full design + per-phase history.
 
