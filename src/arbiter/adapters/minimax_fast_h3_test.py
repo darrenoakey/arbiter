@@ -6,6 +6,8 @@ import inspect
 import json
 from pathlib import Path
 
+import pytest
+
 import arbiter.adapters  # noqa: F401 - imports the complete built-in registry
 from arbiter.adapters.minimax_fast_h3 import MinimaxFastH3Adapter
 from arbiter.adapters.minimax_h3_local import MinimaxH3LocalAdapter
@@ -120,3 +122,21 @@ def test_fasth3_snapshot_failure_does_not_raise(tmp_path, monkeypatch) -> None:
     adapter = MinimaxFastH3Adapter()
     adapter._write_nvfp4_snapshot(_SavableModel(fail=True), _SavableModel())
     assert not (tmp_path / "transformer").exists()
+
+
+def test_fasth3_requires_both_first_and_last_keyframes() -> None:
+    from arbiter.adapters.base import InferenceError
+    from arbiter.adapters import minimax_fast_h3 as fast
+
+    with pytest.raises(InferenceError, match="first and last keyframes"):
+        fast.require_first_and_last_keyframes({"prompt": "x"})
+    with pytest.raises(InferenceError, match="first and last keyframes"):
+        fast.require_first_and_last_keyframes({"first_image_file": "/tmp/a.jpg"})
+    with pytest.raises(InferenceError, match="first and last keyframes"):
+        fast.require_first_and_last_keyframes({"last_image_b64": "xxxx"})
+    fast.require_first_and_last_keyframes(
+        {"first_image_file": "/tmp/a.jpg", "last_image_file": "/tmp/b.jpg"}
+    )
+    fast.require_first_and_last_keyframes(
+        {"first_image_b64": "aaaa", "last_image_b64": "bbbb"}
+    )

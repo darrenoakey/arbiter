@@ -4,6 +4,12 @@ FastH3 is FastVideo's 4-step DMD2 distillation of MiniMax-H3. Same fl2va
 modular pipeline, VAE, tokenizer, and Qwen3-VL text encoder as
 minimax-h3-local; only the denoiser transformer is the distilled student.
 
+The published FastH3 card is T2VA-only; FL2VA is not distilled. This adapter
+still requires both first and last keyframes and runs the shared H3 fl2va
+workflow — music-video clips are unusable without that conditioning. Audio-in
+(driving a clip from an existing soundtrack) is not supported; FastH3 emits
+its own audio and the music-video lane muxes the authoritative Suno track.
+
 The published FastH3 card is explicit that `num_inference_steps=4` is the
 wrong call: MiniMaxH3SetTimestepsStep then builds a native 4-point sigma
 grid and runs 3 forwards, not the 4 trained jump points. This adapter
@@ -16,7 +22,8 @@ The NVFP4 text-encoder snapshot is reused from minimax-h3-local
 quantized once and snapshotted under `/mnt/t9/models/fasth3-nvfp4-fl2va`.
 
 Expected params dict matches VideoGenerateH3Params. `num_inference_steps` is
-accepted then ignored — FastH3 is 4-step only.
+accepted then ignored — FastH3 is 4-step only. Missing first or last
+keyframe is an InferenceError.
 """
 
 from __future__ import annotations
@@ -25,7 +32,7 @@ import logging
 import shutil
 from pathlib import Path
 
-from arbiter.adapters.base import LoadError
+from arbiter.adapters.base import InferenceError, LoadError
 from arbiter.adapters.minimax_h3_local import (
     H3_BASE_REPO,
     H3_FPS,
@@ -94,6 +101,22 @@ def _install_trained_sigma_ladder(pipe) -> None:
 
     pipe.scheduler.set_timesteps = video_set_timesteps
     pipe.audio_scheduler.set_timesteps = audio_set_timesteps
+
+
+def require_first_and_last_keyframes(params: dict) -> None:
+    """Fail closed unless both first and last keyframes are present.
+
+    FastH3 Preview is distilled for T2VA only. The music-video lane still
+    cannot use a clip without first/last conditioning, so this adapter
+    refuses to generate rather than silently dropping to text-only.
+    """
+    first = params.get("first_image_file") or params.get("first_image_b64")
+    last = params.get("last_image_file") or params.get("last_image_b64")
+    if not first or not last:
+        raise InferenceError(
+            "FastH3 requires both first and last keyframes "
+            "(first_image_file/first_image_b64 and last_image_file/last_image_b64)"
+        )
 
 
 @register
@@ -188,6 +211,7 @@ class MinimaxFastH3Adapter(MinimaxH3LocalAdapter):
 
     def infer(self, params: dict, output_dir: Path, cancel_flag) -> dict:
         """Generate one clip, always on the trained 4-step ladder."""
+        require_first_and_last_keyframes(params)
         forced = dict(params)
         forced["num_inference_steps"] = fasth3_steps(params)
         return super().infer(forced, output_dir, cancel_flag)
