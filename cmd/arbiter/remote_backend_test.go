@@ -623,7 +623,7 @@ func TestPickInstanceForJobSpillsFromBusyLocalToRemote(t *testing.T) {
 				MemoryGB: 80, MaxConcurrent: 1, MaxInstances: intPtr(1),
 				PressureIndex: pi(),
 			},
-			"llm:gemma4-26b": {
+			"llm:chat-spill-test": {
 				MemoryGB: 10, MaxConcurrent: 1, MaxInstances: intPtr(1),
 				PressureIndex: pi(),
 				Placements:    []string{"spark", "boringstack", "darrens-mbp"},
@@ -638,7 +638,7 @@ func TestPickInstanceForJobSpillsFromBusyLocalToRemote(t *testing.T) {
 	blocker := mgr.GetModelInstances("ltx2-dev-denoise1")[0]
 	atomic.AddInt32(&blocker.activeJobs, 1)
 
-	job := &Job{ID: "j1", ModelID: "llm:gemma4-26b", State: "queued"}
+	job := &Job{ID: "j1", ModelID: "llm:chat-spill-test", State: "queued"}
 	got, reason := mgr.PickInstanceForJobWithReason(job, true)
 	if got == nil || got.host != "boringstack" {
 		t.Fatalf("spark-busy pick host=%v, want boringstack", hostOf(got))
@@ -649,7 +649,7 @@ func TestPickInstanceForJobSpillsFromBusyLocalToRemote(t *testing.T) {
 
 	atomic.AddInt32(&got.activeJobs, 1)
 	got.setState("loaded")
-	got2, reason2 := mgr.PickInstanceForJobWithReason(&Job{ID: "j2", ModelID: "llm:gemma4-26b", State: "queued"}, true)
+	got2, reason2 := mgr.PickInstanceForJobWithReason(&Job{ID: "j2", ModelID: "llm:chat-spill-test", State: "queued"}, true)
 	if got2 == nil || got2.host != "darrens-mbp" {
 		t.Fatalf("boringstack-full pick host=%v, want darrens-mbp", hostOf(got2))
 	}
@@ -659,7 +659,7 @@ func TestPickInstanceForJobSpillsFromBusyLocalToRemote(t *testing.T) {
 
 	atomic.AddInt32(&got2.activeJobs, 1)
 	got2.setState("loaded")
-	got3, reason3 := mgr.PickInstanceForJobWithReason(&Job{ID: "j3", ModelID: "llm:gemma4-26b", State: "queued"}, true)
+	got3, reason3 := mgr.PickInstanceForJobWithReason(&Job{ID: "j3", ModelID: "llm:chat-spill-test", State: "queued"}, true)
 	if got3 == nil || got3.host != "spark" {
 		t.Fatalf("all-remotes-full pick host=%v, want spark fallback", hostOf(got3))
 	}

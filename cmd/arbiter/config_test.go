@@ -201,7 +201,7 @@ func TestHostsAndPlacementsParse(t *testing.T) {
 			"boringstack": {"addr": "10.0.0.42:11434", "kind": "mlx", "budget_gb": 96}
 		},
 		"models": {
-			"gemma4-26b": {
+			"qwen3.6-27b": {
 				"memory_gb": 20,
 				"placements": ["boringstack", "spark"],
 				"remote_enabled": false
@@ -223,7 +223,7 @@ func TestHostsAndPlacementsParse(t *testing.T) {
 		t.Fatalf("spark / empty should be local")
 	}
 
-	m := cfg.Models["gemma4-26b"]
+	m := cfg.Models["qwen3.6-27b"]
 	if got := m.PlacementsOrDefault(); len(got) != 2 || got[0] != "boringstack" || got[1] != "spark" {
 		t.Fatalf("placements = %v, want [boringstack spark]", got)
 	}
@@ -251,7 +251,7 @@ func TestRemoteInstanceExcludedFromUsedGB(t *testing.T) {
 	}
 
 	// A remote instance reserves nothing locally.
-	remote := NewInstance("gemma4-26b", "gemma4-26b", 1, 20, "python3", ".")
+	remote := NewInstance("qwen3.6-27b", "qwen3.6-27b", 1, 20, "python3", ".")
 	remote.host = "boringstack"
 	if !remote.isRemote() {
 		t.Fatalf("expected remote instance")

@@ -60,10 +60,7 @@ var torchWorkerAdapterParams = map[string]adapterValueValidator{
 }
 
 var vllmLegacyTuningByModel = map[string]string{
-	"llm:gemma4-26b":       `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}`,
-	"llm:gemma4-26b-mtp":   `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}`,
-	"llm:gemma4-26b-plain": `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager`,
-	"llm:qwen3.6-35b":      `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager --enable-auto-tool-choice --tool-call-parser hermes`,
+	"llm:qwen3.6-35b": `--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager --enable-auto-tool-choice --tool-call-parser hermes`,
 }
 
 // The qwen memory-budget transition promotes the combined admission/KV limit

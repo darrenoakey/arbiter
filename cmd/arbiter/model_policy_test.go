@@ -212,18 +212,6 @@ func TestLoadConfigAllowsMinimizedObservedProductionConfig(t *testing.T) {
 		"tts-voxtral": productionRepositoryConfig(root, "vllm-worker", map[string]string{
 			"VLLM_MODE": "tts", "VLLM_MODEL": "mistralai/Voxtral-4B-TTS-2603",
 		}),
-		"llm:gemma4-26b": productionRepositoryConfig(root, "vllm-chat-worker", map[string]string{
-			"LLM_BACKEND": "vllm", "LLM_CTX_SIZE": "8192", "VLLM_MODEL": "RedHatAI/gemma-4-26B-A4B-it-NVFP4",
-			"VLLM_EXTRA_ARGS": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {\"method\":\"mtp\",\"model\":\"google/gemma-4-26B-A4B-it-assistant\",\"num_speculative_tokens\":4}",
-		}),
-		"llm:gemma4-26b-plain": productionRepositoryConfig(root, "vllm-chat-worker", map[string]string{
-			"LLM_BACKEND": "vllm", "LLM_CTX_SIZE": "8192", "VLLM_MODEL": "RedHatAI/gemma-4-26B-A4B-it-NVFP4",
-			"VLLM_EXTRA_ARGS": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager",
-		}),
-		"llm:gemma4-26b-mtp": productionRepositoryConfig(root, "vllm-chat-worker", map[string]string{
-			"LLM_BACKEND": "vllm", "LLM_CTX_SIZE": "8192", "VLLM_MODEL": "RedHatAI/gemma-4-26B-A4B-it-NVFP4",
-			"VLLM_EXTRA_ARGS": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {\"method\":\"mtp\",\"model\":\"google/gemma-4-26B-A4B-it-assistant\",\"num_speculative_tokens\":4}",
-		}),
 		"llm:qwen3.6-35b": productionRepositoryConfig(root, "vllm-chat-worker", map[string]string{
 			"LLM_BACKEND": "vllm", "LLM_CTX_SIZE": "8192", "VLLM_MODEL": "RedHatAI/Qwen3.6-35B-A3B-NVFP4",
 			"VLLM_EXTRA_ARGS": "--max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager",

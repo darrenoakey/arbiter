@@ -161,7 +161,7 @@ const (
 	defaultRemoteLoadTimeout  = 5 * time.Minute
 	defaultRemoteInferTimeout = 30 * time.Minute
 	// remoteMaxTokensDefault is the generous completion budget injected when a
-	// caller didn't set one. Reasoning models (gemma4) split output into hidden
+	// caller didn't set one. Reasoning models split output into hidden
 	// reasoning + visible content; a small budget lets reasoning eat it all,
 	// leaving content empty with finish_reason:length. 4096 keeps content
 	// populated for normal chat/summary/planning replies.
@@ -729,7 +729,7 @@ func validateRemoteEmbeddings(embeddings [][]float64) error {
 
 // mapChatBodyToResult converts a raw OpenAI chat-completion response body into
 // the arbiter chat result shape. Critically it maps message.content (NOT the
-// reasoning) into the "text" field; gemma4 splits output into message.content +
+// reasoning) into the "text" field; reasoning models split output into message.content +
 // message.reasoning, and clients want the answer, not the chain of thought. If
 // content is empty but reasoning is present (small-budget edge case) it falls
 // back to reasoning so the client gets *something* and a reasoning flag.

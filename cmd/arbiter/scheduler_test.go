@@ -768,10 +768,10 @@ func TestGetFullModelsBypassesVRAMForReachableRemote(t *testing.T) {
 		Models: map[string]ModelConfig{
 			// moondream holds 80GB → only 20GB free locally while it runs.
 			"moondream": {MemoryGB: 80, MaxConcurrent: 1, MaxInstances: intPtr(1), PressureIndex: &pi},
-			// gemma "needs" 90GB locally but is placed on boringstack first, spark
+			// remote-chat "needs" 90GB locally but is placed on boringstack first, spark
 			// last. It can never fit in 20GB free — but it must NOT be marked full
 			// because boringstack is reachable and serves it for zero spark VRAM.
-			"gemma": {
+			"remote-chat": {
 				MemoryGB: 90, MaxConcurrent: 1, MaxInstances: intPtr(1),
 				PressureIndex: &pi,
 				Placements:    []string{"boringstack", "spark"},
@@ -792,50 +792,50 @@ func TestGetFullModelsBypassesVRAMForReachableRemote(t *testing.T) {
 	atomic.AddInt32(&blockerInst.activeJobs, 1)
 
 	full := sched.getFullModels("")
-	if full["gemma"] {
-		t.Fatalf("gemma must NOT be VRAM-full while boringstack is reachable (it offloads, 0 spark VRAM); free=%.0f", mgr.FreeGB())
+	if full["remote-chat"] {
+		t.Fatalf("remote-chat must NOT be VRAM-full while boringstack is reachable (it offloads, 0 spark VRAM); free=%.0f", mgr.FreeGB())
 	}
 
 	// Make boringstack unreachable → no remote capacity → gemma is now gated by
 	// local VRAM (90GB can't fit in 20GB free), so it IS full.
 	mgr.SetReachabilityFunc(func(string) bool { return false })
 	full = sched.getFullModels("")
-	if !full["gemma"] {
-		t.Fatal("gemma must be VRAM-full once boringstack is unreachable (falls back to spark, which can't fit it)")
+	if !full["remote-chat"] {
+		t.Fatal("remote-chat must be VRAM-full once boringstack is unreachable (falls back to spark, which can't fit it)")
 	}
 
 	// Reachable again, but kill-switch disables remote for gemma → must be gated
 	// on local VRAM (pins to spark) and therefore full.
 	mgr.SetReachabilityFunc(func(string) bool { return true })
-	gemmaCfg := cfg.Models["gemma"]
+	remoteChatCfg := cfg.Models["remote-chat"]
 	disabled := false
-	gemmaCfg.RemoteEnabled = &disabled
-	cfg.Models["gemma"] = gemmaCfg
+	remoteChatCfg.RemoteEnabled = &disabled
+	cfg.Models["remote-chat"] = remoteChatCfg
 	full = sched.getFullModels("")
-	if !full["gemma"] {
-		t.Fatal("gemma must be VRAM-full when remote is kill-switched off (pins to spark, can't fit)")
+	if !full["remote-chat"] {
+		t.Fatal("remote-chat must be VRAM-full when remote is kill-switched off (pins to spark, can't fit)")
 	}
 
 	// Re-enable remote, reachable. Now trip the LOAD circuit-breaker (simulating
 	// repeated spark-local gemma load failures). A remote-servable model must NOT
 	// be frozen by the spark-local breaker — boringstack can serve.
-	gemmaCfg.RemoteEnabled = nil // default true
-	cfg.Models["gemma"] = gemmaCfg
+	remoteChatCfg.RemoteEnabled = nil // default true
+	cfg.Models["remote-chat"] = remoteChatCfg
 	for i := 0; i < 5; i++ {
-		sched.RecordLoadFailure("gemma")
+		sched.RecordLoadFailure("remote-chat")
 	}
-	if paused, _ := sched.IsModelLoadPaused("gemma"); !paused {
+	if paused, _ := sched.IsModelLoadPaused("remote-chat"); !paused {
 		t.Fatal("precondition: load circuit-breaker should be active after repeated failures")
 	}
 	full = sched.getFullModels("")
-	if full["gemma"] {
-		t.Fatal("gemma must NOT be full while load-CB is active but boringstack is reachable (remote needs no local load)")
+	if full["remote-chat"] {
+		t.Fatal("remote-chat must NOT be full while load-CB is active but boringstack is reachable (remote needs no local load)")
 	}
 	// With boringstack unreachable, the load-CB pause applies normally.
 	mgr.SetReachabilityFunc(func(string) bool { return false })
 	full = sched.getFullModels("")
-	if !full["gemma"] {
-		t.Fatal("gemma must be full when load-CB is active AND no reachable remote (local-only, paused)")
+	if !full["remote-chat"] {
+		t.Fatal("remote-chat must be full when load-CB is active AND no reachable remote (local-only, paused)")
 	}
 }
 

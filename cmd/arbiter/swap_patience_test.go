@@ -100,9 +100,9 @@ func TestCanEvictForSwap(t *testing.T) {
 	cfg := &Config{
 		VRAMBudgetGB: 100,
 		Models: map[string]ModelConfig{
-			"denoise": {MemoryGB: 56, LoadMs: 420000, AvgInferenceMs: 120000}, // 7-min load
-			"gemma":   {MemoryGB: 46, LoadMs: 120000, AvgInferenceMs: 5000},
-			"nocost":  {MemoryGB: 10}, // no LoadMs configured -> 60s floor
+			"denoise":    {MemoryGB: 56, LoadMs: 420000, AvgInferenceMs: 120000}, // 7-min load
+			"challenger": {MemoryGB: 46, LoadMs: 120000, AvgInferenceMs: 5000},
+			"nocost":     {MemoryGB: 10}, // no LoadMs configured -> 60s floor
 		},
 	}
 	logger := NewEventLogger(filepath.Join(dir, "logs"))
@@ -113,7 +113,7 @@ func TestCanEvictForSwap(t *testing.T) {
 	payload := json.RawMessage(`{}`)
 
 	// Victim with no pending work: always evictable.
-	if !sched.canEvictForSwap("denoise", "gemma") {
+	if !sched.canEvictForSwap("denoise", "challenger") {
 		t.Fatal("victim with empty queue must be evictable")
 	}
 
@@ -122,30 +122,30 @@ func TestCanEvictForSwap(t *testing.T) {
 	if _, err := store.CreateJob("denoise", "video-denoise2", payload, 1); err != nil {
 		t.Fatalf("create denoise job: %v", err)
 	}
-	if _, err := store.CreateJob("gemma", "chat-completion", payload, 1); err != nil {
-		t.Fatalf("create gemma job: %v", err)
+	if _, err := store.CreateJob("challenger", "chat-completion", payload, 1); err != nil {
+		t.Fatalf("create challenger job: %v", err)
 	}
-	if sched.canEvictForSwap("denoise", "gemma") {
+	if sched.canEvictForSwap("denoise", "challenger") {
 		t.Fatal("young challenger must NOT evict a victim with queued work")
 	}
 
 	// Backdate the challenger's job past load_ms * patience (7min*2=840s):
 	// guard must release.
 	if _, err := store.db.Exec(
-		"UPDATE jobs SET created_at = created_at - 900 WHERE model_id = 'gemma'"); err != nil {
-		t.Fatalf("backdate gemma job: %v", err)
+		"UPDATE jobs SET created_at = created_at - 900 WHERE model_id = 'challenger'"); err != nil {
+		t.Fatalf("backdate challenger job: %v", err)
 	}
-	if !sched.canEvictForSwap("denoise", "gemma") {
+	if !sched.canEvictForSwap("denoise", "challenger") {
 		t.Fatal("starved challenger (900s wait > 840s threshold) must be allowed to evict")
 	}
 
 	// Negative patience disables the guard entirely.
 	if _, err := store.db.Exec(
-		"UPDATE jobs SET created_at = created_at + 900 WHERE model_id = 'gemma'"); err != nil {
-		t.Fatalf("restore gemma job age: %v", err)
+		"UPDATE jobs SET created_at = created_at + 900 WHERE model_id = 'challenger'"); err != nil {
+		t.Fatalf("restore challenger job age: %v", err)
 	}
 	cfg.SwapPatience = -1
-	if !sched.canEvictForSwap("denoise", "gemma") {
+	if !sched.canEvictForSwap("denoise", "challenger") {
 		t.Fatal("negative swap_patience must disable the guard")
 	}
 	cfg.SwapPatience = 0 // back to default 2.0
@@ -155,14 +155,14 @@ func TestCanEvictForSwap(t *testing.T) {
 	if _, err := store.CreateJob("nocost", "embed-text", payload, 1); err != nil {
 		t.Fatalf("create nocost job: %v", err)
 	}
-	if sched.canEvictForSwap("nocost", "gemma") {
+	if sched.canEvictForSwap("nocost", "challenger") {
 		t.Fatal("fresh challenger must not evict nocost victim (60s floor * 2)")
 	}
 	if _, err := store.db.Exec(
-		"UPDATE jobs SET created_at = created_at - 130 WHERE model_id = 'gemma'"); err != nil {
-		t.Fatalf("backdate gemma job: %v", err)
+		"UPDATE jobs SET created_at = created_at - 130 WHERE model_id = 'challenger'"); err != nil {
+		t.Fatalf("backdate challenger job: %v", err)
 	}
-	if !sched.canEvictForSwap("nocost", "gemma") {
+	if !sched.canEvictForSwap("nocost", "challenger") {
 		t.Fatal("130s challenger must clear the 120s floor threshold")
 	}
 }

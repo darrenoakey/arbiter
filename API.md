@@ -791,9 +791,6 @@ tuning normally uses fixed structured keys. `vllm_extra_args` is always
 rejected. `VLLM_EXTRA_ARGS` is accepted only for these exact model/value pairs:
 
 ```text
-llm:gemma4-26b       = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}
-llm:gemma4-26b-mtp   = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager --speculative-config {"method":"mtp","model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":4}
-llm:gemma4-26b-plain = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager
 llm:qwen3.6-35b      = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --kv-cache-memory-bytes 8G --enforce-eager
 llm:qwen3.6-35b      = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.25 --enforce-eager
 llm:qwen3.6-35b      = --max-model-len 32768 --max-num-batched-tokens 32768 --gpu-memory-utilization 0.50 --enforce-eager
