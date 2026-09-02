@@ -1118,6 +1118,36 @@ func (m *InstanceManager) ModelHasReachableRemoteCapacity(modelID string) bool {
 	return false
 }
 
+// hasReachableHigherPreferenceRemote reports whether host is a lower-preference
+// remote placement for modelID and a higher-preference remote placement is
+// currently reachable. When no_remote_spill is true the scheduler will not
+// dispatch jobs to host while that higher-preference remote is reachable, so
+// speculatively warming it would only waste memory on the fallback machine.
+func (m *InstanceManager) hasReachableHigherPreferenceRemote(modelID, host string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	mc, ok := m.config.GetModel(modelID)
+	if !ok {
+		return false
+	}
+	if !mc.NoRemoteSpillOrDefault() {
+		return false
+	}
+	for _, h := range mc.PlacementsOrDefault() {
+		if h == host {
+			return false
+		}
+		if h == LocalHost {
+			continue
+		}
+		if m.hostReachable(h) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *InstanceManager) PickInstance(modelID string) *Instance {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

@@ -136,6 +136,50 @@ func TestPreloadSkipsAbsentRemoteHost(t *testing.T) {
 	}
 }
 
+// Fix 8 regression: with no_remote_spill=true, speculative preload must NOT
+// warm a lower-preference remote placement while a higher-preference remote is
+// reachable. The dispatcher would skip that fallback anyway, so loading it only
+// burns memory on the standby machine.
+func TestPreloadSkipsLowerPreferenceRemoteWithNoRemoteSpill(t *testing.T) {
+	sched, store, mgr := newRemotePlacementScheduler(t)
+	mgr.SetReachabilityFunc(func(string) bool { return true })
+
+	cfg := sched.config
+	mut := cfg.Models["llm:remote-chat"]
+	noRemoteSpill := true
+	mut.NoRemoteSpill = &noRemoteSpill
+	cfg.Models["llm:remote-chat"] = mut
+
+	// Mark h1 (the higher-preference placement) as already loaded so PickInstance
+	// is forced to consider h2 next.
+	var h1 *Instance
+	for _, inst := range mgr.GetModelInstances("llm:remote-chat") {
+		if inst.host == "h1" {
+			h1 = inst
+			break
+		}
+	}
+	if h1 == nil {
+		t.Fatal("h1 placement instance missing")
+	}
+	h1.mu.Lock()
+	h1.state = "loaded"
+	h1.mu.Unlock()
+
+	if _, err := store.CreateJob("llm:remote-chat", "chat-completion", json.RawMessage(`{}`), 1); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	sched.tryPreload()
+	time.Sleep(200 * time.Millisecond) // a buggy preload flips state async
+
+	for _, inst := range mgr.GetModelInstances("llm:remote-chat") {
+		if inst.host == "h2" && inst.State() != "stopped" {
+			t.Fatalf("h2 state = %s, want stopped (no_remote_spill true, h1 reachable)", inst.State())
+		}
+	}
+}
+
 func TestDispatchJobPromotesFollowerWhenWorkerDies(t *testing.T) {
 	projectRoot := t.TempDir()
 	outputDir := filepath.Join(projectRoot, "output")

@@ -1753,6 +1753,13 @@ func (s *Scheduler) tryPreload() {
 		if !inst.isRemote() && s.config.RemoteAllowedFor(modelID) && s.mgr.ModelHasReachableRemoteCapacity(modelID) {
 			continue
 		}
+		// Fix 8: never speculatively warm a lower-preference remote placement
+		// when no_remote_spill is true and a higher-preference remote is
+		// reachable. The dispatcher would skip this host anyway, so warming it
+		// only wastes resources on the fallback machine.
+		if inst.isRemote() && s.mgr.hasReachableHigherPreferenceRemote(modelID, inst.host) {
+			continue
+		}
 		state := inst.State()
 		if state == "loaded" || state == "loading" {
 			continue
