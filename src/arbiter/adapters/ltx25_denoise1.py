@@ -54,6 +54,11 @@ Expected params dict (README "Stage B: ltx25-denoise" contract):
     start_time          : float — chunk start in seconds (audio mux slice offset)
     fps                 : float — output frame rate, default 25.0
     num_inference_steps : int   — stage-1 diffusion steps, default 30
+    a2v_guidance_scale  : float — stage-1 audio-conditioning guidance scale,
+                                  default 3.0; must be >= 1.0 else InferenceError.
+                                  Forwarded verbatim to FastPipeline.run_denoise_gpu
+                                  (ltx25-spark runner; the A/B lever that trades
+                                  mouth fidelity against identity drift).
 
 Output: `result.mp4` written directly into `output_dir` (the file, not the
 directory, per `FastPipeline.save_denoise_output` / `encode_video_nvenc`'s
@@ -146,6 +151,20 @@ class LTX25Denoise1Adapter(GroupAdapter):
     def infer(
         self, params: dict, output_dir: Path, cancel_flag: threading.Event
     ) -> dict:
+        # Validate params BEFORE the loaded-pipeline check so a malformed job
+        # always reports the real defect, never "not loaded".
+        raw_scale = params.get("a2v_guidance_scale", 3.0)
+        try:
+            a2v_guidance_scale = float(raw_scale)
+        except (TypeError, ValueError) as e:
+            raise InferenceError(
+                f"a2v_guidance_scale must be a number, got {raw_scale!r}"
+            ) from e
+        if a2v_guidance_scale < 1.0:
+            raise InferenceError(
+                f"a2v_guidance_scale must be >= 1.0, got {a2v_guidance_scale}"
+            )
+
         if self._pipeline is None:
             raise InferenceError("LTX 2.5 denoise pipeline not loaded")
 
@@ -190,6 +209,7 @@ class LTX25Denoise1Adapter(GroupAdapter):
                 frames_np = self._pipeline.run_denoise_gpu(
                     data,
                     num_inference_steps=num_inference_steps,
+                    a2v_guidance_scale=a2v_guidance_scale,
                     progress_fn=_progress,
                 )
 

@@ -1,0 +1,19 @@
+{
+  "auto_download": "",
+  "avg_inference_ms": 30000,
+  "group": false,
+  "keep_alive_seconds": 120,
+  "load_ms": 3000,
+  "max_concurrent": 1,
+  "max_instances": 1,
+  "max_runtime_seconds": 1800,
+  "memory_gb": 8,
+  "model_path": "",
+  "pressure_index": 0.5,
+  "worker_cmd": [
+    "/home/darren/src/arbiter/venvs/demucs/bin/python",
+    "-m",
+    "arbiter.worker_main",
+    "vocal-stem"
+  ]
+}

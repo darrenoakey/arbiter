@@ -35,6 +35,7 @@ class JobType(str, Enum):
     LORA_TRAIN = "lora-train"
     EMBED_TEXT = "embed-text"
     DEMUCS = "demucs"
+    VOCAL_STEM = "vocal-stem"
     RVC_TRAIN = "rvc-train"
     RVC_CONVERT = "rvc-convert"
     VOICE_FIT = "voice-fit"
@@ -66,6 +67,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "lora-train": "lora-train",
     "embed-text": "embed-text",
     "demucs": "demucs",
+    "vocal-stem": "vocal-stem",
     "rvc-train": "rvc-train",
     "rvc-convert": "rvc-convert",
     "voice-fit": "voice-fit",
@@ -290,6 +292,7 @@ class LTX25Denoise1Params(BaseModel):
     start_time: float = 0.0
     fps: float = 25.0
     num_inference_steps: int = 30
+    a2v_guidance_scale: float = 3.0  # stage-1 audio-conditioning guidance; >= 1.0
 
 
 class AestheticScoreParams(BaseModel):
@@ -337,6 +340,21 @@ class DemucsParams(BaseModel):
     audio: Optional[str] = None  # base64
     audio_file: Optional[str] = None
     return_b64: bool = False  # inline vocals/accompaniment base64 in the result
+    duration: Optional[float] = None  # optional hint for time estimation
+
+
+class VocalStemParams(BaseModel):
+    """vocal-stem: Demucs htdemucs separation + loudness normalization.
+
+    audio_file is REQUIRED — an absolute path on spark's local disk (the
+    renderer stages its master there). Unlike `demucs`, no base64 input:
+    this job exists to normalize the on-disk master, so it operates on the
+    file directly and lands outputs in the job's output_dir.
+    """
+
+    audio_file: str  # absolute path on spark; must exist
+    model: str = "htdemucs"  # the ONLY supported separator; anything else is rejected
+    target_lufs: float = -14.0  # integrated-loudness target for vocals_normalized.wav
     duration: Optional[float] = None  # optional hint for time estimation
 
 
@@ -416,6 +434,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "lora-train": LoraTrainParams,
     "embed-text": EmbedTextParams,
     "demucs": DemucsParams,
+    "vocal-stem": VocalStemParams,
     "rvc-train": RvcTrainParams,
     "voice-fit": VoiceFitParams,
     "rvc-convert": RvcConvertParams,

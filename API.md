@@ -755,7 +755,7 @@ following exact adapter-to-venv mappings:
 |---|---|
 | `aesthetic-scorer` | `venvs/aesthetic` |
 | `birefnet` | `venvs/birefnet` |
-| `demucs` | `venvs/demucs` |
+| `demucs`, `vocal-stem` | `venvs/demucs` |
 | `embed-text` | `venvs/embed` |
 | `insightface` | `venvs/insightface` |
 | `moondream` | `venvs/moondream` |
@@ -1745,6 +1745,105 @@ curl -s http://localhost:8400/v1/jobs/{job_id} | jq -r '.result.data' | base64 -
 
 ---
 
+### 3.13 vocal-stem
+
+Separate an on-disk audio master into its vocal stem and normalize that stem
+to a target integrated loudness with a true-peak ceiling. Used by the
+mv-lipsync renderer's L1 stage; the returned `stats` loudness record is the
+audited pre/post-LUFS evidence for downstream a2v levers.
+
+Unlike `demucs` (base64 in, two stems back for remixing), `vocal-stem`
+operates on an absolute file path on spark local disk and produces exactly one
+normalized stem plus a stats record. The separation model is not negotiable:
+anything but `htdemucs` is rejected.
+
+**Model**: `vocal-stem` (8 GB VRAM; runs in a `venvs/demucs` subprocess)
+
+**Parameters**
+
+| Parameter      | Type   | Required | Default     | Description                                                        |
+|----------------|--------|----------|-------------|--------------------------------------------------------------------|
+| `audio_file`   | string | Yes      | --          | Absolute path to the audio master on spark local disk; must exist  |
+| `model`        | string | No       | `"htdemucs"`| Separation model; only `htdemucs` is supported (anything else fails)|
+| `target_lufs`  | float  | No       | `-14.0`     | Integrated-loudness target for `vocals_normalized.wav`             |
+| `duration`     | float  | No       | null        | Optional hint for time estimation                                  |
+
+**Result Object**
+
+```json
+{
+  "format": "wav",
+  "file": "vocals_normalized.wav",
+  "vocals": "vocals.wav",
+  "normalized": "vocals_normalized.wav",
+  "stats": "stats.json",
+  "samplerate": 44100,
+  "duration_seconds": 183.2,
+  "input_lufs": -22.4,
+  "output_lufs": -14.0,
+  "gain_db": 8.4,
+  "peak_dbtp": -1.0,
+  "model": "htdemucs",
+  "seconds": 183.2
+}
+```
+
+`output_dir` files: `vocals.wav` (raw stem), `vocals_normalized.wav`
+(gain-matched to `target_lufs`, whole-stem ceiling attenuation applied so the
+true peak never exceeds -1 dBTP), and `stats.json`
+(`{input_lufs, output_lufs, gain_db, peak_dbtp, model, seconds}` — real
+measured values, the actual applied gain, never assumed). `input_lufs` is the
+loudness of the extracted vocal stem before normalization; `gain_db` is the
+total applied gain including any ceiling attenuation, so
+`output_lufs == input_lufs + gain_db` always holds.
+
+**Timing Estimates**
+
+| Metric         | Value                          |
+|----------------|--------------------------------|
+| VRAM           | 8 GB                           |
+| Inference      | ~30 s for a 3-minute master    |
+| Ceiling        | if the LUFS gain would push the true peak above -1 dBTP, the whole stem is attenuated to the ceiling and the recorded `output_lufs`/`gain_db` reflect that |
+
+**curl Example**
+
+```bash
+curl -s -X POST http://localhost:8400/v1/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "vocal-stem",
+    "params": {
+      "audio_file": "/home/darren/video-runs/mv-lipsync/chatswood/audio_full.mp3",
+      "target_lufs": -14.0
+    }
+  }'
+
+curl -s http://localhost:8400/v1/jobs/{job_id} | jq '.result.stats'
+```
+
+---
+
+### 3.14 ltx25-denoise1
+
+Stage-1 LTX 2.5 denoise: decode an encoded latent+mux bundle to raw frames
+(`result.mp4` in `output_dir`). Internal pipeline job type used by the
+mv-lipsync renderer; listed here for its tuning parameters.
+
+**Model**: `ltx25` (48 GB VRAM)
+
+**Parameters**
+
+| Parameter             | Type   | Required | Default | Description                                                              |
+|-----------------------|--------|----------|---------|--------------------------------------------------------------------------|
+| `encoded_file`        | string | Yes      | --      | Absolute path to the stage-0 encode bundle on spark local disk           |
+| `audio_file`          | string | Yes      | --      | Absolute path to the audio track on spark local disk                     |
+| `start_time`          | float  | No       | `0.0`   | Chunk start in seconds (audio mux slice offset)                          |
+| `fps`                 | float  | No       | `25.0`  | Output frame rate                                                        |
+| `num_inference_steps` | int    | No       | `30`    | Stage-1 diffusion steps                                                  |
+| `a2v_guidance_scale`  | float  | No       | `3.0`   | Stage-1 audio-conditioning guidance scale; must be `>= 1.0` or the job fails with `InferenceError`. Forwarded verbatim to the ltx25-spark runner's `FastPipeline.run_denoise_gpu` — the A/B lever trading mouth fidelity against identity drift. |
+
+---
+
 ## 4. Client Workflow
 
 ### Typical Polling Pattern
@@ -1955,6 +2054,7 @@ All values are from calibration on NVIDIA Grace Blackwell (128 GB VRAM, 100 GB b
 | `tts-clone`     | 4         | 43 s      | 4 s            | 1              | 300 s      | tts-clone                            |
 | `tts-design`    | 4         | 43 s      | 5 s            | 1              | 300 s      | tts-design                           |
 | `sonic`         | 5         | 11 s      | 45 s           | 1              | 600 s      | talking-head                         |
+| `vocal-stem`    | 8         | 3 s       | ~30 s          | 1              | 120 s      | vocal-stem                           |
 || `ltx2`          | 55        | 30 s      | 120 s          | 1              | 600 s      | video-generate                       |
 || `minimax-h3`    | 0*        | 0 s       | ~2–8 m*        | 1              | 0 s        | video-generate (cloud API)           |
 

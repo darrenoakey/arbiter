@@ -1,4 +1,4 @@
-# Voice pipeline adapters — demucs, rvc-train, rvc-convert
+# Voice pipeline adapters — demucs, vocal-stem, rvc-train, rvc-convert
 
 Backend for host-voice conversion in the multi-character music-video system.
 A Suno cover carries the right beat/structure but a generic voice; RVC v2
@@ -64,6 +64,7 @@ venvs/demucs/bin/pip install torch torchaudio --index-url https://download.pytor
 venvs/demucs/bin/pip install numpy soundfile
 venvs/demucs/bin/pip install --no-deps demucs==4.1.0          # NOTE: --no-deps, see sphn gotcha
 venvs/demucs/bin/pip install dora-search einops julius lameenc openunmix pyyaml tqdm safetensors huggingface-hub
+venvs/demucs/bin/pip install pyloudnorm==0.2.0                # required by the vocal-stem adapter
 echo /home/darren/src/arbiter/src > venvs/demucs/lib/python3.12/site-packages/arbiter.pth
 
 # --- rvc venv (Applio deps, but KEEP the cu130 torch, not Applio's pinned cu128) ---
@@ -85,6 +86,7 @@ cp assets/config_template.json assets/config.json           # REQUIRED, see extr
 
 ```json
 "demucs":      {"memory_gb": 8,  "max_concurrent": 1, "max_instances": 1, "keep_alive_seconds": 120, "max_runtime_seconds": 1800,  "avg_inference_ms": 15000,   "load_ms": 3000, "pressure_index": 0.5, "worker_cmd": ["/home/darren/src/arbiter/venvs/demucs/bin/python", "-m", "arbiter.worker_main", "demucs"]},
+"vocal-stem":  {"memory_gb": 8,  "max_concurrent": 1, "max_instances": 1, "keep_alive_seconds": 120, "max_runtime_seconds": 1800,  "avg_inference_ms": 30000,   "load_ms": 3000, "pressure_index": 0.5, "worker_cmd": ["/home/darren/src/arbiter/venvs/demucs/bin/python", "-m", "arbiter.worker_main", "vocal-stem"]},
 "rvc-train":   {"memory_gb": 20, "max_concurrent": 1, "max_instances": 1, "keep_alive_seconds": 60,  "max_runtime_seconds": 86400, "avg_inference_ms": 1800000, "load_ms": 3000, "pressure_index": 1,   "worker_cmd": ["/home/darren/src/arbiter/venvs/rvc/bin/python", "-m", "arbiter.worker_main", "rvc-train"]},
 "rvc-convert": {"memory_gb": 8,  "max_concurrent": 1, "max_instances": 1, "keep_alive_seconds": 120, "max_runtime_seconds": 1800,  "avg_inference_ms": 30000,   "load_ms": 3000, "pressure_index": 0.5, "worker_cmd": ["/home/darren/src/arbiter/venvs/rvc/bin/python", "-m", "arbiter.worker_main", "rvc-convert"]}
 ```

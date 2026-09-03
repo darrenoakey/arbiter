@@ -90,7 +90,7 @@ def arbiter_health():
 
 
 @pytest.mark.integration
-class TestDemucs:
+class TestRvcConvert:
     def test_two_stem_separation(self, arbiter_health):
         resp = _api(
             "POST",
@@ -114,6 +114,64 @@ class TestDemucs:
         # Both stems present, non-empty, and the same length as the input clock.
         assert _wav_frames_from_b64(r["vocals_b64"]) > 44100
         assert _wav_frames_from_b64(r["accompaniment_b64"]) > 44100
+
+
+@pytest.mark.integration
+class TestVocalStem:
+    def test_separate_and_normalize_to_target_lufs(self, arbiter_health):
+        # vocal-stem takes an absolute file path on spark local disk (unlike
+        # demucs' base64); the test runs next to the server so a temp file
+        # is directly visible to the worker.
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            src_path = tmp.name
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=220:duration=4",
+                "-f",
+                "lavfi",
+                "-i",
+                "anoisesrc=d=4:c=pink",
+                "-filter_complex",
+                "[0][1]amix=inputs=2,pan=stereo|c0<c0+c1|c1<c0+c1",
+                "-ar",
+                "44100",
+                src_path,
+            ],
+            capture_output=True,
+            check=True,
+        )
+        try:
+            resp = _api(
+                "POST",
+                "/v1/jobs",
+                {
+                    "type": "vocal-stem",
+                    "params": {"audio_file": src_path, "force": True},
+                },
+            )
+            assert resp["model"] == "vocal-stem"
+            result = _poll(resp["job_id"])
+        finally:
+            Path(src_path).unlink(missing_ok=True)
+        assert result["status"] == "completed", (
+            f"vocal-stem failed: {result.get('error')}"
+        )
+        r = result["result"]
+        assert r["file"] == "vocals_normalized.wav"
+        assert r["vocals"] == "vocals.wav"
+        assert r["stats"] == "stats.json"
+        assert r["model"] == "htdemucs"
+        assert r["seconds"] > 0
+        # Normalized stem must land on the -14 LUFS target and stay under
+        # the -1 dBTP ceiling; stats are real measured values.
+        assert abs(r["output_lufs"] - (-14.0)) <= 0.5, r
+        assert r["peak_dbtp"] <= -1.0, r
+        assert r["input_lufs"] < 0.0, r
 
 
 @pytest.mark.integration

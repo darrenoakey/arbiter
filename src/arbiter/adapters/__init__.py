@@ -34,6 +34,7 @@ _ADAPTER_MODULES = (
     "insightface",
     "embed_text",
     "demucs_sep",
+    "vocal_stem",
     "rvc",
     "voice_fit",
     "music_generate",

@@ -29,6 +29,7 @@ def test_no_orphan_map_entries():
 def test_voice_pipeline_job_types_registered():
     expected = {
         "demucs": "demucs",
+        "vocal-stem": "vocal-stem",
         "rvc-train": "rvc-train",
         "rvc-convert": "rvc-convert",
     }
@@ -38,11 +39,26 @@ def test_voice_pipeline_job_types_registered():
 
 
 def test_voice_param_schema_shapes():
-    from arbiter.schemas import DemucsParams, RvcConvertParams, RvcTrainParams
+    from arbiter.schemas import (
+        DemucsParams,
+        LTX25Denoise1Params,
+        RvcConvertParams,
+        RvcTrainParams,
+        VocalStemParams,
+    )
 
     # demucs accepts either b64 or a staged file, and opts into inline b64.
     d = DemucsParams(audio_file="/x.wav")
     assert d.return_b64 is False
+
+    # vocal-stem requires an on-disk audio_file; htdemucs/-14 LUFS defaults.
+    v = VocalStemParams(audio_file="/x.mp3")
+    assert v.model == "htdemucs"
+    assert v.target_lufs == -14.0
+
+    # ltx25-denoise1 defaults the a2v guidance lever to 3.0.
+    p = LTX25Denoise1Params(encoded_file="/e.pt", audio_file="/x.mp3")
+    assert p.a2v_guidance_scale == 3.0
 
     # rvc-train requires a name and defaults to 40k / 300 epochs / rmvpe.
     t = RvcTrainParams(name="leo-laporte", dataset_file="/data")

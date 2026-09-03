@@ -148,6 +148,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "tts-custom",
         "tts-design",
         "tts-kokoro",
+        "vocal-stem",
         "voice-fit",
         "wan-s2v",
         "whisper-large",

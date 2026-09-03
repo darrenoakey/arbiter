@@ -24,6 +24,7 @@ var trustedPythonAdapters = map[string]string{
 	"birefnet":                "birefnet",
 	"composite":               "",
 	"demucs":                  "demucs",
+	"vocal-stem":              "demucs",
 	"echomimic":               "",
 	"embed-text":              "embed",
 	"face-restore":            "",

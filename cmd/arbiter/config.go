@@ -373,6 +373,7 @@ var JobTypeToModel = map[string]string{
 	"composite":               "composite",
 	"embed-text":              "embed-text",
 	"demucs":                  "demucs",
+	"vocal-stem":              "vocal-stem",
 	"rvc-train":               "rvc-train",
 	"rvc-convert":             "rvc-convert",
 	"voice-fit":               "voice-fit",
