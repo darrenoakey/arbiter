@@ -17,6 +17,11 @@ before writing code or tests.
 4. The gate squash-merges, runs `./run check`, fast-forwards `master`, runs `./run deploy`, and publishes. It rolls back prod automatically if deploy fails.
 5. On success: `greenline done` to remove your worktree + branch.
 
+**Long gate waits:** `greenline-wait.sh` must always be run detached (`async`)
+with a `sleep` — never hold a turn polling inline. Submit from the canonical
+repo path (`--repo /Users/darrenoakey/src/arbiter <branch>`) after committing
+in the worktree.
+
 **Never** commit or push on `master` — hooks hard-lock it (reference-transaction
 cannot be bypassed with `--no-verify`; pre-commit/pre-push refuse too). Never edit the
 canonical checkout. If the gate reports a conflict, rebase your worktree on
