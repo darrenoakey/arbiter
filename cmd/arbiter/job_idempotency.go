@@ -17,6 +17,7 @@ type submitJobRequest struct {
 	Model          string          `json:"model"`
 	Params         json.RawMessage `json:"params"`
 	IdempotencyKey json.RawMessage `json:"idempotency_key"`
+	Source         json.RawMessage `json:"source"`
 }
 
 func validateIdempotencyKey(raw json.RawMessage) (string, bool, error) {

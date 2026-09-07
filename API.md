@@ -73,6 +73,7 @@ Content-Type: application/json
 | `model`           | string | No       | Explicit top-level routing model                 |
 | `params`          | object | No       | Parameters specific to the job type (default `{}`) |
 | `idempotency_key` | string | No       | Non-empty key (maximum 256 UTF-8 bytes). Identical normalized retries return the existing job; conflicting reuse returns HTTP 409. |
+| `source`          | object | No       | Caller provenance: `{"who": "...", "why": "..."}`. `who` (≤128 bytes) identifies the submitting service/agent; `why` (≤256 bytes) is the human-meaningful root reason when a task chain drives the job (e.g. `"hang williams video"`). Recorded per job row and shown in `/v1/ps`, `/v1/jobs`, `GET /v1/jobs/{id}`, and the event log. Deliberately NOT part of the dedup/idempotency identity or the LLM cache key. The Python clients (`arbiter.client`, `arbiter_client`) fall back to ambient `ARBITER_WHO`/`ARBITER_WHY` environment context when the explicit arguments are unset, so a root process exports them once and every nested tool inherits them. |
 
 **Request Body Example**
 
@@ -81,7 +82,8 @@ Content-Type: application/json
   "type": "background-remove",
   "params": {
     "image_file": "/mnt/arbiter-store/inbox/photo.png"
-  }
+  },
+  "source": {"who": "waggler", "why": "hang williams video"}
 }
 ```
 
@@ -342,7 +344,19 @@ GET /v1/ps
     "completed": 57,
     "failed": 2,
     "cancelled": 0
-  }
+  },
+  "active_jobs_detail": [
+    {
+      "job_id": "a1b2c3d4",
+      "type": "ltx25-encode",
+      "model": "ltx25",
+      "state": "running",
+      "created_at": 1774045000.0,
+      "started_at": 1774045005.0,
+      "who": "waggler",
+      "why": "hang williams video"
+    }
+  ]
 }
 ```
 
@@ -353,6 +367,7 @@ GET /v1/ps
 | `gpu_utilization_pct` | int   | GPU compute utilization percentage (0-100, -1 if unavailable) |
 | `models`              | array | Status of each registered model                         |
 | `queue`               | object| Job counts by state across all models                   |
+| `active_jobs_detail`  | array| Live-jobs panel: every non-terminal job (queued/scheduled/running/following, oldest first, capped at 200) with its caller provenance (`who`/`why`, present when submitted with `source`). Lets a dashboard answer "who is using the GPU and why" at a glance. |
 
 Each model object:
 
@@ -599,6 +614,16 @@ curl -sS -X PUT http://10.0.0.254:8400/v1/llm/aliases/local-coder \
 curl -sS http://10.0.0.254:8400/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"local-chat","messages":[{"role":"user","content":"ping"}],"max_tokens":16}'
+```
+
+#### Chat provenance (who/why)
+
+`POST /v1/chat/completions` (and `-stream`) accepts non-standard top-level
+`who` (≤128 bytes) and `why` (≤256 bytes) string fields for caller provenance.
+They are popped from the body before canonicalization, so they never reach the
+worker, never change the LLM cache key, and are recorded as the job's `source`
+instead — visible in `/v1/ps` `active_jobs_detail`, `/v1/jobs`, and
+`GET /v1/jobs/{id}`.
 
 # Roll back a bad remap in one operation
 curl -sS -X PUT http://10.0.0.254:8400/v1/llm/aliases/local-coder \

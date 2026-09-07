@@ -45,6 +45,11 @@ type Job struct {
 	// in response.model and in job results, even when the canonical target or a
 	// cached/deduped result carries a different model field.
 	RequestedModel string `json:"requested_model,omitempty"`
+	// Source is optional caller provenance: who submitted the job and, when
+	// a root task drives a tool chain, the human-meaningful why from the top
+	// (e.g. who="waggler", why="hang williams video"). Stored as JSON in the
+	// source column; deliberately excluded from dedup/cache identity.
+	Source *JobSource `json:"source,omitempty"`
 	// IdempotencyKey and RequestHash are persisted admission metadata. They are
 	// intentionally excluded from public job JSON and logs: callers only need
 	// the stable job identity, while the hash is an internal conflict guard.
@@ -77,7 +82,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at REAL,
     canonical_job_id TEXT,
     excluded_hosts TEXT,
-    requested_model TEXT
+    requested_model TEXT,
+    source TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_priority ON jobs(priority) WHERE state = 'queued';
@@ -155,6 +161,54 @@ type Store struct {
 	excludedAt map[string]map[string]time.Time
 }
 
+// migrateAddJobSource adds the source column (caller provenance who/why) to
+// databases that pre-date it. Idempotent, same pattern as
+// migrateAddCanonicalJobID. No index: only ActiveJobsDetail filters on state
+// (already indexed) and reads this column.
+func migrateAddJobSource(db *sql.DB) {
+	_, err := db.Exec(`ALTER TABLE jobs ADD COLUMN source TEXT`)
+	if err == nil {
+		return
+	}
+	msg := err.Error()
+	// "no such table" is expected on a fresh database (the schema const below
+	// creates jobs with the column included); "duplicate column" is expected on
+	// an already-migrated database. Anything else is logged, never fatal.
+	if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "no such table") {
+		slog.Warn("migrate add jobs.source", "error", err)
+	}
+}
+
+// JobCreateOption customizes job creation (provenance, ...).
+type JobCreateOption func(*jobCreateConfig)
+
+type jobCreateConfig struct{ source *JobSource }
+
+// WithSource attaches caller provenance (who/why) to the created job row.
+func WithSource(src *JobSource) JobCreateOption {
+	return func(c *jobCreateConfig) { c.source = src }
+}
+
+func newJobCreateConfig(opts []JobCreateOption) *jobCreateConfig {
+	c := &jobCreateConfig{}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+// nullableSourceJSON renders a source for the source column; NULL when absent.
+func nullableSourceJSON(src *JobSource) any {
+	if src == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(src)
+	if err != nil {
+		return nil
+	}
+	return string(encoded)
+}
+
 func NewStore(dbPath string) (*Store, error) {
 	db, err := sql.Open("sqlite", sqliteStoreDSN(dbPath))
 	if err != nil {
@@ -174,6 +228,7 @@ func NewStore(dbPath string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	migrateAddJobSource(db)
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
@@ -217,14 +272,15 @@ func (s *Store) CreateJob(modelID, jobType string, payload json.RawMessage, prio
 
 // CreateJobWithRequestedModel persists both canonical routing identity and the
 // caller's original model string for response-time provenance.
-func (s *Store) CreateJobWithRequestedModel(modelID, jobType string, payload json.RawMessage, priority float64, requestedModel string) (*Job, error) {
+func (s *Store) CreateJobWithRequestedModel(modelID, jobType string, payload json.RawMessage, priority float64, requestedModel string, opts ...JobCreateOption) (*Job, error) {
+	cfg := newJobCreateConfig(opts)
 	id := genID()
 	now := nowTS()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
-		"INSERT INTO jobs (id, model_id, job_type, state, priority, payload, created_at, requested_model) VALUES (?,?,?,'queued',?,?,?,?)",
-		id, modelID, jobType, priority, string(payload), now, nullableRequestedModel(requestedModel),
+		"INSERT INTO jobs (id, model_id, job_type, state, priority, payload, created_at, requested_model, source) VALUES (?,?,?,'queued',?,?,?,?,?)",
+		id, modelID, jobType, priority, string(payload), now, nullableRequestedModel(requestedModel), nullableSourceJSON(cfg.source),
 	)
 	if err != nil {
 		return nil, err
@@ -232,14 +288,14 @@ func (s *Store) CreateJobWithRequestedModel(modelID, jobType string, payload jso
 	return &Job{
 		ID: id, ModelID: modelID, JobType: jobType,
 		State: "queued", Priority: priority, Payload: payload, CreatedAt: now,
-		RequestedModel: requestedModel,
+		RequestedModel: requestedModel, Source: cfg.source,
 	}, nil
 }
 
 // CreateIdempotentJob transactionally creates a keyed job or returns the
 // existing job for an identical request. A reused key with another immutable
 // request hash reports conflict without mutating either job.
-func (s *Store) CreateIdempotentJob(modelID, jobType string, payload json.RawMessage, priority float64, requestedModel, key, requestHash string) (*Job, bool, bool, error) {
+func (s *Store) CreateIdempotentJob(modelID, jobType string, payload json.RawMessage, priority float64, requestedModel, key, requestHash string, opts ...JobCreateOption) (*Job, bool, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
@@ -248,6 +304,7 @@ func (s *Store) CreateIdempotentJob(modelID, jobType string, payload json.RawMes
 	}
 	defer func() { _ = tx.Rollback() }()
 	job := newQueuedJob(modelID, jobType, payload, priority, requestedModel, key, requestHash)
+	job.Source = newJobCreateConfig(opts).source
 	created, err := insertIdempotentJob(tx, job)
 	if err != nil {
 		return nil, false, false, err
@@ -263,8 +320,8 @@ func (s *Store) CreateIdempotentJob(modelID, jobType string, payload json.RawMes
 
 func insertIdempotentJob(tx *sql.Tx, job *Job) (bool, error) {
 	_, err := tx.Exec(
-		"INSERT INTO jobs (id, model_id, job_type, state, priority, payload, created_at, requested_model) VALUES (?,?,?,'queued',?,?,?,?)",
-		job.ID, job.ModelID, job.JobType, job.Priority, string(job.Payload), job.CreatedAt, nullableRequestedModel(job.RequestedModel),
+		"INSERT INTO jobs (id, model_id, job_type, state, priority, payload, created_at, requested_model, source) VALUES (?,?,?,'queued',?,?,?,?,?)",
+		job.ID, job.ModelID, job.JobType, job.Priority, string(job.Payload), job.CreatedAt, nullableRequestedModel(job.RequestedModel), nullableSourceJSON(job.Source),
 	)
 	if err != nil {
 		return false, err
@@ -336,20 +393,20 @@ type rowScanner interface {
 
 func scanJobFromRow(row rowScanner) (*Job, error) {
 	var j Job
-	var payload, result, errStr, canonical, excluded, requested sql.NullString
+	var payload, result, errStr, canonical, excluded, requested, source sql.NullString
 	var startedAt, finishedAt sql.NullFloat64
 	err := row.Scan(&j.ID, &j.ModelID, &j.JobType, &j.State, &j.Priority,
-		&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt, &canonical, &excluded, &requested)
+		&payload, &result, &errStr, &j.CreatedAt, &startedAt, &finishedAt, &canonical, &excluded, &requested, &source)
 	if err != nil {
 		return nil, err
 	}
-	fillJobNullable(&j, payload, result, errStr, canonical, excluded, requested, startedAt, finishedAt)
+	fillJobNullable(&j, payload, result, errStr, canonical, excluded, requested, source, startedAt, finishedAt)
 	return &j, nil
 }
 
 // fillJobNullable is the shared decode of the nullable job columns so scanJob
 // (QueryRow) and scanJobFromRows (Rows) stay in lockstep when columns change.
-func fillJobNullable(j *Job, payload, result, errStr, canonical, excluded, requested sql.NullString, startedAt, finishedAt sql.NullFloat64) {
+func fillJobNullable(j *Job, payload, result, errStr, canonical, excluded, requested, source sql.NullString, startedAt, finishedAt sql.NullFloat64) {
 	if payload.Valid {
 		j.Payload = json.RawMessage(payload.String)
 	}
@@ -375,6 +432,13 @@ func fillJobNullable(j *Job, payload, result, errStr, canonical, excluded, reque
 	if excluded.Valid && excluded.String != "" {
 		// Stored as a JSON array; ignore malformed values (treat as none).
 		_ = json.Unmarshal([]byte(excluded.String), &j.ExcludedHosts)
+	}
+	if source.Valid && source.String != "" {
+		// Caller provenance; ignore malformed values (treat as none).
+		var src JobSource
+		if err := json.Unmarshal([]byte(source.String), &src); err == nil && (src.Who != "" || src.Why != "") {
+			j.Source = &src
+		}
 	}
 }
 
@@ -554,6 +618,33 @@ func (s *Store) CountCanonicalReferences(origID string) (int, error) {
 		origID,
 	).Scan(&n)
 	return n, err
+}
+
+// ActiveJobsDetail returns the non-terminal jobs (queued, scheduled,
+// running, following), oldest first, for the /v1/ps live-jobs panel. Indexed
+// by idx_jobs_state; the non-terminal set is small by construction, so this
+// stays cheap enough for the 1-second ps cache tick even on the large
+// production database.
+func (s *Store) ActiveJobsDetail(limit int) ([]*Job, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(
+		"SELECT * FROM jobs WHERE state IN ('queued','scheduled','running','following') ORDER BY created_at ASC LIMIT ?",
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var jobs []*Job
+	for rows.Next() {
+		j, err := scanJobFromRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, rows.Err()
 }
 
 func (s *Store) ListJobs(state, modelID string, limit int) ([]*Job, error) {

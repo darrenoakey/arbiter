@@ -108,6 +108,17 @@ def cmd_submit(args):
         sys.exit(1)
 
     data = {"type": args.type, "params": params}
+    # Ambient ARBITER_WHO/ARBITER_WHY context plus explicit flags attach caller
+    # provenance so the server (and dashboards) can show who/why per job.
+    from .client import ambient_source
+
+    source = ambient_source() or {}
+    if getattr(args, "who", None):
+        source["who"] = args.who
+    if getattr(args, "why", None):
+        source["why"] = args.why
+    if source:
+        data["source"] = source
     result = _request("POST", "/v1/jobs", data)
     print(f"Job submitted: {result['job_id']}")
     print(f"  Model: {result['model']}")
@@ -171,6 +182,8 @@ def main(argv: list[str] | None = None):
         "type", help="Job type (e.g., background-remove, video-generate, transcribe)"
     )
     p_submit.add_argument("params", nargs="?", default="{}", help="JSON params")
+    p_submit.add_argument("--who", help="Caller identity recorded on the job")
+    p_submit.add_argument("--why", help="Human-meaningful reason recorded on the job")
 
     p_status = sub.add_parser("status", help="Get job status")
     p_status.add_argument("job_id", help="Job ID")

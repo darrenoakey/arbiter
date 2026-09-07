@@ -284,6 +284,11 @@ func (a *API) refreshStatsAsync() {
 	a.statsAt = time.Now()
 }
 
+// activeJobsDetailLimit caps the /v1/ps live-jobs panel; enough to cover
+// every non-terminal job in any observed workload while keeping the cached
+// response bounded.
+const activeJobsDetailLimit = 200
+
 func (a *API) updatePSCache() {
 	snap := a.mgr.Snapshot()
 
@@ -380,6 +385,37 @@ func (a *API) updatePSCache() {
 		}
 	}
 
+	// Live-jobs panel: every non-terminal job with its caller provenance, so a
+	// dashboard can answer "WHO is using the GPU and WHY" at a glance — e.g.
+	// an ltx25-encode chunk queued by waggler for "hang williams video".
+	// Oldest first, capped; sourced through idx_jobs_state so the 1s tick stays
+	// cheap on the large production database.
+	if jobs, err := a.store.ActiveJobsDetail(activeJobsDetailLimit); err == nil {
+		panel := make([]map[string]any, 0, len(jobs))
+		for _, j := range jobs {
+			entry := map[string]any{
+				"job_id":     j.ID,
+				"type":       j.JobType,
+				"model":      j.ModelID,
+				"state":      j.State,
+				"created_at": j.CreatedAt,
+			}
+			if j.StartedAt != nil {
+				entry["started_at"] = *j.StartedAt
+			}
+			if j.Source != nil {
+				if j.Source.Who != "" {
+					entry["who"] = j.Source.Who
+				}
+				if j.Source.Why != "" {
+					entry["why"] = j.Source.Why
+				}
+			}
+			panel = append(panel, entry)
+		}
+		snap["active_jobs_detail"] = panel
+	}
+
 	data, _ := json.Marshal(snap)
 	a.psCache.Store(data)
 }
@@ -388,6 +424,11 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	var req submitJobRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
+		return
+	}
+	source, err := decodeJobSource(req.Source)
+	if err != nil {
+		writeError(w, 400, err.Error())
 		return
 	}
 	idempotencyKey, hasIdempotencyKey, err := validateIdempotencyKey(req.IdempotencyKey)
@@ -544,7 +585,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if hasIdempotencyKey {
-		a.submitKeyedJob(w, req, modelID, requestedModel, aliasUsed, idempotencyKey)
+		a.submitKeyedJob(w, req, modelID, requestedModel, aliasUsed, idempotencyKey, source)
 		return
 	}
 
@@ -555,7 +596,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	if a.llmCache != nil && (req.Type == "chat-completion" || req.Type == "chat-completion-stream") && !jobForceFlag(req.Params) {
 		if key, err := a.llmCache.Key(req.Params); err == nil {
 			if cached, ok := a.llmCache.Get(key); ok {
-				newJob, err := a.store.CreateJobWithRequestedModel(modelID, req.Type, req.Params, 0, requestedModel)
+				newJob, err := a.store.CreateJobWithRequestedModel(modelID, req.Type, req.Params, 0, requestedModel, WithSource(source))
 				if err == nil {
 					if err := a.store.UpdateState(newJob.ID, "completed", WithResult(cached), WithFinishedAt(nowTS())); err != nil {
 						writeError(w, 500, fmt.Sprintf("complete cached job: %s", err))
@@ -597,7 +638,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 					// needed for correctness — and now CountCanonicalReferences
 					// gives output cleanup a way to know "don't delete this
 					// orig dir, N followers depend on it".
-					newJob, err := a.store.CreateJobWithRequestedModel(modelID, req.Type, req.Params, 0, requestedModel)
+					newJob, err := a.store.CreateJobWithRequestedModel(modelID, req.Type, req.Params, 0, requestedModel, WithSource(source))
 					if err == nil {
 						if err := a.store.SetCanonicalJobID(newJob.ID, origID); err != nil {
 							slog.Warn("dedup: failed to set canonical_job_id",
@@ -621,7 +662,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 					}
 				case "queued", "scheduled", "running":
 					// In-flight — create follower
-					follower, err := a.store.CreateFollowerJobWithRequestedModel(modelID, req.Type, req.Params, origID, requestedModel)
+					follower, err := a.store.CreateFollowerJobWithRequestedModel(modelID, req.Type, req.Params, origID, requestedModel, WithSource(source))
 					if err == nil {
 						a.logger.Log("job.dedup_hit", map[string]any{
 							"job_id": follower.ID, "original_id": origID, "type": "following",
@@ -642,7 +683,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	priority := a.scheduler.computePriority(modelID)
-	job, err := a.store.CreateJobWithRequestedModel(modelID, req.Type, req.Params, priority, requestedModel)
+	job, err := a.store.CreateJobWithRequestedModel(modelID, req.Type, req.Params, priority, requestedModel, WithSource(source))
 	if err != nil {
 		writeError(w, 500, fmt.Sprintf("create job: %s", err))
 		return
@@ -658,7 +699,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		a.store.DedupRegister(dedupHash, job.ID)
 	}
 
-	a.logger.Log("job.submitted", map[string]any{
+	a.logger.Log("job.submitted", mergeLogFields(map[string]any{
 		"job_id":            job.ID,
 		"model_id":          modelID,
 		"job_type":          req.Type,
@@ -666,7 +707,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 		"requested_model":   requestedModel,
 		"resolved_model_id": modelID,
 		"alias_used":        aliasUsed,
-	})
+	}, source))
 
 	a.scheduler.Wake()
 
@@ -679,7 +720,7 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *API) submitKeyedJob(w http.ResponseWriter, req submitJobRequest, modelID, requestedModel, aliasUsed, idempotencyKey string) {
+func (a *API) submitKeyedJob(w http.ResponseWriter, req submitJobRequest, modelID, requestedModel, aliasUsed, idempotencyKey string, source *JobSource) {
 	requestHash, err := normalizedJobRequestHash(req.Type, modelID, req.Params)
 	if err != nil {
 		writeError(w, 400, "invalid job params")
@@ -687,7 +728,7 @@ func (a *API) submitKeyedJob(w http.ResponseWriter, req submitJobRequest, modelI
 	}
 	priority := a.scheduler.computePriority(modelID)
 	job, created, conflict, err := a.store.CreateIdempotentJob(
-		modelID, req.Type, req.Params, priority, requestedModel, idempotencyKey, requestHash,
+		modelID, req.Type, req.Params, priority, requestedModel, idempotencyKey, requestHash, WithSource(source),
 	)
 	if err != nil {
 		writeError(w, 500, fmt.Sprintf("create idempotent job: %s", err))
@@ -736,6 +777,9 @@ func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
 		"status":     job.State,
 		"model":      job.ModelID,
 		"created_at": job.CreatedAt,
+	}
+	if job.Source != nil {
+		resp["source"] = job.Source
 	}
 	if job.RequestedModel != "" {
 		resp["requested_model"] = job.RequestedModel
@@ -869,6 +913,14 @@ func (a *API) bulkStatus(w http.ResponseWriter, r *http.Request) {
 			"type":       j.JobType,
 			"created_at": j.CreatedAt,
 		}
+		if j.Source != nil {
+			if j.Source.Who != "" {
+				entry["who"] = j.Source.Who
+			}
+			if j.Source.Why != "" {
+				entry["why"] = j.Source.Why
+			}
+		}
 		if j.RequestedModel != "" {
 			entry["requested_model"] = j.RequestedModel
 		}
@@ -920,6 +972,14 @@ func (a *API) listJobs(w http.ResponseWriter, r *http.Request) {
 			"model":      j.ModelID,
 			"status":     j.State,
 			"created_at": j.CreatedAt,
+		}
+		if j.Source != nil {
+			if j.Source.Who != "" {
+				entry["who"] = j.Source.Who
+			}
+			if j.Source.Why != "" {
+				entry["why"] = j.Source.Why
+			}
 		}
 		if j.StartedAt != nil {
 			entry["started_at"] = *j.StartedAt
@@ -2127,12 +2187,20 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, fmt.Sprintf("LLM not registered: %s (register via POST /v1/llm/models, or define an alias via PUT /v1/llm/aliases/{alias)}", req.Model))
 		return
 	}
-	a.logger.Log("llm.chat_admitted", map[string]any{
+	// Pop non-standard top-level who/why provenance BEFORE canonicalization:
+	// cache/dedup keys stay provenance-independent and workers never see the
+	// extra fields. The source is recorded on the created job instead.
+	source, body, err := extractChatBodySource(body)
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	a.logger.Log("llm.chat_admitted", mergeLogFields(map[string]any{
 		"requested_model":   req.Model,
 		"resolved_model_id": modelID,
 		"alias_used":        aliasUsed,
 		"stream":            req.Stream,
-	})
+	}, source))
 
 	// Canonicalize the body to the bare canonical model name before cache lookup
 	// and before any worker sees it. This makes alias and concrete-name requests
@@ -2181,13 +2249,13 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 	// Streaming: proxy directly to llama-server for SSE support
 	if req.Stream {
 		setModelIdentityHeaders(w, req.Model, modelID, aliasUsed)
-		a.chatCompletionStreamCaching(w, r, modelID, canonicalBody, cacheKey, req.Model, aliasUsed)
+		a.chatCompletionStreamCaching(w, r, modelID, canonicalBody, cacheKey, req.Model, aliasUsed, source)
 		return
 	}
 
 	// Non-streaming: submit as a regular arbiter job and wait synchronously
 	priority := a.scheduler.computePriority(modelID)
-	job, err := a.store.CreateJobWithRequestedModel(modelID, "chat-completion", json.RawMessage(canonicalBody), priority, req.Model)
+	job, err := a.store.CreateJobWithRequestedModel(modelID, "chat-completion", json.RawMessage(canonicalBody), priority, req.Model, WithSource(source))
 	if err != nil {
 		writeError(w, 500, fmt.Sprintf("create job: %s", err))
 		return
@@ -2266,12 +2334,12 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 // signals completion. There is one queue and one MaxConcurrent — streaming
 // and non-streaming jobs share it.
 func (a *API) chatCompletionStream(w http.ResponseWriter, r *http.Request, modelID string, body []byte) {
-	a.chatCompletionStreamRequested(w, r, modelID, body, bareModelName(modelID))
+	a.chatCompletionStreamRequested(w, r, modelID, body, bareModelName(modelID), nil)
 }
 
-func (a *API) chatCompletionStreamRequested(w http.ResponseWriter, r *http.Request, modelID string, body []byte, requestedModel string) {
+func (a *API) chatCompletionStreamRequested(w http.ResponseWriter, r *http.Request, modelID string, body []byte, requestedModel string, source *JobSource) {
 	priority := a.scheduler.computePriority(modelID)
-	job, err := a.store.CreateJobWithRequestedModel(modelID, "chat-completion-stream", json.RawMessage(body), priority, requestedModel)
+	job, err := a.store.CreateJobWithRequestedModel(modelID, "chat-completion-stream", json.RawMessage(body), priority, requestedModel, WithSource(source))
 	if err != nil {
 		writeError(w, 500, fmt.Sprintf("create job: %s", err))
 		return
@@ -2571,10 +2639,10 @@ func (a *API) storeChatResultIfCacheable(key string, result json.RawMessage) {
 // it to the client as SSE. This makes streamed and non-streamed identical
 // requests share ONE cache entry (the stream flag is not part of the key). If
 // caching is disabled (empty key) it falls back to the live SSE proxy.
-func (a *API) chatCompletionStreamCaching(w http.ResponseWriter, r *http.Request, modelID string, body []byte, cacheKey string, requestedModel, aliasUsed string) {
+func (a *API) chatCompletionStreamCaching(w http.ResponseWriter, r *http.Request, modelID string, body []byte, cacheKey string, requestedModel, aliasUsed string, source *JobSource) {
 	if a.llmCache == nil || cacheKey == "" {
 		setModelIdentityHeaders(w, requestedModel, modelID, aliasUsed)
-		a.chatCompletionStreamRequested(w, r, modelID, body, requestedModel)
+		a.chatCompletionStreamRequested(w, r, modelID, body, requestedModel, source)
 		return
 	}
 
@@ -2582,7 +2650,7 @@ func (a *API) chatCompletionStreamCaching(w http.ResponseWriter, r *http.Request
 	// full completion to cache, then replay it as SSE.
 	nonStreamBody := stripStreamFlag(body)
 	priority := a.scheduler.computePriority(modelID)
-	job, err := a.store.CreateJobWithRequestedModel(modelID, "chat-completion", json.RawMessage(nonStreamBody), priority, requestedModel)
+	job, err := a.store.CreateJobWithRequestedModel(modelID, "chat-completion", json.RawMessage(nonStreamBody), priority, requestedModel, WithSource(source))
 	if err != nil {
 		writeError(w, 500, fmt.Sprintf("create job: %s", err))
 		return

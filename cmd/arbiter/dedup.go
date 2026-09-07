@@ -238,14 +238,15 @@ func (s *Store) CreateFollowerJob(modelID, jobType string, payload json.RawMessa
 
 // CreateFollowerJobWithRequestedModel retains subscriber-specific request
 // identity while coalescing execution under a canonical job.
-func (s *Store) CreateFollowerJobWithRequestedModel(modelID, jobType string, payload json.RawMessage, originalJobID, requestedModel string) (*Job, error) {
+func (s *Store) CreateFollowerJobWithRequestedModel(modelID, jobType string, payload json.RawMessage, originalJobID, requestedModel string, opts ...JobCreateOption) (*Job, error) {
+	cfg := newJobCreateConfig(opts)
 	id := genID()
 	now := nowTS()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
-		"INSERT INTO jobs (id, model_id, job_type, state, priority, payload, created_at, error, requested_model) VALUES (?,?,?,'following',0,?,?,?,?)",
-		id, modelID, jobType, string(payload), now, "following:"+originalJobID, nullableRequestedModel(requestedModel),
+		"INSERT INTO jobs (id, model_id, job_type, state, priority, payload, created_at, error, requested_model, source) VALUES (?,?,?,'following',0,?,?,?,?,?)",
+		id, modelID, jobType, string(payload), now, "following:"+originalJobID, nullableRequestedModel(requestedModel), nullableSourceJSON(cfg.source),
 	)
 	if err != nil {
 		return nil, err
@@ -255,6 +256,7 @@ func (s *Store) CreateFollowerJobWithRequestedModel(modelID, jobType string, pay
 		State: "following", Payload: payload, CreatedAt: now,
 		Error:          "following:" + originalJobID,
 		RequestedModel: requestedModel,
+		Source:         cfg.source,
 	}, nil
 }
 

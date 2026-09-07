@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -25,6 +26,47 @@ from urllib.request import Request, urlopen
 
 
 _DEFAULT_URL = "http://localhost:8400"
+
+# Caller-provenance caps enforced server-side.
+MAX_WHO_BYTES = 128
+MAX_WHY_BYTES = 256
+
+
+def ambient_source() -> dict | None:
+    """Ambient who/why provenance inherited from the environment.
+
+    A root process (an agent task, a waggler run, ...) exports ARBITER_WHY (and
+    optionally ARBITER_WHO); every child that submits arbiter jobs — directly or
+    through a deeper tool — inherits the same human-meaningful reason, so a leaf
+    ltx encode can still say "hang williams video". This is runtime trace
+    context (like W3C traceparent), not configuration: nothing behavioral keys
+    off it. Explicit who=/why= arguments always win.
+    """
+    who = os.environ.get("ARBITER_WHO", "").strip()[:MAX_WHO_BYTES]
+    why = os.environ.get("ARBITER_WHY", "").strip()[:MAX_WHY_BYTES]
+    source: dict = {}
+    if who:
+        source["who"] = who
+    if why:
+        source["why"] = why
+    return source or None
+
+
+def _effective_source(who: str | None, why: str | None) -> dict | None:
+    ambient = ambient_source() or {}
+    if who is not None:
+        who = who.strip()[:MAX_WHO_BYTES]
+        if who:
+            ambient["who"] = who
+        else:
+            ambient.pop("who", None)
+    if why is not None:
+        why = why.strip()[:MAX_WHY_BYTES]
+        if why:
+            ambient["why"] = why
+        else:
+            ambient.pop("why", None)
+    return ambient or None
 
 
 class ArbiterError(Exception):
@@ -59,9 +101,17 @@ class ArbiterClient:
 
     # --- Core API ---
 
-    def submit(self, job_type: str, **params) -> str:
-        """Submit a job. Returns job_id."""
-        resp = self._request("POST", "/v1/jobs", {"type": job_type, "params": params})
+    def submit(self, job_type: str, *, who: str | None = None, why: str | None = None, **params) -> str:
+        """Submit a job. Returns job_id.
+
+        who/why attach caller provenance (who submitted this, and the
+        human-meaningful root reason). Unset fields fall back to the ambient
+        ARBITER_WHO/ARBITER_WHY environment context.
+        """
+        body: dict = {"type": job_type, "params": params}
+        if source := _effective_source(who, why):
+            body["source"] = source
+        resp = self._request("POST", "/v1/jobs", body)
         return resp["job_id"]
 
     def status(self, job_id: str) -> dict:
@@ -97,10 +147,10 @@ class ArbiterClient:
         raise ArbiterError(f"Job {job_id} timed out after {timeout}s", job_id=job_id)
 
     def run(
-        self, job_type: str, timeout: float = 600, poll_interval: float = 1.0, **params
+        self, job_type: str, timeout: float = 600, poll_interval: float = 1.0, *, who: str | None = None, why: str | None = None, **params
     ) -> dict:
         """Submit a job and wait for result. Returns result dict with data_bytes if applicable."""
-        job_id = self.submit(job_type, **params)
+        job_id = self.submit(job_type, who=who, why=why, **params)
         return self.poll(job_id, interval=poll_interval, timeout=timeout)
 
     # --- Convenience methods ---
