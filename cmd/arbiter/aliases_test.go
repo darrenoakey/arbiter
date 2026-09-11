@@ -730,3 +730,161 @@ func writeConfigFixture(t *testing.T, root string, models map[string]ModelConfig
 		t.Fatal(err)
 	}
 }
+
+// aliasFallbackTestAPI builds an API whose alias primary lives only on a remote
+// host and whose fallback is a local-placement model, then installs an explicit
+// reachability predicate so the test controls whether the remote host is up.
+// This is the exact live shape from the 2026-09-10 incident: local-chat pointed
+// at a model placed only on a powered-off Mac, so every admitted job sat
+// "queued" forever while a perfectly healthy local model idled.
+func aliasFallbackTestAPI(t *testing.T, remoteReachable bool) (*API, func()) {
+	t.Helper()
+	api, cleanup := newTestAPIWithHosts(t, map[string]HostConfig{
+		"boringstack": {Addr: "http://127.0.0.1:1", Kind: "nativ", BudgetGB: 20},
+	})
+	remoteOnly := aliasTestModel()
+	remoteOnly.Placements = []string{"boringstack"}
+	localModel := aliasTestModel()
+	localModel.Placements = []string{LocalHost}
+	api.config.Models["llm:remote-only"] = remoteOnly
+	api.config.Models["llm:spark-local"] = localModel
+	api.mgr.SetReachabilityFunc(func(string) bool { return remoteReachable })
+	api.replaceAliases(map[string]string{"local-chat": "llm:remote-only"})
+	api.replaceAliasFallbacks(map[string][]string{"local-chat": {"llm:spark-local"}})
+	return api, cleanup
+}
+
+func TestAliasResolvesToFallbackWhenPrimaryHasNoServablePlacement(t *testing.T) {
+	api, cleanup := aliasFallbackTestAPI(t, false)
+	defer cleanup()
+
+	resolved, alias, ok := api.resolveLLMModelID("local-chat")
+	if !ok || alias != "local-chat" {
+		t.Fatalf("resolve local-chat ok=%v alias=%q", ok, alias)
+	}
+	if resolved != "llm:spark-local" {
+		t.Fatalf("resolved = %q, want the servable fallback while the remote host is down", resolved)
+	}
+
+	response := performRequest(api, http.MethodGet, "/v1/llm/aliases", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("list aliases status = %d: %s", response.Code, response.Body.String())
+	}
+	listed := decodeObject(t, response.Body.Bytes())
+	entry, _ := listed["local-chat"].(map[string]any)
+	if entry["target"] != "llm:remote-only" || entry["resolved"] != "llm:spark-local" {
+		t.Fatalf("alias listing = %+v, want target remote-only resolved spark-local", entry)
+	}
+	chain, _ := entry["fallbacks"].([]any)
+	if len(chain) != 1 || chain[0] != "llm:spark-local" {
+		t.Fatalf("listed fallbacks = %+v", entry["fallbacks"])
+	}
+}
+
+func TestAliasKeepsPrimaryWhenItsRemoteHostIsReachable(t *testing.T) {
+	api, cleanup := aliasFallbackTestAPI(t, true)
+	defer cleanup()
+
+	resolved, _, ok := api.resolveLLMModelID("local-chat")
+	if !ok || resolved != "llm:remote-only" {
+		t.Fatalf("resolved = %q (ok=%v), want the primary while its host is reachable", resolved, ok)
+	}
+}
+
+func TestAliasWithoutFallbacksKeepsUnservablePrimary(t *testing.T) {
+	api, cleanup := aliasFallbackTestAPI(t, false)
+	defer cleanup()
+	api.replaceAliasFallbacks(map[string][]string{})
+
+	resolved, _, ok := api.resolveLLMModelID("local-chat")
+	if !ok || resolved != "llm:remote-only" {
+		t.Fatalf("resolved = %q (ok=%v), want unchanged behaviour without fallbacks", resolved, ok)
+	}
+}
+
+func TestModelHasServablePlacementTracksHostReachability(t *testing.T) {
+	api, cleanup := aliasFallbackTestAPI(t, false)
+	defer cleanup()
+
+	if api.mgr.ModelHasServablePlacement("llm:remote-only") {
+		t.Fatal("remote-only model reported servable while its only host is unreachable")
+	}
+	if !api.mgr.ModelHasServablePlacement("llm:spark-local") {
+		t.Fatal("local-placement model reported unservable")
+	}
+	if api.mgr.ModelHasServablePlacement("llm:not-registered") {
+		t.Fatal("unregistered model reported servable")
+	}
+	api.mgr.SetReachabilityFunc(func(string) bool { return true })
+	if !api.mgr.ModelHasServablePlacement("llm:remote-only") {
+		t.Fatal("remote-only model reported unservable once its host came back")
+	}
+}
+
+func TestPutAliasPersistsFallbacksAndReportsLiveResolution(t *testing.T) {
+	api, cleanup := aliasFallbackTestAPI(t, false)
+	defer cleanup()
+	writeConfigFixture(t, api.projectRoot, api.config.CloneModels(), map[string]string{"local-chat": "llm:remote-only"})
+
+	response := performRequest(api, http.MethodPut, "/v1/llm/aliases/local-chat",
+		`{"target":"llm:remote-only","fallbacks":["llm:spark-local"]}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("put alias status = %d: %s", response.Code, response.Body.String())
+	}
+	body := decodeObject(t, response.Body.Bytes())
+	if body["resolved"] != "llm:spark-local" {
+		t.Fatalf("put alias resolved = %v, want the servable fallback", body["resolved"])
+	}
+
+	reloaded, err := LoadConfig(api.projectRoot)
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	chain := reloaded.LLMAliasFallbacks["local-chat"]
+	if len(chain) != 1 || chain[0] != "llm:spark-local" {
+		t.Fatalf("persisted fallbacks = %+v", reloaded.LLMAliasFallbacks)
+	}
+
+	cleared := performRequest(api, http.MethodPut, "/v1/llm/aliases/local-chat",
+		`{"target":"llm:remote-only","fallbacks":[]}`)
+	if cleared.Code != http.StatusOK {
+		t.Fatalf("clear fallbacks status = %d: %s", cleared.Code, cleared.Body.String())
+	}
+	after, err := LoadConfig(api.projectRoot)
+	if err != nil {
+		t.Fatalf("reload after clear: %v", err)
+	}
+	if len(after.LLMAliasFallbacks) != 0 {
+		t.Fatalf("fallbacks after explicit clear = %+v", after.LLMAliasFallbacks)
+	}
+}
+
+func TestValidateLLMAliasFallbacksPolicy(t *testing.T) {
+	models := map[string]ModelConfig{
+		"llm:qwen":  aliasTestModel(),
+		"llm:gemma": aliasTestModel(),
+	}
+	aliases := map[string]string{"local-chat": "llm:qwen", "local-other": "llm:gemma"}
+	tests := []struct {
+		name      string
+		fallbacks map[string][]string
+	}{
+		{name: "unknown alias", fallbacks: map[string][]string{"local-missing": {"llm:gemma"}}},
+		{name: "empty list", fallbacks: map[string][]string{"local-chat": {}}},
+		{name: "bare target", fallbacks: map[string][]string{"local-chat": {"gemma"}}},
+		{name: "unknown model", fallbacks: map[string][]string{"local-chat": {"llm:absent"}}},
+		{name: "chain", fallbacks: map[string][]string{"local-chat": {"llm:local-other"}}},
+		{name: "repeats primary", fallbacks: map[string][]string{"local-chat": {"llm:qwen"}}},
+		{name: "duplicate entry", fallbacks: map[string][]string{"local-chat": {"llm:gemma", "llm:gemma"}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateLLMAliasFallbacks(test.fallbacks, aliases, models); err == nil {
+				t.Fatal("invalid fallback configuration accepted")
+			}
+		})
+	}
+	if err := validateLLMAliasFallbacks(map[string][]string{"local-chat": {"llm:gemma"}}, aliases, models); err != nil {
+		t.Fatalf("valid fallback configuration rejected: %v", err)
+	}
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net/http"
 	"regexp"
@@ -54,11 +55,49 @@ func validateLLMAliases(aliases map[string]string, models map[string]ModelConfig
 	return nil
 }
 
+// validateLLMAliasFallbacks checks proposed per-alias fallback lists. Every
+// entry must be a registered concrete llm:* model id that is neither an alias
+// (no chains) nor the alias's own primary target, and each list must name an
+// alias that actually exists. Duplicate entries are rejected so the ordered
+// list reads as the operator wrote it.
+func validateLLMAliasFallbacks(fallbacks map[string][]string, aliases map[string]string, models map[string]ModelConfig) error {
+	for alias, chain := range fallbacks {
+		primary, exists := aliases[alias]
+		if !exists {
+			return fmt.Errorf("fallbacks for %q name no configured alias", alias)
+		}
+		if len(chain) == 0 {
+			return fmt.Errorf("alias %q has an empty fallback list; omit the entry instead", alias)
+		}
+		seen := make(map[string]bool, len(chain))
+		for _, target := range chain {
+			if !strings.HasPrefix(target, "llm:") {
+				return fmt.Errorf("alias %q fallback %q must be a canonical llm:* model id", alias, target)
+			}
+			if _, ok := models[target]; !ok {
+				return fmt.Errorf("alias %q fallback %q is not a registered model", alias, target)
+			}
+			if _, isAlias := aliases[strings.TrimPrefix(target, "llm:")]; isAlias {
+				return fmt.Errorf("alias %q fallback %q is itself an alias (chains forbidden)", alias, target)
+			}
+			if target == primary {
+				return fmt.Errorf("alias %q fallback %q repeats the primary target", alias, target)
+			}
+			if seen[target] {
+				return fmt.Errorf("alias %q lists fallback %q twice", alias, target)
+			}
+			seen[target] = true
+		}
+	}
+	return nil
+}
+
 // resolveLLMModelID resolves a requested model string to a canonical model id,
 // reporting whether an alias was used. Resolution order:
 //  1. Exact configured model id (including llm:* ids).
 //  2. Bare LLM name -> llm:<name> if configured.
-//  3. Alias -> configured target.
+//  3. Alias -> configured target, or the first servable fallback when that
+//     target currently has no servable placement.
 //  4. Not found.
 func (a *API) resolveLLMModelID(requested string) (canonicalModelID string, aliasUsed string, ok bool) {
 	if requested == "" {
@@ -80,10 +119,42 @@ func (a *API) resolveLLMModelID(requested string) (canonicalModelID string, alia
 	// 3. Alias.
 	if target, exists := aliases[requested]; exists {
 		if _, exists := models[target]; exists {
-			return target, requested, true
+			return a.aliasTargetOrFallback(requested, target, models), requested, true
 		}
 	}
 	return "", "", false
+}
+
+// aliasTargetOrFallback returns the alias target to admit against. The
+// configured target wins whenever it is servable. When it is not — every host
+// it may run on is an unreachable remote — the first servable configured
+// fallback is used instead, because admitting against an unservable model
+// parks the job in "queued" indefinitely with nothing failing and nothing
+// running (live 2026-09-10 incident). With no servable fallback the configured
+// target is kept, so behaviour is unchanged for aliases without fallbacks.
+func (a *API) aliasTargetOrFallback(alias, target string, models map[string]struct{}) string {
+	if a.mgr == nil || a.mgr.ModelHasServablePlacement(target) {
+		return target
+	}
+	for _, candidate := range a.aliasFallbackSnapshot(alias) {
+		if _, exists := models[candidate]; !exists {
+			continue
+		}
+		if !a.mgr.ModelHasServablePlacement(candidate) {
+			continue
+		}
+		slog.Warn("llm.alias_fallback: primary target has no servable placement",
+			"alias", alias, "primary", target, "resolved", candidate,
+			"reason", "every placement of the primary is an unreachable remote host")
+		a.logger.Log("llm.alias_fallback", map[string]any{
+			"alias":    alias,
+			"primary":  target,
+			"resolved": candidate,
+			"reason":   "primary has no servable placement",
+		})
+		return candidate
+	}
+	return target
 }
 
 // bareModelName returns the bare model name for a canonical llm:* id.
@@ -206,20 +277,33 @@ func (a *API) listAliases(w http.ResponseWriter, r *http.Request) {
 	slices.Sort(keys)
 
 	out := make(map[string]any, len(keys))
+	fallbacks := a.aliasFallbacksSnapshot()
 	for _, alias := range keys {
 		target := aliases[alias]
 		_, configured := models[target]
-		out[alias] = map[string]any{
+		entry := map[string]any{
 			"target":            target,
 			"resolved":          target,
 			"target_configured": configured,
 		}
+		// resolved is what admission would pick RIGHT NOW, which differs from
+		// target while the primary's only placements are unreachable hosts.
+		if configured {
+			entry["resolved"] = a.aliasTargetOrFallback(alias, target, models)
+		}
+		if chain := fallbacks[alias]; len(chain) > 0 {
+			entry["fallbacks"] = chain
+		}
+		out[alias] = entry
 	}
 	writeJSON(w, 200, out)
 }
 
 type aliasUpdateRequest struct {
 	Target string `json:"target"`
+	// Fallbacks, when non-nil, replaces this alias's ordered fallback list. An
+	// explicit empty array clears it; omitting the field leaves it untouched.
+	Fallbacks []string `json:"fallbacks"`
 }
 
 // putAlias handles PUT /v1/llm/aliases/{alias}.
@@ -234,7 +318,7 @@ func (a *API) putAlias(w http.ResponseWriter, r *http.Request) {
 	}
 	var req aliasUpdateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Target == "" {
-		writeError(w, 400, "body must be {\"target\":\"llm:<model>\"}")
+		writeError(w, 400, "body must be {\"target\":\"llm:<model>\",\"fallbacks\":[\"llm:<model>\"]}")
 		return
 	}
 
@@ -250,24 +334,48 @@ func (a *API) putAlias(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	newFallbacks := a.aliasFallbacksSnapshot()
+	if req.Fallbacks != nil {
+		if len(req.Fallbacks) == 0 {
+			delete(newFallbacks, alias)
+		} else {
+			newFallbacks[alias] = slices.Clone(req.Fallbacks)
+		}
+	}
+	// Retargeting can invalidate a previously-valid fallback list (e.g. the new
+	// primary is already named as a fallback), so the whole map is revalidated.
+	if err := validateLLMAliasFallbacks(newFallbacks, newAliases, a.config.CloneModels()); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+
 	if err := SaveLLMAliases(a.projectRoot, newAliases); err != nil {
 		writeError(w, 500, fmt.Sprintf("persist alias: %s", err))
 		return
 	}
+	if err := SaveLLMAliasFallbacks(a.projectRoot, newFallbacks); err != nil {
+		writeError(w, 500, fmt.Sprintf("persist alias fallbacks: %s", err))
+		return
+	}
 	a.replaceAliases(newAliases)
+	a.replaceAliasFallbacks(newFallbacks)
 
+	_, modelIDs := a.aliasStateSnapshot()
+	resolved := a.aliasTargetOrFallback(alias, req.Target, modelIDs)
 	a.logger.Log("llm.alias_updated", map[string]any{
 		"alias":      alias,
 		"old_target": oldTarget,
 		"new_target": req.Target,
-		"resolved":   req.Target,
+		"fallbacks":  newFallbacks[alias],
+		"resolved":   resolved,
 		"actor":      r.RemoteAddr,
 	})
 	writeJSON(w, 200, map[string]any{
 		"alias":      alias,
 		"old_target": oldTarget,
 		"new_target": req.Target,
-		"resolved":   req.Target,
+		"fallbacks":  newFallbacks[alias],
+		"resolved":   resolved,
 	})
 }
 
@@ -306,11 +414,18 @@ func (a *API) deleteAlias(w http.ResponseWriter, r *http.Request) {
 
 	newAliases := maps.Clone(aliases)
 	delete(newAliases, alias)
+	newFallbacks := a.aliasFallbacksSnapshot()
+	delete(newFallbacks, alias)
 	if err := SaveLLMAliases(a.projectRoot, newAliases); err != nil {
 		writeError(w, 500, fmt.Sprintf("persist alias deletion: %s", err))
 		return
 	}
+	if err := SaveLLMAliasFallbacks(a.projectRoot, newFallbacks); err != nil {
+		writeError(w, 500, fmt.Sprintf("persist alias fallback deletion: %s", err))
+		return
+	}
 	a.replaceAliases(newAliases)
+	a.replaceAliasFallbacks(newFallbacks)
 
 	a.logger.Log("llm.alias_deleted", map[string]any{"alias": alias, "force": force})
 	writeJSON(w, 200, map[string]any{
@@ -332,6 +447,36 @@ func (a *API) aliasSnapshot() map[string]string {
 	a.aliasMu.RLock()
 	defer a.aliasMu.RUnlock()
 	return maps.Clone(a.config.LLMAliases)
+}
+
+// aliasFallbackSnapshot returns the ordered fallback list configured for one
+// alias, or nil when it has none.
+func (a *API) aliasFallbackSnapshot(alias string) []string {
+	a.aliasMu.RLock()
+	defer a.aliasMu.RUnlock()
+	return slices.Clone(a.config.LLMAliasFallbacks[alias])
+}
+
+// aliasFallbacksSnapshot returns every configured fallback list.
+func (a *API) aliasFallbacksSnapshot() map[string][]string {
+	a.aliasMu.RLock()
+	defer a.aliasMu.RUnlock()
+	out := make(map[string][]string, len(a.config.LLMAliasFallbacks))
+	for alias, chain := range a.config.LLMAliasFallbacks {
+		out[alias] = slices.Clone(chain)
+	}
+	return out
+}
+
+// replaceAliasFallbacks publishes a new fallback map under the alias lock.
+func (a *API) replaceAliasFallbacks(fallbacks map[string][]string) {
+	a.aliasMu.Lock()
+	defer a.aliasMu.Unlock()
+	next := make(map[string][]string, len(fallbacks))
+	for alias, chain := range fallbacks {
+		next[alias] = slices.Clone(chain)
+	}
+	a.config.LLMAliasFallbacks = next
 }
 
 func (a *API) aliasStateSnapshot() (map[string]string, map[string]struct{}) {

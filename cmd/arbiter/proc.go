@@ -1148,6 +1148,31 @@ func (m *InstanceManager) hasReachableHigherPreferenceRemote(modelID, host strin
 	return false
 }
 
+// ModelHasServablePlacement reports whether the model could run somewhere right
+// now: a local placement always can, and a remote placement can when that host
+// is reachable. A model whose every placement is an unreachable remote host is
+// NOT servable — admitting work against it queues jobs that can never be
+// dispatched (live 2026-09-10: the only placement for the local-chat model was
+// a powered-off Mac and the backlog grew silently for half an hour).
+func (m *InstanceManager) ModelHasServablePlacement(modelID string) bool {
+	cfg, ok := m.config.GetModel(modelID)
+	if !ok {
+		return false
+	}
+	for _, host := range cfg.PlacementsOrDefault() {
+		if m.config.HostIsLocal(host) {
+			return true
+		}
+		if !cfg.RemoteEnabledOrDefault() {
+			continue
+		}
+		if m.hostReachable(host) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *InstanceManager) PickInstance(modelID string) *Instance {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

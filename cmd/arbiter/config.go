@@ -245,6 +245,15 @@ type Config struct {
 	// to a concrete model before scheduling, so aliases create no extra queues,
 	// instances, or caches. See API.md for precedence and management.
 	LLMAliases map[string]string `json:"llm_aliases,omitempty"`
+	// LLMAliasFallbacks lists, per alias, the ordered canonical llm:* model ids
+	// to resolve to when the alias's primary target has no servable placement —
+	// every host it may run on is a remote host that is currently unreachable.
+	// Without this, such an alias admits jobs that can never be dispatched: they
+	// sit "queued" forever and nothing fails (live 2026-09-10: local-chat
+	// pointed at a model placed only on a powered-off Mac, and every agentd3
+	// effort/classification job queued indefinitely). Resolution stays
+	// admission-time only, exactly like the primary target.
+	LLMAliasFallbacks map[string][]string `json:"llm_alias_fallbacks,omitempty"`
 }
 
 type configFileSnapshot struct {
@@ -487,6 +496,12 @@ func LoadConfig(projectRoot string) (*Config, error) {
 	}
 	if err := validateLLMAliases(cfg.LLMAliases, cfg.Models); err != nil {
 		return nil, fmt.Errorf("llm_aliases: %w", err)
+	}
+	if cfg.LLMAliasFallbacks == nil {
+		cfg.LLMAliasFallbacks = map[string][]string{}
+	}
+	if err := validateLLMAliasFallbacks(cfg.LLMAliasFallbacks, cfg.LLMAliases, cfg.Models); err != nil {
+		return nil, fmt.Errorf("llm_alias_fallbacks: %w", err)
 	}
 
 	return cfg, nil
@@ -915,6 +930,23 @@ func SaveLLMAliases(projectRoot string, aliases map[string]string) error {
 		aliases = map[string]string{}
 	}
 	data["llm_aliases"] = aliases
+	return writeConfigData(projectRoot, data)
+}
+
+// SaveLLMAliasFallbacks atomically replaces the persisted per-alias fallback
+// lists while preserving every unrelated mutable configuration key.
+func SaveLLMAliasFallbacks(projectRoot string, fallbacks map[string][]string) error {
+	mutableConfigMu.Lock()
+	defer mutableConfigMu.Unlock()
+	data, err := loadMutableConfigData(projectRoot)
+	if err != nil {
+		return err
+	}
+	if len(fallbacks) == 0 {
+		delete(data, "llm_alias_fallbacks")
+		return writeConfigData(projectRoot, data)
+	}
+	data["llm_alias_fallbacks"] = fallbacks
 	return writeConfigData(projectRoot, data)
 }
 

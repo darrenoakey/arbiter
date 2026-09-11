@@ -566,26 +566,45 @@ Stream callers must use the three pre-body headers for identity.
 
 #### GET /v1/llm/aliases
 
-Returns a name-sorted object. Each value contains `target`, `resolved`, and
-`target_configured`.
+Returns a name-sorted object. Each value contains `target`, `resolved`,
+`target_configured`, and `fallbacks` when any are configured. `resolved` is what
+admission would pick right now, so it differs from `target` while the primary
+has no servable placement.
 
 ```json
 {
   "local-chat": {
-    "target": "llm:qwen",
-    "resolved": "llm:qwen",
-    "target_configured": true
+    "target": "llm:remote-only",
+    "resolved": "llm:spark-local",
+    "target_configured": true,
+    "fallbacks": ["llm:spark-local"]
   }
 }
 ```
 
+#### Alias fallbacks
+
+A model is *servable* when at least one of its placements is the local host or a
+reachable remote host. An alias whose primary target is NOT servable resolves to
+the first servable entry of its ordered `llm_alias_fallbacks` list. Without this,
+such an alias admits jobs that can never be dispatched: they sit `queued`
+indefinitely and nothing fails (2026-09-10: `local-chat` pointed at a model
+placed only on a powered-off Mac and the backlog grew silently for half an hour).
+Resolution stays admission-time only, the primary wins the moment its host is
+reachable again, and an alias with no fallbacks behaves exactly as before.
+Arbiter emits `llm.alias_fallback` whenever a fallback is used.
+
 #### PUT /v1/llm/aliases/{alias}
 
-Creates or remaps one alias using `{"target":"llm:qwen"}`. Arbiter validates
-the complete proposed map, atomically persists it, then swaps the live map.
-Concurrent updates serialize; a persistence failure leaves the live map
-unchanged. The response includes `old_target`, `new_target`, and `resolved`,
-and Arbiter emits `llm.alias_updated`.
+Creates or remaps one alias using `{"target":"llm:qwen"}`, optionally with
+`"fallbacks":["llm:other"]` to replace that alias's ordered fallback list (an
+explicit `[]` clears it; omitting the field leaves it untouched). A fallback must
+be a registered canonical `llm:*` id that is neither an alias nor the primary
+target, and must not repeat. Arbiter validates the complete proposed map,
+atomically persists it, then swaps the live map. Concurrent updates serialize; a
+persistence failure leaves the live map unchanged. The response includes
+`old_target`, `new_target`, `fallbacks`, and the live `resolved` model, and
+Arbiter emits `llm.alias_updated`.
 
 #### DELETE /v1/llm/aliases/{alias}
 
