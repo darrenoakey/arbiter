@@ -967,6 +967,36 @@ func (s *Scheduler) IsModelLoadPaused(modelID string) (bool, time.Time) {
 // blocked job's budget grows linearly with wait time until it fits.
 const pressureAgeRate = 0.01
 
+const (
+	// vramStarvationSeconds is how long a model's oldest queued job must have
+	// waited, while the model is excluded purely because its weights do not
+	// fit, before the scheduler holds VRAM for it. Generous enough that normal
+	// queueing behind a long job never trips it, short enough that a starved
+	// model recovers in minutes rather than never. Observed 2026-09-15:
+	// ltx25-denoise1 (82GB of a 90GB budget) sat unservable for 100+ minutes
+	// because moondream (23.7GB) and a vision LLM (32GB) took every window the
+	// instant it opened.
+	vramStarvationSeconds = 240.0
+	// vramClaimTTL bounds a claim so a model that can never actually fit (or a
+	// queue that drains elsewhere) cannot hold memory back indefinitely. The
+	// claim is renewed each tick while the starvation persists.
+	vramClaimTTL = 90 * time.Second
+)
+
+// claimVRAMIfStarving holds VRAM for a model that is being kept out solely by
+// memory pressure and has waited past the starvation threshold. Only one model
+// holds a claim at a time (ClaimVRAMForStarvedModel enforces that), and the
+// claim retires as soon as the model reserves its memory.
+func (s *Scheduler) claimVRAMIfStarving(modelID string, memoryGB, oldestQueuedAge float64) {
+	if oldestQueuedAge < vramStarvationSeconds {
+		return
+	}
+	if memoryGB > s.mgr.BudgetGB() {
+		return // can never fit even on an empty GPU; a claim would only stall others
+	}
+	s.mgr.ClaimVRAMForStarvedModel(modelID, memoryGB, vramClaimTTL)
+}
+
 // conflictGroupHolds reports whether modelID (which declares a non-empty
 // ConflictGroup) must be held this tick by a same-group constraint:
 //   - a different member of the group currently has active (in-flight) jobs —
@@ -1099,12 +1129,17 @@ func (s *Scheduler) getFullModels(bestModel string) map[string]bool {
 		// starved behind local GPU pressure whenever spark is busy with CUDA
 		// work — exactly the contention the offload exists to avoid.
 		if !s.mgr.IsLoaded(modelID) && !remoteServable {
-			freeGB := s.mgr.FreeGB()
+			freeGB := s.mgr.FreeGBFor(modelID)
 			reclaimableGB := s.mgr.ReclaimableIdleGB(modelID)
 			if cfg.MemoryGB > freeGB+reclaimableGB+1e-9 {
 				slog.Debug("scheduler.full: model won't fit in VRAM",
 					"model", modelID, "needed_gb", cfg.MemoryGB,
 					"free_gb", freeGB, "reclaimable_idle_gb", reclaimableGB)
+				// A model kept out on VRAM alone, whose oldest job has now waited
+				// past the starvation threshold, is losing the load race rather
+				// than merely queueing. Claim the memory so the next window is
+				// held for it instead of being taken by the next small load.
+				s.claimVRAMIfStarving(modelID, cfg.MemoryGB, ages[modelID])
 				full[modelID] = true
 				continue
 			}
@@ -1177,7 +1212,7 @@ func (s *Scheduler) waitForInProgressLoad(inst *Instance) error {
 				return insufficientMemoryError{
 					instanceID: inst.InstanceID,
 					neededGB:   inst.memoryGB,
-					freeGB:     s.mgr.FreeGB(),
+					freeGB:     s.mgr.FreeGBFor(inst.ModelID),
 				}
 			}
 			return fmt.Errorf("instance %s in-progress load ended in state=%s", inst.InstanceID, s2)
@@ -1216,7 +1251,7 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 
 	{
 		needed := inst.memoryGB
-		freeGB := s.mgr.FreeGB()
+		freeGB := s.mgr.FreeGBFor(inst.ModelID)
 
 		slog.Info("ensureLoaded: need VRAM", "instance", inst.InstanceID,
 			"needed_gb", needed, "free_gb", freeGB, "state", state)
@@ -1237,14 +1272,14 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 				if candidateModelID == inst.ModelID {
 					continue
 				}
-				if s.mgr.FreeGB() >= needed {
+				if s.mgr.FreeGBFor(inst.ModelID) >= needed {
 					break
 				}
 				if s.scoreModel(candidateModelID) <= wantedScore {
 					continue
 				}
 				for _, inst2 := range s.mgr.GetModelInstances(candidateModelID) {
-					if s.mgr.FreeGB() >= needed {
+					if s.mgr.FreeGBFor(inst.ModelID) >= needed {
 						break
 					}
 					if inst2.State() != "loaded" {
@@ -1284,7 +1319,7 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 			// Evict idle models. Use the queue-aware evictor so that a model
 			// which still has queued/running work is preserved over a model
 			// with nothing waiting for it.
-			deficit := needed - s.mgr.FreeGB()
+			deficit := needed - s.mgr.FreeGBFor(inst.ModelID)
 			if deficit > 0 {
 				queuedJobs := make(map[string]int)
 				for _, modelID := range s.config.ModelIDs() {
@@ -1307,14 +1342,14 @@ func (s *Scheduler) ensureLoaded(inst *Instance) error {
 			// Retry
 			if !s.mgr.ReserveMemoryFor(inst, needed) {
 				slog.Warn("ensureLoaded: can't reserve VRAM after eviction",
-					"instance", inst.InstanceID, "needed_gb", needed, "free_gb", s.mgr.FreeGB())
+					"instance", inst.InstanceID, "needed_gb", needed, "free_gb", s.mgr.FreeGBFor(inst.ModelID))
 				// Mark so a concurrent waiter (loser of the loadInFlight CAS) returns
 				// insufficientMemoryError too, and requeues instead of failing.
 				inst.lastLoadInsufficientMem.Store(true)
 				return insufficientMemoryError{
 					instanceID: inst.InstanceID,
 					neededGB:   needed,
-					freeGB:     s.mgr.FreeGB(),
+					freeGB:     s.mgr.FreeGBFor(inst.ModelID),
 				}
 			}
 		}

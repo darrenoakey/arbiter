@@ -906,9 +906,17 @@ type InstanceManager struct {
 	usedGB       float64
 	reservations map[string]*Reservation
 	reservedGB   float64
-	pythonBin    string
-	projectRoot  string
-	config       *Config // shared with the rest of the arbiter; mutated under m.mu
+	// starvationClaim: a soft hold that lets ONE chronically starved model win
+	// the VRAM race. A model whose weights are a large fraction of the budget
+	// (e.g. an 82GB denoise in a 90GB budget) can otherwise never load while
+	// small models cycle: every time enough VRAM frees, a 1-30s model grabs it
+	// first, the big load fails, and the job cools down — forever. While a claim
+	// is held, every OTHER model sees the claimed GB subtracted from free VRAM,
+	// so the window is preserved until the claimant loads or the claim expires.
+	starvationClaim starvationClaim
+	pythonBin       string
+	projectRoot     string
+	config          *Config // shared with the rest of the arbiter; mutated under m.mu
 	// remoteHosts is per-host advisory memory accounting for remote executors.
 	// It is intentionally SEPARATE from usedGB/budgetGB (spark's audited
 	// local-CUDA ledger). Phase 1 only builds the registry from config; Phase 2
@@ -1477,10 +1485,98 @@ func (m *InstanceManager) IsLoaded(modelID string) bool {
 }
 
 // FreeGB returns free VRAM (budget minus usage minus reservations).
+// Equivalent to FreeGBFor("") — the view of a caller that owns no starvation
+// claim. Use FreeGBFor when deciding whether a SPECIFIC model can load.
 func (m *InstanceManager) FreeGB() float64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.freeGBLocked()
+	return m.freeGBForLocked("")
+}
+
+// FreeGBFor returns free VRAM as seen by modelID. The claimant of an active
+// starvation claim sees its claimed GB as available (the hold exists for it);
+// every other model sees that memory withheld, which is what stops a stream of
+// small fast loads from perpetually stealing the window a big model needs.
+func (m *InstanceManager) FreeGBFor(modelID string) float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.freeGBForLocked(modelID)
+}
+
+func (m *InstanceManager) freeGBForLocked(modelID string) float64 {
+	free := m.freeGBLocked()
+	if claimGB := m.claimHeldAgainstLocked(modelID); claimGB > 0 {
+		free -= claimGB
+	}
+	return free
+}
+
+// claimHeldAgainstLocked returns the GB withheld from modelID by another
+// model's live starvation claim (0 when there is none, the claim has expired,
+// or modelID is the claimant).
+func (m *InstanceManager) claimHeldAgainstLocked(modelID string) float64 {
+	c := m.starvationClaim
+	if c.modelID == "" || c.modelID == modelID {
+		return 0
+	}
+	if time.Now().After(c.until) {
+		return 0
+	}
+	return c.gb
+}
+
+// starvationClaim is a time-bounded hold on VRAM for one starved model.
+type starvationClaim struct {
+	modelID string
+	gb      float64
+	until   time.Time
+}
+
+// ClaimVRAMForStarvedModel places (or renews) the single starvation claim.
+// Returns false when a different model already holds a live claim — only one
+// model is ever prioritised at a time, so small models are never starved by a
+// pile-up of competing claims. The claim is released automatically when the
+// claimant reserves its memory, and expires after ttl regardless, so a model
+// that can never fit cannot deadlock the fleet.
+func (m *InstanceManager) ClaimVRAMForStarvedModel(modelID string, gb float64, ttl time.Duration) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	cur := m.starvationClaim
+	if cur.modelID != "" && cur.modelID != modelID && now.Before(cur.until) {
+		return false
+	}
+	first := cur.modelID != modelID
+	m.starvationClaim = starvationClaim{modelID: modelID, gb: gb, until: now.Add(ttl)}
+	if first {
+		slog.Warn("VRAM starvation claim placed — holding memory for a starved model",
+			"model", modelID, "claim_gb", gb, "ttl", ttl.String(),
+			"used_gb", m.usedGB, "budget_gb", m.budgetGB)
+	}
+	return true
+}
+
+// ReleaseVRAMClaim drops modelID's starvation claim if it holds one.
+func (m *InstanceManager) ReleaseVRAMClaim(modelID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.starvationClaim.modelID != modelID {
+		return
+	}
+	m.starvationClaim = starvationClaim{}
+	slog.Info("VRAM starvation claim released", "model", modelID)
+}
+
+// VRAMClaimHolder reports the model currently holding a live starvation claim
+// ("" when none). Exposed for status reporting and tests.
+func (m *InstanceManager) VRAMClaimHolder() (string, float64) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	c := m.starvationClaim
+	if c.modelID == "" || time.Now().After(c.until) {
+		return "", 0
+	}
+	return c.modelID, c.gb
 }
 
 // ReclaimableIdleGB returns the total VRAM (GB) currently held by loaded
@@ -1682,15 +1778,31 @@ func (m *InstanceManager) ReconcileUsedGB(actualGB, tolerance float64) {
 // ReserveMemoryFor when a specific instance owns the reservation — that path
 // also marks the instance so death-path cleanup is automatic.
 func (m *InstanceManager) ReserveMemory(gb float64) bool {
+	return m.reserveMemoryForModel("", gb)
+}
+
+// reserveMemoryForModel reserves gb against the budget as seen by modelID, so
+// an active starvation claim held by another model withholds its memory here
+// too — that is what actually preserves the window for the starved model
+// rather than merely deferring the decision. A successful reservation by the
+// claimant retires its own claim.
+func (m *InstanceManager) reserveMemoryForModel(modelID string, gb float64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.usedGB+gb > m.budgetGB-m.reservedGB {
+	claimed := m.claimHeldAgainstLocked(modelID)
+	if m.usedGB+gb > m.budgetGB-m.reservedGB-claimed {
 		slog.Info("VRAM reserve failed", "needed_gb", gb, "used_gb", m.usedGB,
 			"reserved_gb", m.reservedGB, "budget_gb", m.budgetGB,
-			"free_gb", m.budgetGB-m.usedGB-m.reservedGB)
+			"starvation_claim_gb", claimed, "claim_holder", m.starvationClaim.modelID,
+			"free_gb", m.budgetGB-m.usedGB-m.reservedGB-claimed)
 		return false
 	}
 	m.usedGB += gb
+	if modelID != "" && m.starvationClaim.modelID == modelID {
+		m.starvationClaim = starvationClaim{}
+		slog.Info("VRAM starvation claim satisfied — starved model got its memory",
+			"model", modelID, "gb", gb)
+	}
 	slog.Info("VRAM reserved", "gb", gb, "used_gb", m.usedGB, "free_gb", m.budgetGB-m.usedGB-m.reservedGB)
 	return true
 }
@@ -1724,7 +1836,7 @@ func (m *InstanceManager) ReserveMemoryFor(inst *Instance, gb float64) bool {
 	}
 	inst.mu.Unlock()
 
-	if !m.ReserveMemory(gb) {
+	if !m.reserveMemoryForModel(inst.ModelID, gb) {
 		return false
 	}
 
