@@ -123,3 +123,45 @@ func TestSchedulerNeverClaimsForAnImpossibleModel(t *testing.T) {
 		t.Fatalf("claimed for an unloadable model (holder=%q)", holder)
 	}
 }
+
+// TestSmallerModelNeverClaimsBehindAResidentGiant pins the priority inversion
+// seen live on 2026-09-15: with an 82GB denoise legitimately resident for half
+// an hour, the 32GB vision LLM starved, claimed, and withheld the leftover 8GB
+// from every 1-20GB model — the whole fleet stopped dispatching. Only a model
+// bigger than what is already resident is being raced and may claim.
+func TestSmallerModelNeverClaimsBehindAResidentGiant(t *testing.T) {
+	mgr := newClaimTestManager(t, 90)
+	giant := NewInstance("ltx25-denoise1", "ltx25-denoise1#0", 1, 82, "python3", ".")
+	mgr.Register(giant)
+	giant.setState("loaded")
+
+	sched := &Scheduler{mgr: mgr}
+	sched.claimVRAMIfStarving("llm:qwen3-vl-8b-fp8", 32, vramStarvationSeconds*10)
+	if holder, _ := mgr.VRAMClaimHolder(); holder != "" {
+		t.Fatalf("a smaller model claimed behind a resident giant (holder=%q)", holder)
+	}
+	// Small models must still be able to use the leftover VRAM.
+	if !mgr.reserveMemoryForModel("aesthetic-scorer", 1) {
+		t.Fatal("leftover VRAM was withheld from a small model")
+	}
+}
+
+// TestBigModelStillClaimsAgainstSmallResidents keeps the original outage fixed:
+// the giant squeezed by small, fast-cycling residents may still claim.
+func TestBigModelStillClaimsAgainstSmallResidents(t *testing.T) {
+	mgr := newClaimTestManager(t, 90)
+	for _, spec := range []struct {
+		model string
+		gb    float64
+	}{{"moondream", 23.7}, {"llm:qwen3-vl-8b-fp8", 32}} {
+		inst := NewInstance(spec.model, spec.model+"#0", 1, spec.gb, "python3", ".")
+		mgr.Register(inst)
+		inst.setState("loaded")
+	}
+
+	sched := &Scheduler{mgr: mgr}
+	sched.claimVRAMIfStarving("ltx25-denoise1", 82, vramStarvationSeconds*2)
+	if holder, _ := mgr.VRAMClaimHolder(); holder != "ltx25-denoise1" {
+		t.Fatalf("starved giant did not claim against small residents (holder=%q)", holder)
+	}
+}

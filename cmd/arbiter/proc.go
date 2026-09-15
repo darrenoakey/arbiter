@@ -1592,6 +1592,31 @@ func (m *InstanceManager) ReclaimableIdleGB(excludeModelID string) float64 {
 	return m.reclaimableIdleGBLocked(excludeModelID)
 }
 
+// LargestResidentGB returns the biggest per-instance VRAM footprint currently
+// resident on spark, ignoring instances of excludeModelID. A starvation claim
+// is only ever justified for a model that is LARGER than everything already
+// resident: that is the model small, fast-cycling loads can steal windows from.
+// A smaller model waiting behind a legitimately resident giant is not racing —
+// it is simply queued — and must not be allowed to withhold the leftover VRAM
+// that other small models can still use.
+func (m *InstanceManager) LargestResidentGB(excludeModelID string) float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var largest float64
+	for _, inst := range m.instances {
+		if inst.ModelID == excludeModelID || inst.isRemote() {
+			continue
+		}
+		if inst.State() == "unloaded" {
+			continue
+		}
+		if inst.memoryGB > largest {
+			largest = inst.memoryGB
+		}
+	}
+	return largest
+}
+
 func (m *InstanceManager) freeGBLocked() float64 {
 	return m.budgetGB - m.usedGB - m.reservedGB
 }

@@ -994,6 +994,15 @@ func (s *Scheduler) claimVRAMIfStarving(modelID string, memoryGB, oldestQueuedAg
 	if memoryGB > s.mgr.BudgetGB() {
 		return // can never fit even on an empty GPU; a claim would only stall others
 	}
+	// Only a model larger than everything currently resident can be losing the
+	// load race — that is the failure this claim exists for. A SMALLER model
+	// waiting behind a resident giant (e.g. a 32GB LLM queued while an 82GB
+	// denoise legitimately runs for half an hour) is not being raced; letting it
+	// claim would withhold the leftover VRAM that 1-20GB models can still use
+	// and stall the whole fleet until the giant finished.
+	if largest := s.mgr.LargestResidentGB(modelID); memoryGB <= largest {
+		return
+	}
 	s.mgr.ClaimVRAMForStarvedModel(modelID, memoryGB, vramClaimTTL)
 }
 
