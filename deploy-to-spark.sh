@@ -59,12 +59,47 @@ echo "    $(md5 -q vllm-chat-worker-linux-arm64 2>/dev/null || md5sum vllm-chat-
 # in-flight work finish before we bounce it, so a redeploy never kills a
 # running job (e.g. a 10-min ltx2 denoise). Tolerant of an older binary that
 # lacks /v1/drain. Bounded wait; override with DEPLOY_FORCE=1 to skip, or
-# DEPLOY_DRAIN_TIMEOUT to change the ceiling (default 1800s).
+# DEPLOY_DRAIN_TIMEOUT to change the ceiling.
+#
+# The default ceiling is deliberately SHORT (120s). This deploy runs inside a
+# greenline release with a hard, non-negotiable 600-second end-to-end deadline;
+# an ltx25 denoise chunk runs 20-45 minutes, so waiting it out guarantees the
+# release is SIGTERM-killed mid-deploy (seen 2026-09-14: killed release left
+# arbiter draining and wedged the whole fleet). Short jobs finish inside the
+# window, and anything still in flight is REQUEUED by the shutdown path
+# (scheduler.shouldRequeueForShutdown) rather than lost — it simply reruns
+# after the bounce. Raise it only for a manual deploy outside the gate.
+#
+# The drain is LEASED and renewed on every poll. A deploy killed here (gate
+# deadline, ^C, crash) therefore cannot leave the fleet wedged: the lease
+# lapses within DEPLOY_DRAIN_LEASE seconds and arbiter resumes dispatch on its
+# own. The trap below is the fast path for signals we can actually catch; the
+# server-side lease covers SIGKILL, which we cannot.
 ARBITER_URL="http://10.0.0.254:8400"
-DEPLOY_DRAIN_TIMEOUT="${DEPLOY_DRAIN_TIMEOUT:-1800}"
+DEPLOY_DRAIN_TIMEOUT="${DEPLOY_DRAIN_TIMEOUT:-120}"
+DEPLOY_DRAIN_LEASE="${DEPLOY_DRAIN_LEASE:-300}"
+DRAIN_REQUESTED=0
+
+drain_request() { # renews the lease; idempotent
+    curl -s --max-time 5 -X POST "$ARBITER_URL/v1/drain" \
+        -H 'Content-Type: application/json' \
+        -d "{\"lease_seconds\":${DEPLOY_DRAIN_LEASE}}" >/dev/null 2>&1
+}
+
+resume_if_aborted() {
+    rc=$?
+    if [ "$DRAIN_REQUESTED" = "1" ]; then
+        echo "==> Deploy ended before the bounce (rc=$rc) — resuming arbiter dispatch"
+        curl -s --max-time 5 -X POST "$ARBITER_URL/v1/drain" \
+            -H 'Content-Type: application/json' -d '{"resume":true}' >/dev/null 2>&1 || true
+    fi
+}
+
 if [ "${DEPLOY_FORCE:-0}" = "1" ]; then
     echo "==> DEPLOY_FORCE=1 — skipping graceful drain (may kill in-flight jobs)"
-elif curl -s --max-time 5 -X POST "$ARBITER_URL/v1/drain" >/dev/null 2>&1; then
+elif drain_request; then
+    DRAIN_REQUESTED=1
+    trap resume_if_aborted EXIT INT TERM HUP
     echo "==> Draining arbiter (no new jobs; waiting for in-flight to finish, max ${DEPLOY_DRAIN_TIMEOUT}s)..."
     drain_deadline=$(( $(date +%s) + DEPLOY_DRAIN_TIMEOUT ))
     while :; do
@@ -80,12 +115,18 @@ elif curl -s --max-time 5 -X POST "$ARBITER_URL/v1/drain" >/dev/null 2>&1; then
         fi
         echo "    ${active} job(s) still in flight; waiting..."
         sleep 10
+        drain_request # renew the lease while we keep waiting
     done
 else
     echo "==> No /v1/drain on running arbiter (older binary) — proceeding without drain"
 fi
 
 echo "==> Stopping arbiter on spark..."
+# Past this point the old process is going away, so an abort no longer needs a
+# resume call: the restarted arbiter starts undrained, and a drain request that
+# never got renewed expires server-side anyway.
+DRAIN_REQUESTED=0
+trap - EXIT INT TERM HUP
 ssh "$SPARK" "/home/darren/local/auto/run stop arbiter" 2>&1 | tail -1 || true
 
 # A terminated arbiter can remain in uninterruptible SQLite/filesystem I/O for

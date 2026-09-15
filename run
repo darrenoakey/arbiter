@@ -46,9 +46,15 @@ case "$CMD" in
         ;;
     deploy)
         # greenline deploy: drain-gated redeploy to spark. NEVER DEPLOY_FORCE=1.
-        # DEPLOY_DRAIN_TIMEOUT is generous because a denoise chunk can run ~13min.
+        # Do NOT override DEPLOY_DRAIN_TIMEOUT here. This runs inside a greenline
+        # release with a hard 600s end-to-end deadline; the old 9000s override
+        # made every deploy during a long denoise wait ~2.5h for a drain that
+        # could never finish in time, so the release was SIGTERM-killed mid-deploy
+        # (2026-09-14: left arbiter draining and wedged the whole fleet). The
+        # script's own bounded default applies; in-flight jobs are requeued by
+        # the shutdown path, not lost.
         export PATH="$PATH:/usr/local/go/bin"
-        exec env DEPLOY_DRAIN_TIMEOUT="${DEPLOY_DRAIN_TIMEOUT:-9000}" ./deploy-to-spark.sh
+        exec ./deploy-to-spark.sh
         ;;
     test)
         exec python -m pytest tests/ "$@"

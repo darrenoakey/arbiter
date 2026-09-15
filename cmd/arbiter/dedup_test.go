@@ -38,6 +38,11 @@ func TestReconcileFollowingJobs(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(outputDir, "jobs", completedOrig.ID), 0o755); err != nil {
 		t.Fatalf("mkdir completed original dir: %v", err)
 	}
+	// ResolveFollowers refuses to resolve completed originals whose artifact
+	// vanished — give this one a real file so it stays a completed resolution.
+	if err := os.WriteFile(filepath.Join(outputDir, "jobs", completedOrig.ID, "result.png"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write completed original artifact: %v", err)
+	}
 	completedFollowerA, _ := store.CreateFollowerJob("z-image-turbo", "image-generate", completedPayload, completedOrig.ID)
 	completedFollowerB, _ := store.CreateFollowerJob("z-image-turbo", "image-generate", completedPayload, completedOrig.ID)
 

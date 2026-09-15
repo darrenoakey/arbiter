@@ -29,7 +29,13 @@ type Scheduler struct {
 	// draining: when set, the scheduler stops starting NEW jobs (queued jobs
 	// stay queued, in-flight jobs run to completion). Used for graceful
 	// shutdown / safe redeploy so a bounce never kills a running job.
-	draining        atomic.Bool
+	draining atomic.Bool
+	// drainLeaseUntil: unix-nanos deadline for an externally requested drain.
+	// A deploy that asks for drain must keep renewing its lease; if the
+	// deploying process dies (crash, SIGKILL, gate deadline) the lease lapses
+	// and the scheduler resumes dispatch on its own. Zero means "no lease" —
+	// an indefinite drain, used by in-process graceful shutdown.
+	drainLeaseUntil atomic.Int64
 	cooldownMu      sync.Mutex
 	cooldownUntil   map[string]time.Time // model -> skip until this time (load failures)
 	pressureMu      sync.Mutex
@@ -570,17 +576,53 @@ func (s *Scheduler) MarkShuttingDown() {
 	s.shuttingDown.Store(true)
 }
 
-// SetDraining toggles drain mode. While draining, the scheduler dispatches no
-// new jobs; in-flight work finishes and queued work waits. Resuming (false)
-// returns to normal dispatch.
+// SetDraining toggles drain mode indefinitely. While draining, the scheduler
+// dispatches no new jobs; in-flight work finishes and queued work waits.
+// Resuming (false) returns to normal dispatch and drops any drain lease.
 func (s *Scheduler) SetDraining(on bool) {
-	s.draining.Store(on)
-	slog.Info("scheduler drain mode changed", "draining", on)
+	s.setDraining(on, 0)
 }
 
-// IsDraining reports whether drain mode is active.
+// SetDrainingFor enters drain mode under a bounded lease. The caller is
+// expected to renew the lease while it still needs the drain (a deploy renews
+// on every poll). If the caller dies without resuming — a killed deploy, a
+// gate deadline, SIGKILL — the lease lapses and dispatch resumes by itself
+// instead of leaving the whole fleet silently wedged with a full queue and
+// zero active jobs. A non-positive lease means indefinite.
+func (s *Scheduler) SetDrainingFor(lease time.Duration) {
+	s.setDraining(true, lease)
+}
+
+func (s *Scheduler) setDraining(on bool, lease time.Duration) {
+	if on && lease > 0 {
+		s.drainLeaseUntil.Store(time.Now().Add(lease).UnixNano())
+	} else {
+		s.drainLeaseUntil.Store(0)
+	}
+	prev := s.draining.Swap(on)
+	if prev != on {
+		slog.Info("scheduler drain mode changed", "draining", on, "lease", lease.String())
+	}
+}
+
+// IsDraining reports whether drain mode is active, expiring a lapsed drain
+// lease first so an abandoned deploy cannot stall the queue forever.
 func (s *Scheduler) IsDraining() bool {
-	return s.draining.Load()
+	if !s.draining.Load() {
+		return false
+	}
+	deadline := s.drainLeaseUntil.Load()
+	if deadline == 0 || time.Now().UnixNano() < deadline {
+		return true
+	}
+	// Lease lapsed: nobody renewed it. Resume dispatch and say so loudly —
+	// this only happens when the process that requested the drain died.
+	if s.drainLeaseUntil.CompareAndSwap(deadline, 0) {
+		s.draining.Store(false)
+		slog.Warn("drain lease expired without renewal — resuming dispatch",
+			"expired_at", time.Unix(0, deadline).UTC().Format(time.RFC3339))
+	}
+	return false
 }
 
 func (s *Scheduler) shouldRequeueForShutdown(err error, resp *WorkerResponse) bool {
@@ -1515,6 +1557,27 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 	// failover counter is no longer needed.
 	s.clearFailoverAttempts(job.ID)
 
+	// Fail closed on a vanished output artifact. A worker can report success
+	// after writing its result, but a CIFS reconnect can drop the write
+	// server-side after close() returned — and completing anyway poisons the
+	// dedup cache with a bodyless result that is replayed forever as instant
+	// "completed" jobs whose output never materializes (2026-09-14
+	// ltx25-denoise1 incident). Convert to an error so the normal failure
+	// path (job state, follower promotion, circuit breaker) applies.
+	if resp != nil {
+		if name := fileArtifactName(resp.Result); name != "" {
+			artifact := filepath.Join(jobDir, name)
+			if info, statErr := os.Stat(artifact); statErr != nil || info.Size() == 0 {
+				detail := ""
+				if statErr != nil {
+					detail = fmt.Sprintf(": %v", statErr)
+				}
+				resp.Status = "error"
+				resp.Error = fmt.Sprintf("output artifact missing or empty after completion: %s%s", artifact, detail)
+			}
+		}
+	}
+
 	switch resp.Status {
 	case "cancelled":
 		s.updateJobState(job.ID, "cancelled", WithFinishedAt(nowTS()))
@@ -1799,7 +1862,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 		// Drain mode: start no new work. In-flight jobs finish on their own
 		// goroutines; queued jobs stay queued for after the restart. We skip
 		// eviction too — no need to churn VRAM while winding down.
-		if s.draining.Load() {
+		if s.IsDraining() {
 			continue
 		}
 

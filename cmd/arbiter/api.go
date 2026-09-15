@@ -624,6 +624,19 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 			if origJob != nil {
 				switch origJob.State {
 				case "completed":
+					if !jobArtifactExists(a.config, a.outputDir, origJob) {
+						// Poisoned cache entry: the original claims completion but
+						// its on-disk artifact is gone (e.g. a CIFS write lost on
+						// share reconnect). Replaying it would mint another
+						// bodyless "completed" job, so fall through and re-run for
+						// real; the fresh registration below replaces the entry.
+						slog.Warn("dedup: original artifact missing, re-running instead of cache hit",
+							"original", origID, "type", req.Type)
+						a.logger.Log("job.dedup_stale", map[string]any{
+							"original_id": origID, "type": req.Type,
+						})
+						break
+					}
 					// Instant cache hit — create pre-completed job. Store the
 					// canonical job id in the DB instead of creating a
 					// filesystem symlink: previous os.Symlink(origDir, newDir)
@@ -804,7 +817,16 @@ func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
 		// Encode adapters write encoded.pt; synthesizing result.{format}
 		// made completed jobs look empty to pollers that only see result.pt.
 		if job.State == "completed" && result != nil {
-			resultFile := resultArtifactPath(resolveJobDir(a.config, a.outputDir, job.ID), result)
+			// A dedup-cache-hit job has no output dir of its own; its result
+			// inherits the ORIGINAL job's artifact. Synthesizing the path from
+			// the cache-hit job's own id points at a dir that never existed
+			// (2026-09-14 incident: every dedup hit of a file-producing job
+			// "completed" with an unresolvable result_path).
+			artifactJobID := job.ID
+			if job.CanonicalJobID != "" {
+				artifactJobID = job.CanonicalJobID
+			}
+			resultFile := resultArtifactPath(resolveJobDir(a.config, a.outputDir, artifactJobID), result)
 			if resultFile != "" {
 				result["result_path"] = resultFile
 				skipData := r.URL.Query().Get("no_data") == "1"
@@ -2785,6 +2807,7 @@ func (a *API) drain(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Resume           bool `json:"resume"`
 		ShutdownWhenIdle bool `json:"shutdown_when_idle"`
+		LeaseSeconds     int  `json:"lease_seconds"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&req) // body is optional
@@ -2797,23 +2820,50 @@ func (a *API) drain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.scheduler.SetDraining(true)
+	// Every externally requested drain carries a lease the caller must renew
+	// (POST again) while it still needs the drain. A deploy that is killed
+	// mid-drain therefore cannot leave the scheduler wedged: the lease lapses
+	// and dispatch resumes on its own. shutdown_when_idle drains are the one
+	// exception — they end in a process exit, and a mid-flight resume there
+	// would start a job that the imminent bounce would kill.
+	lease := defaultDrainLease
+	if req.LeaseSeconds > 0 {
+		lease = time.Duration(req.LeaseSeconds) * time.Second
+	}
+	if req.ShutdownWhenIdle {
+		a.scheduler.SetDraining(true)
+	} else {
+		a.scheduler.SetDrainingFor(lease)
+	}
 	active := a.mgr.TotalActiveJobs()
 	a.logger.Log("scheduler.drain", map[string]any{
 		"draining": true, "active_jobs": active, "shutdown_when_idle": req.ShutdownWhenIdle,
+		"lease_seconds": int(lease / time.Second),
 	})
 
 	if req.ShutdownWhenIdle {
 		a.startDrainShutdownMonitor()
 	}
 
-	writeJSON(w, 200, map[string]any{
+	resp := map[string]any{
 		"draining":           true,
 		"active_jobs":        active,
 		"shutdown_when_idle": req.ShutdownWhenIdle,
 		"message":            "no new jobs will start; in-flight jobs will finish. poll GET /v1/ps for draining && active_jobs==0",
-	})
+	}
+	if !req.ShutdownWhenIdle {
+		resp["lease_seconds"] = int(lease / time.Second)
+		resp["message"] = "no new jobs will start; in-flight jobs will finish. " +
+			"RENEW by POSTing /v1/drain again before the lease expires, or dispatch resumes. " +
+			"poll GET /v1/ps for draining && active_jobs==0"
+	}
+	writeJSON(w, 200, resp)
 }
+
+// defaultDrainLease bounds how long a single drain request holds the scheduler
+// down without renewal. Comfortably longer than a deploy's poll interval, far
+// shorter than the multi-hour wedge an abandoned drain used to cause.
+const defaultDrainLease = 5 * time.Minute
 
 // startDrainShutdownMonitor launches (at most once) a goroutine that waits for
 // all in-flight jobs to finish, then triggers a graceful process shutdown.

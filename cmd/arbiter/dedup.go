@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -271,13 +272,33 @@ func (s *Store) ResolveFollowers(originalJobID string, originalState string, res
 	}
 
 	now := nowTS()
+
+	// A completed original whose artifact vanished (e.g. a CIFS write lost on
+	// share reconnect) must NOT resolve its followers into bodyless
+	// completions — those poison the dedup cache forever. Demote to the
+	// failure path so the oldest follower is promoted to re-run for real.
+	if originalState == "completed" && result != nil {
+		if name := fileArtifactName(*result); name != "" {
+			artifact := filepath.Join(outputDir, "jobs", originalJobID, name)
+			if info, err := os.Stat(artifact); err != nil || info.Size() == 0 {
+				slog.Warn("resolve followers: original artifact missing, promoting follower to re-run",
+					"original", originalJobID, "artifact", artifact, "stat_err", err)
+				originalState = "failed"
+			}
+		}
+	}
+
 	for _, fid := range followers {
 		if originalState == "completed" {
-			// Symlink output directory
+			// Symlink output directory. The target is RELATIVE (just the orig
+			// dir name): an absolute Linux path is stored server-side by the
+			// macOS SMB share and then fails to traverse from spark's own CIFS
+			// mount with EINVAL (2026-09-14 incident) — a relative target
+			// resolves against the parent dir on both sides of the share.
 			origDir := fmt.Sprintf("%s/jobs/%s", outputDir, originalJobID)
 			followerDir := fmt.Sprintf("%s/jobs/%s", outputDir, fid)
 			_ = os.RemoveAll(followerDir)
-			_ = os.Symlink(origDir, followerDir)
+			_ = os.Symlink(filepath.Base(origDir), followerDir)
 
 			s.mu.Lock()
 			if result != nil {

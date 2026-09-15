@@ -638,7 +638,10 @@ func TestConflictGroupExclusionAndPriority(t *testing.T) {
 // draining the scheduler starts no new jobs (a queued job stays queued and no
 // instance becomes active), and resuming restarts dispatch. This is the
 // primitive a safe redeploy relies on — bounce only once nothing is in flight.
-func TestDrainModeBlocksNewDispatch(t *testing.T) {
+// newDrainTestScheduler builds a real scheduler backed by a real store and an
+// idle stub worker, so drain tests exercise genuine dispatch behaviour.
+func newDrainTestScheduler(t *testing.T) (*Scheduler, *Store, *InstanceManager) {
+	t.Helper()
 	projectRoot := t.TempDir()
 	workerPath := filepath.Join(projectRoot, "llm-worker")
 	writeIdleWorker(t, workerPath)
@@ -654,7 +657,7 @@ func TestDrainModeBlocksNewDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
-	defer store.Close()
+	t.Cleanup(func() { store.Close() })
 	store.InitDedup()
 
 	pi := 1.0
@@ -665,12 +668,92 @@ func TestDrainModeBlocksNewDispatch(t *testing.T) {
 		},
 	}
 	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
-	defer logger.Close()
+	t.Cleanup(func() { logger.Close() })
 	mgr := NewInstanceManager(cfg, "python3", projectRoot)
 	mgr.ScaleModel("llm:m", 1, cfg.Models["llm:m"])
 	// Point the instance at the idle worker so load succeeds without a real model.
 	mgr.GetModelInstances("llm:m")[0].workerCmd = []string{workerPath}
-	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
+	return NewScheduler(cfg, store, mgr, logger, outputDir), store, mgr
+}
+
+// TestDrainLeaseExpiryResumesDispatch pins the fix for a real outage: a deploy
+// asked arbiter to drain, was killed by its gate deadline before resuming, and
+// the whole fleet sat with a full queue and zero active jobs until a human
+// noticed. An unrenewed drain lease must expire and dispatch must restart by
+// itself, with nobody calling resume.
+func TestDrainLeaseExpiryResumesDispatch(t *testing.T) {
+	sched, store, mgr := newDrainTestScheduler(t)
+
+	sched.SetDrainingFor(600 * time.Millisecond)
+	if !sched.IsDraining() {
+		t.Fatal("IsDraining() = false immediately after SetDrainingFor")
+	}
+
+	job, err := store.CreateJob("llm:m", "embed-text", json.RawMessage(`{}`), 1)
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sched.Run(ctx)
+
+	// Within the lease, the job must stay queued.
+	time.Sleep(300 * time.Millisecond)
+	if after, _ := store.GetJob(job.ID); after.State != "queued" {
+		t.Fatalf("during lease: job state = %s, want queued", after.State)
+	}
+	if got := mgr.TotalActiveJobs(); got != 0 {
+		t.Fatalf("during lease: TotalActiveJobs() = %d, want 0", got)
+	}
+
+	// After the lease lapses — no resume call, simulating the killed deploy —
+	// drain must lift and the queued job must be dispatched.
+	moved := false
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if after, _ := store.GetJob(job.ID); after.State != "queued" {
+			moved = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !moved {
+		t.Fatal("job stayed queued after the drain lease expired — fleet still wedged")
+	}
+	if sched.IsDraining() {
+		t.Fatal("IsDraining() = true after the lease expired")
+	}
+}
+
+// TestDrainWithoutLeaseHoldsIndefinitely guards the shutdown_when_idle path:
+// that drain ends in a process exit, so it must NOT self-resume and let a job
+// start into an imminent bounce.
+func TestDrainWithoutLeaseHoldsIndefinitely(t *testing.T) {
+	sched, _, _ := newDrainTestScheduler(t)
+	sched.SetDraining(true)
+	time.Sleep(300 * time.Millisecond)
+	if !sched.IsDraining() {
+		t.Fatal("unleased drain self-resumed; shutdown drains must hold until exit")
+	}
+}
+
+// TestDrainLeaseRenewalExtends proves a live deploy keeps the drain by simply
+// re-asking for it, which is what the deploy poll loop does every few seconds.
+func TestDrainLeaseRenewalExtends(t *testing.T) {
+	sched, _, _ := newDrainTestScheduler(t)
+	sched.SetDrainingFor(400 * time.Millisecond)
+	for i := 0; i < 4; i++ {
+		time.Sleep(150 * time.Millisecond)
+		sched.SetDrainingFor(400 * time.Millisecond) // renew, as the deploy does
+		if !sched.IsDraining() {
+			t.Fatalf("renewal %d: drain lifted while the lease was being renewed", i)
+		}
+	}
+}
+
+func TestDrainModeBlocksNewDispatch(t *testing.T) {
+	sched, store, mgr := newDrainTestScheduler(t)
 
 	sched.SetDraining(true)
 	if !sched.IsDraining() {

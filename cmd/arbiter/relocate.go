@@ -156,3 +156,47 @@ func walkReplace(v any, oldP, newP string) any {
 	}
 	return v
 }
+
+// fileArtifactName returns the basename of the on-disk artifact referenced by
+// a job result, or "" when the result does not reference one. Results that
+// carry inline data (e.g. chat completions cached with a "data" field) are
+// not file-backed and always return "".
+func fileArtifactName(result json.RawMessage) string {
+	if len(result) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(result, &m); err != nil {
+		return ""
+	}
+	if _, inline := m["data"]; inline {
+		return ""
+	}
+	name, _ := m["file"].(string)
+	name = filepath.Base(strings.TrimSpace(name))
+	if name == "" || name == "." || name == string(os.PathSeparator) {
+		return ""
+	}
+	return name
+}
+
+// jobArtifactExists reports whether the on-disk artifact referenced by a
+// job's result exists and is non-empty. Results without a file artifact
+// (inline data, no result at all) count as existing — there is nothing to
+// verify. Canonical (dedup-cache-hit) jobs inherit the ORIGINAL job's output
+// directory, so the artifact is probed there.
+func jobArtifactExists(cfg *Config, outputDir string, job *Job) bool {
+	if job == nil || job.Result == nil {
+		return true
+	}
+	name := fileArtifactName(*job.Result)
+	if name == "" {
+		return true
+	}
+	jobID := job.ID
+	if job.CanonicalJobID != "" {
+		jobID = job.CanonicalJobID
+	}
+	info, err := os.Stat(filepath.Join(resolveJobDir(cfg, outputDir, jobID), name))
+	return err == nil && info.Size() > 0
+}
