@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -290,15 +289,26 @@ func (s *Store) ResolveFollowers(originalJobID string, originalState string, res
 
 	for _, fid := range followers {
 		if originalState == "completed" {
-			// Symlink output directory. The target is RELATIVE (just the orig
-			// dir name): an absolute Linux path is stored server-side by the
-			// macOS SMB share and then fails to traverse from spark's own CIFS
-			// mount with EINVAL (2026-09-14 incident) — a relative target
-			// resolves against the parent dir on both sides of the share.
-			origDir := fmt.Sprintf("%s/jobs/%s", outputDir, originalJobID)
-			followerDir := fmt.Sprintf("%s/jobs/%s", outputDir, fid)
-			_ = os.RemoveAll(followerDir)
-			_ = os.Symlink(filepath.Base(origDir), followerDir)
+			// Point the follower at the original in the DB rather than aliasing
+			// its output directory on the share. Two reasons, both learned the
+			// hard way:
+			//   1. Output pruning only spares an original that something still
+			//      references (CountCanonicalReferences). A follower linked ONLY
+			//      by a filesystem symlink is invisible to that check, so prune
+			//      could delete the original's artifacts while the follower's
+			//      result JSON still pointed at them — regenerating exactly the
+			//      bodyless "completed" jobs with empty output dirs this whole
+			//      mechanism exists to prevent.
+			//   2. A symlink written through the macOS SMB share is not
+			//      traversable from spark's own CIFS mount (EINVAL), absolute or
+			//      relative, so the alias did not even work where it was needed.
+			// The result JSON already references the original's canonical output
+			// paths directly, so no aliasing is required for correctness — this
+			// matches the dedup cache-hit path in the API.
+			if err := s.SetCanonicalJobID(fid, originalJobID); err != nil {
+				slog.Error("resolve follower: set canonical_job_id",
+					"job_id", fid, "orig", originalJobID, "error", err)
+			}
 
 			s.mu.Lock()
 			if result != nil {

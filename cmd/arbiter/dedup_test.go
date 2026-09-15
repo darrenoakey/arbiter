@@ -85,12 +85,13 @@ func TestReconcileFollowingJobs(t *testing.T) {
 		if follower.Result == nil || string(*follower.Result) != string(completedResult) {
 			t.Fatalf("completed follower result = %v, want %s", follower.Result, completedResult)
 		}
-		info, err := os.Lstat(filepath.Join(outputDir, "jobs", followerID))
-		if err != nil {
-			t.Fatalf("stat follower symlink %s: %v", followerID, err)
+		// A resolved follower points at the original in the DB (which is what
+		// output pruning consults) and leaves no filesystem alias behind.
+		if follower.CanonicalJobID != completedOrig.ID {
+			t.Fatalf("follower %s canonical_job_id = %q, want %s", followerID, follower.CanonicalJobID, completedOrig.ID)
 		}
-		if info.Mode()&os.ModeSymlink == 0 {
-			t.Fatalf("follower dir for %s is not a symlink", followerID)
+		if _, err := os.Lstat(filepath.Join(outputDir, "jobs", followerID)); !os.IsNotExist(err) {
+			t.Fatalf("follower %s left an output alias on disk (err=%v)", followerID, err)
 		}
 	}
 

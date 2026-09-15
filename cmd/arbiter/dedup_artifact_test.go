@@ -179,11 +179,15 @@ func TestResolveFollowersPromotesWhenOriginalArtifactMissing(t *testing.T) {
 	}
 }
 
-// TestResolveFollowersRelativeSymlink proves the follower output dir is a
-// RELATIVE symlink (bare original dir name). The previous absolute spark path
-// was stored server-side by the macOS SMB share and failed to traverse from
-// spark's own CIFS mount with EINVAL, making every follower dir unreadable.
-func TestResolveFollowersRelativeSymlink(t *testing.T) {
+// TestResolveFollowersPointsAtCanonicalJob proves a resolved follower is
+// recorded as a DB pointer to the original, not as a filesystem alias. That
+// pointer is what output pruning consults (CountCanonicalReferences): without
+// it, prune deletes an original whose followers' results still reference its
+// artifacts, which is precisely how bodyless "completed" jobs with empty output
+// directories were manufactured (2026-09-14/15 incident). A symlink could never
+// serve this role — prune cannot see it, and a symlink written through the
+// macOS SMB share is not traversable from spark's CIFS mount (EINVAL) anyway.
+func TestResolveFollowersPointsAtCanonicalJob(t *testing.T) {
 	store, outputDir := newTestStore(t)
 
 	payload := json.RawMessage(`{"chunk":8}`)
@@ -209,21 +213,26 @@ func TestResolveFollowersRelativeSymlink(t *testing.T) {
 
 	store.ResolveFollowers(orig.ID, "completed", &origResult, "", outputDir)
 
-	target, err := os.Readlink(filepath.Join(outputDir, "jobs", follower.ID))
-	if err != nil {
-		t.Fatalf("follower dir is not a symlink: %v", err)
-	}
-	if target != orig.ID {
-		t.Fatalf("symlink target = %q, want bare relative name %q", target, orig.ID)
-	}
-	if info, err := os.Stat(filepath.Join(outputDir, "jobs", follower.ID, "result.mp4")); err != nil || info.Size() == 0 {
-		t.Fatalf("artifact unreadable through relative symlink: %v", err)
-	}
 	got, err := store.GetJob(follower.ID)
 	if err != nil {
 		t.Fatalf("get follower: %v", err)
 	}
 	if got.State != "completed" {
 		t.Fatalf("follower state = %q, want completed", got.State)
+	}
+
+	// The pointer prune consults must exist, so the original's artifacts are
+	// protected for as long as a follower's result references them.
+	refs, err := store.CountCanonicalReferences(orig.ID)
+	if err != nil {
+		t.Fatalf("count canonical references: %v", err)
+	}
+	if refs != 1 {
+		t.Fatalf("CountCanonicalReferences(orig) = %d, want 1 — prune would delete artifacts a follower still needs", refs)
+	}
+
+	// And no unreadable filesystem alias is left behind on the share.
+	if _, err := os.Lstat(filepath.Join(outputDir, "jobs", follower.ID)); !os.IsNotExist(err) {
+		t.Fatalf("follower output path exists on disk (err=%v); dedup must not alias directories", err)
 	}
 }
