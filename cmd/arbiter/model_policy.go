@@ -10,6 +10,22 @@ import (
 
 const stillImageDisabledMessage = "still-image generation is actively disabled in Arbiter; callers must use the Mac mini Codex image service"
 
+// referenceImageEditModel is the ONE sanctioned exception to the still-image
+// policy (owner decision, 2026-09-16). It is a reference-conditioned local
+// editor (FLUX.2-klein-9B) used to produce *reference renders* for other
+// pipelines — e.g. a "what would a pro DSLR shot of this photo look like"
+// target that a per-segment grading loop then steers toward. It is NOT an
+// image generator for end users: it always requires an input image, it is
+// never wired into generate_image / daz-agent-sdk / the Mac mini Codex IGS
+// route, and it must never be used as a fallback when IGS is unavailable.
+// The legacy image-generate / image-edit job types and every other still-image
+// marker stay disabled.
+const referenceImageEditModel = "reference-image-edit"
+
+func isReferenceImageEditModel(modelID string) bool {
+	return normalizedPolicyText(modelID) == referenceImageEditModel
+}
+
 const untrustedWorkerCommandMessage = "worker_cmd is not a trusted repository-owned Arbiter adapter/worker identity"
 
 var disabledStillImageMarkers = []string{
@@ -56,6 +72,7 @@ var trustedPythonAdapters = map[string]string{
 	"tts-kokoro":              "kokoro",
 	"wan-s2v":                 "",
 	"whisper-large":           "whisper",
+	referenceImageEditModel:   "flux2",
 }
 
 var trustedRepositoryWorkers = map[string]string{
@@ -82,6 +99,9 @@ func normalizedPolicyText(value string) string {
 func isDisabledStillImageModel(modelID string) bool {
 	normalized := normalizedPolicyText(modelID)
 	if normalized == "" {
+		return false
+	}
+	if normalized == referenceImageEditModel {
 		return false
 	}
 	if normalized == "lora-train" || normalized == "ltx2" || strings.HasPrefix(normalized, "ltx2-") ||
@@ -130,6 +150,12 @@ func nestedModelRoutesJob(jobType string) bool {
 func disabledStillImageConfig(modelID string, cfg ModelConfig) bool {
 	if isDisabledStillImageModel(modelID) {
 		return true
+	}
+	if isReferenceImageEditModel(modelID) {
+		// The sanctioned reference editor legitimately names a FLUX checkpoint
+		// and the venvs/flux2 interpreter; the worker command itself is still
+		// pinned by validateWorkerCommand to the trusted adapter identity.
+		return false
 	}
 	videoLora := normalizedPolicyText(modelID) == "ltx2" || strings.HasPrefix(normalizedPolicyText(modelID), "ltx2-") ||
 		normalizedPolicyText(modelID) == "ltx25" || strings.HasPrefix(normalizedPolicyText(modelID), "ltx25-")
@@ -231,6 +257,10 @@ func untrustedWorkerPolicyError(modelID, detail string) error {
 
 func rejectDisabledStillImage(jobType, modelID string) error {
 	if jobType == "image-generate" || jobType == "image-edit" || isDisabledStillImageModel(modelID) {
+		return fmt.Errorf("%s", stillImageDisabledMessage)
+	}
+	if isReferenceImageEditModel(modelID) && jobType != "reference-image-edit" {
+		// The reference editor cannot be smuggled in under another job type.
 		return fmt.Errorf("%s", stillImageDisabledMessage)
 	}
 	return nil

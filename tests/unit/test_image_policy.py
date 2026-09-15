@@ -11,10 +11,36 @@ from textwrap import dedent
 import pytest
 
 from arbiter.image_policy import (
+    REFERENCE_IMAGE_EDIT_MODEL,
     STILL_IMAGE_DISABLED_MESSAGE,
     StillImageGenerationDisabled,
     is_disabled_still_image_model,
 )
+
+
+def test_reference_image_edit_is_the_only_still_image_exception():
+    """The reference editor is allowed; the checkpoint it uses is still denied under any other id."""
+    assert not is_disabled_still_image_model(REFERENCE_IMAGE_EDIT_MODEL)
+    assert not is_disabled_still_image_model("Reference_Image_Edit")
+    assert is_disabled_still_image_model("black-forest-labs/FLUX.2-klein-9B")
+    assert is_disabled_still_image_model("flux2")
+    assert is_disabled_still_image_model("reference-image-edit-lora")
+
+
+def test_reference_image_edit_requires_an_input_image(tmp_path):
+    """No text-to-image path exists: a prompt without an image fails before any model call."""
+    from arbiter.adapters.base import InferenceError
+    from arbiter.adapters.reference_image_edit import ReferenceImageEditAdapter, fit_within
+
+    adapter = ReferenceImageEditAdapter()
+    adapter._pipe = object()  # type: ignore[assignment]  # never invoked on this path
+    with pytest.raises(InferenceError, match="requires an input image"):
+        adapter.infer({"prompt": "pro dslr"}, tmp_path, threading.Event())
+    with pytest.raises(InferenceError, match="prompt is required"):
+        adapter.infer({"image": "eA=="}, tmp_path, threading.Event())
+    assert fit_within(1592, 1197) == (1536, 1152)
+    assert fit_within(4000, 3000) == (1536, 1152)
+    assert fit_within(1024, 768) == (1024, 768)
 
 
 @pytest.mark.parametrize(
@@ -140,6 +166,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "minimax-h3-local",
         "moondream",
         "music-generate",
+        "reference-image-edit",
         "rvc-convert",
         "rvc-train",
         "sadtalker",

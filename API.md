@@ -1082,6 +1082,28 @@ Still-image creation and editing are not Arbiter job types. Requests using
 other still-image generator aliases return HTTP 400. Use the Mac mini Codex
 image service. BiRefNet background removal and LTX2 video remain supported.
 
+**One scoped exception — `reference-image-edit` (owner decision 2026-09-16).**
+A reference-conditioned local editor (FLUX.2-klein-9B, `venvs/flux2`) whose
+only purpose is to render *reference targets* for other pipelines — e.g. a
+"what would a pro DSLR shot of this photo look like" image that a per-segment
+grading loop then steers the ORIGINAL pixels toward. It always requires an
+input image (no text-to-image path), it is never wired into `generate_image`,
+`daz-agent-sdk`, or the Codex IGS route, and it must never be used as a
+fallback for real image generation. Cannot be reached through `image-edit`,
+`image-generate`, or any other job type, and cannot be redirected to another
+adapter.
+
+```json
+{"type": "reference-image-edit",
+ "params": {"prompt": "the same photo taken with a professional DSLR, ...",
+            "image_file": "/mnt/arbiter-store/inbox/photo.jpg",
+            "steps": 4, "guidance_scale": 1.0, "seed": 42}}
+```
+
+Result: `{"format":"png","width":W,"height":H,"steps":4,"seed":42,"file":"result.png",
+"model":"black-forest-labs/FLUX.2-klein-9B"}` plus `result_path`. Inputs larger
+than 1536 px on the long side are downscaled (klein is a ~1 MP model).
+
 <!-- Retired still-image API reference intentionally hidden; retained only as migration history.
 
 ### 3.1 image-generate

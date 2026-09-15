@@ -31,6 +31,7 @@ class JobType(str, Enum):
     LTX25_ENCODE = "ltx25-encode"
     LTX25_DENOISE1 = "ltx25-denoise1"
     AESTHETIC_SCORE = "aesthetic-score"
+    REFERENCE_IMAGE_EDIT = "reference-image-edit"
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
     EMBED_TEXT = "embed-text"
@@ -63,6 +64,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "ltx25-encode": "ltx25-encode",
     "ltx25-denoise1": "ltx25-denoise1",
     "aesthetic-score": "aesthetic-scorer",
+    "reference-image-edit": "reference-image-edit",
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
     "embed-text": "embed-text",
@@ -300,6 +302,17 @@ class AestheticScoreParams(BaseModel):
     image_file: Optional[str] = None
 
 
+class ReferenceImageEditParams(BaseModel):
+    """Reference render of an existing image; an input image is mandatory."""
+
+    prompt: str
+    image: Optional[str] = None  # base64
+    image_file: Optional[str] = None
+    steps: int = 4
+    guidance_scale: float = 1.0
+    seed: int = 42
+
+
 class TTSVoxtralParams(BaseModel):
     text: str
     voice: str = "alloy"
@@ -428,6 +441,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "ltx25-encode": LTX25EncodeParams,
     "ltx25-denoise1": LTX25Denoise1Params,
     "aesthetic-score": AestheticScoreParams,
+    "reference-image-edit": ReferenceImageEditParams,
     "tts-voxtral": TTSVoxtralParams,
     "video-generate-h3": VideoGenerateH3Params,
     "video-generate-fast-h3": VideoGenerateH3Params,

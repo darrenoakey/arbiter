@@ -1,0 +1,19 @@
+{
+  "auto_download": "black-forest-labs/FLUX.2-klein-9B",
+  "avg_inference_ms": 12000,
+  "group": false,
+  "keep_alive_seconds": 600,
+  "load_ms": 90000,
+  "max_concurrent": 1,
+  "max_instances": 1,
+  "max_runtime_seconds": 900,
+  "memory_gb": 36,
+  "model_path": "",
+  "pressure_index": 0.5,
+  "worker_cmd": [
+    "/home/darren/src/arbiter/venvs/flux2/bin/python",
+    "-m",
+    "arbiter.worker_main",
+    "reference-image-edit"
+  ]
+}

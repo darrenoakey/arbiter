@@ -2,7 +2,7 @@
 
 # Arbiter
 
-Arbiter is your personal GPU workstation manager for vision analysis, background removal, audio, speech, talking heads, and video. Still-image generation is actively disabled; use the Mac mini Codex image service for image creation or editing.
+Arbiter is your personal GPU workstation manager for vision analysis, background removal, audio, speech, talking heads, and video. Still-image generation is actively disabled; use the Mac mini Codex image service for image creation or editing. The one scoped exception is `reference-image-edit`, a reference-conditioned FLUX.2-klein editor that only renders reference targets for other pipelines (input image mandatory, never a fallback for real image generation).
 
 You submit a job (transcribe a recording, remove a background, clone a voice), and Arbiter handles the rest: loading the right model, running your request, and giving you back the result when it's ready.
 

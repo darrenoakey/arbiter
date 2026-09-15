@@ -185,6 +185,14 @@ The `ref:` prefix is resolved in `_resolve_media()` in `src/arbiter/adapters/bas
   disguised as another job type. User-facing image creation/editing belongs to
   the Mac mini Codex image service. BiRefNet `background-remove` and every LTX2
   video stage remain supported.
+  **Single scoped exception (owner decision 2026-09-16):** `reference-image-edit`
+  (`adapters/reference_image_edit.py`, Go `referenceImageEditModel`) — a
+  reference-conditioned FLUX.2-klein-9B editor used ONLY to render reference
+  targets for other pipelines (e.g. a pro-DSLR look for a grading loop to aim
+  at). Input image mandatory; never wired into generate_image / daz-agent-sdk /
+  Codex IGS; never a fallback. Its job type and model id are the only opening;
+  `image-edit`/`image-generate`, legacy `flux2`, and every marker stay denied
+  (`reference_image_edit_policy_test.go`, `test_image_policy.py`).
 - **SJF scheduling**: `priority = avg_inference_ms + (load_ms if not loaded else 0)`. Shortest jobs run first. Already-loaded models get natural priority.
 - **SQLite queue**: Persistent, crash-recoverable. On restart, incomplete jobs are re-queued.
 - **Dedup followers**: Duplicate requests are persisted as jobs with `state=following` and `error=following:<original_job_id>`. Startup recovery must requeue `scheduled`/`running` jobs, then reconcile followers so none remain attached to terminal or missing originals.

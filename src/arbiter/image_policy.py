@@ -38,6 +38,15 @@ _DISABLED_MARKERS = (
 )
 
 
+# The ONE sanctioned exception (owner decision, 2026-09-16): a reference-
+# conditioned local editor that renders *reference targets* for other
+# pipelines. It always requires an input image, is never wired into
+# generate_image / daz-agent-sdk / the Mac mini Codex IGS route, and must never
+# be used as a still-image fallback. See adapters/reference_image_edit.py and
+# the Go `referenceImageEditModel` policy.
+REFERENCE_IMAGE_EDIT_MODEL = "reference-image-edit"
+
+
 class StillImageGenerationDisabled(RuntimeError):
     """Raised before any disabled still-image model can load or infer."""
 
@@ -50,6 +59,8 @@ def is_disabled_still_image_model(model_id: str) -> bool:
     """Return whether a model identifier belongs to a still-image generator."""
     normalized = _normalize(model_id)
     if not normalized:
+        return False
+    if normalized == REFERENCE_IMAGE_EDIT_MODEL:
         return False
     if normalized == "lora-train" or normalized.startswith("ltx2-"):
         return False
