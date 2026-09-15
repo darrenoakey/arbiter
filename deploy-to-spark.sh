@@ -17,6 +17,67 @@ REMOTE=/home/darren/src/arbiter
 
 cd "$(dirname "$0")"
 
+ARBITER_URL="http://10.0.0.254:8400"
+DEPLOY_DRAIN_TIMEOUT="${DEPLOY_DRAIN_TIMEOUT:-120}"
+DEPLOY_DRAIN_LEASE="${DEPLOY_DRAIN_LEASE:-300}"
+DRAIN_REQUESTED=0
+drain_deadline=0
+
+drain_request() { # renews the lease; idempotent
+    curl -s --max-time 5 -X POST "$ARBITER_URL/v1/drain" \
+        -H 'Content-Type: application/json' \
+        -d "{\"lease_seconds\":${DEPLOY_DRAIN_LEASE}}" >/dev/null 2>&1
+}
+
+resume_if_aborted() {
+    rc=$?
+    if [ "$DRAIN_REQUESTED" = "1" ]; then
+        echo "==> Deploy ended before the bounce (rc=$rc) — resuming arbiter dispatch"
+        curl -s --max-time 5 -X POST "$ARBITER_URL/v1/drain" \
+            -H 'Content-Type: application/json' -d '{"resume":true}' >/dev/null 2>&1 || true
+    fi
+}
+
+# Graceful drain: ask the running arbiter to stop starting NEW jobs and let
+# in-flight work finish before we bounce it, so a redeploy never kills a
+# running job (e.g. a 10-min ltx2 denoise). Tolerant of an older binary that
+# lacks /v1/drain. Bounded wait; override with DEPLOY_FORCE=1 to skip, or
+# DEPLOY_DRAIN_TIMEOUT to change the ceiling.
+#
+# The default ceiling is deliberately SHORT (120s). This deploy runs inside a
+# greenline release with a hard, non-negotiable 600-second end-to-end deadline;
+# an ltx25 denoise chunk runs 20-45 minutes, so waiting it out guarantees the
+# release is SIGTERM-killed mid-deploy (seen 2026-09-14: killed release left
+# arbiter draining and wedged the whole fleet). Short jobs finish inside the
+# window, and anything still in flight is REQUEUED by the shutdown path
+# (scheduler.shouldRequeueForShutdown) rather than lost — it simply reruns
+# after the bounce. Raise it only for a manual deploy outside the gate.
+#
+# The drain is requested UP FRONT — before the local build/test phase — so the
+# in-flight window overlaps it instead of serializing after it (measured
+# 2026-09-15: a full drain-window wait cost 120s of a 203.8s release). The
+# deadline is counted from this request, so the time spent building/testing
+# consumes the same 120s window: short jobs get no less protection, and a bit
+# more wall-clock to finish. If a build/test step fails, the EXIT trap below
+# resumes dispatch immediately; worst case the lease lapses after
+# DEPLOY_DRAIN_LEASE seconds and arbiter resumes dispatch on its own.
+#
+# The drain is LEASED and renewed on every poll. A deploy killed here (gate
+# deadline, ^C, crash) therefore cannot leave the fleet wedged: the lease
+# lapses within DEPLOY_DRAIN_LEASE seconds and arbiter resumes dispatch on its
+# own. The trap below is the fast path for signals we can actually catch; the
+# server-side lease covers SIGKILL, which we cannot.
+if [ "${DEPLOY_FORCE:-0}" = "1" ]; then
+    echo "==> DEPLOY_FORCE=1 — skipping graceful drain (may kill in-flight jobs)"
+elif drain_request; then
+    DRAIN_REQUESTED=1
+    trap resume_if_aborted EXIT INT TERM HUP
+    drain_deadline=$(( $(date +%s) + DEPLOY_DRAIN_TIMEOUT ))
+    echo "==> Drain requested (no new jobs) — in-flight work winds down while we build/test locally"
+else
+    echo "==> No /v1/drain on running arbiter (older binary) — proceeding without drain"
+fi
+
 echo "==> Running Go tests..."
 # ARBITER_GO_TEST_SKIP: optional regex of environment-dependent tests to skip
 # (some remote-host tests require live local ollama / remote Macs on the LAN).
@@ -55,53 +116,12 @@ echo "    $(md5 -q arbiter-linux-arm64 2>/dev/null || md5sum arbiter-linux-arm64
 echo "    $(md5 -q llm-worker-linux-arm64 2>/dev/null || md5sum llm-worker-linux-arm64 | awk '{print $1}') llm-worker"
 echo "    $(md5 -q vllm-chat-worker-linux-arm64 2>/dev/null || md5sum vllm-chat-worker-linux-arm64 | awk '{print $1}') vllm-chat-worker"
 
-# Graceful drain: ask the running arbiter to stop starting NEW jobs and let
-# in-flight work finish before we bounce it, so a redeploy never kills a
-# running job (e.g. a 10-min ltx2 denoise). Tolerant of an older binary that
-# lacks /v1/drain. Bounded wait; override with DEPLOY_FORCE=1 to skip, or
-# DEPLOY_DRAIN_TIMEOUT to change the ceiling.
-#
-# The default ceiling is deliberately SHORT (120s). This deploy runs inside a
-# greenline release with a hard, non-negotiable 600-second end-to-end deadline;
-# an ltx25 denoise chunk runs 20-45 minutes, so waiting it out guarantees the
-# release is SIGTERM-killed mid-deploy (seen 2026-09-14: killed release left
-# arbiter draining and wedged the whole fleet). Short jobs finish inside the
-# window, and anything still in flight is REQUEUED by the shutdown path
-# (scheduler.shouldRequeueForShutdown) rather than lost — it simply reruns
-# after the bounce. Raise it only for a manual deploy outside the gate.
-#
-# The drain is LEASED and renewed on every poll. A deploy killed here (gate
-# deadline, ^C, crash) therefore cannot leave the fleet wedged: the lease
-# lapses within DEPLOY_DRAIN_LEASE seconds and arbiter resumes dispatch on its
-# own. The trap below is the fast path for signals we can actually catch; the
-# server-side lease covers SIGKILL, which we cannot.
-ARBITER_URL="http://10.0.0.254:8400"
-DEPLOY_DRAIN_TIMEOUT="${DEPLOY_DRAIN_TIMEOUT:-120}"
-DEPLOY_DRAIN_LEASE="${DEPLOY_DRAIN_LEASE:-300}"
-DRAIN_REQUESTED=0
-
-drain_request() { # renews the lease; idempotent
-    curl -s --max-time 5 -X POST "$ARBITER_URL/v1/drain" \
-        -H 'Content-Type: application/json' \
-        -d "{\"lease_seconds\":${DEPLOY_DRAIN_LEASE}}" >/dev/null 2>&1
-}
-
-resume_if_aborted() {
-    rc=$?
-    if [ "$DRAIN_REQUESTED" = "1" ]; then
-        echo "==> Deploy ended before the bounce (rc=$rc) — resuming arbiter dispatch"
-        curl -s --max-time 5 -X POST "$ARBITER_URL/v1/drain" \
-            -H 'Content-Type: application/json' -d '{"resume":true}' >/dev/null 2>&1 || true
-    fi
-}
-
-if [ "${DEPLOY_FORCE:-0}" = "1" ]; then
-    echo "==> DEPLOY_FORCE=1 — skipping graceful drain (may kill in-flight jobs)"
-elif drain_request; then
-    DRAIN_REQUESTED=1
-    trap resume_if_aborted EXIT INT TERM HUP
-    echo "==> Draining arbiter (no new jobs; waiting for in-flight to finish, max ${DEPLOY_DRAIN_TIMEOUT}s)..."
-    drain_deadline=$(( $(date +%s) + DEPLOY_DRAIN_TIMEOUT ))
+# Rejoin the drain requested before the build/test phase. Its deadline was
+# set at that request, so the build/test time counts against the same bounded
+# window — this loop only waits out the remainder.
+if [ "$DRAIN_REQUESTED" = "1" ]; then
+    drain_request # renew the lease across the build/test gap
+    echo "==> Draining arbiter (waiting for in-flight to finish, deadline ${DEPLOY_DRAIN_TIMEOUT}s from drain request)..."
     while :; do
         active=$(curl -s --max-time 5 "$ARBITER_URL/v1/ps" 2>/dev/null \
             | python3 -c 'import sys,json; print(json.load(sys.stdin).get("active_jobs",0))' 2>/dev/null || echo 0)
@@ -117,8 +137,6 @@ elif drain_request; then
         sleep 10
         drain_request # renew the lease while we keep waiting
     done
-else
-    echo "==> No /v1/drain on running arbiter (older binary) — proceeding without drain"
 fi
 
 echo "==> Stopping arbiter on spark..."
@@ -208,7 +226,41 @@ rm -f /tmp/cron.base
 "
 
 echo "==> Starting arbiter on spark..."
-ssh "$SPARK" "/home/darren/local/auto/run start arbiter" 2>&1 | tail -1
+# Race with auto's restart-on-crash: when the pre-stop drain actually emptied
+# the fleet, arbiter is idle and exits on SIGTERM within milliseconds. auto's
+# stop can lose its own state machine race to its restart policy and bring
+# arbiter right back (seen 2026-09-15: "Failed to SIGKILL ... No such
+# process" during stop, then "Process arbiter is already running" on start,
+# which aborted the release and forced a rollback). The resurrected process
+# also predates the binary upload above, so it must never be accepted. If
+# start reports the service already running, bounce it once more: a fresh,
+# complete stop of the live resurrected process wins the state machine, and
+# the retry starts the new binary.
+start_out=""
+if ! start_out=$(ssh "$SPARK" "/home/darren/local/auto/run start arbiter" 2>&1); then
+    if echo "$start_out" | grep -q "already running"; then
+        echo "==> auto restarted arbiter during the stop — bouncing it once more"
+        ssh "$SPARK" "/home/darren/local/auto/run stop arbiter" 2>&1 | tail -1 || true
+        if ! ssh "$SPARK" 'deadline=$(( $(date +%s) + 120 ))
+        while lsof -nP -iTCP:8400 -sTCP:LISTEN >/dev/null 2>&1; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "    FAILED — resurrected arbiter still owns port 8400 after 120s"
+                exit 1
+            fi
+            sleep 1
+        done'; then
+            exit 1
+        fi
+        start_out=$(ssh "$SPARK" "/home/darren/local/auto/run start arbiter" 2>&1) || {
+            echo "$start_out" | tail -1
+            exit 1
+        }
+    else
+        echo "$start_out" | tail -1
+        exit 1
+    fi
+fi
+echo "$start_out" | tail -1
 
 echo "==> Waiting for health check..."
 for i in $(seq 1 20); do
