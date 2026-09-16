@@ -41,6 +41,7 @@ class JobType(str, Enum):
     RVC_CONVERT = "rvc-convert"
     VOICE_FIT = "voice-fit"
     MUSIC_GENERATE = "music-generate"
+    MUSIC_GENERATE_YUE2 = "music-generate-yue2"
 
 
 # Maps job type to model_id
@@ -74,6 +75,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "rvc-convert": "rvc-convert",
     "voice-fit": "voice-fit",
     "music-generate": "music-generate",
+    "music-generate-yue2": "yue2",
 }
 
 
@@ -421,6 +423,16 @@ class MusicGenerateParams(BaseModel):
     format: str = "mp3"  # mp3 (320kbps, default) | wav | flac | ogg
     model: Optional[str] = None
 
+class Yue2MusicParams(BaseModel):
+    style: str = ""  # style/genre prompt, e.g. "funk, upbeat, horns, ..."
+    lyrics: Optional[str] = None  # section-tagged lyrics ([Verse], [Chorus], ...)
+    cot: str = "full"  # full (melody+chords) | melody | off
+    seed: Optional[int] = None
+    cfg_scale: Optional[float] = None  # semantic CFG, default 1.0 (1.01 for cot=off)
+    abc: Optional[str] = None  # external ABC score (requires cot=melody/full)
+    format: str = "mp3"  # mp3 (320kbps, default) | wav | flac | ogg
+    model: Optional[str] = None
+
 
 # Maps job type to its parameter validation schema
 JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
@@ -453,4 +465,5 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "voice-fit": VoiceFitParams,
     "rvc-convert": RvcConvertParams,
     "music-generate": MusicGenerateParams,
+    "music-generate-yue2": Yue2MusicParams,
 }

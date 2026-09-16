@@ -39,6 +39,7 @@ _ADAPTER_MODULES = (
     "rvc",
     "voice_fit",
     "music_generate",
+    "yue2",
 )
 
 for _module_name in _ADAPTER_MODULES:

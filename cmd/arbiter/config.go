@@ -387,6 +387,7 @@ var JobTypeToModel = map[string]string{
 	"rvc-convert":             "rvc-convert",
 	"voice-fit":               "voice-fit",
 	"music-generate":          "music-generate",
+	"music-generate-yue2":     "yue2",
 	"reference-image-edit":    referenceImageEditModel,
 }
 
