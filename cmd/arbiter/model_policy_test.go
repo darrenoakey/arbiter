@@ -57,6 +57,18 @@ func TestMusicGenerateAdmission(t *testing.T) {
 	}
 }
 
+func TestYue2Admission(t *testing.T) {
+	if err := validateJobModelCompatibility("music-generate-yue2", "yue2"); err != nil {
+		t.Fatalf("exact yue2 model rejected: %v", err)
+	}
+	if got := JobTypeToModel["music-generate-yue2"]; got != "yue2" {
+		t.Fatalf("JobTypeToModel[music-generate-yue2] = %q, want yue2", got)
+	}
+	if venv, ok := trustedPythonAdapters["yue2"]; !ok || venv != "yue2" {
+		t.Fatalf("trustedPythonAdapters[yue2] = %q, want yue2", venv)
+	}
+}
+
 func TestMiniMaxH3TopLevelSubmissionAndLTX2Default(t *testing.T) {
 	api, cleanup := newTestAPI(t)
 	defer cleanup()
