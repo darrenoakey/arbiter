@@ -40,6 +40,7 @@ _ADAPTER_MODULES = (
     "voice_fit",
     "music_generate",
     "yue2",
+    "photo_enhance",
 )
 
 for _module_name in _ADAPTER_MODULES:

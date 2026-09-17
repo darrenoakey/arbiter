@@ -26,6 +26,21 @@ def test_no_orphan_map_entries():
     assert set(JOB_TYPE_PARAMS) == values
 
 
+def test_photo_enhance_job_type_registered():
+    assert JOB_TYPE_TO_MODEL["photo-enhance"] == "photo-enhance"
+    assert "photo-enhance" in JOB_TYPE_PARAMS
+
+
+def test_photo_enhance_param_schema_shape():
+    from arbiter.schemas import PhotoEnhanceParams
+
+    params = PhotoEnhanceParams()
+    assert params.turns == 45 and params.candidates == 6
+    assert params.detail is True and params.stage == "full" and params.seed == 42
+    probe = PhotoEnhanceParams(image_file="/tmp/x.png", stage="probe", turns=1, candidates=1)
+    assert probe.image is None and probe.stage == "probe"
+
+
 def test_voice_pipeline_job_types_registered():
     expected = {
         "demucs": "demucs",

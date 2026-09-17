@@ -389,6 +389,7 @@ var JobTypeToModel = map[string]string{
 	"music-generate":          "music-generate",
 	"music-generate-yue2":     "yue2",
 	"reference-image-edit":    referenceImageEditModel,
+	"photo-enhance":           "photo-enhance",
 }
 
 func LoadConfig(projectRoot string) (*Config, error) {

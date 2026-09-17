@@ -42,6 +42,7 @@ class JobType(str, Enum):
     VOICE_FIT = "voice-fit"
     MUSIC_GENERATE = "music-generate"
     MUSIC_GENERATE_YUE2 = "music-generate-yue2"
+    PHOTO_ENHANCE = "photo-enhance"
 
 
 # Maps job type to model_id
@@ -76,6 +77,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "voice-fit": "voice-fit",
     "music-generate": "music-generate",
     "music-generate-yue2": "yue2",
+    "photo-enhance": "photo-enhance",
 }
 
 
@@ -315,6 +317,20 @@ class ReferenceImageEditParams(BaseModel):
     seed: int = 42
 
 
+class PhotoEnhanceParams(BaseModel):
+    """Full photo-enhance pipeline: detail recovery, reference render, guided
+    photometric climb. Everything runs on spark; the caller only submits."""
+
+    image: Optional[str] = None  # base64
+    image_file: Optional[str] = None  # staged path on spark
+    turns: int = 45
+    candidates: int = 6
+    detail: bool = True
+    seed: int = 42
+    stage: str = "full"  # "full" | "probe" (SeedVR2 detail pass only, for bring-up)
+    why: Optional[str] = None
+
+
 class TTSVoxtralParams(BaseModel):
     text: str
     voice: str = "alloy"
@@ -466,4 +482,5 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "rvc-convert": RvcConvertParams,
     "music-generate": MusicGenerateParams,
     "music-generate-yue2": Yue2MusicParams,
+    "photo-enhance": PhotoEnhanceParams,
 }
