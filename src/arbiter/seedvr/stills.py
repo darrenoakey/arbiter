@@ -192,10 +192,14 @@ class SeedVR2Upscaler:
         frame = torch.from_numpy(np.asarray(image.convert("RGB"))).permute(2, 0, 1).unsqueeze(0).float() / 255.0
         condition = transform(frame.to(get_device()))
 
-        # encode condition latents (VAE phase: DiT off GPU)
+        # encode condition latents (VAE phase: DiT off GPU). Autocast like
+        # the DiT/decode phases: without it the encoder accumulates fp32
+        # feature maps (a 3072 px frame OOMed a 40 GB worker at the
+        # inflation concat).
         runner.dit.to("cpu")
         runner.vae.to(get_device())
-        cond_latents = runner.vae_encode([condition])
+        with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
+            cond_latents = runner.vae_encode([condition])
         runner.vae.to("cpu")
         runner.dit.to(get_device())
 
