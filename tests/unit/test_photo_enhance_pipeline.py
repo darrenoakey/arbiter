@@ -59,6 +59,28 @@ def test_photo_enhance_module_imports_without_scipy():
     assert "photo-enhance" in list_registered()
 
 
+def test_module_without_spec_breaks_find_spec_and_spec_fixes_it():
+    """Regression: shim modules must carry a __spec__.
+
+    types.ModuleType sets __spec__ to None, and importlib.util.find_spec
+    raises ValueError for sys.modules entries without one — diffusers
+    probes flash_attn exactly this way, which killed the worker load.
+    """
+    import importlib.util
+    import sys
+    import types
+
+    mod = types.ModuleType("shimprobe_test")
+    sys.modules["shimprobe_test"] = mod
+    try:
+        with pytest.raises(ValueError):
+            importlib.util.find_spec("shimprobe_test")
+        mod.__spec__ = importlib.util.spec_from_loader("shimprobe_test", loader=None)
+        assert importlib.util.find_spec("shimprobe_test") is not None
+    finally:
+        del sys.modules["shimprobe_test"]
+
+
 def test_person_masks_partition_a_real_cutout():
     cutout = Image.new("RGBA", (32, 24), (10, 20, 30, 0))  # transparent background
     for x in range(8, 24):  # person block in the middle

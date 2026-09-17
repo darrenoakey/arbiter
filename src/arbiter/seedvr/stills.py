@@ -68,18 +68,28 @@ def _sdpa_varlen(q, k, v, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=Non
 # Inject fake flash_attn and apex modules BEFORE any vendored import so
 # the unconditional imports resolve to torch fallbacks.
 def _install_shims() -> None:
+    import importlib.util
     import torch
+
+    def _spec(name: str):
+        # importlib.util.find_spec(name) consults sys.modules first and
+        # raises ValueError if the cached module has no __spec__; diffusers
+        # probes flash_attn/apex exactly that way at import time.
+        return importlib.util.spec_from_loader(name, loader=None)
 
     if "flash_attn" not in sys.modules:
         flash = types.ModuleType("flash_attn")
         flash.flash_attn_varlen_func = _sdpa_varlen
+        flash.__spec__ = _spec("flash_attn")
         sys.modules["flash_attn"] = flash
     if "apex" not in sys.modules:
         apex = types.ModuleType("apex")
         normalization = types.ModuleType("apex.normalization")
         normalization.FusedLayerNorm = torch.nn.LayerNorm
         normalization.FusedRMSNorm = torch.nn.RMSNorm
+        normalization.__spec__ = _spec("apex.normalization")
         apex.normalization = normalization
+        apex.__spec__ = _spec("apex")
         sys.modules["apex"] = apex
         sys.modules["apex.normalization"] = normalization
 
