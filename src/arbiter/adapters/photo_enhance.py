@@ -23,13 +23,6 @@ import time
 from pathlib import Path
 
 from arbiter.adapters.base import InferenceError, ModelAdapter
-from arbiter.adapters.photo_enhance_impl.client import ArbiterClient
-from arbiter.adapters.photo_enhance_impl.climb import GuidedClimb
-from arbiter.adapters.photo_enhance_impl.detail import recover_detail
-from arbiter.adapters.photo_enhance_impl.masks import person_masks
-from arbiter.adapters.photo_enhance_impl.reference import render_reference
-from arbiter.adapters.photo_enhance_impl.settings import Settings
-from arbiter.adapters.photo_enhance_impl.vision_chat import VisionChat
 from arbiter.adapters.registry import register
 
 log = logging.getLogger(__name__)
@@ -39,17 +32,28 @@ SUB_WHY = "photo-enhance pipeline job"
 
 @register
 class PhotoEnhanceAdapter(ModelAdapter):
+    """Whole photo-enhance pipeline on spark (see module docstring above).
+
+    Every heavy dependency (the vendored pipeline package, PIL, scipy,
+    torch) is imported lazily inside load()/infer(): this module is
+    imported by every adapter worker at registry boot, so module-level
+    imports here would impose photo-enhance's venv deps on all models
+    (that broke every other worker with 'No module named scipy').
+    """
+
     model_id = "photo-enhance"
 
     def __init__(self) -> None:
-        self._settings = Settings()
+        self._settings = None
         self._upscaler = None
 
     # ##################################################################
     # load
     def load(self, device: str = "cuda") -> None:
+        from arbiter.adapters.photo_enhance_impl.settings import Settings
         from arbiter.seedvr.stills import SeedVR2Upscaler
 
+        self._settings = Settings()
         upscaler = SeedVR2Upscaler(self._settings.seedvr2_home, self._settings.seedvr2_ckpt)
         upscaler.load()
         self._upscaler = upscaler
@@ -69,6 +73,13 @@ class PhotoEnhanceAdapter(ModelAdapter):
         if self._upscaler is None:
             raise InferenceError("photo-enhance not loaded")
         self._check_cancel(cancel_flag)
+
+        from arbiter.adapters.photo_enhance_impl.client import ArbiterClient
+        from arbiter.adapters.photo_enhance_impl.climb import GuidedClimb
+        from arbiter.adapters.photo_enhance_impl.detail import recover_detail
+        from arbiter.adapters.photo_enhance_impl.masks import person_masks
+        from arbiter.adapters.photo_enhance_impl.reference import render_reference
+        from arbiter.adapters.photo_enhance_impl.vision_chat import VisionChat
 
         image = self._resolve_image(params)
 

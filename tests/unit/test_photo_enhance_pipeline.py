@@ -29,6 +29,36 @@ from arbiter.adapters.photo_enhance_impl.masks import person_masks
 from arbiter.adapters.photo_enhance_impl.vision_chat import VisionChat, parse_json_object
 
 
+def test_photo_enhance_module_imports_without_scipy():
+    """Regression: module-level imports broke every other adapter worker.
+
+    Every worker boots through arbiter.adapters.__init__, which imports
+    this adapter; a module-level `import scipy` (via the vendored
+    operators) made ALL models fail to spawn with ModuleNotFoundError in
+    venvs that lack photo-enhance's deps. Heavy imports must stay lazy.
+    """
+    import importlib
+    import sys
+
+    class _ScipyBlocker:
+        def find_spec(self, name, path=None, target=None):
+            if name == "scipy" or name.startswith("scipy."):
+                raise ModuleNotFoundError(f"{name!r} blocked by regression test")
+            return None
+
+    blocker = _ScipyBlocker()
+    sys.meta_path.insert(0, blocker)
+    sys.modules.pop("arbiter.adapters.photo_enhance", None)
+    try:
+        module = importlib.import_module("arbiter.adapters.photo_enhance")
+    finally:
+        sys.meta_path.remove(blocker)
+    assert module.PhotoEnhanceAdapter.model_id == "photo-enhance"
+    from arbiter.adapters.registry import list_registered
+
+    assert "photo-enhance" in list_registered()
+
+
 def test_person_masks_partition_a_real_cutout():
     cutout = Image.new("RGBA", (32, 24), (10, 20, 30, 0))  # transparent background
     for x in range(8, 24):  # person block in the middle
