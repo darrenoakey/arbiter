@@ -69,6 +69,18 @@ func TestYue2Admission(t *testing.T) {
 	}
 }
 
+func TestPhotoEnhanceAdmission(t *testing.T) {
+	if err := validateJobModelCompatibility("photo-enhance", "photo-enhance"); err != nil {
+		t.Fatalf("exact photo-enhance model rejected: %v", err)
+	}
+	if got := JobTypeToModel["photo-enhance"]; got != "photo-enhance" {
+		t.Fatalf("JobTypeToModel[photo-enhance] = %q, want photo-enhance", got)
+	}
+	if venv, ok := trustedPythonAdapters["photo-enhance"]; !ok || venv != "photo-enhance" {
+		t.Fatalf("trustedPythonAdapters[photo-enhance] = %q, want photo-enhance", venv)
+	}
+}
+
 func TestMiniMaxH3TopLevelSubmissionAndLTX2Default(t *testing.T) {
 	api, cleanup := newTestAPI(t)
 	defer cleanup()

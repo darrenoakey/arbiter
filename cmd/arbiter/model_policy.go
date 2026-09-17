@@ -65,6 +65,7 @@ var trustedPythonAdapters = map[string]string{
 	"voice-fit":               "voxsmith",
 	"music-generate":          "music-generate",
 	"yue2":                    "yue2",
+	"photo-enhance":           "photo-enhance",
 	"sadtalker":               "",
 	"sonic":                   "",
 	"tts-clone":               "qwentts",
