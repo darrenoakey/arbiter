@@ -76,7 +76,17 @@ class VisionChat:
 
     # ##################################################################
     # ask once
+    # the vision backend (vllm-served qwen3-vl) restarts several times a
+    # day under fleet load and answers 5xx while down; a climb turn must
+    # ride that out instead of failing the whole photo after the outer
+    # retry. 5xx and connection errors retry with a backoff (3 tries);
+    # a 4xx is a real protocol bug and fails immediately.
+    retry_backoff_seconds = 60.0
+
     def _ask_once(self) -> str:
+        import time
+        import urllib.error
+
         body = {
             "model": self.settings.vision_model,
             "stream": False,
@@ -89,9 +99,21 @@ class VisionChat:
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=VISION_TIMEOUT) as response:
-            payload = json.load(response)
-        return payload["choices"][0]["message"]["content"]
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=VISION_TIMEOUT) as response:
+                    payload = json.load(response)
+                return payload["choices"][0]["message"]["content"]
+            except urllib.error.HTTPError as err:
+                if err.code < 500:
+                    raise
+                last_error = err
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as err:
+                last_error = err
+            log.warning("vision chat attempt %d failed (%s); backing off", attempt + 1, last_error)
+            time.sleep(self.retry_backoff_seconds)
+        raise RuntimeError(f"vision chat failed after 3 attempts: {last_error}")
 
     # ##################################################################
     # openai turn

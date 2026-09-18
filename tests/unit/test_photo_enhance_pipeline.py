@@ -210,3 +210,47 @@ def test_parse_json_object_round_trips_operators_style_proposals():
     proposal = {"segment": "person", "tool": "fill_light", "amount": 0.4, "why": "face is dark"}
     wrapped = f'Here is my proposal:\n```json\n{json.dumps(proposal)}\n```\nDone.'
     assert parse_json_object(wrapped) == proposal
+
+
+# ##################################################################
+# test vision chat retries through a 5xx backend restart
+# regression: qwen3-vl answers 500 while the vllm worker restarts
+# (~5 min fleet-wide, several times a day); a climb turn must ride it
+# out. Serves 500, 500, then 200 from a real loopback HTTP server.
+def test_vision_chat_retries_5xx_then_succeeds():
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from arbiter.adapters.photo_enhance_impl.settings import Settings
+    from arbiter.adapters.photo_enhance_impl.vision_chat import VisionChat
+
+    calls = {"count": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            calls["count"] += 1
+            if calls["count"] < 3:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b"backend restarting")
+                return
+            body = json.dumps({"choices": [{"message": {"content": '{"a": 1}'}}]}).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        chat = VisionChat(Settings(arbiter_url=f"http://127.0.0.1:{server.server_port}"))
+        chat.retry_backoff_seconds = 0.0
+        chat.user("propose an edit")
+        assert chat.ask() == '{"a": 1}'
+        assert calls["count"] == 3
+    finally:
+        server.shutdown()
+        server.server_close()
