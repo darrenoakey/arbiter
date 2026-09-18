@@ -145,11 +145,13 @@ class SeedVR2Upscaler:
         runner.config.diffusion.timesteps.sampling.steps = 1
         runner.configure_diffusion()
         self.runner = runner
+        pos_path = Path(os.environ.get("SEEDVR_POS_EMB", str(VENDOR / "pos_emb.pt")))
+        neg_path = Path(os.environ.get("SEEDVR_NEG_EMB", str(VENDOR / "neg_emb.pt")))
         self._text_embeds = {
-            "texts_pos": [torch.load(VENDOR / "pos_emb.pt", map_location="cpu")],
-            "texts_neg": [torch.load(VENDOR / "neg_emb.pt", map_location="cpu")],
+            "texts_pos": [torch.load(pos_path, map_location="cpu")],
+            "texts_neg": [torch.load(neg_path, map_location="cpu")],
         }
-        log.info("seedvr2 3B loaded from %s", self.checkpoint)
+        log.info("seedvr2 3B loaded from %s (pos emb: %s)", self.checkpoint, pos_path)
 
     # ##################################################################
     # upscale
