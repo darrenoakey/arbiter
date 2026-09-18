@@ -22,7 +22,10 @@ from .settings import Settings
 
 log = logging.getLogger(__name__)
 
-VISION_TIMEOUT = 300
+# qwen3-vl on spark can sit behind a long queue of photo-namer drip jobs or
+# a multi-minute vllm (re)load; a climb turn is not worth killing over that.
+VISION_TIMEOUT = 900
+MAX_ATTEMPTS = 2
 JPEG_QUALITY = 88
 MAX_TOKENS = 2500
 TEMPERATURE = 0.5
@@ -62,6 +65,18 @@ class VisionChat:
     # ##################################################################
     # ask
     def ask(self) -> str:
+        last_err: Exception | None = None
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                return self._ask_once()
+            except (TimeoutError, OSError) as err:
+                last_err = err
+                log.warning("vision chat attempt %d failed: %s", attempt, err)
+        raise RuntimeError(f"vision chat failed after {MAX_ATTEMPTS} attempts: {last_err}")
+
+    # ##################################################################
+    # ask once
+    def _ask_once(self) -> str:
         body = {
             "model": self.settings.vision_model,
             "stream": False,
