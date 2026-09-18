@@ -254,8 +254,14 @@ class SeedVR2Upscaler:
         if out_w < trim_w * scale or out_h < trim_h * scale:
             raise RuntimeError(f"seedvr2 returned {out_w}x{out_h}, expected at least {trim_w * scale}x{trim_h * scale}")
         result = Image.fromarray(sample, "RGB")
-        # exact 2x contract for the tile blender: crop the top-left 2x box
-        return result.crop((0, 0, trim_w * scale, trim_h * scale))
+        # exact 2x contract for the tile blender: crop the top-left 2x box,
+        # then anchor-blend: the official SeedVR2 full-precision generation
+        # drifts far harder from the input than the mflux port this tool was
+        # tuned on, so each tile is blended back toward its upscaled input.
+        # 0.65 keeps the recovered texture while restoring input fidelity.
+        result = result.crop((0, 0, trim_w * scale, trim_h * scale))
+        anchor = image.resize(result.size, Image.Resampling.LANCZOS)
+        return Image.blend(anchor, result, 0.65)
 
     # ##################################################################
     # close
