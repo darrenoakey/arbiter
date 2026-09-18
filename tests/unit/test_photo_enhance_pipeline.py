@@ -16,10 +16,12 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from arbiter.adapters.photo_enhance_impl import detail as detail_module
 from arbiter.adapters.photo_enhance_impl.detail import (
     OVERLAP,
     SCALE,
     TILE,
+    Tile,
     assemble_tiles,
     axis_offsets,
     feather,
@@ -157,6 +159,23 @@ def test_recover_detail_aligns_odd_tiles_and_covers_the_frame():
     assert result.size == source.size
     assert seen, "executor was never called"
     assert all(w % DIVISIBILITY == 0 and h % DIVISIBILITY == 0 for w, h in seen)
+
+
+def test_assemble_tiles_fills_sub_16px_exposed_border():
+    """Regression: /16-snapped tiles on a 1197 px-tall image expose a 13 px
+    band the shifted tiles no longer cover; assemble must edge-fill it
+    instead of raising, since the caller resamples back to native size."""
+    tiles = [
+        Tile(0, 0, 13, 1536, 1184),
+        Tile(1, 56, 13, 1536, 1184),
+    ]
+    upscaled = [Image.new("RGB", (t.width * SCALE, t.height * SCALE), (90, 120, 30)) for t in tiles]
+    width, height = 1592 * SCALE, 1197 * SCALE
+    result = assemble_tiles(tiles, upscaled, width, height)
+    assert result.size == (width, height)
+    pixels = np.asarray(result)
+    assert np.allclose(pixels[100, 100], (90, 120, 30), atol=2)
+    assert np.allclose(pixels[5, 5], (90, 120, 30), atol=2)
 
 
 def test_feather_is_never_zero_and_ramps_at_both_ends():
