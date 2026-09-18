@@ -114,27 +114,28 @@ def assemble_tiles(tiles: list[Tile], upscaled: list[Image.Image], width: int, h
         top, left = tile.top * SCALE, tile.left * SCALE
         total[top : top + expected[0], left : left + expected[1]] += pixels * ramp[:, :, None]
         weight[top : top + expected[0], left : left + expected[1]] += ramp[:, :, None]
-    if not np.all(weight > 0):
+    covered = (weight > 0)[..., 0]
+    if not covered.any():
+        raise RuntimeError("seedvr2 tiles do not cover the frame")
+    # normalize only the covered pixels first: the border fill below must
+    # replicate finished pixels, not un-normalized weighted sums.
+    blended = np.zeros_like(total)
+    blended[covered] = total[covered] / weight[covered]
+    if not covered.all():
         # SeedVR2 snaps tiles to /16 px; when a single tile spans a whole
         # axis its flush-edge shift can expose a sub-16 px border on the
         # opposite side. Replicate the nearest covered pixels there — the
         # frame is Lanczos-resampled back to native size by the caller, so
-        # the band is invisible. A total miss is still an error.
-        covered_rows = np.where((weight > 0).any(axis=(1, 2)))[0]
-        covered_cols = np.where((weight > 0).any(axis=(0, 2)))[0]
-        if covered_rows.size == 0 or covered_cols.size == 0:
-            raise RuntimeError("seedvr2 tiles do not cover the frame")
+        # the band is invisible.
+        covered_rows = np.where(covered.any(axis=1))[0]
+        covered_cols = np.where(covered.any(axis=0))[0]
         first_row, last_row = covered_rows[0], covered_rows[-1]
         first_col, last_col = covered_cols[0], covered_cols[-1]
-        total[:first_row] = total[first_row]
-        total[last_row + 1 :] = total[last_row]
-        total[:, :first_col] = total[:, first_col : first_col + 1]
-        total[:, last_col + 1 :] = total[:, last_col : last_col + 1]
-        weight[:first_row] = 1.0
-        weight[last_row + 1 :] = 1.0
-        weight[:, :first_col] = 1.0
-        weight[:, last_col + 1 :] = 1.0
-    return Image.fromarray(np.clip(total / weight + 0.5, 0, 255).astype(np.uint8), "RGB")
+        blended[:first_row] = blended[first_row]
+        blended[last_row + 1 :] = blended[last_row]
+        blended[:, :first_col] = blended[:, first_col : first_col + 1]
+        blended[:, last_col + 1 :] = blended[:, last_col : last_col + 1]
+    return Image.fromarray(np.clip(blended + 0.5, 0, 255).astype(np.uint8), "RGB")
 
 
 # ##################################################################
