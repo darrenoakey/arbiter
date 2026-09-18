@@ -133,7 +133,7 @@ class SeedVR2Upscaler:
         self._set_seed = set_seed
         runner = VideoDiffusionInfer(config)
         OmegaConf.set_readonly(runner.config, False)
-        from common.distributed import init_torch
+        from common.distributed import get_device, init_torch
 
         init_torch(cudnn_benchmark=False)
         runner.configure_dit_model(device="cuda", checkpoint=self.checkpoint)
