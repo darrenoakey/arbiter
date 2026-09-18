@@ -140,6 +140,15 @@ class SeedVR2Upscaler:
         runner.configure_vae_model()
         if hasattr(runner.vae, "set_memory_limit"):
             runner.vae.set_memory_limit(**runner.config.vae.memory_limit)
+        # Keep both models resident on the GPU: the DiT in bf16 weights
+        # (6.8 GB vs 13.5 fp32, no per-forward autocast weight casting;
+        # bf16 is closer to the mflux port's 8-bit reference than fp32) plus
+        # the bf16 VAE leaves ample activation headroom in the worker cap,
+        # and per-tile device shuffling costs minutes of PCIe traffic.
+        import torch as _torch
+
+        runner.dit.to(device="cuda", dtype=_torch.bfloat16)
+        runner.vae.to(get_device())
         runner.config.diffusion.cfg.scale = 1.0
         runner.config.diffusion.cfg.rescale = 0.0
         runner.config.diffusion.timesteps.sampling.steps = 1
@@ -198,12 +207,11 @@ class SeedVR2Upscaler:
         # the DiT/decode phases: without it the encoder accumulates fp32
         # feature maps (a 3072 px frame OOMed a 40 GB worker at the
         # inflation concat).
-        runner.dit.to("cpu")
-        runner.vae.to(get_device())
+        # encode condition latents. Both models are already resident (see
+        # load); autocast bounds the encoder's feature-map accumulation (a
+        # 3072 px frame OOMed a 40 GB worker at the inflation concat).
         with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=True):
             cond_latents = runner.vae_encode([condition])
-        runner.vae.to("cpu")
-        runner.dit.to(get_device())
 
         embeds = {
             "texts_pos": [emb.to(get_device()) for emb in self._text_embeds["texts_pos"]],
