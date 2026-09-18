@@ -228,17 +228,23 @@ def test_vision_chat_retries_5xx_then_succeeds():
     calls = {"count": 0}
 
     class Handler(BaseHTTPRequestHandler):
-        def do_POST(self):
-            calls["count"] += 1
-            if calls["count"] < 3:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(b"backend restarting")
-                return
-            body = json.dumps({"choices": [{"message": {"content": '{"a": 1}'}}]}).encode()
-            self.send_response(200)
+        # HTTP/1.1 + Content-Length on every reply: a length-less close-delimited
+        # body races the client's read and shows up as a flaky connection reset.
+        protocol_version = "HTTP/1.1"
+
+        def reply(self, code, body):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            calls["count"] += 1
+            if calls["count"] < 3:
+                self.reply(500, b"backend restarting")
+                return
+            self.reply(200, json.dumps({"choices": [{"message": {"content": '{"a": 1}'}}]}).encode())
 
         def log_message(self, *_args):
             return
@@ -254,3 +260,113 @@ def test_vision_chat_retries_5xx_then_succeeds():
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ##################################################################
+# test climb transcript is bounded to the served context window
+# regression: job 0ba205f57358 (2026-09-18) grew the climb thread to
+# 13885 input tokens at turn ~20; every later turn died with vllm's
+# "maximum context length is 16384 tokens" error, and the 5xx path sat
+# on 60s backoffs before failing a photo that had already cost 25
+# minutes of GPU. A long thread must be trimmed before it is sent.
+def test_fit_to_context_keeps_opening_and_newest_turns_within_budget():
+    from arbiter.adapters.photo_enhance_impl.vision_chat import (
+        DROPPED_TURNS_NOTE,
+        VisionChat,
+        estimate_tokens,
+    )
+
+    messages = [{"role": "user", "content": "OPENING RULES " + "r" * 4000}]
+    for turn in range(40):
+        messages.append({"role": "assistant", "content": f"proposal {turn} " + "p" * 900})
+        messages.append({"role": "user", "content": f"verdict {turn} " + "v" * 900})
+    messages[-1]["images"] = ["ZmFrZQ==", "ZmFrZQ==", "ZmFrZQ==", "ZmFrZQ=="]
+
+    budget = VisionChat.prompt_budget()
+    assert estimate_tokens(messages) > budget, "fixture must overflow the window"
+
+    fitted = VisionChat.fit_to_context(messages, budget)
+    assert estimate_tokens(fitted) <= budget
+    assert fitted[0] is messages[0], "opening rules turn must survive"
+    assert fitted[1]["content"] == DROPPED_TURNS_NOTE
+    assert fitted[-1] is messages[-1], "newest turn must survive"
+    assert fitted[-1]["images"] == messages[-1]["images"], "images on the newest turn are kept"
+    assert len(fitted) < len(messages)
+
+
+def test_fit_to_context_leaves_short_threads_untouched():
+    from arbiter.adapters.photo_enhance_impl.vision_chat import VisionChat
+
+    messages = [{"role": "user", "content": "short opening"}, {"role": "assistant", "content": "ok"}]
+    assert VisionChat.fit_to_context(messages, VisionChat.prompt_budget()) == messages
+
+
+def test_context_overflow_tokens_reads_vllm_validation_error():
+    from arbiter.adapters.photo_enhance_impl.vision_chat import context_overflow_tokens
+
+    detail = (
+        "vllm.exceptions.VLLMValidationError: This model's maximum context length is 16384 tokens. "
+        "However, you requested 2500 output tokens and your prompt contains at least 13885 input "
+        "tokens, for a total of at least 16385 tokens. (parameter=input_tokens, value=13885)"
+    )
+    assert context_overflow_tokens(detail) == 1
+    assert context_overflow_tokens("backend restarting") is None
+
+
+# The backend's context rejection is permanent for that prompt size, so the
+# climb must re-trim and retry IMMEDIATELY — never spend a 60s backoff on it.
+def test_vision_chat_trims_and_retries_immediately_on_context_overflow():
+    import json
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from arbiter.adapters.photo_enhance_impl.settings import Settings
+    from arbiter.adapters.photo_enhance_impl.vision_chat import VisionChat
+
+    seen: list[int] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def reply(self, code, body):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append(len(payload["messages"]))
+            if len(seen) == 1:
+                self.reply(
+                    500,
+                    b"This model's maximum context length is 16384 tokens. However, you requested "
+                    b"2500 output tokens and your prompt contains at least 13885 input tokens, for "
+                    b"a total of at least 16385 tokens.",
+                )
+                return
+            self.reply(200, json.dumps({"choices": [{"message": {"content": '{"ok": 1}'}}]}).encode())
+
+        def log_message(self, *_args):
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        chat = VisionChat(Settings(arbiter_url=f"http://127.0.0.1:{server.server_port}"))
+        chat.retry_backoff_seconds = 5.0  # a backoff here would be the bug
+        chat.user("OPENING " + "o" * 3000)
+        for turn in range(30):
+            chat.assistant(f"proposal {turn} " + "p" * 900)
+            chat.user(f"verdict {turn} " + "v" * 900)
+        started = time.monotonic()
+        assert chat.ask() == '{"ok": 1}'
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert len(seen) == 2, f"expected one trimmed retry, got {seen}"
+    assert seen[1] < seen[0], "retry must send fewer turns"
+    assert elapsed < 2.0, f"context retry waited {elapsed:.1f}s; it must not back off"

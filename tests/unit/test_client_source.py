@@ -45,6 +45,7 @@ class TestEffectiveSource:
         assert source == {"who": "beezle3", "why": "hang williams video"}
 
     def test_explicit_empty_string_clears_ambient_field(self, monkeypatch):
+        monkeypatch.delenv("ARBITER_WHO", raising=False)
         monkeypatch.setenv("ARBITER_WHY", "ambient reason")
         source = _effective_source(None, "")
         assert source is None
@@ -54,5 +55,7 @@ class TestEffectiveSource:
         monkeypatch.delenv("ARBITER_WHY", raising=False)
         assert _effective_source(None, None) is None
 
-    def test_who_only(self):
+    def test_who_only(self, monkeypatch):
+        monkeypatch.delenv("ARBITER_WHO", raising=False)
+        monkeypatch.delenv("ARBITER_WHY", raising=False)
         assert _effective_source("photo-namer", None) == {"who": "photo-namer"}

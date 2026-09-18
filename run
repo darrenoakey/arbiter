@@ -39,6 +39,12 @@ case "$CMD" in
             exit 1
         fi
         python3 -m unittest scripts/test_gpu_idle_hook.py
+        # Python adapter unit tests. PYTHONPATH=src is mandatory: `arbiter` is
+        # installed in develop mode pointing at the CANONICAL checkout, so
+        # without it a worktree gate would silently test the canonical sources
+        # instead of the candidate. tests/integration is excluded on purpose —
+        # it drives the live spark fleet, which the gate must not depend on.
+        PYTHONPATH="$SCRIPT_DIR/src" python3 -m pytest tests/unit -q
         if [ -n "${ARBITER_GO_TEST_SKIP:-}" ]; then
             go build ./cmd/arbiter/ && go vet ./cmd/arbiter/ && go test ./cmd/arbiter/ -count=1 -p 1 -skip "$ARBITER_GO_TEST_SKIP"
         else

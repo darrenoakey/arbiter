@@ -166,6 +166,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "minimax-h3-local",
         "moondream",
         "music-generate",
+        "photo-enhance",
         "reference-image-edit",
         "rvc-convert",
         "rvc-train",
@@ -179,6 +180,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "voice-fit",
         "wan-s2v",
         "whisper-large",
+        "yue2",
     ]
     script = dedent(
         """
