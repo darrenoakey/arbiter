@@ -57,6 +57,12 @@ var vllmAdapterParams = map[string]adapterValueValidator{
 // earlyoom floors mid-render.
 var torchWorkerAdapterParams = map[string]adapterValueValidator{
 	"PYTORCH_CUDA_ALLOC_CONF": exactAdapterValues("expandable_segments:True"),
+	// photo-enhance SeedVR2 conditioning: the shipped pos_emb.pt encodes the
+	// authors' heavy "cinematic" prompt; operators can point these at
+	// neutralized embeddings (e.g. averaged with the negative) for a
+	// detail-recovery-only restoration.
+	"SEEDVR_NEG_EMB": absoluteModelPathAdapterValue,
+	"SEEDVR_POS_EMB": absoluteModelPathAdapterValue,
 }
 
 var vllmLegacyTuningByModel = map[string]string{
