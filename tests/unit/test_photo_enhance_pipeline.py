@@ -141,6 +141,24 @@ def test_assemble_tiles_blends_overlaps_seamlessly():
     assert np.abs(result - expected).max() <= 2.0
 
 
+def test_recover_detail_aligns_odd_tiles_and_covers_the_frame():
+    # awkward size: not a multiple of 16 on either axis, larger than one tile
+    from arbiter.adapters.photo_enhance_impl.detail import DIVISIBILITY, recover_detail
+
+    source = Image.new("RGB", (1600, 700), (30, 60, 90))
+    seen = []
+
+    def executor(crop: Image.Image) -> Image.Image:
+        seen.append(crop.size)
+        # the runner contract: exact 2x of the (already /16) crop
+        return crop.resize((crop.width * SCALE, crop.height * SCALE), Image.Resampling.NEAREST)
+
+    result = recover_detail(source, executor)
+    assert result.size == source.size
+    assert seen, "executor was never called"
+    assert all(w % DIVISIBILITY == 0 and h % DIVISIBILITY == 0 for w, h in seen)
+
+
 def test_feather_is_never_zero_and_ramps_at_both_ends():
     weights = feather(100, 10)
     assert weights.min() > 0
