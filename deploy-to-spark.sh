@@ -23,6 +23,30 @@ DEPLOY_DRAIN_LEASE="${DEPLOY_DRAIN_LEASE:-300}"
 DRAIN_REQUESTED=0
 drain_deadline=0
 
+# Idempotent-redeploy fast path. Greenline runs this deploy twice per release
+# (candidate deploy, then a publish deploy of the merged tree — for a
+# fast-forward release byte-identical to the candidate). Redeploying the exact
+# same tree reproduces every artifact the full path produces, so the repeat
+# deploy collapses to a drift-heal + health check instead of a second
+# drain/build/bounce (measured 2026-09-18: the repeat deploy's 120s drain
+# deadline alone was most of a 256.6s release vs the 180s target).
+#
+# The key covers everything the full path ships or builds from: HEAD, the full
+# git worktree state, and a content hash of the directories/files rsync'd or
+# scp'd to spark. It is recorded on spark ONLY after a full deploy passes its
+# health check; a missing or mismatched key always falls through to the full
+# path, so this can never skip a deploy that would have changed production.
+deploy_key() {
+    {
+        echo "deploy-key-v1"
+        git rev-parse HEAD 2>/dev/null || echo "no-git"
+        git status --porcelain=v1 2>/dev/null || true
+        git diff HEAD 2>/dev/null || true
+        find src/arbiter config/spark scripts/spark-host/arbiter-firewall-guard -type f 2>/dev/null \
+            | LC_ALL=C sort | while IFS= read -r f; do md5 -q "$f"; done
+    } | md5 -q
+}
+
 drain_request() { # renews the lease; idempotent
     curl -s --max-time 5 -X POST "$ARBITER_URL/v1/drain" \
         -H 'Content-Type: application/json' \
@@ -67,6 +91,37 @@ resume_if_aborted() {
 # lapses within DEPLOY_DRAIN_LEASE seconds and arbiter resumes dispatch on its
 # own. The trap below is the fast path for signals we can actually catch; the
 # server-side lease covers SIGKILL, which we cannot.
+DEPLOY_KEY="$(deploy_key)"
+DEPLOY_KEY_PATH="$REMOTE/local/.deploy-key"
+
+if [ "${DEPLOY_FORCE:-0}" != "1" ]; then
+    remote_key="$(ssh -o ConnectTimeout=5 "$SPARK" "cat '$DEPLOY_KEY_PATH' 2>/dev/null" || true)"
+    if [ -n "$remote_key" ] && [ "$remote_key" = "$DEPLOY_KEY" ]; then
+        echo "==> Spark already runs this exact tree ($DEPLOY_KEY) — skipping drain, build, sync, and bounce"
+        # The one state heal the full path performs that a no-op deploy must
+        # keep: a symlinked .venv python silently loses venv activation (see
+        # the full path's comment below).
+        echo "==> Ensuring .venv python is a real binary (not a symlink)..."
+        ssh "$SPARK" "test -L '$REMOTE/.venv/bin/python' && cp --remove-destination /usr/bin/python3.12 '$REMOTE/.venv/bin/python' '$REMOTE/.venv/bin/python3' '$REMOTE/.venv/bin/python3.12' && echo '    converted .venv python symlinks to real binary copies' || echo '    .venv python already a real binary'"
+        echo "==> Waiting for health check..."
+        fast_healthy=0
+        for _ in $(seq 1 20); do
+            if curl -s --max-time 5 http://10.0.0.254:8400/v1/health 2>/dev/null | grep -q '"status":"ok"'; then
+                fast_healthy=1
+                break
+            fi
+            sleep 1
+        done
+        if [ "$fast_healthy" = "1" ]; then
+            echo "    healthy"
+            curl -s --max-time 5 http://10.0.0.254:8400/v1/health
+            echo ""
+            exit 0
+        fi
+        echo "    health check failed — falling through to a full redeploy"
+    fi
+fi
+
 if [ "${DEPLOY_FORCE:-0}" = "1" ]; then
     echo "==> DEPLOY_FORCE=1 — skipping graceful drain (may kill in-flight jobs)"
 elif drain_request; then
@@ -266,6 +321,11 @@ echo "==> Waiting for health check..."
 for i in $(seq 1 20); do
     if curl -s --max-time 5 http://10.0.0.254:8400/v1/health 2>/dev/null | grep -q '"status":"ok"'; then
         echo "    healthy"
+        # Record the deployed content key so an identical repeat deploy
+        # (greenline's publish deploy) takes the fast path above. Never
+        # recorded on failure — a failed deploy must not arm the skip.
+        ssh "$SPARK" "printf '%s' '$DEPLOY_KEY' > '$DEPLOY_KEY_PATH'" \
+            || echo "    WARNING: could not record deploy key — next deploy takes the full path"
         curl -s --max-time 5 http://10.0.0.254:8400/v1/health
         echo ""
         exit 0
