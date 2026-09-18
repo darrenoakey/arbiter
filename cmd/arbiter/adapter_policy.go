@@ -60,9 +60,10 @@ var torchWorkerAdapterParams = map[string]adapterValueValidator{
 	// photo-enhance SeedVR2 conditioning: the shipped pos_emb.pt encodes the
 	// authors' heavy "cinematic" prompt; operators can point these at
 	// neutralized embeddings (e.g. averaged with the negative) for a
-	// detail-recovery-only restoration.
-	"SEEDVR_NEG_EMB": absoluteModelPathAdapterValue,
-	"SEEDVR_POS_EMB": absoluteModelPathAdapterValue,
+	// detail-recovery-only restoration. These are .pt tensor files, not
+	// .gguf models, so they use the generic data-path validator.
+	"SEEDVR_NEG_EMB": absoluteDataPathAdapterValue,
+	"SEEDVR_POS_EMB": absoluteDataPathAdapterValue,
 }
 
 var vllmLegacyTuningByModel = map[string]string{
@@ -259,6 +260,23 @@ func absoluteModelPathAdapterValue(_ string, value string) error {
 	}
 	if !info.Mode().IsRegular() || strings.ToLower(filepath.Ext(value)) != ".gguf" {
 		return fmt.Errorf("llama.cpp model path must be a regular .gguf file")
+	}
+	return nil
+}
+
+// absoluteDataPathAdapterValue accepts any existing regular file at an
+// absolute path — for weight/embedding assets (e.g. SeedVR2 .pt
+// conditioning tensors) that are not .gguf models.
+func absoluteDataPathAdapterValue(_ string, value string) error {
+	if err := validateResolvedPath(value, false); err != nil {
+		return err
+	}
+	info, err := os.Lstat(value)
+	if err != nil {
+		return fmt.Errorf("inspect data path: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("data path must be a regular file")
 	}
 	return nil
 }
