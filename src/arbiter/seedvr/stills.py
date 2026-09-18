@@ -227,7 +227,7 @@ class SeedVR2Upscaler:
             video_tensors = runner.inference(
                 noises=[noises],
                 conditions=conditions,
-                dit_offload=True,
+                dit_offload=False,
                 **embeds,
             )
         sample = video_tensors[0]
@@ -250,9 +250,6 @@ class SeedVR2Upscaler:
         except Exception as err:
             log.warning("seedvr2 colour fix skipped: %s", err)
 
-        runner.dit.to("cpu")
-        torch.cuda.empty_cache()
-        runner.dit.to(get_device())
         out_w, out_h = sample.shape[1], sample.shape[0]
         if out_w < trim_w * scale or out_h < trim_h * scale:
             raise RuntimeError(f"seedvr2 returned {out_w}x{out_h}, expected at least {trim_w * scale}x{trim_h * scale}")
