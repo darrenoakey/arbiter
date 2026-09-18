@@ -27,6 +27,7 @@ const (
 	gpuIdleDefaultAgentd3Policy   = "yolo"
 	gpuIdleMaxPayloadBytes        = 4096
 	gpuIdleSampleCap              = 48
+	gpuIdleProgressLogEvery       = time.Minute
 )
 
 // GPUIdleConfig is the hung-job GPU-idle watchdog. Zero values mean defaults.
@@ -44,7 +45,18 @@ type GPUIdleConfig struct {
 }
 
 // GPUIdleWatchdog kills local workers that still look running while the GPU
-// has been continuously idle, then starts an agentd3 investigation.
+// has been continuously idle AND the worker itself has gone silent, then starts
+// an agentd3 investigation.
+//
+// The worker-silence condition is not optional garnish. GPU utilization alone is
+// NOT a liveness signal: a healthy worker can legitimately sit at 0% for many
+// minutes. Observed 2026-09-18 on job 0c2b2db53140 (photo-enhance): the SeedVR2
+// tile pass finished, and the reference/climb phases that follow are CPU
+// PIL/numpy work on a 5292x3969 frame whose vision turns were answered from the
+// on-disk LLMCache (qwen3-vl had just been evicted and never reloaded). nvidia-smi
+// read 0% for 181s while the worker was accepting a climb step every ~35s, and
+// the watchdog destroyed 16 minutes of finished GPU work. A worker that is still
+// emitting stdout/stderr is making progress and must never be killed here.
 type GPUIdleWatchdog struct {
 	cfg       *Config
 	mgr       *InstanceManager
@@ -58,10 +70,11 @@ type GPUIdleWatchdog struct {
 	killInstance       func(inst *Instance)
 	startInvestigation func(report GPUIdleKillReport) error
 
-	mu        sync.Mutex
-	idleSince time.Time
-	lastKill  time.Time
-	samples   []gpuIdleSample
+	mu              sync.Mutex
+	idleSince       time.Time
+	lastKill        time.Time
+	lastProgressLog time.Time
+	samples         []gpuIdleSample
 }
 
 type gpuIdleSample struct {
@@ -72,6 +85,9 @@ type gpuIdleSample struct {
 type gpuIdleVictim struct {
 	Inst *Instance
 	Jobs []*Job
+	// OutputAge is how long the worker has been silent on stdout/stderr at the
+	// sample time. Negative means the worker has never emitted anything.
+	OutputAge time.Duration
 }
 
 // GPUIdleKillReport is the payload written to disk and POSTed to the laptop hook.
@@ -121,6 +137,9 @@ type gpuIdleInstDetail struct {
 	PID        int      `json:"pid"`
 	ActiveJobs int      `json:"active_jobs"`
 	PendingIDs []string `json:"pending_job_ids,omitempty"`
+	// SilentForSeconds is how long the worker had produced no stdout/stderr when
+	// it was killed; -1 means it never produced any output at all.
+	SilentForSeconds float64 `json:"silent_for_seconds"`
 }
 
 // NewGPUIdleWatchdog constructs a watchdog. Caller starts it with Run.
@@ -236,7 +255,7 @@ func (w *GPUIdleWatchdog) tick() time.Duration {
 		return cfg.highInterval()
 	}
 	next := cfg.lowInterval()
-	victims := w.listLocalRunning()
+	victims := w.listLocalRunning(at)
 	if len(victims) == 0 {
 		w.resetIdle()
 		return next
@@ -252,10 +271,53 @@ func (w *GPUIdleWatchdog) tick() time.Duration {
 	}
 	ready := idleFor >= cfg.idleFor() && (w.lastKill.IsZero() || sinceKill >= cfg.cooldown())
 	w.mu.Unlock()
-	if ready {
-		w.fire(victims, util, at, idleFor)
+	if !ready {
+		return next
 	}
+	// Second gate: only workers that have ALSO stopped emitting output for the
+	// whole idle window are hung. A chatty worker keeps its instance alive and
+	// leaves the GPU-idle clock running, so the kill lands the moment it truly
+	// goes quiet — no extra window is added.
+	silent := silentVictims(victims, cfg.idleFor())
+	if len(silent) == 0 {
+		w.noteProgressSkip(at, victims)
+		return next
+	}
+	w.fire(silent, util, at, idleFor)
 	return next
+}
+
+// silentVictims keeps only the victims whose worker has emitted nothing for at
+// least the idle window. Never-spawned / never-spoken instances (zero last
+// output) count as silent.
+func silentVictims(victims []gpuIdleVictim, window time.Duration) []gpuIdleVictim {
+	var out []gpuIdleVictim
+	for _, v := range victims {
+		if v.OutputAge < 0 || v.OutputAge >= window {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// noteProgressSkip logs (at most once per minute) that the GPU is idle but every
+// candidate worker is still producing output, so nothing was killed.
+func (w *GPUIdleWatchdog) noteProgressSkip(at time.Time, victims []gpuIdleVictim) {
+	w.mu.Lock()
+	due := w.lastProgressLog.IsZero() || at.Sub(w.lastProgressLog) >= gpuIdleProgressLogEvery
+	if due {
+		w.lastProgressLog = at
+	}
+	w.mu.Unlock()
+	if !due {
+		return
+	}
+	ages := make([]string, 0, len(victims))
+	for _, v := range victims {
+		ages = append(ages, fmt.Sprintf("%s=%.0fs", v.Inst.InstanceID, v.OutputAge.Seconds()))
+	}
+	slog.Info("gpu idle watchdog: GPU idle but workers still emitting progress; not killing",
+		"instances", strings.Join(ages, " "))
 }
 
 func (w *GPUIdleWatchdog) resetIdle() {
@@ -273,7 +335,7 @@ func (w *GPUIdleWatchdog) recordSample(util int, at time.Time) {
 	}
 }
 
-func (w *GPUIdleWatchdog) listLocalRunning() []gpuIdleVictim {
+func (w *GPUIdleWatchdog) listLocalRunning(at time.Time) []gpuIdleVictim {
 	var victims []gpuIdleVictim
 	running, _ := w.store.GetRunningJobs()
 	byModel := map[string][]*Job{}
@@ -294,9 +356,23 @@ func (w *GPUIdleWatchdog) listLocalRunning() []gpuIdleVictim {
 			continue
 		}
 		jobs := collectVictimJobs(inst, byID, byModel)
-		victims = append(victims, gpuIdleVictim{Inst: inst, Jobs: jobs})
+		victims = append(victims, gpuIdleVictim{Inst: inst, Jobs: jobs, OutputAge: outputAge(inst, at)})
 	}
 	return victims
+}
+
+// outputAge is how long the worker has been silent, or -1 when it has never
+// emitted anything (which the silence gate treats as hung, not as fresh).
+func outputAge(inst *Instance, at time.Time) time.Duration {
+	last := inst.LastOutputAt()
+	if last.IsZero() {
+		return -1
+	}
+	age := at.Sub(last)
+	if age < 0 {
+		return 0
+	}
+	return age
 }
 
 func collectVictimJobs(inst *Instance, byID map[string]*Job, byModel map[string][]*Job) []*Job {
@@ -366,7 +442,7 @@ func (w *GPUIdleWatchdog) failJob(job *Job, idleFor time.Duration) {
 	if job == nil {
 		return
 	}
-	errMsg := fmt.Sprintf("killed by gpu-idle-watchdog: GPU utilization stayed at or below %d%% for %.0fs while this job was running", w.cfg.GPUIdle.lowUtilPct(), idleFor.Seconds())
+	errMsg := fmt.Sprintf("killed by gpu-idle-watchdog: GPU utilization stayed at or below %d%% for %.0fs and the worker produced no output for that whole window while this job was running", w.cfg.GPUIdle.lowUtilPct(), idleFor.Seconds())
 	if err := w.store.UpdateState(job.ID, "failed", WithError(errMsg), WithFinishedAt(nowTS())); err != nil {
 		slog.Warn("gpu idle watchdog: fail job", "job_id", job.ID, "error", err)
 		return
@@ -383,12 +459,13 @@ func (w *GPUIdleWatchdog) buildReport(victims []gpuIdleVictim, util int, at time
 	seenJob := map[string]bool{}
 	for _, v := range victims {
 		insts = append(insts, gpuIdleInstDetail{
-			InstanceID: v.Inst.InstanceID,
-			ModelID:    v.Inst.ModelID,
-			State:      v.Inst.State(),
-			PID:        v.Inst.PID(),
-			ActiveJobs: v.Inst.ActiveJobs(),
-			PendingIDs: v.Inst.PendingJobIDs(),
+			InstanceID:       v.Inst.InstanceID,
+			ModelID:          v.Inst.ModelID,
+			State:            v.Inst.State(),
+			PID:              v.Inst.PID(),
+			ActiveJobs:       v.Inst.ActiveJobs(),
+			PendingIDs:       v.Inst.PendingJobIDs(),
+			SilentForSeconds: v.OutputAge.Seconds(),
 		})
 		for _, job := range v.Jobs {
 			if job == nil || seenJob[job.ID] {
@@ -490,7 +567,7 @@ func renderGPUIdlePrompt(report GPUIdleKillReport) string {
 	body, _ := json.MarshalIndent(reportWithoutPrompt(report), "", "  ")
 	var b strings.Builder
 	b.WriteString("Arbiter on spark (10.0.0.254) killed hung GPU work because nvidia-smi utilization stayed at or below ")
-	b.WriteString(fmt.Sprintf("%d%% for %.0f continuous seconds while local jobs still appeared running.\n\n", report.LowUtilPct, report.IdleForSeconds))
+	b.WriteString(fmt.Sprintf("%d%% for %.0f continuous seconds AND the worker emitted no stdout/stderr for that whole window while local jobs still appeared running (per-instance silence is in `silent_for_seconds`; -1 means the worker never spoke).\n\n", report.LowUtilPct, report.IdleForSeconds))
 	b.WriteString("Investigate WHY the worker was stuck (deadlock, waiting on IO/network, infinite CPU loop, adapter bug, silent CUDA stall). ")
 	b.WriteString("Read the logs and job records below. If it is a code bug in arbiter, fix it. ")
 	b.WriteString("Do not cancel other people's jobs. Do not bounce arbiter while unrelated work is in flight.\n\n")

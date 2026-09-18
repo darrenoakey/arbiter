@@ -70,6 +70,118 @@ func addRunningLocal(t *testing.T, mgr *InstanceManager, store *Store, model, in
 	return inst, job
 }
 
+// A worker that keeps logging is making progress even at 0% GPU (the
+// photo-enhance climb phase: CPU PIL work plus LLMCache-served vision turns).
+// Killing it destroys finished GPU work, so silence is required too.
+func TestGPUIdleWatchdogSparesWorkerStillEmittingOutput(t *testing.T) {
+	w, store, mgr, clock := newTestIdleWatchdog(t)
+	inst, job := addRunningLocal(t, mgr, store, "ltx2", "ltx2#chatty")
+	var killed []string
+	w.killInstance = func(in *Instance) { killed = append(killed, in.InstanceID) }
+
+	// One "climb step logged" every 30s across a 10-minute idle GPU stretch.
+	for elapsed := 0; elapsed <= 600; elapsed += 30 {
+		inst.NoteOutputAt(*clock)
+		w.tick()
+		*clock = clock.Add(30 * time.Second)
+	}
+	if len(killed) != 0 {
+		t.Fatalf("killed a worker that was still emitting output: %v", killed)
+	}
+	live, err := store.GetJob(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live.State != "running" {
+		t.Fatalf("job state = %s, want running", live.State)
+	}
+}
+
+// Once the chatty worker goes quiet for the full window it is hung and dies —
+// and the extra gate must not delay that beyond the configured idle window.
+func TestGPUIdleWatchdogKillsOnceOutputStops(t *testing.T) {
+	w, store, mgr, clock := newTestIdleWatchdog(t)
+	inst, job := addRunningLocal(t, mgr, store, "ltx2", "ltx2#stalls")
+	var killed []string
+	w.killInstance = func(in *Instance) { killed = append(killed, in.InstanceID) }
+
+	for elapsed := 0; elapsed < 120; elapsed += 30 {
+		inst.NoteOutputAt(*clock)
+		w.tick()
+		*clock = clock.Add(30 * time.Second)
+	}
+	lastSpoke := clock.Add(-30 * time.Second)
+	// Silent from here. GPU has already been idle for 120s, so the kill lands
+	// exactly one idle window after the last log line, not two.
+	for !clock.After(lastSpoke.Add(180 * time.Second)) {
+		w.tick()
+		if len(killed) > 0 {
+			break
+		}
+		*clock = clock.Add(5 * time.Second)
+	}
+	if len(killed) != 1 || killed[0] != inst.InstanceID {
+		t.Fatalf("killed = %v, want [%s]", killed, inst.InstanceID)
+	}
+	silentFor := clock.Sub(lastSpoke)
+	if silentFor > 185*time.Second {
+		t.Fatalf("kill came %s after last output, want <= ~180s", silentFor)
+	}
+	failed, err := store.GetJob(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.State != "failed" {
+		t.Fatalf("job state = %s, want failed", failed.State)
+	}
+}
+
+func TestGPUIdleWatchdogReportRecordsWorkerSilence(t *testing.T) {
+	w, store, mgr, clock := newTestIdleWatchdog(t)
+	inst, _ := addRunningLocal(t, mgr, store, "ltx2", "ltx2#silent")
+	inst.NoteOutputAt(*clock)
+	w.killInstance = func(*Instance) {}
+	got := make(chan GPUIdleKillReport, 1)
+	w.startInvestigation = func(r GPUIdleKillReport) error {
+		got <- r
+		return nil
+	}
+	w.tick()
+	*clock = clock.Add(181 * time.Second)
+	w.tick()
+	select {
+	case report := <-got:
+		if len(report.Instances) != 1 {
+			t.Fatalf("instances = %+v", report.Instances)
+		}
+		if report.Instances[0].SilentForSeconds < 180 {
+			t.Fatalf("silent_for_seconds = %v, want >= 180", report.Instances[0].SilentForSeconds)
+		}
+		if !strings.Contains(report.Prompt, "no stdout/stderr") {
+			t.Fatalf("prompt missing silence evidence: %s", report.Prompt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("investigation was not dispatched")
+	}
+}
+
+func TestInstanceLastOutputAtTracksWorkerLines(t *testing.T) {
+	inst := NewInstance("ltx2", "ltx2#out", 1, 40, "python3", t.TempDir())
+	if !inst.LastOutputAt().IsZero() {
+		t.Fatalf("fresh instance has output time %s", inst.LastOutputAt())
+	}
+	before := time.Now()
+	inst.noteOutput()
+	if got := inst.LastOutputAt(); got.Before(before) {
+		t.Fatalf("noteOutput recorded %s, before %s", got, before)
+	}
+	stamp := time.Unix(1_700_000_123, 0)
+	inst.NoteOutputAt(stamp)
+	if got := inst.LastOutputAt(); !got.Equal(stamp) {
+		t.Fatalf("NoteOutputAt = %s, want %s", got, stamp)
+	}
+}
+
 func TestGPUIdleWatchdogHighUtilUsesLongIntervalAndDoesNotKill(t *testing.T) {
 	w, store, mgr, _ := newTestIdleWatchdog(t)
 	addRunningLocal(t, mgr, store, "ltx2", "ltx2#1")

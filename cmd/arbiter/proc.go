@@ -96,6 +96,38 @@ type Instance struct {
 	// it never gates scheduling.
 	reasonMu        sync.Mutex
 	placementReason string
+
+	// lastOutputNanos is the wall-clock time (UnixNano) of the most recent byte
+	// the worker subprocess emitted on stdout or stderr, plus the moment the
+	// subprocess was spawned. It is the ONLY liveness signal arbiter has for a
+	// worker whose current phase does not touch the GPU: photo-enhance spends
+	// minutes at a time in CPU PIL/numpy work on 21-megapixel frames and in
+	// LLMCache-served vision turns, during which nvidia-smi legitimately reads
+	// 0%. The GPU-idle watchdog requires BOTH an idle GPU and this silence
+	// before it calls a worker hung (see gpu_idle_watchdog.go). Zero means the
+	// worker has never emitted anything, which counts as silent.
+	lastOutputNanos atomic.Int64
+}
+
+// noteOutput records that the worker subprocess just produced output. Called on
+// spawn and for every stdout/stderr line; cheap enough for a chatty adapter.
+func (inst *Instance) noteOutput() {
+	inst.lastOutputNanos.Store(time.Now().UnixNano())
+}
+
+// NoteOutputAt records worker output at an explicit time (tests use a fake clock).
+func (inst *Instance) NoteOutputAt(at time.Time) {
+	inst.lastOutputNanos.Store(at.UnixNano())
+}
+
+// LastOutputAt is the last time the worker subprocess emitted stdout/stderr, or
+// the zero time if it has never emitted anything.
+func (inst *Instance) LastOutputAt() time.Time {
+	nanos := inst.lastOutputNanos.Load()
+	if nanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanos)
 }
 
 // setPlacementReason records the reason the latest dispatch chose this instance.
@@ -335,12 +367,14 @@ func (inst *Instance) Spawn() error {
 	inst.stderr = stderr
 	inst.readerDone = make(chan struct{})
 	inst.state = "unloaded"
+	inst.noteOutput() // a freshly spawned worker is alive, even before it logs
 
 	// Read stderr in background (adapter logs)
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 		for scanner.Scan() {
+			inst.noteOutput()
 			slog.Info("adapter", "instance", inst.InstanceID, "msg", scanner.Text())
 		}
 	}()
@@ -357,6 +391,7 @@ func (inst *Instance) Spawn() error {
 func (inst *Instance) readLoop() {
 	defer close(inst.readerDone)
 	for inst.stdout.Scan() {
+		inst.noteOutput()
 		// Copy the line — scanner.Bytes() is reused on next Scan()
 		line := make([]byte, len(inst.stdout.Bytes()))
 		copy(line, inst.stdout.Bytes())
