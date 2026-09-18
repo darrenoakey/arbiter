@@ -2152,6 +2152,17 @@ The memory manager enforces a VRAM budget (default 100 GB) using LRU eviction:
 
 4. **Budget enforcement**: The total VRAM of all loaded models must not exceed `vram_budget_gb`. If a model cannot fit even after evicting all idle models, the job waits until enough VRAM is freed.
 
+### GPU-idle hung-job watchdog
+
+A background loop inside the arbiter process samples `nvidia-smi` utilization. High util is polled every 30s; when util is at or below 5% it polls every 5s. If a **local** instance still has active jobs (not `loading`/`starting`, not remote) while GPU util stays continuously low for 180 seconds, the watchdog:
+
+1. Snapshots the running jobs (id, type, model, params, `who`/`why`, PIDs) plus log paths.
+2. Writes `/mnt/arbiter-store/output/gpu-idle-kills/<timestamp>-<job>.json`.
+3. Kills the worker (same `Instance.Kill` path as the emergency guardian) and fails the jobs with `killed by gpu-idle-watchdog`.
+4. POSTs the report to `http://10.0.0.44:8655/investigate` so the laptop hook opens an agentd3 investigation (`origin.kind=service`, `actor=arbiter-gpu-idle-watchdog`).
+
+Config lives under `gpu_idle` in `local/config.json`. Zero values mean the defaults above. Set `gpu_idle.disabled: true` to turn it off. Loading-stuck remains owned by the model health watchdog; this loop only fires when inference appears to be running.
+
 ### Tips for Client Developers
 
 - **Batch similar jobs together.** Submit related caption, audio, or video-stage work together to reduce cold loads.

@@ -199,10 +199,13 @@ type Config struct {
 	// force-kills the worst-offending instance. 0 = default 4GB; negative
 	// disables the co-trigger.
 	EmergencyMemFreeFloorGB float64 `json:"emergency_memfree_floor_gb"`
-	Host                    string  `json:"host"`
-	Port                    int     `json:"port"`
-	OutputDir               string  `json:"output_dir"`
-	ShareMount              string  `json:"share_mount"` // e.g. "/mnt/arbiter-store" — if set, monitored and remounted when unhealthy
+	// GPUIdle is the hung-job GPU-idle watchdog. Zero values mean defaults
+	// (enabled, 180s continuous idle, 5% util, 30s/5s poll, laptop hook URL).
+	GPUIdle    GPUIdleConfig `json:"gpu_idle,omitempty"`
+	Host       string        `json:"host"`
+	Port       int           `json:"port"`
+	OutputDir  string        `json:"output_dir"`
+	ShareMount string        `json:"share_mount"` // e.g. "/mnt/arbiter-store" — if set, monitored and remounted when unhealthy
 	// AutoWakeSeconds is the grace period before a model that has queued jobs
 	// but max_instances=0 is automatically scaled back to 1. A parked model
 	// still accepts job submissions, so an operator who scales to 0 (to free

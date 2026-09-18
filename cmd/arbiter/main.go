@@ -107,7 +107,7 @@ func main() {
 	if cfg.OutputDir != "" {
 		outputDir = cfg.OutputDir
 	}
-	for _, subdir := range []string{"jobs", "logs", "refs"} {
+	for _, subdir := range []string{"jobs", "logs", "refs", "gpu-idle-kills"} {
 		if err := os.MkdirAll(filepath.Join(outputDir, subdir), 0o755); err != nil {
 			slog.Error("create output directory", "subdir", subdir, "error", err)
 			os.Exit(1)
@@ -209,6 +209,7 @@ func main() {
 	go sched.RunInboxWatchdog(ctx)
 	go NewMemoryWatchdog(cfg, mgr, eventLog, projectRoot).Run(ctx, 30*time.Second)
 	go NewEmergencyGuardian(cfg, mgr, eventLog).Run(ctx, 0)
+	go NewGPUIdleWatchdog(cfg, mgr, store, eventLog, outputDir).Run(ctx)
 	// LLM chat cache sweeper: immediate startup sweep + daily thereafter.
 	api.StartLLMCacheSweeper(ctx.Done())
 	if cfg.ShareMount != "" {

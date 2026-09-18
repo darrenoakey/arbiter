@@ -38,6 +38,7 @@ case "$CMD" in
             echo "$unformatted" >&2
             exit 1
         fi
+        python3 -m unittest scripts/test_gpu_idle_hook.py
         if [ -n "${ARBITER_GO_TEST_SKIP:-}" ]; then
             go build ./cmd/arbiter/ && go vet ./cmd/arbiter/ && go test ./cmd/arbiter/ -count=1 -p 1 -skip "$ARBITER_GO_TEST_SKIP"
         else

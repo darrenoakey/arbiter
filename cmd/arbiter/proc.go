@@ -192,6 +192,30 @@ func (inst *Instance) ActiveJobs() int {
 	return int(atomic.LoadInt32(&inst.activeJobs))
 }
 
+// PID returns the worker subprocess PID, or 0 if no process is attached.
+func (inst *Instance) PID() int {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if inst.cmd == nil || inst.cmd.Process == nil {
+		return 0
+	}
+	return inst.cmd.Process.Pid
+}
+
+// PendingJobIDs returns the in-flight worker request ids (job ids).
+func (inst *Instance) PendingJobIDs() []string {
+	inst.pendingMu.Lock()
+	defer inst.pendingMu.Unlock()
+	ids := make([]string, 0, len(inst.pending))
+	for id := range inst.pending {
+		if id == "" || id == "_default" {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // RSSAnon returns the anonymous RSS (heap + stack) of the worker process tree
 // (root + all descendants) in MB. Subprocess accounting matters: workers like
 // llm-worker shell out to llama-server, and Python adapters fork CUDA helpers

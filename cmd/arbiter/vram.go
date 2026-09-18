@@ -63,3 +63,20 @@ func GetGPUUtilization() int {
 	}
 	return pct
 }
+
+// GetGPUStatusLine returns a one-line nvidia-smi snapshot for diagnostics.
+func GetGPUStatusLine() string {
+	out, err := exec.Command(
+		"nvidia-smi",
+		"--query-gpu=utilization.gpu,power.draw,temperature.gpu",
+		"--format=csv,noheader",
+	).Output()
+	if err != nil {
+		return ""
+	}
+	line := strings.TrimSpace(string(out))
+	if idx := strings.IndexByte(line, '\n'); idx >= 0 {
+		line = line[:idx]
+	}
+	return line
+}
