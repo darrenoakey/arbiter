@@ -34,6 +34,7 @@ class JobType(str, Enum):
     REFERENCE_IMAGE_EDIT = "reference-image-edit"
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
+    FINE_TUNE = "fine-tune"
     EMBED_TEXT = "embed-text"
     DEMUCS = "demucs"
     VOCAL_STEM = "vocal-stem"
@@ -69,6 +70,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "reference-image-edit": "reference-image-edit",
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
+    "fine-tune": "fine-tune",
     "embed-text": "embed-text",
     "demucs": "demucs",
     "vocal-stem": "vocal-stem",
@@ -343,21 +345,31 @@ class LoraTrainParams(BaseModel):
     data_dir: str
     model_name: str
     run_name: Optional[str] = None
-    lora_rank: int = 16
-    lora_alpha: int = 32
+    lora_rank: int = 32
+    lora_alpha: int = 64
     lora_dropout: float = 0.05
     learning_rate: float = 2e-4
+    lr_scheduler_type: str = "cosine"
     batch_size: int = 4
     grad_accum_steps: int = 4
     num_epochs: int = 1
     max_iters: int = 0
     max_seq_length: int = 2048
-    warmup_ratio: float = 0.03
+    warmup_ratio: float = 0.05
+    weight_decay: float = 0.01
     save_steps: int = 500
     eval_steps: int = 500
     load_in_4bit: bool = True
     full_finetune: bool = False
+    mask_prompt: bool = True
+    export_merged: bool = True
+    export_format: str = "merged_16bit"
+    export_dir: Optional[str] = None
     chat_template: Optional[str] = None
+
+
+class FineTuneParams(LoraTrainParams):
+    pass
 
 
 class EmbedTextParams(BaseModel):
@@ -474,6 +486,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "video-generate-h3": VideoGenerateH3Params,
     "video-generate-fast-h3": VideoGenerateH3Params,
     "lora-train": LoraTrainParams,
+    "fine-tune": FineTuneParams,
     "embed-text": EmbedTextParams,
     "demucs": DemucsParams,
     "vocal-stem": VocalStemParams,

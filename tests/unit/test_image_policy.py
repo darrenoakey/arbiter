@@ -64,7 +64,7 @@ def test_disabled_aliases(model_id):
 
 @pytest.mark.parametrize(
     "model_id",
-    ["birefnet", "ltx2", "ltx2-dev-denoise2-lora", "lora-train", "moondream"],
+    ["birefnet", "ltx2", "ltx2-dev-denoise2-lora", "lora-train", "fine-tune", "moondream"],
 )
 def test_non_still_models_remain_allowed(model_id):
     assert not is_disabled_still_image_model(model_id)
@@ -150,6 +150,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "embed-text",
         "face-restore",
         "face-restore-codeformer",
+        "fine-tune",
         "insightface",
         "latentsync",
         "lora-train",

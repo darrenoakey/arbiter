@@ -30,6 +30,7 @@ _ADAPTER_MODULES = (
     "face_restore_codeformer",
     "aesthetic_scorer",
     "reference_image_edit",
+    "fine_tune",
     "lora_train",
     "composite",
     "insightface",

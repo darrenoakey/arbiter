@@ -62,7 +62,7 @@ def is_disabled_still_image_model(model_id: str) -> bool:
         return False
     if normalized == REFERENCE_IMAGE_EDIT_MODEL:
         return False
-    if normalized == "lora-train" or normalized.startswith("ltx2-"):
+    if normalized in ("lora-train", "fine-tune") or normalized.startswith("ltx2-"):
         return False
     return "lora" in normalized.split("-") or any(
         marker in normalized for marker in _DISABLED_MARKERS

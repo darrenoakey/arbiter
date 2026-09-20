@@ -19,7 +19,7 @@ func TestStillImageModelClassification(t *testing.T) {
 		}
 	}
 	for _, id := range []string{
-		"birefnet", "ltx2", "ltx2-denoise2", "ltx2-dev-denoise1-lora", "lora-train",
+		"birefnet", "ltx2", "ltx2-denoise2", "ltx2-dev-denoise1-lora", "lora-train", "fine-tune",
 		"minimax-h3", "moondream", "sonic", "whisper-large", "music-generate", "llm:qwen3.6-35b", "flora", "floral-voice",
 	} {
 		if isDisabledStillImageModel(id) {

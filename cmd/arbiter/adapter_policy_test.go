@@ -145,7 +145,7 @@ func TestAdapterParamsRejectVllmCompatibilityNearNeighbors(t *testing.T) {
 
 func TestLLMAliasesDoNotCreateAdapterPolicyModels(t *testing.T) {
 	aliases := []string{
-		"local-chat", "local-summariser", "local-extract", "local-coder", "local-vision",
+		"local-chat", "local-summariser", "local-extract", "local-coder", "local-vision", "local-titler",
 	}
 	for _, alias := range aliases {
 		if _, exists := vllmLegacyTuningByModel["llm:"+alias]; exists {

@@ -48,6 +48,7 @@ var trustedPythonAdapters = map[string]string{
 	"insightface":             "insightface",
 	"latentsync":              "",
 	"lora-train":              "",
+	"fine-tune":               "",
 	"ltx2":                    "",
 	"ltx2-denoise1":           "",
 	"ltx2-denoise2":           "",
@@ -106,7 +107,7 @@ func isDisabledStillImageModel(modelID string) bool {
 	if normalized == referenceImageEditModel {
 		return false
 	}
-	if normalized == "lora-train" || normalized == "ltx2" || strings.HasPrefix(normalized, "ltx2-") ||
+	if normalized == "lora-train" || normalized == "fine-tune" || normalized == "ltx2" || strings.HasPrefix(normalized, "ltx2-") ||
 		normalized == "ltx25" || strings.HasPrefix(normalized, "ltx25-") {
 		return false
 	}

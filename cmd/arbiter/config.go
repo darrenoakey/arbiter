@@ -382,6 +382,7 @@ var JobTypeToModel = map[string]string{
 	"aesthetic-score":         "aesthetic-scorer",
 	"tts-voxtral":             "tts-voxtral",
 	"lora-train":              "lora-train",
+	"fine-tune":               "fine-tune",
 	"composite":               "composite",
 	"embed-text":              "embed-text",
 	"demucs":                  "demucs",
