@@ -38,13 +38,23 @@ _DISABLED_MARKERS = (
 )
 
 
-# The ONE sanctioned exception (owner decision, 2026-09-16): a reference-
-# conditioned local editor that renders *reference targets* for other
-# pipelines. It always requires an input image, is never wired into
-# generate_image / daz-agent-sdk / the Mac mini Codex IGS route, and must never
-# be used as a still-image fallback. See adapters/reference_image_edit.py and
-# the Go `referenceImageEditModel` policy.
+# The TWO sanctioned exceptions:
+#
+# 1. (owner decision, 2026-09-16) ``reference-image-edit`` — a reference-
+#    conditioned local editor that renders *reference targets* for other
+#    pipelines. It always requires an input image, is never wired into
+#    generate_image / daz-agent-sdk / the Mac mini Codex IGS route, and must
+#    never be used as a still-image fallback. See
+#    adapters/reference_image_edit.py and the Go ``referenceImageEditModel``
+#    policy.
+#
+# 2. (owner decision, 2026-09-21) ``qwen-image-2.1`` — a local unified
+#    text-to-image + reference-editing adapter (``Qwen/Qwen-Image-2.1``)
+#    exposed only through the ``qwen-image`` job type. Every other
+#    ``qwen-image-*`` id (including LoRA variants) stays denied. See
+#    adapters/qwen_image_21.py and the Go ``qwenImage21Model`` policy.
 REFERENCE_IMAGE_EDIT_MODEL = "reference-image-edit"
+QWEN_IMAGE_21_MODEL = "qwen-image-2.1"
 
 
 class StillImageGenerationDisabled(RuntimeError):
@@ -60,7 +70,9 @@ def is_disabled_still_image_model(model_id: str) -> bool:
     normalized = _normalize(model_id)
     if not normalized:
         return False
-    if normalized == REFERENCE_IMAGE_EDIT_MODEL:
+    if normalized == _normalize(REFERENCE_IMAGE_EDIT_MODEL):
+        return False
+    if normalized == _normalize(QWEN_IMAGE_21_MODEL):
         return False
     if normalized in ("lora-train", "fine-tune") or normalized.startswith("ltx2-"):
         return False

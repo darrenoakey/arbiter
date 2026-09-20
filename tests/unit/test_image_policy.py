@@ -27,6 +27,20 @@ def test_reference_image_edit_is_the_only_still_image_exception():
     assert is_disabled_still_image_model("reference-image-edit-lora")
 
 
+def test_qwen_image_21_is_the_second_sanctioned_exception():
+    """Owner decision 2026-09-21: the unified Qwen adapter is allowed under its
+    exact id, and near-neighbour aliases (LoRA variants, renamed copies, the
+    generic generator alias) all stay denied."""
+    from arbiter.image_policy import QWEN_IMAGE_21_MODEL
+
+    assert not is_disabled_still_image_model(QWEN_IMAGE_21_MODEL)
+    assert not is_disabled_still_image_model("Qwen.Image.2.1")
+    assert is_disabled_still_image_model("qwen-image-2.1-lora")
+    assert is_disabled_still_image_model("Qwen/Image-Generator")
+    assert is_disabled_still_image_model("Qwen/Qwen-Image-2.1")
+    assert is_disabled_still_image_model("qwen-image-edit")
+
+
 def test_reference_image_edit_requires_an_input_image(tmp_path):
     """No text-to-image path exists: a prompt without an image fails before any model call."""
     from arbiter.adapters.base import InferenceError
@@ -168,6 +182,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "moondream",
         "music-generate",
         "photo-enhance",
+        "qwen-image-2.1",
         "reference-image-edit",
         "rvc-convert",
         "rvc-train",

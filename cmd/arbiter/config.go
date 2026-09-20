@@ -393,6 +393,7 @@ var JobTypeToModel = map[string]string{
 	"music-generate":          "music-generate",
 	"music-generate-yue2":     "yue2",
 	"reference-image-edit":    referenceImageEditModel,
+	"qwen-image":              qwenImage21Model,
 	"photo-enhance":           "photo-enhance",
 }
 

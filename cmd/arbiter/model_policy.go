@@ -10,7 +10,7 @@ import (
 
 const stillImageDisabledMessage = "still-image generation is actively disabled in Arbiter; callers must use the Mac mini Codex image service"
 
-// referenceImageEditModel is the ONE sanctioned exception to the still-image
+// referenceImageEditModel is sanctioned exception #1 to the still-image
 // policy (owner decision, 2026-09-16). It is a reference-conditioned local
 // editor (FLUX.2-klein-9B) used to produce *reference renders* for other
 // pipelines — e.g. a "what would a pro DSLR shot of this photo look like"
@@ -22,8 +22,22 @@ const stillImageDisabledMessage = "still-image generation is actively disabled i
 // marker stay disabled.
 const referenceImageEditModel = "reference-image-edit"
 
+// qwenImage21Model is sanctioned exception #2 to the still-image policy
+// (owner decision, 2026-09-21): a local unified text-to-image +
+// reference-image editing adapter (Qwen/Qwen-Image-2.1, venvs/qwenimage)
+// exposed only through the `qwen-image` job type. Unlike the reference-only
+// FLUX editor it legitimately generates images from text. It is not wired
+// into generate_image / daz-agent-sdk / the Mac mini Codex IGS route, and
+// every other qwen-image* id (LoRA variants, renamed copies) stays disabled.
+const qwenImage21Model = "qwen-image-2.1"
+const qwenImageJobType = "qwen-image"
+
 func isReferenceImageEditModel(modelID string) bool {
 	return normalizedPolicyText(modelID) == referenceImageEditModel
+}
+
+func isQwenImage21Model(modelID string) bool {
+	return normalizedPolicyText(modelID) == normalizedPolicyText(qwenImage21Model)
 }
 
 const untrustedWorkerCommandMessage = "worker_cmd is not a trusted repository-owned Arbiter adapter/worker identity"
@@ -76,6 +90,7 @@ var trustedPythonAdapters = map[string]string{
 	"wan-s2v":                 "",
 	"whisper-large":           "whisper",
 	referenceImageEditModel:   "flux2",
+	qwenImage21Model:          "qwenimage",
 }
 
 var trustedRepositoryWorkers = map[string]string{
@@ -105,6 +120,9 @@ func isDisabledStillImageModel(modelID string) bool {
 		return false
 	}
 	if normalized == referenceImageEditModel {
+		return false
+	}
+	if isQwenImage21Model(normalized) {
 		return false
 	}
 	if normalized == "lora-train" || normalized == "fine-tune" || normalized == "ltx2" || strings.HasPrefix(normalized, "ltx2-") ||
@@ -158,6 +176,11 @@ func disabledStillImageConfig(modelID string, cfg ModelConfig) bool {
 		// The sanctioned reference editor legitimately names a FLUX checkpoint
 		// and the venvs/flux2 interpreter; the worker command itself is still
 		// pinned by validateWorkerCommand to the trusted adapter identity.
+		return false
+	}
+	if isQwenImage21Model(modelID) {
+		// The sanctioned Qwen adapter legitimately names the Qwen checkpoint
+		// in auto_download and the venvs/qwenimage interpreter.
 		return false
 	}
 	videoLora := normalizedPolicyText(modelID) == "ltx2" || strings.HasPrefix(normalizedPolicyText(modelID), "ltx2-") ||
@@ -264,6 +287,10 @@ func rejectDisabledStillImage(jobType, modelID string) error {
 	}
 	if isReferenceImageEditModel(modelID) && jobType != "reference-image-edit" {
 		// The reference editor cannot be smuggled in under another job type.
+		return fmt.Errorf("%s", stillImageDisabledMessage)
+	}
+	if isQwenImage21Model(modelID) && jobType != qwenImageJobType {
+		// Same narrowing for the Qwen unified adapter.
 		return fmt.Errorf("%s", stillImageDisabledMessage)
 	}
 	return nil

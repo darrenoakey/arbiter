@@ -32,6 +32,7 @@ class JobType(str, Enum):
     LTX25_DENOISE1 = "ltx25-denoise1"
     AESTHETIC_SCORE = "aesthetic-score"
     REFERENCE_IMAGE_EDIT = "reference-image-edit"
+    QWEN_IMAGE = "qwen-image"
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
     FINE_TUNE = "fine-tune"
@@ -68,6 +69,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "ltx25-denoise1": "ltx25-denoise1",
     "aesthetic-score": "aesthetic-scorer",
     "reference-image-edit": "reference-image-edit",
+    "qwen-image": "qwen-image-2.1",
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
     "fine-tune": "fine-tune",
@@ -319,6 +321,22 @@ class ReferenceImageEditParams(BaseModel):
     seed: int = 42
 
 
+class QwenImageParams(BaseModel):
+    """Qwen-Image-2.1 unified generation: prompt alone is text-to-image,
+    prompt + image is editing/enhancement/multi-reference composition."""
+
+    prompt: str
+    image: Optional[str] = None  # base64 condition image (edit mode)
+    image_file: Optional[str] = None  # staged path on spark
+    negative_prompt: Optional[str] = None  # only used with true_cfg_scale > 1
+    steps: int = 40
+    true_cfg_scale: float = 1.0  # model is meant to be sampled without guidance
+    seed: int = 42
+    width: Optional[int] = None  # both or neither; snapped to /16, cap 2752
+    height: Optional[int] = None
+    output_resolution: int = 1024  # target side for T2I default and edit mode
+
+
 class PhotoEnhanceParams(BaseModel):
     """Full photo-enhance pipeline: detail recovery, reference render, guided
     photometric climb. Everything runs on spark; the caller only submits."""
@@ -482,6 +500,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "ltx25-denoise1": LTX25Denoise1Params,
     "aesthetic-score": AestheticScoreParams,
     "reference-image-edit": ReferenceImageEditParams,
+    "qwen-image": QwenImageParams,
     "tts-voxtral": TTSVoxtralParams,
     "video-generate-h3": VideoGenerateH3Params,
     "video-generate-fast-h3": VideoGenerateH3Params,

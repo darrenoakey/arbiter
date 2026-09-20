@@ -1104,6 +1104,36 @@ Result: `{"format":"png","width":W,"height":H,"steps":4,"seed":42,"file":"result
 "model":"black-forest-labs/FLUX.2-klein-9B"}` plus `result_path`. Inputs larger
 than 1536 px on the long side are downscaled (klein is a ~1 MP model).
 
+**Second scoped exception — `qwen-image` (owner decision, 2026-09-21).**
+A local unified text-to-image + reference-image editing adapter
+(`Qwen/Qwen-Image-2.1`, 7B single-stream DiT + Qwen3-VL text encoder, ~33 GB
+bf16, `venvs/qwenimage`, declared 44 GB) exposed only through the
+`qwen-image` job type / `qwen-image-2.1` model id. `prompt` alone is
+text-to-image; `prompt` + `image` switches to edit/enhance/multi-reference
+mode (the pipeline derives output dimensions from the condition image's
+aspect ratio at `output_resolution`, default 1024). Native RGBA transparency
+is prompt-driven ("This is an RGBA image with transparency. ..."). The model
+is meant to be sampled WITHOUT classifier-free guidance: `true_cfg_scale`
+stays 1.0 unless a `negative_prompt` justifies raising it. Sides cap at
+2752 px and snap to /16; steps default 40 (max 60). Like exception #1 it is
+not wired into `generate_image` / `daz-agent-sdk` / the Codex IGS route, and
+every other `qwen-image*` id (LoRA variants, renamed copies) stays denied.
+See `requirements/qwen-image.txt` to recreate the venv.
+
+```json
+{"type": "qwen-image",
+ "params": {"prompt": "a panda riding a bicycle through a bamboo forest, ...",
+            "width": 1280, "height": 768, "steps": 40, "seed": 42}}
+{"type": "qwen-image",
+ "params": {"prompt": "the same shot as if taken by the greatest photographer ...",
+            "image_file": "/mnt/arbiter-store/inbox/photo.jpg",
+            "output_resolution": 1280}}
+```
+
+Result: `{"format":"png","mode":"t2i"|"edit","width":W,"height":H,"steps":N,
+"seed":S,"true_cfg_scale":C,"model":"Qwen/Qwen-Image-2.1","file":"result.png"}`
+plus `result_path`.
+
 <!-- Retired still-image API reference intentionally hidden; retained only as migration history.
 
 ### 3.1 image-generate

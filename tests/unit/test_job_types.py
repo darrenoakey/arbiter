@@ -31,6 +31,20 @@ def test_photo_enhance_job_type_registered():
     assert "photo-enhance" in JOB_TYPE_PARAMS
 
 
+def test_qwen_image_job_type_registered():
+    from arbiter.schemas import QwenImageParams
+
+    assert JOB_TYPE_TO_MODEL["qwen-image"] == "qwen-image-2.1"
+    assert "qwen-image" in JOB_TYPE_PARAMS
+    # Unified params: prompt alone is text-to-image; image switches to edit
+    # mode. Sampled without guidance by default, 40 card-default steps.
+    params = QwenImageParams(prompt="a panda riding a bicycle")
+    assert params.steps == 40 and params.true_cfg_scale == 1.0
+    assert params.image is None and params.output_resolution == 1024
+    edit = QwenImageParams(prompt="enhance this photo", image_file="/mnt/x.jpg")
+    assert edit.image_file == "/mnt/x.jpg"
+
+
 def test_photo_enhance_param_schema_shape():
     from arbiter.schemas import PhotoEnhanceParams
 
