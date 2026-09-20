@@ -650,7 +650,7 @@ curl -sS -X PUT http://10.0.0.254:8400/v1/llm/aliases/local-coder \
 ```
 
 New clients should request `local-chat`, `local-summariser`, `local-extract`,
-`local-coder`, or `local-vision`. Durable provenance must record the resolved
+`local-coder`, `local-vision`, or `local-titler`. Durable provenance must record the resolved
 canonical ID from the response header or job fields, never the category.
 
 ### POST /v1/jobs/status -- Bulk Poll Job Status

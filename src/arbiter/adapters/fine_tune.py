@@ -7,6 +7,7 @@ import os
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["UNSLOTH_DISABLE_STATISTICS"] = "1"
 
 import importlib
 import json
@@ -132,9 +133,26 @@ class FineTuneAdapter(ModelAdapter):
 
         self._check_cancel(cancel_flag)
 
-        log.info("Loading base model: %s (4bit=%s)", model_name, load_in_4bit)
+        os.environ["UNSLOTH_DISABLE_STATISTICS"] = "1"
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+        try:
+            _u = importlib.import_module("unsloth.models._utils")
+            setattr(_u, "has_internet", lambda *a, **kw: False)
+        except Exception:
+            pass
+
+        log.info("Resolving base model: %s (4bit=%s)", model_name, load_in_4bit)
+        if os.path.exists(model_name):
+            model_path = model_name
+        else:
+            from huggingface_hub import snapshot_download
+            model_path = snapshot_download(model_name)
+        log.info("Loading base model from: %s", model_path)
+
         model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_name,
+            model_name=model_path,
             max_seq_length=max_seq_length,
             load_in_4bit=load_in_4bit,
             device_map={"": 0},
