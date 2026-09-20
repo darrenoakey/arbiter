@@ -3,12 +3,19 @@
 # This is the ONLY way to push code to spark — do not edit files in place on spark.
 #
 # Steps:
-#   1. Run tests locally
+#   1. Smoke-test the Python adapter package on the target venv (spark)
 #   2. Cross-compile binaries for Linux ARM64
 #   3. Stop arbiter on spark
 #   4. Sync Python adapters + binaries
 #   5. Start arbiter
 #   6. Verify health
+#
+# Validation lives in the greenline gate (./run check), which runs the FULL
+# Go + Python suites on this exact tree immediately before the deploy; this
+# script must not re-run them (measured 2026-09-20: a duplicate full Go suite
+# here cost ~45s of every release for zero added coverage — the canonical
+# checkout it runs from is the tree the gate just validated). The cross-
+# compile below still fails on any build breakage before prod is touched.
 
 set -euo pipefail
 
@@ -133,18 +140,6 @@ else
     echo "==> No /v1/drain on running arbiter (older binary) — proceeding without drain"
 fi
 
-echo "==> Running Go tests..."
-# ARBITER_GO_TEST_SKIP: optional regex of environment-dependent tests to skip
-# (some remote-host tests require live local ollama / remote Macs on the LAN).
-# Default (unset) runs the FULL suite — do not set it to dodge real failures.
-if [ -n "${ARBITER_GO_TEST_SKIP:-}" ]; then
-    echo "    skipping env-dependent tests matching: $ARBITER_GO_TEST_SKIP"
-    go test ./cmd/arbiter/ -count=1 -skip "$ARBITER_GO_TEST_SKIP" >/dev/null
-else
-    go test ./cmd/arbiter/ -count=1 >/dev/null
-fi
-echo "    go tests passed"
-
 echo "==> Smoke-testing Python adapter package on spark..."
 # This is the exact import sequence that worker_main.py does on startup.
 # If this fails, the deploy is aborted BEFORE we touch the running arbiter —
@@ -171,17 +166,29 @@ echo "    $(md5 -q arbiter-linux-arm64 2>/dev/null || md5sum arbiter-linux-arm64
 echo "    $(md5 -q llm-worker-linux-arm64 2>/dev/null || md5sum llm-worker-linux-arm64 | awk '{print $1}') llm-worker"
 echo "    $(md5 -q vllm-chat-worker-linux-arm64 2>/dev/null || md5sum vllm-chat-worker-linux-arm64 | awk '{print $1}') vllm-chat-worker"
 
-# Rejoin the drain requested before the build/test phase. Its deadline was
-# set at that request, so the build/test time counts against the same bounded
-# window — this loop only waits out the remainder.
+# Rejoin the drain requested before the build/test phase. Patience is
+# PER-JOB, measured from each job's own start (scripts/drain_wait.py): a job
+# is protected until it has run one full drain window, so a long job that
+# already outlived the window costs no further wait — it is requeued by the
+# shutdown path either way (measured 2026-09-20: two multi-minute training
+# jobs burned ~80s of a 209.6s release waiting out a wall-clock deadline that
+# was never going to let them finish). Short jobs keep the same or better
+# protection they always had; the overall deadline below still bounds the
+# total wait.
 if [ "$DRAIN_REQUESTED" = "1" ]; then
     drain_request # renew the lease across the build/test gap
-    echo "==> Draining arbiter (waiting for in-flight to finish, deadline ${DEPLOY_DRAIN_TIMEOUT}s from drain request)..."
+    echo "==> Draining arbiter (deadline ${DEPLOY_DRAIN_TIMEOUT}s from drain request; per-job patience ${DEPLOY_DRAIN_TIMEOUT}s from each job's start)..."
     while :; do
-        active=$(curl -s --max-time 5 "$ARBITER_URL/v1/ps" 2>/dev/null \
-            | python3 -c 'import sys,json; print(json.load(sys.stdin).get("active_jobs",0))' 2>/dev/null || echo 0)
+        verdict="$(curl -s --max-time 5 "$ARBITER_URL/v1/ps" 2>/dev/null \
+            | python3 scripts/drain_wait.py "${DEPLOY_DRAIN_TIMEOUT}" 2>/dev/null || printf '0\t0')"
+        active="${verdict%%$'\t'*}"
+        waitable="${verdict##*$'\t'}"
         if [ "${active:-0}" = "0" ]; then
             echo "    drained — 0 in-flight jobs"
+            break
+        fi
+        if [ "$waitable" != "1" ]; then
+            echo "    long-job cut — every in-flight job already ran past the ${DEPLOY_DRAIN_TIMEOUT}s patience window; proceeding (shutdown requeues them)"
             break
         fi
         if [ "$(date +%s)" -ge "$drain_deadline" ]; then
