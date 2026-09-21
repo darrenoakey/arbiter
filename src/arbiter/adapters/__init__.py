@@ -43,6 +43,7 @@ _ADAPTER_MODULES = (
     "music_generate",
     "yue2",
     "photo_enhance",
+    "trellis2",
 )
 
 for _module_name in _ADAPTER_MODULES:

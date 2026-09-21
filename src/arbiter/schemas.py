@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -45,6 +45,7 @@ class JobType(str, Enum):
     MUSIC_GENERATE = "music-generate"
     MUSIC_GENERATE_YUE2 = "music-generate-yue2"
     PHOTO_ENHANCE = "photo-enhance"
+    IMAGE_TO_3D = "image-to-3d"
 
 
 # Maps job type to model_id
@@ -82,6 +83,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "music-generate": "music-generate",
     "music-generate-yue2": "yue2",
     "photo-enhance": "photo-enhance",
+    "image-to-3d": "trellis2",
 }
 
 
@@ -337,6 +339,17 @@ class QwenImageParams(BaseModel):
     output_resolution: int = 1024  # target side for T2I default and edit mode
 
 
+class ImageTo3DParams(BaseModel):
+    image: Optional[str] = None  # base64; RGBA with real alpha skips BiRefNet
+    image_file: Optional[str] = None  # staged path on spark
+    resolution: Literal[512, 1024, 1536] = 1024
+    steps: int = Field(default=12, ge=1, le=50)
+    seed: int = Field(default=42, ge=0, le=4294967295)
+    texture_size: Literal[1024, 2048, 4096] = 2048
+    decimation: int = Field(default=500000, ge=100000, le=1000000)
+    include_stl: bool = False  # untextured geometry-only STL beside result.glb
+
+
 class PhotoEnhanceParams(BaseModel):
     """Full photo-enhance pipeline: detail recovery, reference render, guided
     photometric climb. Everything runs on spark; the caller only submits."""
@@ -515,4 +528,5 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "music-generate": MusicGenerateParams,
     "music-generate-yue2": Yue2MusicParams,
     "photo-enhance": PhotoEnhanceParams,
+    "image-to-3d": ImageTo3DParams,
 }

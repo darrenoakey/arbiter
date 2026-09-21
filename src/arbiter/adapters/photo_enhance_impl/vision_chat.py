@@ -136,7 +136,8 @@ class VisionChat:
                     payload = json.load(response)
                 return payload["choices"][0]["message"]["content"]
             except urllib.error.HTTPError as err:
-                detail = read_error_body(err)
+                with err:
+                    detail = read_error_body(err)
                 overflow = context_overflow_tokens(detail)
                 if overflow is not None and trims < CONTEXT_RETRIES:
                     # permanent for this prompt size: trim by the reported

@@ -104,7 +104,8 @@ class GpuIdleHookTests(unittest.TestCase):
         req = urllib.request.Request(self.hook_url + "/nope", data=b"{}", method="POST")
         with self.assertRaises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(req, timeout=5)
-        self.assertEqual(caught.exception.code, 404)
+        with caught.exception:
+            self.assertEqual(caught.exception.code, 404)
 
 
 if __name__ == "__main__":

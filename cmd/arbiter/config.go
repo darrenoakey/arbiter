@@ -395,6 +395,7 @@ var JobTypeToModel = map[string]string{
 	"reference-image-edit":    referenceImageEditModel,
 	"qwen-image":              qwenImage21Model,
 	"photo-enhance":           "photo-enhance",
+	"image-to-3d":             "trellis2",
 }
 
 func LoadConfig(projectRoot string) (*Config, error) {

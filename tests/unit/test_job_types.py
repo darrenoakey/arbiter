@@ -31,6 +31,16 @@ def test_photo_enhance_job_type_registered():
     assert "photo-enhance" in JOB_TYPE_PARAMS
 
 
+def test_image_to_3d_job_type_registered():
+    from arbiter.schemas import ImageTo3DParams
+
+    assert JOB_TYPE_TO_MODEL["image-to-3d"] == "trellis2"
+    assert "image-to-3d" in JOB_TYPE_PARAMS
+    params = ImageTo3DParams(image_file="/mnt/x.png")
+    assert params.resolution == 1024 and params.steps == 12
+    assert params.include_stl is False and params.texture_size == 2048
+
+
 def test_qwen_image_job_type_registered():
     from arbiter.schemas import QwenImageParams
 

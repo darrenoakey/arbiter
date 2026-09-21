@@ -135,7 +135,7 @@ def assemble_tiles(tiles: list[Tile], upscaled: list[Image.Image], width: int, h
         blended[last_row + 1 :] = blended[last_row]
         blended[:, :first_col] = blended[:, first_col : first_col + 1]
         blended[:, last_col + 1 :] = blended[:, last_col : last_col + 1]
-    return Image.fromarray(np.clip(blended + 0.5, 0, 255).astype(np.uint8), "RGB")
+    return Image.fromarray(np.clip(blended + 0.5, 0, 255).astype(np.uint8))
 
 
 # ##################################################################

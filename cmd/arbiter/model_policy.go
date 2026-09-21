@@ -91,6 +91,7 @@ var trustedPythonAdapters = map[string]string{
 	"whisper-large":           "whisper",
 	referenceImageEditModel:   "flux2",
 	qwenImage21Model:          "qwenimage",
+	"trellis2":                "trellis2",
 }
 
 var trustedRepositoryWorkers = map[string]string{

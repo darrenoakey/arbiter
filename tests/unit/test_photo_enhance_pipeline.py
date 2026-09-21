@@ -130,14 +130,14 @@ def test_assemble_tiles_blends_overlaps_seamlessly():
     tiles = plan_tiles(width, height)
     upscaled = []
     for t in tiles:
-        crop = Image.fromarray(base[t.top : t.top + t.height, t.left : t.left + t.width].astype(np.uint8), "RGB")
+        crop = Image.fromarray(base[t.top : t.top + t.height, t.left : t.left + t.width].astype(np.uint8))
         crop = crop.resize((t.width * SCALE, t.height * SCALE), Image.Resampling.BILINEAR)
         upscaled.append(crop)
     result = np.asarray(
         assemble_tiles(tiles, upscaled, width * SCALE, height * SCALE), dtype=np.float32
     )
     expected = np.asarray(
-        Image.fromarray(base.astype(np.uint8), "RGB").resize((width * SCALE, height * SCALE), Image.Resampling.BILINEAR),
+        Image.fromarray(base.astype(np.uint8)).resize((width * SCALE, height * SCALE), Image.Resampling.BILINEAR),
         dtype=np.float32,
     )
     assert np.abs(result - expected).max() <= 2.0

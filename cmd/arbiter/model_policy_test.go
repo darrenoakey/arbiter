@@ -20,7 +20,7 @@ func TestStillImageModelClassification(t *testing.T) {
 	}
 	for _, id := range []string{
 		"birefnet", "ltx2", "ltx2-denoise2", "ltx2-dev-denoise1-lora", "lora-train", "fine-tune",
-		"minimax-h3", "moondream", "sonic", "whisper-large", "music-generate", "llm:qwen3.6-35b", "flora", "floral-voice",
+		"minimax-h3", "moondream", "sonic", "whisper-large", "music-generate", "llm:qwen3.6-35b", "flora", "floral-voice", "trellis2",
 	} {
 		if isDisabledStillImageModel(id) {
 			t.Errorf("%q was incorrectly classified as a still-image model", id)

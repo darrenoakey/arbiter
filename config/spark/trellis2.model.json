@@ -1,0 +1,22 @@
+{
+  "auto_download": "microsoft/TRELLIS.2-4B",
+  "avg_inference_ms": 120000,
+  "group": false,
+  "keep_alive_seconds": 600,
+  "load_ms": 180000,
+  "max_concurrent": 1,
+  "max_instances": 1,
+  "max_runtime_seconds": 1800,
+  "memory_gb": 48,
+  "model_path": "",
+  "pressure_index": 0.5,
+  "adapter_params": {
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+  },
+  "worker_cmd": [
+    "/home/darren/src/arbiter/venvs/trellis2/bin/python",
+    "-m",
+    "arbiter.worker_main",
+    "trellis2"
+  ]
+}
