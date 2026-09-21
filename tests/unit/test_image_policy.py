@@ -41,6 +41,18 @@ def test_qwen_image_21_is_the_second_sanctioned_exception():
     assert is_disabled_still_image_model("qwen-image-edit")
 
 
+def test_qwen_image_21_heretic_is_the_third_sanctioned_exception():
+    """Owner decision 2026-09-22: the abliterated-text-encoder variant is
+    allowed under its exact id only; every near-neighbour alias stays denied."""
+    from arbiter.image_policy import QWEN_IMAGE_21_HERETIC_MODEL
+
+    assert not is_disabled_still_image_model(QWEN_IMAGE_21_HERETIC_MODEL)
+    assert not is_disabled_still_image_model("Qwen.Image.2.1.Heretic")
+    assert is_disabled_still_image_model("qwen-image-2.1-heretic-lora")
+    assert is_disabled_still_image_model("qwen-image-heretic")
+    assert is_disabled_still_image_model("qwen-image-2.1-uncensored")
+
+
 def test_reference_image_edit_requires_an_input_image(tmp_path):
     """No text-to-image path exists: a prompt without an image fails before any model call."""
     from arbiter.adapters.base import InferenceError
@@ -183,6 +195,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "music-generate",
         "photo-enhance",
         "qwen-image-2.1",
+        "qwen-image-2.1-heretic",
         "reference-image-edit",
         "rvc-convert",
         "rvc-train",

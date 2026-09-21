@@ -63,3 +63,22 @@ def test_estimate_time_scales_with_steps_and_edit_mode():
     edit = adapter.estimate_time({"prompt": "x", "steps": 40, "image_file": "/i.jpg"})
     assert edit > t2i > 0
     assert adapter.estimate_time({"prompt": "x", "steps": 20}) < t2i
+
+
+def test_heretic_adapter_identity():
+    """Exception #3: same pipeline, same behavior, abliterated text encoder
+    checkpoint on spark; distinct model id."""
+    from arbiter.adapters.qwen_image_21 import (
+        QWEN_IMAGE_21_HERETIC_MODEL_ID,
+        QWEN_IMAGE_21_HERETIC_PATH,
+        QwenImage21HereticAdapter,
+    )
+
+    adapter = QwenImage21HereticAdapter()
+    assert adapter.model_id == "qwen-image-2.1-heretic"
+    assert QWEN_IMAGE_21_HERETIC_MODEL_ID == "qwen-image-2.1-heretic"
+    assert adapter.hf_model_path == QWEN_IMAGE_21_HERETIC_PATH
+    assert QWEN_IMAGE_21_HERETIC_PATH == "/mnt/t9/models/qwen-image-2.1-heretic"
+    assert adapter.model_id != QwenImage21Adapter.model_id
+    # Identical inference behavior inherited from the stock adapter.
+    assert type(adapter).estimate_time is QwenImage21Adapter.estimate_time

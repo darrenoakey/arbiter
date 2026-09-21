@@ -99,3 +99,87 @@ func TestQwenImage21ModelRegistrationRoundTrip(t *testing.T) {
 		t.Fatalf("qwen-image-2.1 model registration rejected: %v", err)
 	}
 }
+
+// --- Sanctioned exception #3: qwen-image-2.1-heretic -------------------------
+
+func qwenImage21HereticConfig(root string) ModelConfig {
+	return ModelConfig{
+		MemoryGB:      52,
+		MaxConcurrent: 1,
+		MaxInstances:  intPtr(1),
+		AutoDownload:  "",
+		ModelPath:     "/mnt/t9/models/qwen-image-2.1-heretic",
+		WorkerCmd: []string{
+			filepath.Join(root, "venvs", "qwenimage", "bin", "python"),
+			"-m", "arbiter.worker_main", qwenImage21HereticModel,
+		},
+	}
+}
+
+func TestQwenImage21HereticIsAllowedByPolicy(t *testing.T) {
+	if isDisabledStillImageModel(qwenImage21HereticModel) {
+		t.Fatal("qwen-image-2.1-heretic must not be classified as a disabled still-image model")
+	}
+	root := t.TempDir()
+	cfg := qwenImage21HereticConfig(root)
+	if disabledStillImageConfig(qwenImage21HereticModel, cfg) {
+		t.Fatal("qwen-image-2.1-heretic config naming the merged local dir and venv was refused")
+	}
+	if err := validatePythonWorkerCommand(root, qwenImage21HereticModel, cfg.WorkerCmd); err != nil {
+		t.Fatalf("qwen-image-2.1-heretic worker command rejected: %v", err)
+	}
+	if err := rejectDisabledStillImage(qwenImageHereticJobType, qwenImage21HereticModel); err != nil {
+		t.Fatalf("qwen-image-heretic job type rejected: %v", err)
+	}
+	if err := validateJobModelCompatibility(qwenImageHereticJobType, qwenImage21HereticModel); err != nil {
+		t.Fatalf("qwen-image-heretic routing rejected: %v", err)
+	}
+	if got := JobTypeToModel[qwenImageHereticJobType]; got != qwenImage21HereticModel {
+		t.Fatalf("JobTypeToModel[qwen-image-heretic] = %q, want %q", got, qwenImage21HereticModel)
+	}
+	if venv, ok := trustedPythonAdapters[qwenImage21HereticModel]; !ok || venv != "qwenimage" {
+		t.Fatalf("trustedPythonAdapters[qwen-image-2.1-heretic] = %q ok=%v, want qwenimage", venv, ok)
+	}
+}
+
+func TestQwenImage21HereticExceptionIsNarrow(t *testing.T) {
+	root := t.TempDir()
+	// Near-neighbour aliases stay disabled.
+	for _, modelID := range []string{"qwen-image-2.1-heretic-lora", "qwen-image-heretic", "qwen-image-2.1-uncensored"} {
+		if !isDisabledStillImageModel(modelID) {
+			t.Fatalf("%q was not classified as a disabled still-image model", modelID)
+		}
+	}
+	// The heretic adapter cannot be smuggled in under other job types,
+	// including the stock qwen-image job type and legacy image markers.
+	for _, jobType := range []string{"qwen-image", "image-edit", "image-generate", "reference-image-edit"} {
+		if err := rejectDisabledStillImage(jobType, qwenImage21HereticModel); err == nil {
+			t.Fatalf("job type %q accepted the heretic adapter as an override", jobType)
+		}
+	}
+	// The stock qwen adapter cannot serve the heretic job type, and the heretic
+	// job type cannot be redirected to another adapter.
+	if err := rejectDisabledStillImage(qwenImageHereticJobType, qwenImage21Model); err == nil {
+		t.Fatal("qwen-image-heretic accepted the stock qwen adapter as an override")
+	}
+	for _, modelID := range []string{"flux2", "reference-image-edit", "birefnet", "qwen-image-2.1"} {
+		if err := validateJobModelCompatibility(qwenImageHereticJobType, modelID); err == nil {
+			t.Fatalf("qwen-image-heretic routed to %q", modelID)
+		}
+	}
+	// A worker command that selects a different adapter is still untrusted.
+	mismatched := qwenImage21HereticConfig(root)
+	mismatched.WorkerCmd[3] = "flux2"
+	if err := validatePythonWorkerCommand(root, qwenImage21HereticModel, mismatched.WorkerCmd); err == nil ||
+		!strings.Contains(err.Error(), untrustedWorkerCommandMessage) {
+		t.Fatalf("qwen-image-2.1-heretic accepted a worker command selecting the flux2 adapter: %v", err)
+	}
+}
+
+func TestQwenImage21HereticModelRegistrationRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	cfg := qwenImage21HereticConfig(root)
+	if err := validateModelWorkerPolicy(root, qwenImage21HereticModel, cfg, true); err != nil {
+		t.Fatalf("qwen-image-2.1-heretic model registration rejected: %v", err)
+	}
+}

@@ -33,6 +33,7 @@ class JobType(str, Enum):
     AESTHETIC_SCORE = "aesthetic-score"
     REFERENCE_IMAGE_EDIT = "reference-image-edit"
     QWEN_IMAGE = "qwen-image"
+    QWEN_IMAGE_HERETIC = "qwen-image-heretic"
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
     FINE_TUNE = "fine-tune"
@@ -71,6 +72,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "aesthetic-score": "aesthetic-scorer",
     "reference-image-edit": "reference-image-edit",
     "qwen-image": "qwen-image-2.1",
+    "qwen-image-heretic": "qwen-image-2.1-heretic",
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
     "fine-tune": "fine-tune",
@@ -514,6 +516,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "aesthetic-score": AestheticScoreParams,
     "reference-image-edit": ReferenceImageEditParams,
     "qwen-image": QwenImageParams,
+    "qwen-image-heretic": QwenImageParams,
     "tts-voxtral": TTSVoxtralParams,
     "video-generate-h3": VideoGenerateH3Params,
     "video-generate-fast-h3": VideoGenerateH3Params,

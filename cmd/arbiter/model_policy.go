@@ -32,12 +32,25 @@ const referenceImageEditModel = "reference-image-edit"
 const qwenImage21Model = "qwen-image-2.1"
 const qwenImageJobType = "qwen-image"
 
+// qwenImage21HereticModel is sanctioned exception #3 to the still-image
+// policy (owner decision, 2026-09-22): the identical Qwen-Image-2.1 pipeline
+// (same DiT/VAE, same venvs/qwenimage interpreter) with the stock Qwen3-VL
+// text encoder swapped for the community abliterated ("heretic") text
+// encoder, exposed only through the `qwen-image-heretic` job type. Every
+// other qwen-image* id (LoRA variants, renamed copies) stays disabled.
+const qwenImage21HereticModel = "qwen-image-2.1-heretic"
+const qwenImageHereticJobType = "qwen-image-heretic"
+
 func isReferenceImageEditModel(modelID string) bool {
 	return normalizedPolicyText(modelID) == referenceImageEditModel
 }
 
 func isQwenImage21Model(modelID string) bool {
 	return normalizedPolicyText(modelID) == normalizedPolicyText(qwenImage21Model)
+}
+
+func isQwenImage21HereticModel(modelID string) bool {
+	return normalizedPolicyText(modelID) == normalizedPolicyText(qwenImage21HereticModel)
 }
 
 const untrustedWorkerCommandMessage = "worker_cmd is not a trusted repository-owned Arbiter adapter/worker identity"
@@ -91,6 +104,7 @@ var trustedPythonAdapters = map[string]string{
 	"whisper-large":           "whisper",
 	referenceImageEditModel:   "flux2",
 	qwenImage21Model:          "qwenimage",
+	qwenImage21HereticModel:   "qwenimage",
 	"trellis2":                "trellis2",
 }
 
@@ -124,6 +138,9 @@ func isDisabledStillImageModel(modelID string) bool {
 		return false
 	}
 	if isQwenImage21Model(normalized) {
+		return false
+	}
+	if isQwenImage21HereticModel(normalized) {
 		return false
 	}
 	if normalized == "lora-train" || normalized == "fine-tune" || normalized == "ltx2" || strings.HasPrefix(normalized, "ltx2-") ||
@@ -179,9 +196,9 @@ func disabledStillImageConfig(modelID string, cfg ModelConfig) bool {
 		// pinned by validateWorkerCommand to the trusted adapter identity.
 		return false
 	}
-	if isQwenImage21Model(modelID) {
-		// The sanctioned Qwen adapter legitimately names the Qwen checkpoint
-		// in auto_download and the venvs/qwenimage interpreter.
+	if isQwenImage21Model(modelID) || isQwenImage21HereticModel(modelID) {
+		// The sanctioned Qwen adapters legitimately name the Qwen checkpoint
+		// (or its local merged heretic dir) and the venvs/qwenimage interpreter.
 		return false
 	}
 	videoLora := normalizedPolicyText(modelID) == "ltx2" || strings.HasPrefix(normalizedPolicyText(modelID), "ltx2-") ||
@@ -292,6 +309,11 @@ func rejectDisabledStillImage(jobType, modelID string) error {
 	}
 	if isQwenImage21Model(modelID) && jobType != qwenImageJobType {
 		// Same narrowing for the Qwen unified adapter.
+		return fmt.Errorf("%s", stillImageDisabledMessage)
+	}
+	if isQwenImage21HereticModel(modelID) && jobType != qwenImageHereticJobType {
+		// The heretic variant is narrowed to its own job type, and the stock
+		// adapter above is already barred from claiming it.
 		return fmt.Errorf("%s", stillImageDisabledMessage)
 	}
 	return nil

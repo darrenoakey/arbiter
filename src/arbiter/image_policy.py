@@ -53,8 +53,16 @@ _DISABLED_MARKERS = (
 #    exposed only through the ``qwen-image`` job type. Every other
 #    ``qwen-image-*`` id (including LoRA variants) stays denied. See
 #    adapters/qwen_image_21.py and the Go ``qwenImage21Model`` policy.
+#
+# 3. (owner decision, 2026-09-22) ``qwen-image-2.1-heretic`` — the identical
+#    pipeline with the stock Qwen3-VL text encoder swapped for the community
+#    abliterated (``heretic``) text encoder, exposed only through the
+#    ``qwen-image-heretic`` job type. See
+#    adapters/qwen_image_21.py (QwenImage21HereticAdapter) and the Go
+#    ``qwenImage21HereticModel`` policy.
 REFERENCE_IMAGE_EDIT_MODEL = "reference-image-edit"
 QWEN_IMAGE_21_MODEL = "qwen-image-2.1"
+QWEN_IMAGE_21_HERETIC_MODEL = "qwen-image-2.1-heretic"
 
 
 class StillImageGenerationDisabled(RuntimeError):
@@ -73,6 +81,8 @@ def is_disabled_still_image_model(model_id: str) -> bool:
     if normalized == _normalize(REFERENCE_IMAGE_EDIT_MODEL):
         return False
     if normalized == _normalize(QWEN_IMAGE_21_MODEL):
+        return False
+    if normalized == _normalize(QWEN_IMAGE_21_HERETIC_MODEL):
         return False
     if normalized in ("lora-train", "fine-tune") or normalized.startswith("ltx2-"):
         return False

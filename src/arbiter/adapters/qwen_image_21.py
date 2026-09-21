@@ -17,6 +17,14 @@ enhancement, or multi-reference composition. Scope, enforced in
 * every ``qwen-image-*`` alias except this exact id (e.g. a LoRA variant)
   stays denied.
 
+Sanctioned still-image exception #3 (owner decision, 2026-09-22):
+``qwen-image-2.1-heretic`` / job type ``qwen-image-heretic`` — the identical
+pipeline with the stock Qwen3-VL text encoder swapped for the community
+abliterated (``heretic``) text encoder (``pottokao/Qwen-Image-2.1-Text-
+Encoder-Heretic``). Same DiT, same venv, same params; only the text encoder
+differs. The DiT weights are the stock ``Qwen/Qwen-Image-2.1`` snapshot
+symlinked under ``/mnt/t9/models/qwen-image-2.1-heretic`` on spark.
+
 Runs in the isolated ``venvs/qwenimage`` environment (torch 2.12 cu130,
 transformers 5.17, diffusers pinned from git because ``QwenImage21Pipeline``
 is not in a released diffusers yet) via ``worker_cmd``. ``diffusers`` and
@@ -48,6 +56,10 @@ from arbiter.adapters.registry import register
 log = logging.getLogger(__name__)
 
 QWEN_IMAGE_21_HF_ID = "Qwen/Qwen-Image-2.1"
+QWEN_IMAGE_21_HERETIC_MODEL_ID = "qwen-image-2.1-heretic"
+# Local merged pipeline dir on spark: the stock Qwen-Image-2.1 snapshot with
+# text_encoder/ replaced by pottokao/Qwen-Image-2.1-Text-Encoder-Heretic.
+QWEN_IMAGE_21_HERETIC_PATH = "/mnt/t9/models/qwen-image-2.1-heretic"
 DEFAULT_STEPS = 40  # card default
 MAX_STEPS = 60
 MAX_SIDE = 2752  # largest supported aspect-ratio side (16:9 / 9:16)
@@ -72,6 +84,8 @@ def snap_side(value: int) -> int:
 @register
 class QwenImage21Adapter(ModelAdapter):
     model_id = "qwen-image-2.1"
+    #: HF repo id (stock) or local merged pipeline dir (heretic subclass).
+    hf_model_path: str = QWEN_IMAGE_21_HF_ID
 
     def __init__(self):
         self._pipe: _Image21Pipeline | None = None
@@ -83,12 +97,12 @@ class QwenImage21Adapter(ModelAdapter):
         diffusers = importlib.import_module("diffusers")
         QwenImage21Pipeline = diffusers.QwenImage21Pipeline
 
-        log.info("Loading %s on %s ...", QWEN_IMAGE_21_HF_ID, device)
+        log.info("Loading %s on %s ...", self.hf_model_path, device)
         with HeapTrimGuard():
             self._pipe = cast(
                 _Image21Pipeline,
                 QwenImage21Pipeline.from_pretrained(
-                    QWEN_IMAGE_21_HF_ID,
+                    self.hf_model_path,
                     torch_dtype=torch.bfloat16,
                 ),
             )
@@ -99,7 +113,7 @@ class QwenImage21Adapter(ModelAdapter):
         log.info("%s ready.", QWEN_IMAGE_21_HF_ID)
 
     def unload(self) -> None:
-        log.info("Unloading %s.", QWEN_IMAGE_21_HF_ID)
+        log.info("Unloading %s.", self.hf_model_path)
         self._pipe = None
         self._cleanup_gpu()
 
@@ -188,7 +202,7 @@ class QwenImage21Adapter(ModelAdapter):
             "steps": steps,
             "seed": seed,
             "true_cfg_scale": true_cfg,
-            "model": QWEN_IMAGE_21_HF_ID,
+            "model": self.hf_model_path,
             "file": "result.png",
         }
 
@@ -197,3 +211,20 @@ class QwenImage21Adapter(ModelAdapter):
         edit = 1 if (params.get("image") or params.get("image_file")) else 0
         # 7B DiT at ~1-4 MP; conditioning images add text-encoder vision tokens
         return 6000.0 + 350.0 * steps + 1500.0 * edit
+
+
+@register
+class QwenImage21HereticAdapter(QwenImage21Adapter):
+    """Abliterated-text-encoder variant of the sanctioned Qwen-Image-2.1
+    pipeline (exception #3, owner decision 2026-09-22).
+
+    Identical DiT/VAE and sampling behavior to :class:`QwenImage21Adapter`;
+    only the text encoder differs (community ``heretic`` abliteration of the
+    Qwen3-VL-8B text encoder, which removes the prompt-level censorship baked
+    into the stock text encoder). Serves ONLY the ``qwen-image-heretic`` job
+    type under the ``qwen-image-2.1-heretic`` model id; every other
+    ``qwen-image-*`` id stays denied.
+    """
+
+    model_id = QWEN_IMAGE_21_HERETIC_MODEL_ID
+    hf_model_path = QWEN_IMAGE_21_HERETIC_PATH
