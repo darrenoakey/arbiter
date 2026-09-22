@@ -92,4 +92,17 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   LTX 2.5 encode writes `encoded.pt`, not `result.pt`. A completed job with no
   inlined `data` is usually the poller looking at the wrong filename.
 
+## GPU idle watchdog (false-kill contract)
+
+- The watchdog kills a worker only when GPU util stays low AND the worker has a
+  pending request it never answered. A worker that already returned (e.g.
+  inference done, `result.mp4` written) must never be killed because later
+  bookkeeping blocked — the scheduler releases the dispatch slot before
+  share/DB completion work, and the watchdog skips workers with no pending
+  request and ignores samples stalled behind a hung `nvidia-smi` call
+  (2026-09-22 false kill of finished job 633b27a52464; fix on master).
+- When adding post-inference completion work, keep it off the dispatch slot's
+  critical path — an 18-minute blocked bundle once let the idle window elapse
+  in a single tick.
+
 
