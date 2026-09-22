@@ -365,6 +365,20 @@ func (s *Scheduler) releaseInFlight(jobID string) (*Instance, bool) {
 	return entry.inst, true
 }
 
+// releaseDispatchSlot drops the in-flight reservation and the activeJobs
+// count. Idempotent: the post-InferRaw path and the dispatch defer both call
+// it, and the reconciler may have healed the slot already.
+func (s *Scheduler) releaseDispatchSlot(job *Job, inst *Instance) {
+	if job == nil {
+		return
+	}
+	if _, ok := s.releaseInFlight(job.ID); !ok {
+		return
+	}
+	s.mgr.ReleaseAndCheck(inst)
+	s.rescoreModel(job.ModelID)
+}
+
 // tryFailover handles a CONFIRMED-absence (INFRA) error from a REMOTE instance
 // by transparently failing the job over to the next box, invisibly to the
 // client. It is the heart of the HARD requirement "mid-job host loss is never a
@@ -1413,14 +1427,8 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 				slog.Error("mark panicked job failed", "job", job.ID, "error", err)
 			}
 		}
-		// Release the activeJobs slot + pressure through the in-flight registry.
-		// Idempotent: if the reconciler already healed this dispatch (store went
-		// terminal while this goroutine was stranded), releaseInFlight returns
-		// ok=false and we skip the decrement so the counters can't go negative.
-		if _, ok := s.releaseInFlight(job.ID); ok {
-			s.mgr.ReleaseAndCheck(inst)
-			s.rescoreModel(job.ModelID)
-		}
+		// Idempotent with the early release after InferRaw returns.
+		s.releaseDispatchSlot(job, inst)
 	}()
 
 	slog.Info("dispatching job", "job_id", job.ID, "model", job.ModelID, "instance", inst.InstanceID)
@@ -1552,6 +1560,13 @@ func (s *Scheduler) dispatchJobToInstance(job *Job, inst *Instance, pressure flo
 	// context and return the result in the local llm-worker's shape.
 	resp, err := inst.backend.InferRaw(job.ID, job.JobType, job.Payload, jobDir)
 	elapsed := time.Since(start).Seconds()
+	// The worker has returned, or the call failed closed. It is idle and
+	// waiting for the next command. Drop the slot before any share or DB
+	// work so a stalled Stat, relocate, or sqlite write cannot look like a
+	// hung GPU job. 2026-09-22 job 633b27a52464: result.mp4 was on disk at
+	// 13:06Z and completion was not logged until 13:24Z; the idle watchdog
+	// killed the live worker in that window.
+	s.releaseDispatchSlot(job, inst)
 
 	// Transparent mid-job failover: a CONFIRMED-absence error from a remote
 	// instance requeues the job (excluded_hosts + running→queued) instead of

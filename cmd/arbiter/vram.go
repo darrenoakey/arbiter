@@ -1,21 +1,34 @@
 package main
 
 import (
+	"context"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// nvidiaSMITimeout bounds every nvidia-smi exec. A driver lock makes the
+// query block with no output (observed 14 minutes on 2026-09-22 while
+// ltx25-denoise1 job 633b27a52464 had already finished). Callers treat a
+// timeout like any other query failure: utilization -1, empty process map.
+const nvidiaSMITimeout = 8 * time.Second
+
+func runNvidiaSMI(args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), nvidiaSMITimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "nvidia-smi", args...).Output()
+}
 
 // GetPerProcessVRAM returns a map of PID -> VRAM usage in bytes.
 // Uses nvidia-smi to query actual GPU memory per process.
 func GetPerProcessVRAM() map[int]int64 {
 	result := make(map[int]int64)
 
-	out, err := exec.Command(
-		"nvidia-smi",
+	out, err := runNvidiaSMI(
 		"--query-compute-apps=pid,used_memory",
 		"--format=csv,noheader,nounits",
-	).Output()
+	)
 	if err != nil {
 		return result
 	}
@@ -44,11 +57,10 @@ func GetPerProcessVRAM() map[int]int64 {
 
 // GetGPUUtilization returns GPU compute utilization as a percentage (0-100).
 func GetGPUUtilization() int {
-	out, err := exec.Command(
-		"nvidia-smi",
+	out, err := runNvidiaSMI(
 		"--query-gpu=utilization.gpu",
 		"--format=csv,noheader,nounits",
-	).Output()
+	)
 	if err != nil {
 		return -1
 	}
@@ -66,11 +78,10 @@ func GetGPUUtilization() int {
 
 // GetGPUStatusLine returns a one-line nvidia-smi snapshot for diagnostics.
 func GetGPUStatusLine() string {
-	out, err := exec.Command(
-		"nvidia-smi",
+	out, err := runNvidiaSMI(
 		"--query-gpu=utilization.gpu,power.draw,temperature.gpu",
 		"--format=csv,noheader",
-	).Output()
+	)
 	if err != nil {
 		return ""
 	}

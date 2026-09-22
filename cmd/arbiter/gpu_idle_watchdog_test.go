@@ -400,3 +400,99 @@ func TestGPUIdleConfigZeroValuesUseDefaults(t *testing.T) {
 		t.Fatalf("url = %s", c.agentd3URL())
 	}
 }
+
+// 2026-09-22 job 633b27a52464: inference had returned and result.mp4 was on
+// disk, but completion bookkeeping was still blocked, so activeJobs stayed 1
+// and the worker was silent. That is not a hung GPU kernel.
+func TestGPUIdleWatchdogSparesWorkerThatAlreadyReturned(t *testing.T) {
+	w, store, mgr, clock := newTestIdleWatchdog(t)
+	inst, job := addRunningLocal(t, mgr, store, "ltx2", "ltx2#returned")
+	inst.pendingMu.Lock()
+	delete(inst.pending, job.ID)
+	inst.pendingMu.Unlock()
+	var killed []string
+	w.killInstance = func(in *Instance) { killed = append(killed, in.InstanceID) }
+
+	w.tick()
+	*clock = clock.Add(181 * time.Second)
+	w.tick()
+	if len(killed) != 0 {
+		t.Fatalf("killed a worker that had already returned its result: %v", killed)
+	}
+	live, err := store.GetJob(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live.State != "running" {
+		t.Fatalf("job state = %s, want running", live.State)
+	}
+}
+
+// A nvidia-smi call that blocks for minutes and then returns 0% did not
+// observe the GPU for that gap. One late sample must not satisfy the idle window.
+func TestGPUIdleWatchdogStalledUtilQueryDoesNotCountAsIdle(t *testing.T) {
+	w, store, mgr, clock := newTestIdleWatchdog(t)
+	_, job := addRunningLocal(t, mgr, store, "ltx2", "ltx2#smi-hang")
+	var killed []string
+	w.killInstance = func(in *Instance) { killed = append(killed, in.InstanceID) }
+
+	w.tick() // fast 0% sample, starts the idle clock
+	w.gpuUtil = func() int {
+		*clock = clock.Add(14 * time.Minute)
+		return 0
+	}
+	w.tick()
+	if len(killed) != 0 {
+		t.Fatalf("killed after an unobserved util gap: %v", killed)
+	}
+	w.gpuUtil = func() int { return 0 }
+	w.tick()
+	if len(killed) != 0 {
+		t.Fatalf("killed on the first sample after a stalled query: %v", killed)
+	}
+	live, err := store.GetJob(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live.State != "running" {
+		t.Fatalf("job state = %s, want running", live.State)
+	}
+}
+
+func TestReleaseDispatchSlotDropsActiveJobsOnce(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	cfg := &Config{
+		VRAMBudgetGB: 90,
+		Models:       map[string]ModelConfig{"ltx2": {MemoryGB: 40, MaxConcurrent: 1}},
+	}
+	mgr := NewInstanceManager(cfg, "python3", dir)
+	logger := NewEventLogger(filepath.Join(dir, "logs"))
+	t.Cleanup(logger.Close)
+	sched := NewScheduler(cfg, store, mgr, logger, dir)
+	inst := NewInstance("ltx2", "ltx2#slot", 1, 40, "python3", dir)
+	inst.state = "loaded"
+	mgr.Register(inst)
+	job, err := store.CreateJob("ltx2", "video-generate", json.RawMessage(`{"prompt":"x"}`), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sched.markInFlight(job.ID, inst, 1, false) {
+		t.Fatal("markInFlight rejected the first dispatch")
+	}
+	if inst.ActiveJobs() != 1 {
+		t.Fatalf("activeJobs = %d, want 1", inst.ActiveJobs())
+	}
+	sched.releaseDispatchSlot(job, inst)
+	if inst.ActiveJobs() != 0 {
+		t.Fatalf("activeJobs after release = %d, want 0", inst.ActiveJobs())
+	}
+	sched.releaseDispatchSlot(job, inst)
+	if inst.ActiveJobs() != 0 {
+		t.Fatalf("second release changed activeJobs to %d", inst.ActiveJobs())
+	}
+}

@@ -246,10 +246,18 @@ func (w *GPUIdleWatchdog) Run(ctx context.Context) {
 }
 
 func (w *GPUIdleWatchdog) tick() time.Duration {
+	cfg := w.cfg.GPUIdle
+	queryStart := w.now()
 	util := w.gpuUtil()
 	at := w.now()
 	w.recordSample(util, at)
-	cfg := w.cfg.GPUIdle
+	// A hung nvidia-smi call is not continuous observation. Counting the
+	// blackout as idle made one 0% sample after a 14-minute driver lock
+	// satisfy the kill window immediately (2026-09-22, job 633b27a52464).
+	if at.Sub(queryStart) > cfg.lowInterval() {
+		w.resetIdle()
+		return cfg.lowInterval()
+	}
 	if util < 0 || util > cfg.lowUtilPct() {
 		w.resetIdle()
 		return cfg.highInterval()
@@ -353,6 +361,17 @@ func (w *GPUIdleWatchdog) listLocalRunning(at time.Time) []gpuIdleVictim {
 			continue
 		}
 		if inst.ActiveJobs() == 0 {
+			continue
+		}
+		// No outstanding worker request means inference already returned
+		// (readLoop clears pending before the dispatch goroutine resumes).
+		// The stall, if any, is server-side bookkeeping — Stat, relocate,
+		// sqlite — not a hung GPU kernel. Killing the process destroys a
+		// loaded model that is waiting for the next command.
+		// 2026-09-22 ltx25-denoise1 job 633b27a52464: result.mp4 was on disk
+		// at 13:06Z, the worker was idle, and the watchdog killed it at 13:24Z
+		// while completion bookkeeping was still blocked.
+		if len(inst.PendingJobIDs()) == 0 {
 			continue
 		}
 		jobs := collectVictimJobs(inst, byID, byModel)
