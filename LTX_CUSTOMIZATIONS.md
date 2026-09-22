@@ -225,3 +225,20 @@ swaps — *no code change*, same 22B arch, **improved audio**:
 neither**. Verify the 1.1 distilled still uses `STAGE_2_DISTILLED_SIGMA_VALUES`
 from `ltx_pipelines.utils.constants` before trusting output; re-run an
 audio-driven A/B (does motion still follow the beat?) after the swap.
+
+## J. LTX 2.5 stage-1 guiding keyframes (opt-in)
+
+`ltx25-denoise1` param `stage1_guiding_keyframes` defaults to `false`. The
+historical Spark runner path is unchanged: `combined_image_conditionings`
+puts frame 0 in `VideoConditionByLatentIndex` and later keys in
+`VideoConditionByKeyframeIndex`.
+
+Official `ltx_pipelines.keyframe_interpolation` instead calls
+`image_conditionings_by_adding_guiding_latent` for every key, in both
+stages. The opt-in does **not** claim that equivalence. After
+`load_denoise_input`, and only when the flag is a real `true`, the adapter
+replaces the single stage-1 frame-0 latent-index item with
+`VideoConditionByKeyframeIndex(keyframes=old.latent, frame_idx=0,
+strength=old.strength)`. The latent tensor object is reused, not cloned.
+`images`, seed, audio, and prompt tensors are not rewritten, so stage 2
+keeps being rebuilt from `images` by `combined_image_conditionings`.

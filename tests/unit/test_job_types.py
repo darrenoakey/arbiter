@@ -95,9 +95,11 @@ def test_voice_param_schema_shapes():
     assert v.model == "htdemucs"
     assert v.target_lufs == -14.0
 
-    # ltx25-denoise1 defaults the a2v guidance lever to 3.0.
+    # ltx25-denoise1 defaults the a2v guidance lever to 3.0 and keeps
+    # stage-1 guiding keyframes off so old jobs stay on latent-index frame 0.
     p = LTX25Denoise1Params(encoded_file="/e.pt", audio_file="/x.mp3")
     assert p.a2v_guidance_scale == 3.0
+    assert p.stage1_guiding_keyframes is False
 
     # rvc-train requires a name and defaults to 40k / 300 epochs / rmvpe.
     t = RvcTrainParams(name="leo-laporte", dataset_file="/data")

@@ -213,15 +213,32 @@ ssh "$SPARK" "/home/darren/local/auto/run stop arbiter" 2>&1 | tail -1 || true
 # longer than auto's ten-second port-reclaim window. Starting immediately then
 # fails even though the old listener has already received SIGKILL. Wait for the
 # kernel to finish releasing that exact listening socket before replacing the
-# binary. Do not kill anything else here: auto already targeted the service and
-# production may host unrelated Arbiter instances on other ports.
+# binary. Do not kill unrelated listeners. If auto loses the stop race and
+# respawns /home/darren/src/arbiter/arbiter-go, stop that service again — a
+# healthy respawn will otherwise hold port 8400 until this wait fails.
 echo "==> Waiting for the stopped arbiter to release port 8400..."
 if ! ssh "$SPARK" 'deadline=$(( $(date +%s) + 300 ))
+restopped=""
 while lsof -nP -iTCP:8400 -sTCP:LISTEN >/dev/null 2>&1; do
     if [ "$(date +%s)" -ge "$deadline" ]; then
         echo "    FAILED — terminated arbiter still owns port 8400 after 300s"
         lsof -nP -iTCP:8400 -sTCP:LISTEN 2>&1 || true
         exit 1
+    fi
+    # auto can lose the stop race and respawn arbiter while this wait runs.
+    # A healthy respawn never exits, so waiting the full 300s fails the
+    # release (2026-09-22 gl/stage1-guiding-keyframes). Stop that service
+    # again. A dying uninterruptible process is left alone.
+    pid=$(lsof -t -nP -iTCP:8400 -sTCP:LISTEN 2>/dev/null | head -1 || true)
+    if [ -n "$pid" ] && [ "$pid" != "$restopped" ]; then
+        exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+        state=$(sed -n "s/.*) //p" "/proc/$pid/stat" 2>/dev/null | awk "{print \$1}")
+        if [ "$exe" = "/home/darren/src/arbiter/arbiter-go" ] && [ "$state" != "D" ]; then
+            echo "    respawned arbiter pid $pid state ${state:-unknown} still listening — stopping it again"
+            /home/darren/local/auto/run stop arbiter >/dev/null 2>&1 || true
+            kill -TERM "$pid" >/dev/null 2>&1 || true
+            restopped=$pid
+        fi
     fi
     sleep 1
 done'; then

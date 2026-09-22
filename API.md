@@ -1937,6 +1937,7 @@ mv-lipsync renderer; listed here for its tuning parameters.
 | `fps`                 | float  | No       | `25.0`  | Output frame rate                                                        |
 | `num_inference_steps` | int    | No       | `30`    | Stage-1 diffusion steps                                                  |
 | `a2v_guidance_scale`  | float  | No       | `3.0`   | Stage-1 audio-conditioning guidance scale; must be `>= 1.0` or the job fails with `InferenceError`. Forwarded verbatim to the ltx25-spark runner's `FastPipeline.run_denoise_gpu` — the A/B lever trading mouth fidelity against identity drift. |
+| `stage1_guiding_keyframes` | bool | No | `false` | Opt-in. Must be a JSON boolean; `1`, `"true"`, and `null` are rejected. When `true`, after `load_denoise_input` the adapter converts only the stage-1 frame-0 `VideoConditionByLatentIndex` into `VideoConditionByKeyframeIndex(keyframes=same latent tensor, frame_idx=0, strength=same strength)`. Seed, images, audio, prompt contexts, and stage-2 inputs are unchanged. Stage 2 is still rebuilt from `images` by `combined_image_conditionings`, so this is not full official keyframe-interpolation equivalence. Absent or `false` keeps the historical path. |
 
 ---
 

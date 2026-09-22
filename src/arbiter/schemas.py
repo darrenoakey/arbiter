@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # --- Job type enum ---
@@ -307,6 +307,18 @@ class LTX25Denoise1Params(BaseModel):
     fps: float = 25.0
     num_inference_steps: int = 30
     a2v_guidance_scale: float = 3.0  # stage-1 audio-conditioning guidance; >= 1.0
+    # Opt-in. False preserves combined_image_conditionings frame-0 replacement.
+    stage1_guiding_keyframes: bool = False
+
+    @field_validator("stage1_guiding_keyframes", mode="before")
+    @classmethod
+    def _strict_stage1_guiding_keyframes(cls, value: object) -> bool:
+        if type(value) is not bool:
+            raise ValueError(
+                "stage1_guiding_keyframes must be a JSON boolean, "
+                f"got {type(value).__name__}"
+            )
+        return value
 
 
 class AestheticScoreParams(BaseModel):

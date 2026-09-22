@@ -59,6 +59,19 @@ Expected params dict (README "Stage B: ltx25-denoise" contract):
                                   Forwarded verbatim to FastPipeline.run_denoise_gpu
                                   (ltx25-spark runner; the A/B lever that trades
                                   mouth fidelity against identity drift).
+    stage1_guiding_keyframes : bool — opt-in, default false. When true, after
+                                  load_denoise_input, the single stage-1 frame-0
+                                  VideoConditionByLatentIndex is replaced by
+                                  VideoConditionByKeyframeIndex(keyframes=the same
+                                  latent tensor, frame_idx=0, strength=the same
+                                  strength). Seed, images, audio, prompt contexts,
+                                  and stage-2 inputs are not touched. This is not
+                                  full official-pipeline equivalence: official
+                                  keyframe interpolation guides every key in both
+                                  stages; stage 2 here is still rebuilt from
+                                  images by combined_image_conditionings. Absent
+                                  or false keeps the historical path. Only a real
+                                  boolean is accepted.
 
 Output: `result.mp4` written directly into `output_dir` (the file, not the
 directory, per `FastPipeline.save_denoise_output` / `encode_video_nvenc`'s
@@ -89,6 +102,136 @@ log = logging.getLogger(__name__)
 # lane's runner). See ltx25-spark/README.md section 2 ("PYTHONPATH & Arbiter
 # Worker Rule").
 LTX25_SPARK_DIR = Path("/home/darren/src/ltx25-spark")
+_STAGE1_CONDITIONINGS_KEY = "stage_1_conditionings"
+
+
+def parse_stage1_guiding_keyframes(params: dict) -> bool:
+    """Return the opt-in flag. Missing means false; only a real bool is valid."""
+    if "stage1_guiding_keyframes" not in params:
+        return False
+    value = params["stage1_guiding_keyframes"]
+    # Reject ints, strings, and null. JSON true/false are the only accepted
+    # forms; "true" and 1 must not silently change the historical path.
+    if type(value) is not bool:
+        raise InferenceError(
+            "stage1_guiding_keyframes must be a boolean, "
+            f"got {type(value).__name__}: {value!r}"
+        )
+    return value
+
+
+def _guiding_conditioning_types():
+    """Import the worker's real conditioning classes. Never called on the default path."""
+    try:
+        import torch
+        from ltx_core.conditioning.types.keyframe_cond import (
+            VideoConditionByKeyframeIndex,
+        )
+        from ltx_core.conditioning.types.latent_cond import (
+            VideoConditionByLatentIndex,
+        )
+    except ImportError as exc:
+        raise InferenceError(
+            "stage1_guiding_keyframes requires ltx_core conditioning types "
+            f"inside the audited worker: {exc}"
+        ) from exc
+    return torch, VideoConditionByLatentIndex, VideoConditionByKeyframeIndex
+
+
+def _require_frame0_latent(item, torch_module) -> None:
+    latent = getattr(item, "latent", None)
+    if not isinstance(latent, torch_module.Tensor) or latent.ndim != 5:
+        shape = tuple(getattr(latent, "shape", ()))
+        raise InferenceError(
+            "stage1 frame-0 latent must be a rank-5 torch.Tensor "
+            f"[B, C, F, H, W], got {type(latent).__name__} shape {shape}"
+        )
+    if latent.shape[0] < 1 or latent.shape[1] < 1 or latent.shape[2] < 1:
+        raise InferenceError(
+            "stage1 frame-0 latent must have non-empty batch, channel, and "
+            f"frame dims, got shape {tuple(latent.shape)}"
+        )
+    strength = getattr(item, "strength", None)
+    if isinstance(strength, bool) or not isinstance(strength, (int, float)):
+        raise InferenceError(
+            "stage1 frame-0 strength must be a real number, "
+            f"got {type(strength).__name__}: {strength!r}"
+        )
+    if strength != strength or strength in (float("inf"), float("-inf")):
+        raise InferenceError(
+            f"stage1 frame-0 strength must be finite, got {strength!r}"
+        )
+
+
+def apply_stage1_guiding_keyframes(data: dict) -> None:
+    """Rewrite only stage-1 frame-0 latent-index conditioning to a guiding keyframe.
+
+    Official Lightricks keyframe interpolation uses
+    image_conditionings_by_adding_guiding_latent for every key. Spark's
+    combined_image_conditionings uses VideoConditionByLatentIndex for frame 0
+    and VideoConditionByKeyframeIndex for later keys. This isolates the stage-1
+    frame-0 semantic change. It does not modify any other dict entry, so seed,
+    images, audio, and prompt tensors stay identical and stage 2 — rebuilt
+    later from images — stays on the historical combined path.
+    """
+    if not isinstance(data, dict):
+        raise InferenceError("denoise input must be a dict")
+    conditionings = data.get(_STAGE1_CONDITIONINGS_KEY)
+    if not isinstance(conditionings, list):
+        raise InferenceError(
+            "stage1_guiding_keyframes requires stage_1_conditionings to be a list"
+        )
+    torch_module, latent_type, keyframe_type = _guiding_conditioning_types()
+    allowed = (latent_type, keyframe_type)
+    frame0_index = None
+    for index, item in enumerate(conditionings):
+        kind = type(item)
+        if kind not in allowed:
+            raise InferenceError(
+                "stage1_guiding_keyframes expected VideoConditionByLatentIndex "
+                "or VideoConditionByKeyframeIndex, got "
+                f"{kind.__module__}.{kind.__name__}"
+            )
+        if kind is not latent_type:
+            continue
+        if item.latent_idx != 0:
+            raise InferenceError(
+                "stage1_guiding_keyframes only converts frame-0 "
+                f"VideoConditionByLatentIndex, found latent_idx={item.latent_idx!r}"
+            )
+        if frame0_index is not None:
+            raise InferenceError(
+                "stage1_guiding_keyframes expected exactly one frame-0 "
+                "VideoConditionByLatentIndex"
+            )
+        _require_frame0_latent(item, torch_module)
+        frame0_index = index
+    if frame0_index is None:
+        raise InferenceError(
+            "stage1_guiding_keyframes expected exactly one frame-0 "
+            "VideoConditionByLatentIndex, found 0"
+        )
+    item = conditionings[frame0_index]
+    # Same tensor object: guiding tokens must be the encoded frame, not a clone.
+    conditionings[frame0_index] = keyframe_type(
+        keyframes=item.latent,
+        frame_idx=0,
+        strength=item.strength,
+    )
+    log.info(
+        "stage1_guiding_keyframes: converted 1 frame-0 "
+        "VideoConditionByLatentIndex to VideoConditionByKeyframeIndex "
+        "shape=%s strength=%s; stage2/images/seed/audio/prompt untouched",
+        tuple(item.latent.shape),
+        item.strength,
+    )
+
+
+def maybe_apply_stage1_guiding_keyframes(data: dict, enabled: bool) -> None:
+    """Apply the opt-in. False returns without importing conditioning types."""
+    if not enabled:
+        return
+    apply_stage1_guiding_keyframes(data)
 
 
 @register
@@ -164,6 +307,7 @@ class LTX25Denoise1Adapter(GroupAdapter):
             raise InferenceError(
                 f"a2v_guidance_scale must be >= 1.0, got {a2v_guidance_scale}"
             )
+        stage1_guiding_keyframes = parse_stage1_guiding_keyframes(params)
 
         if self._pipeline is None:
             raise InferenceError("LTX 2.5 denoise pipeline not loaded")
@@ -197,6 +341,9 @@ class LTX25Denoise1Adapter(GroupAdapter):
             # map_location rationale as the 2.3 lane's load_denoise1_input;
             # see LTX_CUSTOMIZATIONS.md §G).
             data = self._pipeline.load_denoise_input(encoded_file)
+            # Opt-in only. Default false leaves the loaded bundle untouched,
+            # including stage-1 latent-index conditioning.
+            maybe_apply_stage1_guiding_keyframes(data, stage1_guiding_keyframes)
             self._check_cancel(cancel_flag)
 
             # PHASE 2 (GPU, locked): stage-1 diffusion (544x960) -> 2x latent
@@ -227,7 +374,7 @@ class LTX25Denoise1Adapter(GroupAdapter):
                 audio_path=audio_file,
                 start_time=start_time,
             )
-        except CancelledException:
+        except (CancelledException, InferenceError):
             raise
         except Exception as e:
             raise InferenceError(f"ltx25 run_denoise failed: {e}") from e
