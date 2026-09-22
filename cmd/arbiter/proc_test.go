@@ -2,8 +2,10 @@ package main
 
 import (
 	"math"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestCreateReservationRejectsUnsafeMemoryWithoutAccountingChange(t *testing.T) {
@@ -260,5 +262,56 @@ func TestHardKillModelRecreatesConfiguredSlots(t *testing.T) {
 	}
 	if len(before) != len(after) {
 		t.Fatalf("instance count changed unexpectedly: before=%d after=%d", len(before), len(after))
+	}
+}
+
+// Regression: KillAll used to hold the manager RLock across inst.Kill(), and
+// Kill waits for the instance's readLoop to exit. The readLoop exit path
+// (markSubprocessExited → ReleaseMemory) takes the manager WRITE lock, so the
+// RWMutex writer-pending state blocked it: every instance teardown paid the
+// full 5s "readLoop did not exit" timeout, and without that timeout the pair
+// deadlocked forever. KillAll must snapshot under the lock and kill after
+// releasing it.
+func TestKillAllReleasesExitingReadLoopsWithoutManagerLock(t *testing.T) {
+	projectRoot := t.TempDir()
+	workerPath := filepath.Join(projectRoot, "llm-worker")
+	// A worker that just sleeps: Spawn succeeds, readLoop blocks in Scan on
+	// the open pipe until Kill SIGKILLs it and the pipe hits EOF.
+	if err := os.WriteFile(workerPath, []byte("#!/bin/sh\nsleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewInstanceManager(&Config{VRAMBudgetGB: 70}, "python3", projectRoot)
+	cfg := ModelConfig{
+		MemoryGB:      4,
+		MaxConcurrent: 1,
+		MaxInstances:  intPtr(1),
+		WorkerCmd:     []string{workerPath},
+	}
+	mgr.ScaleModel("llm:killall-deadlock", 1, cfg)
+	insts := mgr.GetModelInstances("llm:killall-deadlock")
+	if len(insts) != 1 {
+		t.Fatalf("instances = %d, want 1", len(insts))
+	}
+	inst := insts[0]
+	if err := inst.Spawn(); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	// Make the readLoop exit path take the manager lock: with vramHeld, EOF
+	// triggers ReleaseMemory, which needs m.mu — the lock KillAll held.
+	if !mgr.ReserveMemoryFor(inst, 4) {
+		t.Fatal("reserve memory for spawned instance")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		mgr.KillAll()
+		close(done)
+	}()
+	// The wedged path costs exactly the 5s reader timeout per instance; the
+	// healthy path is well under a second even on a loaded machine.
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+		t.Fatal("KillAll deadlocked: instance readLoops could not take the manager lock")
 	}
 }

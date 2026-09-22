@@ -412,7 +412,21 @@ func (inst *Instance) readLoop() {
 		}
 		inst.pendingMu.Unlock()
 		if ok {
-			ch <- line
+			// Never block the readLoop on a consumer. The channel has buffer 1
+			// and exactly one response is ever dispatched per registration, but a
+			// full buffer here (consumer abandoned its request without draining)
+			// would previously wedge readLoop forever: readerDone never closes,
+			// every subsequent Kill pays the 5s reader timeout, and the death
+			// drain below deadlocks holding pendingMu (observed: 2 wedged
+			// instances per full check-suite run, ~10s of serial test time plus a
+			// permanently broken instance). A full buffer means the consumer
+			// already has a response queued; the duplicate is safe to drop.
+			select {
+			case ch <- line:
+			default:
+				slog.Warn("dropping response for abandoned pending request",
+					"instance", inst.InstanceID, "req_id", resp.ReqID)
+			}
 		} else {
 			slog.Warn("no pending request for response", "instance", inst.InstanceID, "req_id", resp.ReqID)
 		}
@@ -429,7 +443,14 @@ func (inst *Instance) readLoop() {
 			ReqID:  reqID,
 			Error:  "subprocess died",
 		})
-		ch <- errResp
+		// Non-blocking for the same reason as the dispatch send above: a
+		// consumer that abandoned its request may have left an undrained
+		// response in the buffer, and a blocking send here would deadlock the
+		// death drain (pendingMu held) and never close readerDone.
+		select {
+		case ch <- errResp:
+		default:
+		}
 		delete(inst.pending, reqID)
 	}
 	inst.pendingMu.Unlock()
@@ -776,6 +797,14 @@ func (inst *Instance) Kill() {
 			"instance", inst.InstanceID, "root", rootPid, "survivors", lastSurvivors)
 	}
 
+	// Pattern sweep for anything that escaped the tree walk (e.g. EngineCore
+	// already reparented to init when we started). This runs BEFORE the
+	// readLoop wait, not after: a reparented pipe-holding survivor is exactly
+	// what keeps the worker's stdout pipe open and readLoop's Scan blocked, so
+	// sweeping first lets the reaped orphan close the pipe and unblocks
+	// readLoop immediately instead of eating the full 5s reader timeout.
+	reapWorkersExcept(0)
+
 	// Wait for the previous readLoop goroutine to actually exit before
 	// returning. Otherwise a fast Spawn() that follows can race: the old
 	// readLoop is still reading from inst.stdout, and when Spawn reassigns
@@ -790,10 +819,6 @@ func (inst *Instance) Kill() {
 				"instance", inst.InstanceID, "root", rootPid)
 		}
 	}
-
-	// Pattern sweep for anything that escaped the tree walk (e.g. EngineCore
-	// already reparented to init when we started).
-	reapWorkersExcept(0)
 }
 
 // pidAlive returns true if the process exists AND is not a zombie. A zombie
@@ -875,8 +900,32 @@ func collectDescendants(rootPid int) []int {
 // Patterns include the Python multiprocessing children of vLLM (which rename
 // themselves to "VLLM::EngineCore" via setproctitle), since those reparent to
 // init the moment vllm serve dies and then aren't reachable via PPID walks.
+// reapSweepMinInterval debounces the orphan sweep: Kill calls arrive in
+// clusters (scale-down storms, test cleanup) and each sweep scans the whole
+// process table, so a second sweep within this window adds latency without
+// adding coverage — anything reaped by the skipped sweep would have been
+// caught by the one that just ran, and anything created after it is caught by
+// the next one.
+const reapSweepMinInterval = 2 * time.Second
+
+var (
+	reapMu     sync.Mutex
+	lastReapAt time.Time
+)
+
 func reapWorkersExcept(excludePid int) {
-	patterns := []string{
+	reapMu.Lock()
+	if time.Since(lastReapAt) < reapSweepMinInterval {
+		reapMu.Unlock()
+		return
+	}
+	lastReapAt = time.Now()
+	reapMu.Unlock()
+	// One pgrep for all patterns instead of one per pattern: a full command-
+	// line scan of every process on the host was measured at ~1s+ per pattern
+	// under load, and Kill runs this sweep on every teardown — 7 scans made
+	// each test-suite Kill cost 5-10s when the machine was busy.
+	pattern := strings.Join([]string{
 		"llama.cpp/build/bin/llama-server",
 		"arbiter/vllm-chat-worker",
 		"arbiter/llm-worker",
@@ -884,29 +933,27 @@ func reapWorkersExcept(excludePid int) {
 		".venv-vllm/bin/vllm",
 		"VLLM::EngineCore",
 		"vllm.entrypoints",
+	}, "|")
+	output, err := exec.Command("pgrep", "-f", pattern).Output()
+	if err != nil {
+		return
 	}
 	selfPid := os.Getpid()
-	for _, pattern := range patterns {
-		output, err := exec.Command("pgrep", "-f", pattern).Output()
-		if err != nil {
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		if line == "" {
 			continue
 		}
-		for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-			if line == "" {
-				continue
-			}
-			pid, err := strconv.Atoi(line)
-			if err != nil || pid == selfPid || pid == excludePid {
-				continue
-			}
-			// Skip processes still rooted under the running arbiter — those
-			// are healthy in-flight loads, not orphans.
-			if hasAncestor(pid, selfPid) {
-				continue
-			}
-			if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
-				slog.Warn("reaped orphan worker", "pid", pid, "pattern", pattern)
-			}
+		pid, err := strconv.Atoi(line)
+		if err != nil || pid == selfPid || pid == excludePid {
+			continue
+		}
+		// Skip processes still rooted under the running arbiter — those
+		// are healthy in-flight loads, not orphans.
+		if hasAncestor(pid, selfPid) {
+			continue
+		}
+		if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
+			slog.Warn("reaped orphan worker", "pid", pid)
 		}
 	}
 }
@@ -2833,10 +2880,17 @@ func (m *InstanceManager) ApplyModelConfig(modelID string, cfg ModelConfig) {
 	}
 }
 
-func (m *InstanceManager) retireInstanceLocked(modelID, instanceID string, result map[string]any) {
+// retireInstanceLocked decides the instance's fate and updates the manager
+// maps under m.mu. Any teardown (Unload/Kill) is returned as a closure for
+// the CALLER to run AFTER releasing m.mu: inst.Kill() waits on the instance's
+// readLoop, whose exit path takes the manager write lock (ReleaseMemory), so
+// running teardown while holding m.mu deadlocks the cycle and costs the full
+// 5s reader timeout per instance (ReloadModel/scale-down both retire many
+// instances in one locked loop, serialising that penalty).
+func (m *InstanceManager) retireInstanceLocked(modelID, instanceID string, result map[string]any) func() {
 	inst := m.instances[instanceID]
 	if inst == nil {
-		return
+		return nil
 	}
 
 	ids := m.byModel[modelID]
@@ -2852,34 +2906,41 @@ func (m *InstanceManager) retireInstanceLocked(modelID, instanceID string, resul
 
 	if state == "stopped" || state == "unloaded" || state == "error" {
 		if state == "unloaded" {
-			inst.Kill()
+			teardown := func() { inst.Kill() }
+			delete(m.instances, instanceID)
+			result["removed"] = result["removed"].(int) + 1
+			slog.Info("instance removed", "model", modelID, "instance", instanceID, "was", state)
+			return teardown
 		}
 		delete(m.instances, instanceID)
 		result["removed"] = result["removed"].(int) + 1
 		slog.Info("instance removed", "model", modelID, "instance", instanceID, "was", state)
-		return
+		return nil
 	}
 
 	if state == "loaded" && active == 0 {
 		slog.Info("evicting idle instance", "instance", instanceID, "reason", "reload_or_scale_down")
-		if err := inst.Unload(); err != nil {
-			slog.Error("instance unload failed", "instance", instanceID, "error", err)
-		}
 		m.usedGB -= inst.memoryGB
 		if m.usedGB < 0 {
 			m.usedGB = 0
 		}
-		inst.Kill()
+		teardown := func() {
+			if err := inst.Unload(); err != nil {
+				slog.Error("instance unload failed", "instance", instanceID, "error", err)
+			}
+			inst.Kill()
+		}
 		delete(m.instances, instanceID)
 		result["removed"] = result["removed"].(int) + 1
 		slog.Info("instance removed", "model", modelID, "instance", instanceID)
-		return
+		return teardown
 	}
 
 	m.condemned[instanceID] = true
 	result["condemned"] = result["condemned"].(int) + 1
 	slog.Info("instance condemned", "model", modelID, "instance", instanceID,
 		"state", state, "active_jobs", active)
+	return nil
 }
 
 // localInstanceIDsLocked returns the model's LOCAL ("#N" pool) instance ids.
@@ -2938,10 +2999,16 @@ func (m *InstanceManager) ScaleModel(modelID string, newCount int, cfg ModelConf
 	toRemove := currentIDs[newCount:]
 
 	m.mu.Lock()
+	var teardowns []func()
 	for _, iid := range toRemove {
-		m.retireInstanceLocked(modelID, iid, result)
+		if fn := m.retireInstanceLocked(modelID, iid, result); fn != nil {
+			teardowns = append(teardowns, fn)
+		}
 	}
 	m.mu.Unlock()
+	for _, fn := range teardowns {
+		fn()
+	}
 
 	return addMissingRemotePlacements(result, m, modelID, cfg)
 }
@@ -2979,10 +3046,16 @@ func (m *InstanceManager) ReloadModel(modelID string, targetCount int, cfg Model
 	}
 
 	m.mu.Lock()
+	var teardowns []func()
 	for _, iid := range currentIDs {
-		m.retireInstanceLocked(modelID, iid, result)
+		if fn := m.retireInstanceLocked(modelID, iid, result); fn != nil {
+			teardowns = append(teardowns, fn)
+		}
 	}
 	m.mu.Unlock()
+	for _, fn := range teardowns {
+		fn()
+	}
 
 	result["added"] = result["added"].(int) + m.registerMissingRemotePlacements(modelID, cfg)
 	return result
@@ -3156,11 +3229,22 @@ func parseInstanceIndex(instanceID, modelID string) int {
 	return -1
 }
 
-// KillAll shuts down all subprocesses.
+// KillAll shuts down all subprocesses. The instance list is snapshotted under
+// the RLock and the kills run AFTER the lock is released: inst.Kill() waits
+// for the instance's readLoop to exit, and readLoop's exit path takes the
+// manager write lock (ReleaseMemory). Holding the RLock across the kills
+// deadlocks that cycle — readLoop blocks on the writer-pending RWMutex while
+// Kill blocks on readLoop, so every teardown pays the full 5s reader timeout
+// (observed as a guaranteed 5s per KillAll in the check suite; without the
+// timeout it would wedge forever).
 func (m *InstanceManager) KillAll() {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	insts := make([]*Instance, 0, len(m.instances))
 	for _, inst := range m.instances {
+		insts = append(insts, inst)
+	}
+	m.mu.RUnlock()
+	for _, inst := range insts {
 		inst.Kill()
 	}
 }
