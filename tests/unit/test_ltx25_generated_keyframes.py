@@ -23,7 +23,9 @@ from arbiter.adapters.ltx25_denoise1 import (
     apply_generated_keyframes,
     interior_keyframe_positions,
     maybe_apply_generated_keyframes,
+    parse_generated_keyframe_positions,
     parse_generated_keyframes,
+    resolve_keyframe_positions,
 )
 from arbiter.schemas import LTX25Denoise1Params
 
@@ -210,3 +212,69 @@ class TestGeneratedKeyframesSlotContract:
         source = helper.read_text()
         assert _OFFICIAL_KEYFRAME_POSITION_LINE in source
         assert "def evenly_spaced_keyframe_positions" in source
+
+
+class TestExplicitKeyframePositions:
+    def test_schema_default_is_empty(self):
+        params = LTX25Denoise1Params(encoded_file="/e.pt", audio_file="/x.mp3")
+        assert params.generated_keyframe_positions == []
+
+    def test_schema_accepts_strictly_increasing_ints(self):
+        params = LTX25Denoise1Params(
+            encoded_file="/e.pt",
+            audio_file="/x.mp3",
+            generated_keyframe_positions=[120, 124],
+        )
+        assert params.generated_keyframe_positions == [120, 124]
+
+    @pytest.mark.parametrize(
+        "value",
+        [True, 120, "120", None, [True], [1.5], [124, 120], [1, 1], [-1]],
+    )
+    def test_schema_rejects_bad_lists(self, value):
+        with pytest.raises(ValidationError, match="generated_keyframe_positions"):
+            LTX25Denoise1Params(
+                encoded_file="/e.pt",
+                audio_file="/x.mp3",
+                generated_keyframe_positions=value,
+            )
+
+    def test_parser_missing_is_empty(self):
+        assert parse_generated_keyframe_positions({}) == ()
+
+    def test_empty_does_not_import_slot_type(self):
+        sentinel = object()
+        payload = {
+            "stage_1_conditionings": [sentinel],
+            "num_frames": 129,
+            "seed": 7,
+        }
+        before = set(sys.modules)
+        maybe_apply_generated_keyframes(payload, 0, ())
+        assert payload["stage_1_conditionings"][0] is sentinel
+        assert "ltx_core.conditioning.types.keyframe_slots" not in (
+            set(sys.modules) - before
+        )
+
+    def test_late_positions_append_real_slot(self):
+        _, slot_type = _import_real_slot_types()
+        sentinel = object()
+        payload = {
+            "stage_1_conditionings": [sentinel],
+            "num_frames": 129,
+            "seed": 2089827940,
+            "images": ("start", "end"),
+        }
+        apply_generated_keyframes(payload, 0, (120, 124))
+        assert payload["stage_1_conditionings"][0] is sentinel
+        slot = payload["stage_1_conditionings"][1]
+        assert type(slot) is slot_type
+        assert tuple(slot.pixel_frame_indices) == (120, 124)
+        assert payload["seed"] == 2089827940
+
+    def test_endpoints_and_both_selectors_fail_closed(self):
+        with pytest.raises(InferenceError, match="interior"):
+            resolve_keyframe_positions(0, (0, 64), 129)
+        with pytest.raises(InferenceError, match="not both"):
+            resolve_keyframe_positions(3, (120, 124), 129)
+

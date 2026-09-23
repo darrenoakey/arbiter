@@ -273,6 +273,63 @@ def parse_generated_keyframes(params: dict) -> int:
     return value
 
 
+def parse_generated_keyframe_positions(params: dict) -> tuple[int, ...]:
+    """Return explicit interior positions. Missing means none.
+
+    A JSON list of real ints only. Bools are rejected. Order must already be
+    strictly increasing so a shuffled caller cannot silently change the slot.
+    """
+    if "generated_keyframe_positions" not in params:
+        return ()
+    value = params["generated_keyframe_positions"]
+    if type(value) is not list:
+        raise InferenceError(
+            "generated_keyframe_positions must be a list of integers, "
+            f"got {type(value).__name__}: {value!r}"
+        )
+    if len(value) > GENERATED_KEYFRAMES_MAX:
+        raise InferenceError(
+            "generated_keyframe_positions must contain at most "
+            f"{GENERATED_KEYFRAMES_MAX} frames, got {len(value)}"
+        )
+    positions = []
+    for item in value:
+        if type(item) is not int:
+            raise InferenceError(
+                "generated_keyframe_positions entries must be integers, "
+                f"got {type(item).__name__}: {item!r}"
+            )
+        if item < 0:
+            raise InferenceError(
+                f"generated_keyframe_positions must be non-negative, got {item}"
+            )
+        positions.append(item)
+    if positions != sorted(set(positions)):
+        raise InferenceError(
+            "generated_keyframe_positions must be strictly increasing, "
+            f"got {positions}"
+        )
+    return tuple(positions)
+
+
+def resolve_keyframe_positions(
+    count: int, positions: tuple[int, ...], num_frames: int
+) -> list[int]:
+    """Choose even spacing or the explicit interior list, never both."""
+    if count and positions:
+        raise InferenceError(
+            "set generated_keyframes or generated_keyframe_positions, not both"
+        )
+    if not positions:
+        return interior_keyframe_positions(count, num_frames)
+    if positions[0] <= 0 or positions[-1] >= num_frames - 1:
+        raise InferenceError(
+            "generated_keyframe_positions must be interior frames, "
+            f"excluding 0 and {num_frames - 1}, got {list(positions)}"
+        )
+    return list(positions)
+
+
 # Locked to ltx_pipelines.utils.helpers.evenly_spaced_keyframe_positions.
 # Imported as a function only inside the audited worker would also import
 # ltx_pipelines.utils, which pulls torchaudio. The formula itself is the
@@ -314,14 +371,16 @@ def interior_keyframe_positions(count: int, num_frames: int) -> list[int]:
     )
 
 
-def apply_generated_keyframes(data: dict, count: int) -> None:
+def apply_generated_keyframes(
+    data: dict, count: int, positions: tuple[int, ...] = ()
+) -> None:
     """Append official interior keyframe slots to stage-1 conditionings.
 
     Does not rewrite existing items, images, seed, audio, prompt tensors, or
     stage 2. Stage 2 stays the historical combined-image refine of the
     upscaled stage-1 latent, matching ``ti2vid_two_stages``.
     """
-    if count == 0:
+    if count == 0 and not positions:
         return
     if not isinstance(data, dict):
         raise InferenceError("denoise input must be a dict")
@@ -336,7 +395,7 @@ def apply_generated_keyframes(data: dict, count: int) -> None:
             "generated_keyframes requires num_frames to be a positive integer, "
             f"got {num_frames!r}"
         )
-    positions = interior_keyframe_positions(count, num_frames)
+    chosen = resolve_keyframe_positions(count, positions, num_frames)
     try:
         from ltx_core.conditioning.types.keyframe_slots import (
             VideoGeneratedKeyframeSlots,
@@ -347,7 +406,7 @@ def apply_generated_keyframes(data: dict, count: int) -> None:
             f"inside the audited worker: {exc}"
         ) from exc
     try:
-        slot = VideoGeneratedKeyframeSlots(pixel_frame_indices=positions)
+        slot = VideoGeneratedKeyframeSlots(pixel_frame_indices=chosen)
     except ValueError as exc:
         raise InferenceError(f"generated_keyframes rejected: {exc}") from exc
     before = len(conditionings)
@@ -367,11 +426,13 @@ def apply_generated_keyframes(data: dict, count: int) -> None:
     )
 
 
-def maybe_apply_generated_keyframes(data: dict, count: int) -> None:
-    """Apply the opt-in. Zero returns without importing pipeline helpers."""
-    if count == 0:
+def maybe_apply_generated_keyframes(
+    data: dict, count: int, positions: tuple[int, ...] = ()
+) -> None:
+    """Apply the opt-in. Zero and empty returns without importing slot types."""
+    if count == 0 and not positions:
         return
-    apply_generated_keyframes(data, count)
+    apply_generated_keyframes(data, count, positions)
 
 
 @register
@@ -449,6 +510,11 @@ class LTX25Denoise1Adapter(GroupAdapter):
             )
         stage1_guiding_keyframes = parse_stage1_guiding_keyframes(params)
         generated_keyframes = parse_generated_keyframes(params)
+        generated_keyframe_positions = parse_generated_keyframe_positions(params)
+        if generated_keyframes and generated_keyframe_positions:
+            raise InferenceError(
+                "set generated_keyframes or generated_keyframe_positions, not both"
+            )
 
         if self._pipeline is None:
             raise InferenceError("LTX 2.5 denoise pipeline not loaded")
@@ -485,7 +551,9 @@ class LTX25Denoise1Adapter(GroupAdapter):
             # Opt-in only. Default false leaves the loaded bundle untouched,
             # including stage-1 latent-index conditioning.
             maybe_apply_stage1_guiding_keyframes(data, stage1_guiding_keyframes)
-            maybe_apply_generated_keyframes(data, generated_keyframes)
+            maybe_apply_generated_keyframes(
+                data, generated_keyframes, generated_keyframe_positions
+            )
             self._check_cancel(cancel_flag)
 
             # PHASE 2 (GPU, locked): stage-1 diffusion (544x960) -> 2x latent

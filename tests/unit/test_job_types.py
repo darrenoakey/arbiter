@@ -101,6 +101,7 @@ def test_voice_param_schema_shapes():
     assert p.a2v_guidance_scale == 3.0
     assert p.stage1_guiding_keyframes is False
     assert p.generated_keyframes == 0
+    assert p.generated_keyframe_positions == []
 
     # rvc-train requires a name and defaults to 40k / 300 epochs / rmvpe.
     t = RvcTrainParams(name="leo-laporte", dataset_file="/data")

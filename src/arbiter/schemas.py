@@ -311,6 +311,38 @@ class LTX25Denoise1Params(BaseModel):
     stage1_guiding_keyframes: bool = False
     # Opt-in interior slots. 0 preserves the historical endpoint-only bundle.
     generated_keyframes: int = 0
+    # Explicit interior pixel frames. Empty preserves even-spacing/off behavior.
+    generated_keyframe_positions: list[int] = []
+
+    @field_validator("generated_keyframe_positions", mode="before")
+    @classmethod
+    def _strict_generated_keyframe_positions(cls, value: object) -> list[int]:
+        if type(value) is not list:
+            raise ValueError(
+                "generated_keyframe_positions must be a JSON list, "
+                f"got {type(value).__name__}"
+            )
+        if len(value) > 8:
+            raise ValueError(
+                f"generated_keyframe_positions must contain at most 8 frames, got {len(value)}"
+            )
+        positions = []
+        for item in value:
+            if type(item) is not int:
+                raise ValueError(
+                    "generated_keyframe_positions entries must be JSON integers, "
+                    f"got {type(item).__name__}"
+                )
+            if item < 0:
+                raise ValueError(
+                    f"generated_keyframe_positions must be non-negative, got {item}"
+                )
+            positions.append(item)
+        if positions != sorted(set(positions)):
+            raise ValueError(
+                "generated_keyframe_positions must be strictly increasing"
+            )
+        return positions
 
     @field_validator("stage1_guiding_keyframes", mode="before")
     @classmethod
