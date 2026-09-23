@@ -313,6 +313,18 @@ class LTX25Denoise1Params(BaseModel):
     generated_keyframes: int = 0
     # Explicit interior pixel frames. Empty preserves even-spacing/off behavior.
     generated_keyframe_positions: list[int] = []
+    # Opt-in. False keeps the historical stage-2 end-image rebuild.
+    stage2_drop_end_image: bool = False
+
+    @field_validator("stage2_drop_end_image", mode="before")
+    @classmethod
+    def _strict_stage2_drop_end_image(cls, value: object) -> bool:
+        if type(value) is not bool:
+            raise ValueError(
+                "stage2_drop_end_image must be a JSON boolean, "
+                f"got {type(value).__name__}"
+            )
+        return value
 
     @field_validator("generated_keyframe_positions", mode="before")
     @classmethod

@@ -435,6 +435,87 @@ def maybe_apply_generated_keyframes(
     apply_generated_keyframes(data, count, positions)
 
 
+def parse_stage2_drop_end_image(params: dict) -> bool:
+    """Return the opt-in that removes end images from stage 2 only.
+
+    Missing means false. Only a real bool is valid.
+    """
+    if "stage2_drop_end_image" not in params:
+        return False
+    value = params["stage2_drop_end_image"]
+    if type(value) is not bool:
+        raise InferenceError(
+            "stage2_drop_end_image must be a boolean, "
+            f"got {type(value).__name__}: {value!r}"
+        )
+    return value
+
+
+def _image_frame_index(item: object) -> int:
+    """Read a bundle image's frame index without importing pipeline types."""
+    if isinstance(item, dict):
+        raw = item.get("frame_idx", item.get("frame", 0))
+    elif isinstance(item, (tuple, list)) and len(item) >= 3:
+        raw = item[2]
+    else:
+        return 0
+    if type(raw) is not int:
+        raise InferenceError(
+            "stage2_drop_end_image requires image frame_idx to be an integer, "
+            f"got {type(raw).__name__}: {raw!r}"
+        )
+    return raw
+
+
+def drop_stage2_end_image(data: dict) -> None:
+    """Remove non-zero frame images so stage 2 does not rebuild the end anchor.
+
+    Stage 1 keeps the already-encoded conditionings. The spark runner reads
+    ``data["images"]`` only when building stage-2 conditionings.
+    """
+    if not isinstance(data, dict):
+        raise InferenceError("denoise input must be a dict")
+    images = data.get("images")
+    if not isinstance(images, list):
+        raise InferenceError(
+            "stage2_drop_end_image requires images to be a list"
+        )
+    kept = []
+    dropped = 0
+    for item in images:
+        if _image_frame_index(item) == 0:
+            kept.append(item)
+        else:
+            dropped += 1
+    if dropped == 0:
+        raise InferenceError(
+            "stage2_drop_end_image found no end image to drop"
+        )
+    if not kept:
+        raise InferenceError(
+            "stage2_drop_end_image would remove every image"
+        )
+    stage1 = data.get("stage_1_conditionings")
+    data["images"] = kept
+    if data.get("stage_1_conditionings") is not stage1:
+        raise InferenceError(
+            "stage2_drop_end_image must not rewrite stage_1_conditionings"
+        )
+    log.info(
+        "stage2_drop_end_image: dropped %s end image(s); kept %s start image(s); "
+        "stage_1_conditionings untouched",
+        dropped,
+        len(kept),
+    )
+
+
+def maybe_drop_stage2_end_image(data: dict, enabled: bool) -> None:
+    """Apply the opt-in. False returns without reading images."""
+    if not enabled:
+        return
+    drop_stage2_end_image(data)
+
+
 @register
 class LTX25Denoise1Adapter(GroupAdapter):
     """22B transformer + distilled LoRA + upscaler + VAE decoder, all
@@ -515,6 +596,7 @@ class LTX25Denoise1Adapter(GroupAdapter):
             raise InferenceError(
                 "set generated_keyframes or generated_keyframe_positions, not both"
             )
+        stage2_drop_end_image = parse_stage2_drop_end_image(params)
 
         if self._pipeline is None:
             raise InferenceError("LTX 2.5 denoise pipeline not loaded")
@@ -554,6 +636,7 @@ class LTX25Denoise1Adapter(GroupAdapter):
             maybe_apply_generated_keyframes(
                 data, generated_keyframes, generated_keyframe_positions
             )
+            maybe_drop_stage2_end_image(data, stage2_drop_end_image)
             self._check_cancel(cancel_flag)
 
             # PHASE 2 (GPU, locked): stage-1 diffusion (544x960) -> 2x latent
