@@ -452,18 +452,32 @@ def parse_stage2_drop_end_image(params: dict) -> bool:
 
 
 def _image_frame_index(item: object) -> int:
-    """Read a bundle image's frame index without importing pipeline types."""
-    if isinstance(item, dict):
+    """Read a bundle image's frame index without importing pipeline types.
+
+    Saved bundles contain ``ImageConditioningInput`` namedtuples ordered
+    ``(path, frame_idx, strength, crf)``. Index 2 is strength, usually ``1.0``,
+    so a positional read must not treat that as the frame.
+    """
+    if hasattr(item, "frame_idx"):
+        raw = item.frame_idx
+    elif isinstance(item, dict):
         raw = item.get("frame_idx", item.get("frame", 0))
-    elif isinstance(item, (tuple, list)) and len(item) >= 3:
-        raw = item[2]
+    elif isinstance(item, (tuple, list)) and len(item) >= 2:
+        raw = item[1]
     else:
         return 0
-    if type(raw) is not int:
+    if type(raw) is bool or not isinstance(raw, (int, float)):
         raise InferenceError(
             "stage2_drop_end_image requires image frame_idx to be an integer, "
             f"got {type(raw).__name__}: {raw!r}"
         )
+    if isinstance(raw, float):
+        if not raw.is_integer():
+            raise InferenceError(
+                "stage2_drop_end_image requires an integer frame_idx, "
+                f"got {raw}"
+            )
+        raw = int(raw)
     return raw
 
 

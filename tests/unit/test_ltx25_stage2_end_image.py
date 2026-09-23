@@ -6,6 +6,8 @@ It must not rewrite stage-1 conditionings or import a pipeline module.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import pytest
 from pydantic import ValidationError
 
@@ -61,6 +63,32 @@ class TestStage2DropEndImage:
         ]
         assert payload["stage_1_conditionings"] is stage1
         assert payload["seed"] == 2089827940
+
+    def test_namedtuple_uses_frame_idx_not_strength(self):
+        class ImageConditioningInput(NamedTuple):
+            path: str
+            frame_idx: int
+            strength: float
+            crf: int | None = None
+
+        stage1 = ["keep"]
+        payload = {
+            "images": [
+                ImageConditioningInput("/start.png", 0, 1.0),
+                ImageConditioningInput("/end.png", 128, 1.0),
+            ],
+            "stage_1_conditionings": stage1,
+        }
+        drop_stage2_end_image(payload)
+        assert payload["images"] == [ImageConditioningInput("/start.png", 0, 1.0)]
+        assert payload["stage_1_conditionings"] is stage1
+
+    def test_fractional_frame_fails_closed(self):
+        with pytest.raises(InferenceError, match="integer frame_idx"):
+            drop_stage2_end_image({
+                "images": [{"path": "/start.png", "frame_idx": 1.5}],
+                "stage_1_conditionings": [],
+            })
 
     def test_missing_end_image_fails_closed(self):
         with pytest.raises(InferenceError, match="no end image"):
