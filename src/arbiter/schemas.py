@@ -315,6 +315,24 @@ class LTX25Denoise1Params(BaseModel):
     generated_keyframe_positions: list[int] = []
     # Opt-in. False keeps the historical stage-2 end-image rebuild.
     stage2_drop_end_image: bool = False
+    # Opt-in. None leaves the encoded end-anchor strength unchanged.
+    end_image_strength: float | None = None
+
+    @field_validator("end_image_strength", mode="before")
+    @classmethod
+    def _strict_end_image_strength(cls, value: object) -> float | None:
+        if value is None:
+            return None
+        if type(value) is bool or not isinstance(value, (int, float)):
+            raise ValueError(
+                "end_image_strength must be a JSON number, "
+                f"got {type(value).__name__}"
+            )
+        if value <= 0 or value > 1:
+            raise ValueError(
+                f"end_image_strength must be in (0, 1], got {value}"
+            )
+        return float(value)
 
     @field_validator("stage2_drop_end_image", mode="before")
     @classmethod

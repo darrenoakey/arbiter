@@ -530,6 +530,89 @@ def maybe_drop_stage2_end_image(data: dict, enabled: bool) -> None:
     drop_stage2_end_image(data)
 
 
+def parse_end_image_strength(params: dict) -> float | None:
+    """Return an opt-in end-anchor strength. Missing means leave it unchanged.
+
+    Only a real int or float in ``(0, 1]`` is valid. Bools are rejected.
+    """
+    if "end_image_strength" not in params:
+        return None
+    value = params["end_image_strength"]
+    if type(value) is bool or not isinstance(value, (int, float)):
+        raise InferenceError(
+            "end_image_strength must be a number, "
+            f"got {type(value).__name__}: {value!r}"
+        )
+    if value <= 0 or value > 1:
+        raise InferenceError(
+            f"end_image_strength must be in (0, 1], got {value}"
+        )
+    return float(value)
+
+
+def apply_end_image_strength(data: dict, strength: float) -> None:
+    """Set the end anchor strength on stage 1 and the stage-2 image list.
+
+    Frame 0 is unchanged. A bundle with no end anchor fails closed.
+    """
+    if not isinstance(data, dict):
+        raise InferenceError("denoise input must be a dict")
+    stage1 = data.get("stage_1_conditionings")
+    if not isinstance(stage1, list):
+        raise InferenceError(
+            "end_image_strength requires stage_1_conditionings to be a list"
+        )
+    stage1_changed = 0
+    for item in stage1:
+        frame = getattr(item, "frame_idx", None)
+        if type(frame) is not int or frame <= 0 or not hasattr(item, "strength"):
+            continue
+        item.strength = strength
+        stage1_changed += 1
+    if stage1_changed == 0:
+        raise InferenceError(
+            "end_image_strength found no stage-1 end conditioning"
+        )
+    images = data.get("images")
+    if not isinstance(images, list):
+        raise InferenceError("end_image_strength requires images to be a list")
+    updated = []
+    image_changed = 0
+    for item in images:
+        if _image_frame_index(item) == 0:
+            updated.append(item)
+            continue
+        if hasattr(item, "_replace"):
+            updated.append(item._replace(strength=strength))
+        elif isinstance(item, dict):
+            copied = dict(item)
+            copied["strength"] = strength
+            updated.append(copied)
+        else:
+            raise InferenceError(
+                "end_image_strength cannot set strength on "
+                f"{type(item).__name__}"
+            )
+        image_changed += 1
+    if image_changed == 0:
+        raise InferenceError("end_image_strength found no end image")
+    data["images"] = updated
+    log.info(
+        "end_image_strength: set %s stage-1 end conditioning(s) and %s "
+        "end image(s) to %s; frame 0 untouched",
+        stage1_changed,
+        image_changed,
+        strength,
+    )
+
+
+def maybe_apply_end_image_strength(data: dict, strength: float | None) -> None:
+    """Apply the opt-in. None returns without reading the bundle."""
+    if strength is None:
+        return
+    apply_end_image_strength(data, strength)
+
+
 @register
 class LTX25Denoise1Adapter(GroupAdapter):
     """22B transformer + distilled LoRA + upscaler + VAE decoder, all
@@ -611,6 +694,11 @@ class LTX25Denoise1Adapter(GroupAdapter):
                 "set generated_keyframes or generated_keyframe_positions, not both"
             )
         stage2_drop_end_image = parse_stage2_drop_end_image(params)
+        end_image_strength = parse_end_image_strength(params)
+        if stage2_drop_end_image and end_image_strength is not None:
+            raise InferenceError(
+                "set stage2_drop_end_image or end_image_strength, not both"
+            )
 
         if self._pipeline is None:
             raise InferenceError("LTX 2.5 denoise pipeline not loaded")
@@ -651,6 +739,7 @@ class LTX25Denoise1Adapter(GroupAdapter):
                 data, generated_keyframes, generated_keyframe_positions
             )
             maybe_drop_stage2_end_image(data, stage2_drop_end_image)
+            maybe_apply_end_image_strength(data, end_image_strength)
             self._check_cancel(cancel_flag)
 
             # PHASE 2 (GPU, locked): stage-1 diffusion (544x960) -> 2x latent

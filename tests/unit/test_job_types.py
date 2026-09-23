@@ -103,6 +103,7 @@ def test_voice_param_schema_shapes():
     assert p.generated_keyframes == 0
     assert p.generated_keyframe_positions == []
     assert p.stage2_drop_end_image is False
+    assert p.end_image_strength is None
 
     # rvc-train requires a name and defaults to 40k / 300 epochs / rmvpe.
     t = RvcTrainParams(name="leo-laporte", dataset_file="/data")
