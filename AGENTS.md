@@ -105,4 +105,24 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   critical path — an 18-minute blocked bundle once let the idle window elapse
   in a single tick.
 
+## LTX 2.5 conditioning changes
+
+- Do not `import ltx_pipelines.utils.helpers` from an adapter unit test or from
+  the default denoise path. Importing `ltx_pipelines.utils` executes
+  `utils/__init__.py`, which imports blocks and then torchaudio. The laptop
+  gate has torch but not torchaudio. Construct `VideoGeneratedKeyframeSlots`
+  from `ltx_core` directly, and lock interior positions to the
+  `torch.linspace(...)[1:-1]` line in `helpers.py`.
+- `generated_keyframes` defaults to 0. A positive count is interior slots only;
+  it does not replace endpoint conditioning. Do not deploy this repo while an
+  `ltx25-denoise1` job is running — `./run deploy` is drain-gated and the
+  greenline release dies at 600s if the drain cannot finish.
+
+## Greenline submit from agents
+
+- Never hold a turn on `greenline submit`. Start it detached and sleep. The
+  10-minute turn wall kills the release mid-check, leaves a dead lock holder,
+  and does not deploy. Check output is fully buffered until the process exits,
+  so a killed log can look like a hang after pytest even when Go tests are fine.
+
 

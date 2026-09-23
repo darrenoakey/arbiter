@@ -72,6 +72,18 @@ Expected params dict (README "Stage B: ltx25-denoise" contract):
                                   images by combined_image_conditionings. Absent
                                   or false keeps the historical path. Only a real
                                   boolean is accepted.
+    generated_keyframes      : int  — opt-in, default 0. When positive, after
+                                  load_denoise_input the adapter appends one
+                                  VideoGeneratedKeyframeSlots item to
+                                  stage_1_conditionings. Positions are the
+                                  official evenly spaced interior frames
+                                  (torch.linspace over the pixel span, endpoints
+                                  excluded). DiffusionStage already applies those
+                                  slots and strips them back out of the latent
+                                  before stage 2, matching ti2vid_two_stages.
+                                  0 or absent does not import the slot type and
+                                  does not touch the bundle. Only a real int in
+                                  [0, 8] is accepted; bools are rejected.
 
 Output: `result.mp4` written directly into `output_dir` (the file, not the
 directory, per `FastPipeline.save_denoise_output` / `encode_video_nvenc`'s
@@ -234,6 +246,134 @@ def maybe_apply_stage1_guiding_keyframes(data: dict, enabled: bool) -> None:
     apply_stage1_guiding_keyframes(data)
 
 
+# One interior slot is a full latent frame of extra tokens. Eight is already
+# denser than the official first-and-last-frame examples and is the shared-GPU
+# ceiling: a larger request would be a caller bug, not a quality setting.
+GENERATED_KEYFRAMES_MAX = 8
+
+
+def parse_generated_keyframes(params: dict) -> int:
+    """Return the opt-in interior-slot count. Missing means 0.
+
+    Only a real int is valid. ``True`` is an int subclass and must not become 1.
+    """
+    if "generated_keyframes" not in params:
+        return 0
+    value = params["generated_keyframes"]
+    if type(value) is not int:
+        raise InferenceError(
+            "generated_keyframes must be an integer, "
+            f"got {type(value).__name__}: {value!r}"
+        )
+    if value < 0 or value > GENERATED_KEYFRAMES_MAX:
+        raise InferenceError(
+            "generated_keyframes must be in "
+            f"[0, {GENERATED_KEYFRAMES_MAX}], got {value}"
+        )
+    return value
+
+
+# Locked to ltx_pipelines.utils.helpers.evenly_spaced_keyframe_positions.
+# Imported as a function only inside the audited worker would also import
+# ltx_pipelines.utils, which pulls torchaudio. The formula itself is the
+# contract; the unit test fails if the upstream return line changes.
+_OFFICIAL_KEYFRAME_POSITION_LINE = (
+    "return torch.linspace(0, num_frames - 1, num_keyframes + 2)"
+    ".round().to(torch.int64).tolist()[1:-1]"
+)
+
+
+def interior_keyframe_positions(count: int, num_frames: int) -> list[int]:
+    """Evenly spaced interior pixel frames, endpoints excluded.
+
+    This is the body of ``evenly_spaced_keyframe_positions``. A count that
+    cannot leave both endpoints free is rejected, matching that helper.
+    """
+    if count < 0:
+        raise InferenceError(
+            f"generated_keyframes rejected: count must be non-negative, got {count}"
+        )
+    if count == 0:
+        return []
+    if num_frames < count + 2:
+        raise InferenceError(
+            "generated_keyframes rejected: need at least count + 2 frames, "
+            f"got count={count}, num_frames={num_frames}"
+        )
+    try:
+        import torch
+    except ImportError as exc:
+        raise InferenceError(
+            f"generated_keyframes requires torch inside the audited worker: {exc}"
+        ) from exc
+    return (
+        torch.linspace(0, num_frames - 1, count + 2)
+        .round()
+        .to(torch.int64)
+        .tolist()[1:-1]
+    )
+
+
+def apply_generated_keyframes(data: dict, count: int) -> None:
+    """Append official interior keyframe slots to stage-1 conditionings.
+
+    Does not rewrite existing items, images, seed, audio, prompt tensors, or
+    stage 2. Stage 2 stays the historical combined-image refine of the
+    upscaled stage-1 latent, matching ``ti2vid_two_stages``.
+    """
+    if count == 0:
+        return
+    if not isinstance(data, dict):
+        raise InferenceError("denoise input must be a dict")
+    conditionings = data.get(_STAGE1_CONDITIONINGS_KEY)
+    if not isinstance(conditionings, list):
+        raise InferenceError(
+            "generated_keyframes requires stage_1_conditionings to be a list"
+        )
+    num_frames = data.get("num_frames")
+    if type(num_frames) is not int or num_frames < 1:
+        raise InferenceError(
+            "generated_keyframes requires num_frames to be a positive integer, "
+            f"got {num_frames!r}"
+        )
+    positions = interior_keyframe_positions(count, num_frames)
+    try:
+        from ltx_core.conditioning.types.keyframe_slots import (
+            VideoGeneratedKeyframeSlots,
+        )
+    except ImportError as exc:
+        raise InferenceError(
+            "generated_keyframes requires VideoGeneratedKeyframeSlots "
+            f"inside the audited worker: {exc}"
+        ) from exc
+    try:
+        slot = VideoGeneratedKeyframeSlots(pixel_frame_indices=positions)
+    except ValueError as exc:
+        raise InferenceError(f"generated_keyframes rejected: {exc}") from exc
+    before = len(conditionings)
+    existing = list(conditionings)
+    conditionings.append(slot)
+    if conditionings[:before] != existing:
+        raise InferenceError(
+            "generated_keyframes must append; existing stage-1 items changed"
+        )
+    log.info(
+        "generated_keyframes: appended 1 VideoGeneratedKeyframeSlots "
+        "count=%s positions=%s existing_stage1_items=%s; "
+        "stage2/images/seed/audio/prompt untouched",
+        count,
+        tuple(slot.pixel_frame_indices),
+        before,
+    )
+
+
+def maybe_apply_generated_keyframes(data: dict, count: int) -> None:
+    """Apply the opt-in. Zero returns without importing pipeline helpers."""
+    if count == 0:
+        return
+    apply_generated_keyframes(data, count)
+
+
 @register
 class LTX25Denoise1Adapter(GroupAdapter):
     """22B transformer + distilled LoRA + upscaler + VAE decoder, all
@@ -308,6 +448,7 @@ class LTX25Denoise1Adapter(GroupAdapter):
                 f"a2v_guidance_scale must be >= 1.0, got {a2v_guidance_scale}"
             )
         stage1_guiding_keyframes = parse_stage1_guiding_keyframes(params)
+        generated_keyframes = parse_generated_keyframes(params)
 
         if self._pipeline is None:
             raise InferenceError("LTX 2.5 denoise pipeline not loaded")
@@ -344,6 +485,7 @@ class LTX25Denoise1Adapter(GroupAdapter):
             # Opt-in only. Default false leaves the loaded bundle untouched,
             # including stage-1 latent-index conditioning.
             maybe_apply_stage1_guiding_keyframes(data, stage1_guiding_keyframes)
+            maybe_apply_generated_keyframes(data, generated_keyframes)
             self._check_cancel(cancel_flag)
 
             # PHASE 2 (GPU, locked): stage-1 diffusion (544x960) -> 2x latent

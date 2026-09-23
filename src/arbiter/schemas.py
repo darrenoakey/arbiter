@@ -309,6 +309,8 @@ class LTX25Denoise1Params(BaseModel):
     a2v_guidance_scale: float = 3.0  # stage-1 audio-conditioning guidance; >= 1.0
     # Opt-in. False preserves combined_image_conditionings frame-0 replacement.
     stage1_guiding_keyframes: bool = False
+    # Opt-in interior slots. 0 preserves the historical endpoint-only bundle.
+    generated_keyframes: int = 0
 
     @field_validator("stage1_guiding_keyframes", mode="before")
     @classmethod
@@ -317,6 +319,20 @@ class LTX25Denoise1Params(BaseModel):
             raise ValueError(
                 "stage1_guiding_keyframes must be a JSON boolean, "
                 f"got {type(value).__name__}"
+            )
+        return value
+
+    @field_validator("generated_keyframes", mode="before")
+    @classmethod
+    def _strict_generated_keyframes(cls, value: object) -> int:
+        if type(value) is not int:
+            raise ValueError(
+                "generated_keyframes must be a JSON integer, "
+                f"got {type(value).__name__}"
+            )
+        if value < 0 or value > 8:
+            raise ValueError(
+                f"generated_keyframes must be in [0, 8], got {value}"
             )
         return value
 
