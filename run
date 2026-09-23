@@ -38,18 +38,34 @@ case "$CMD" in
             echo "$unformatted" >&2
             exit 1
         fi
-        python3 -m unittest scripts/test_gpu_idle_hook.py
+        # Python and Go suites are independent (different toolchains,
+        # port-0-bound servers, namespaced fixtures), and both are mostly
+        # wall-clock under a contended gate machine. Run them overlapped so
+        # the release pays max(pytest, go) instead of pytest + go (measured
+        # 2026-09-23: ~70s + ~60s serial vs ~60s overlapped).
+        python3 -m unittest scripts/test_gpu_idle_hook.py &
+        py_unittest_pid=$!
         # Python adapter unit tests. PYTHONPATH=src is mandatory: `arbiter` is
         # installed in develop mode pointing at the CANONICAL checkout, so
         # without it a worktree gate would silently test the canonical sources
         # instead of the candidate. tests/integration is excluded on purpose —
         # it drives the live spark fleet, which the gate must not depend on.
-        PYTHONPATH="$SCRIPT_DIR/src" python3 -m pytest tests/unit -q
+        PYTHONPATH="$SCRIPT_DIR/src" python3 -m pytest tests/unit -q &
+        py_pytest_pid=$!
+        py_status=0
+        go_status=0
         if [ -n "${ARBITER_GO_TEST_SKIP:-}" ]; then
-            go build ./cmd/arbiter/ && go vet ./cmd/arbiter/ && go test ./cmd/arbiter/ -count=1 -p 1 -skip "$ARBITER_GO_TEST_SKIP"
+            go build ./cmd/arbiter/ && go vet ./cmd/arbiter/ && go test ./cmd/arbiter/ -count=1 -p 1 -skip "$ARBITER_GO_TEST_SKIP" || go_status=$?
         else
-            go build ./cmd/arbiter/ && go vet ./cmd/arbiter/ && go test ./cmd/arbiter/ -count=1 -p 1
+            go build ./cmd/arbiter/ && go vet ./cmd/arbiter/ && go test ./cmd/arbiter/ -count=1 -p 1 || go_status=$?
         fi
+        wait "$py_unittest_pid" || py_status=$?
+        wait "$py_pytest_pid" || py_status=$?
+        if [ "$py_status" -ne 0 ]; then
+            echo "Python test suite failed (see output above)" >&2
+            exit "$py_status"
+        fi
+        exit "$go_status"
         ;;
     deploy)
         # greenline deploy: drain-gated redeploy to spark. NEVER DEPLOY_FORCE=1.

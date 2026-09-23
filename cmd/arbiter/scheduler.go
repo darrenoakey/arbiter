@@ -163,10 +163,14 @@ const (
 // so the dispatcher can step past one job no host can currently accept instead
 // of head-of-line blocking every sibling behind it. placementScanBackoff
 // prevents re-scanning an unplaceable job every 100ms tick.
-const (
-	placementScanLimit   = 8
-	placementScanBackoff = 5 * time.Second
-)
+const placementScanLimit = 8
+
+// placementScanBackoff prevents re-scanning an unplaceable job every 100ms
+// tick. It is a var (not a const) so tests can shrink the retry cadence:
+// under a contended gate machine a freshly submitted job's first placement
+// attempt often finds its instance still spawning, and a 5s rest quantizes
+// every such miss into a 5s wait per test. Production default is unchanged.
+var placementScanBackoff = 5 * time.Second
 
 // ClearStaleExclusionsForHost delegates to the store, used by the host monitor
 // on RECOVERED and first successful probe. Returns the count of jobs healed.
@@ -2104,7 +2108,9 @@ func (s *Scheduler) setPlacementBackoff(jobID string, now time.Time) {
 
 // autoWakeCheckInterval rate-limits the parked-model scan (it queries the
 // store per model) so the 100ms tick doesn't hammer SQLite.
-const autoWakeCheckInterval = 5 * time.Second
+// Var for the same test-cadence reason as placementScanBackoff; production
+// default unchanged.
+var autoWakeCheckInterval = 5 * time.Second
 
 // defaultAutoWakeGrace is how long a parked model may hold queued work before
 // the guard scales it back up, when config.auto_wake_seconds is unset.
