@@ -2,10 +2,33 @@
 
 from __future__ import annotations
 
+import math
 from enum import Enum
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
+
+
+def _strict_attention_strengths(value: object) -> list[float] | None:
+    if value is None:
+        return None
+    if type(value) is not list:
+        raise ValueError(
+            "end_image_attention_strengths must be a JSON list or null"
+        )
+    strengths = []
+    for item in value:
+        if type(item) is bool or not isinstance(item, (int, float)):
+            raise ValueError(
+                "end_image_attention_strengths entries must be JSON numbers"
+            )
+        number = float(item)
+        if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+            raise ValueError(
+                "end_image_attention_strengths entries must be finite and in [0, 1]"
+            )
+        strengths.append(number)
+    return strengths
 
 
 # --- Job type enum ---
@@ -284,6 +307,13 @@ class VideoGenerateH3Params(BaseModel):
     num_inference_steps: int = 8
 
 
+class LTX25ImageConditioningParams(BaseModel):
+    path: str
+    frame_idx: int
+    strength: float = 1.0
+    crf: int | None = None
+
+
 class LTX25EncodeParams(BaseModel):
     prompt: str = ""
     description: Optional[str] = None
@@ -292,12 +322,21 @@ class LTX25EncodeParams(BaseModel):
     audio_start_time: float = 0.0
     audio_duration: float
     image_file: Optional[str] = None
+    images: list[LTX25ImageConditioningParams] = []
     num_frames: int
     height: int = 1088
     width: int = 1920
     fps: float = 25.0
     seed: int = 42
     chunk_index: int = 0
+    end_image_attention_strengths: list[float] | None = None
+
+    @field_validator("end_image_attention_strengths", mode="before")
+    @classmethod
+    def _strict_end_image_attention_strengths(
+        cls, value: object
+    ) -> list[float] | None:
+        return _strict_attention_strengths(value)
 
 
 class LTX25Denoise1Params(BaseModel):
@@ -317,6 +356,14 @@ class LTX25Denoise1Params(BaseModel):
     stage2_drop_end_image: bool = False
     # Opt-in. None leaves the encoded end-anchor strength unchanged.
     end_image_strength: float | None = None
+    end_image_attention_strengths: list[float] | None = None
+
+    @field_validator("end_image_attention_strengths", mode="before")
+    @classmethod
+    def _strict_end_image_attention_strengths(
+        cls, value: object
+    ) -> list[float] | None:
+        return _strict_attention_strengths(value)
 
     @field_validator("end_image_strength", mode="before")
     @classmethod

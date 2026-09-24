@@ -1,0 +1,30 @@
+{
+  "capability_version": "ltx25-temporal-endpoint-v1",
+  "release_id": "46172b9-8b350b3f-temporal-085d91d22bd6",
+  "source": {
+    "archive": "ltx25-46172b9-custom-8b350b3f.tar.gz",
+    "archive_sha256": "ee5de2ef67fe98d962d62d5ae59bcd76e9a86e020cd86cdc5803962a9acad27b",
+    "commit": "46172b97612b9b68e98f862f2b13322f608ab009",
+    "tree": "cd69b4acf635a012d58fbc1a1fdfbfe4cf337d21",
+    "runner_sha256": "8b350b3fc34fa603dadfc6f2d98f7feab7e72fe2d608412702d50d0b5e413bce",
+    "runner_test_sha256": "c11fecea3d3b517fb97b657c4daaf6a9a24d2d36799e8bea8664578a1b41c945"
+  },
+  "patch": {
+    "file": "temporal-attention.patch",
+    "sha256": "085d91d22bd67b639f1fdac860f010358a532fd991abb532e41e15693a0547b1"
+  },
+  "patched_files": {
+    "packages/ltx-core/src/ltx_core/types.py": "0f7847e5d663f86582d91a73b2718104c1a2f3f4e05c3d0a6c201151aeea2113",
+    "packages/ltx-core/src/ltx_core/conditioning/mask_utils.py": "ad846c72c68f58a69220f5a2a9a7dc3b2af1f2767789693b182210c4a462fe82",
+    "packages/ltx-core/src/ltx_core/conditioning/types/attention_strength_wrapper.py": "21c078e5bb1339f81cdc96573a3dedfe454b926ac7404453b8c8fd202a8b5472",
+    "packages/ltx-core/src/ltx_core/model/transformer/modality.py": "82ea4fb6c5182014f58f0b31b338a58d84e66b3ed6a08919dd0835c8aed14aa2",
+    "packages/ltx-core/src/ltx_core/model/transformer/transformer_args.py": "555d2660c9d309a667fc89dd2f3788502a864d415e44e4af43dea04932e167be",
+    "packages/ltx-core/src/ltx_core/model/transformer/attention.py": "16ac314fd07e165a7401f7ddc8a6ca23f38c12bbba74194ab61d0a2fbcee3107",
+    "packages/ltx-core/src/ltx_core/model/transformer/transformer.py": "b129d8825c4ab31c9a225237dc10cf11e085a0705fcf93ae3a6fc27c8a71bfa8",
+    "packages/ltx-core/src/ltx_core/model/transformer/cudagraph_capture.py": "5a9896aae8f961d7f0088bdca534d001b029b8b188d51d33da1464627b6fef01",
+    "packages/ltx-pipelines/src/ltx_pipelines/utils/denoisers.py": "c1698e03636cf1cd46173bf760d4b5534e5e8ba4fea8b56c5f8675706e9807c1",
+    "packages/ltx-pipelines/src/ltx_pipelines/utils/helpers.py": "252befd87569f05a5bce60280545c00ac2b36d1686d501c3a28fa9a8ed45dc2c",
+    "video_fast_gpu.py": "1c8ea922378515ca891fda5d9af7b68a3ad945f0ba7138a44da9fda49267040f",
+    "tests/test_video_fast_gpu.py": "c11fecea3d3b517fb97b657c4daaf6a9a24d2d36799e8bea8664578a1b41c945"
+  }
+}

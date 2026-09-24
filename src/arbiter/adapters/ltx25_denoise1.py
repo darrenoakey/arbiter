@@ -93,9 +93,7 @@ exact-path contract) — the FINAL chunk artifact.
 from __future__ import annotations
 
 import gc
-import importlib
 import logging
-import sys
 import threading
 from pathlib import Path
 
@@ -106,14 +104,15 @@ from arbiter.adapters.base import (
     InferenceError,
     LoadError,
 )
+from arbiter.adapters.ltx25_temporal_attention import (
+    load_ltx25_runtime,
+    require_temporal_attention_bridge,
+    resolve_denoise_temporal_attention_ramp,
+)
 from arbiter.adapters.registry import register
 
 log = logging.getLogger(__name__)
 
-# The dedicated LTX 2.5 runner tree — deliberately NOT ltx2-spark (the 2.3
-# lane's runner). See ltx25-spark/README.md section 2 ("PYTHONPATH & Arbiter
-# Worker Rule").
-LTX25_SPARK_DIR = Path("/home/darren/src/ltx25-spark")
 _STAGE1_CONDITIONINGS_KEY = "stage_1_conditionings"
 
 
@@ -625,6 +624,8 @@ class LTX25Denoise1Adapter(GroupAdapter):
 
     def __init__(self):
         self._pipeline = None
+        self._runtime_module = None
+        self._runtime_provenance = None
         self._device: str = "cuda"
         # Serialises the GPU phase only (run_denoise_gpu: stage1 + upscale +
         # stage2 + decode). save_denoise_output's NVENC encode/mux is CPU/
@@ -635,20 +636,9 @@ class LTX25Denoise1Adapter(GroupAdapter):
     def load(self, device: str = "cuda") -> None:
         self._device = device
 
-        spark_str = str(LTX25_SPARK_DIR)
-        if spark_str not in sys.path:
-            sys.path.insert(0, spark_str)
-
         try:
-            importlib.import_module("ltx_core")
-            importlib.import_module("ltx_pipelines")
-        except ImportError as e:
-            raise LoadError(f"ltx_core / ltx_pipelines not importable: {e}")
-
-        try:
-            FastPipeline = importlib.import_module("video_fast_gpu").FastPipeline
-
-            self._pipeline = FastPipeline()
+            self._runtime_module, self._runtime_provenance = load_ltx25_runtime()
+            self._pipeline = self._runtime_module.FastPipeline()
             log.info(
                 "LTX25-denoise1: pre-loading 22B transformer + LoRA + "
                 "upscaler + VAE decoder (~49.7GB resident)"
@@ -732,6 +722,12 @@ class LTX25Denoise1Adapter(GroupAdapter):
             # map_location rationale as the 2.3 lane's load_denoise1_input;
             # see LTX_CUSTOMIZATIONS.md §G).
             data = self._pipeline.load_denoise_input(encoded_file)
+            temporal_attention_strengths = resolve_denoise_temporal_attention_ramp(
+                data, params, self._runtime_provenance
+            )
+            require_temporal_attention_bridge(
+                self._runtime_module, temporal_attention_strengths
+            )
             # Opt-in only. Default false leaves the loaded bundle untouched,
             # including stage-1 latent-index conditioning.
             maybe_apply_stage1_guiding_keyframes(data, stage1_guiding_keyframes)

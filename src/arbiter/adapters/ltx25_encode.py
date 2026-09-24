@@ -43,9 +43,7 @@ from __future__ import annotations
 
 import dataclasses
 import gc
-import importlib
 import logging
-import sys
 import threading
 from pathlib import Path
 
@@ -55,15 +53,16 @@ from arbiter.adapters.base import (
     InferenceError,
     LoadError,
 )
+from arbiter.adapters.ltx25_temporal_attention import (
+    END_IMAGE_ATTENTION_STRENGTHS,
+    load_ltx25_runtime,
+    normalize_end_image_attention_strengths,
+    preserve_encoded_temporal_attention_ramp,
+    validate_ramp_images,
+)
 from arbiter.adapters.registry import register
 
 log = logging.getLogger(__name__)
-
-# The dedicated LTX 2.5 runner tree — deliberately NOT ltx2-spark (the 2.3
-# lane's runner). See ltx25-spark/README.md section 2 ("PYTHONPATH & Arbiter
-# Worker Rule").
-LTX25_SPARK_DIR = Path("/home/darren/src/ltx25-spark")
-
 
 def _validate_frame_count(num_frames_raw) -> int:
     if num_frames_raw is None:
@@ -140,6 +139,7 @@ class LTX25EncodeAdapter(GroupAdapter):
 
     def __init__(self):
         self._pipeline = None
+        self._runtime_provenance = None
         self._device: str = "cuda"
         # Serialises the GPU-bound forward passes only; audio decode (CPU)
         # and torch.save (CPU) run outside the lock so a second concurrent
@@ -149,20 +149,9 @@ class LTX25EncodeAdapter(GroupAdapter):
     def load(self, device: str = "cuda") -> None:
         self._device = device
 
-        spark_str = str(LTX25_SPARK_DIR)
-        if spark_str not in sys.path:
-            sys.path.insert(0, spark_str)
-
         try:
-            importlib.import_module("ltx_core")
-            importlib.import_module("ltx_pipelines")
-        except ImportError as e:
-            raise LoadError(f"ltx_core / ltx_pipelines not importable: {e}")
-
-        try:
-            FastPipeline = importlib.import_module("video_fast_gpu").FastPipeline
-
-            self._pipeline = FastPipeline()
+            runtime, self._runtime_provenance = load_ltx25_runtime()
+            self._pipeline = runtime.FastPipeline()
             # Pre-load the encoders so subsequent chunks reuse them.
             self._pipeline._ensure_encode_models()
             log.info("LTX25-encode: encoders loaded")
@@ -195,6 +184,11 @@ class LTX25EncodeAdapter(GroupAdapter):
             raise InferenceError("prompt/description is required")
 
         num_frames = _validate_frame_count(params.get("num_frames"))
+        attention_strengths = normalize_end_image_attention_strengths(
+            params.get(END_IMAGE_ATTENTION_STRENGTHS), num_frames
+        )
+        if attention_strengths is not None:
+            validate_ramp_images(params.get("images"), num_frames)
         fps = float(params.get("fps", 25.0))
         seed = int(params.get("seed", 42))
         chunk_index = int(params.get("chunk_index", params.get("index", 0)))
@@ -224,6 +218,13 @@ class LTX25EncodeAdapter(GroupAdapter):
                     seed=seed,
                     progress_fn=_progress,
                 )
+
+            preserve_encoded_temporal_attention_ramp(
+                result,
+                list(attention_strengths) if attention_strengths is not None else None,
+                num_frames,
+                self._runtime_provenance,
+            )
 
             self._check_cancel(cancel_flag)
 

@@ -1,0 +1,358 @@
+--- a/packages/ltx-core/src/ltx_core/types.py
++++ b/packages/ltx-core/src/ltx_core/types.py
+@@ -247,0 +248,19 @@
++
++
++@dataclass(frozen=True)
++class TemporalAttentionBias:
++    """Compact asymmetric bias for generated-video queries to one guide range."""
++
++    query_log_weights: torch.Tensor
++    key_start: int
++    key_end: int
++    query_chunk_size: int = 256
++
++    def clone(self) -> "TemporalAttentionBias":
++        return replace(self, query_log_weights=self.query_log_weights.clone())
++
++    def repeat(self, repeats: int) -> "TemporalAttentionBias":
++        return replace(self, query_log_weights=self.query_log_weights.repeat(repeats, 1))
++
++    def split(self, sizes: list[int]) -> list["TemporalAttentionBias"]:
++        return [replace(self, query_log_weights=part) for part in self.query_log_weights.split(sizes, dim=0)]
+@@ -287,0 +307 @@
++    temporal_attention_bias: TemporalAttentionBias | None = None
+@@ -300 +320,4 @@
+-        )
++            temporal_attention_bias=(
++                self.temporal_attention_bias.clone() if self.temporal_attention_bias is not None else None
++            ),
++        )
+--- a/packages/ltx-core/src/ltx_core/conditioning/mask_utils.py
++++ b/packages/ltx-core/src/ltx_core/conditioning/mask_utils.py
+@@ -10 +10,63 @@
+-    from ltx_core.types import LatentState
++    from ltx_core.types import LatentState, TemporalAttentionBias
++
++
++def sample_temporal_attention_strengths(
++    strengths: torch.Tensor,
++    positions: torch.Tensor,
++    num_video_tokens: int,
++) -> torch.Tensor:
++    """Interpolate decoded-frame strengths at the actual generated-token times."""
++    if strengths.ndim not in (1, 2) or strengths.shape[-1] < 2:
++        raise ValueError(f"strengths must have shape (N,) or (B, N), got {tuple(strengths.shape)}")
++    if positions.ndim not in (3, 4) or positions.shape[1] < 1:
++        raise ValueError(f"positions must have shape (B, axes, T[, bounds]), got {tuple(positions.shape)}")
++    if num_video_tokens < 1 or num_video_tokens > positions.shape[2]:
++        raise ValueError(f"num_video_tokens must be in [1, {positions.shape[2]}], got {num_video_tokens}")
++
++    times = positions[:, 0, :num_video_tokens].to(torch.float32)
++    if times.ndim == 3:
++        times = times.mean(dim=-1)
++    first = times.amin(dim=1, keepdim=True)
++    span = times.amax(dim=1, keepdim=True) - first
++    if torch.any(span <= 0):
++        raise ValueError("generated-video query temporal layout has no positive span")
++
++    values = strengths.to(device=positions.device, dtype=torch.float32)
++    if values.ndim == 1:
++        values = values.unsqueeze(0)
++    if values.shape[0] not in (1, times.shape[0]):
++        raise ValueError(f"strength batch must be 1 or {times.shape[0]}, got {values.shape[0]}")
++    values = values.expand(times.shape[0], -1)
++    coordinates = (times - first) * (values.shape[1] - 1) / span
++    lower = coordinates.floor().to(torch.long).clamp(max=values.shape[1] - 1)
++    upper = (lower + 1).clamp(max=values.shape[1] - 1)
++    fraction = coordinates - lower
++    return values.gather(1, lower) * (1.0 - fraction) + values.gather(1, upper) * fraction
++
++
++def build_temporal_attention_bias(
++    latent_state: LatentState,
++    strengths: torch.Tensor,
++    num_video_tokens: int,
++    key_start: int,
++    key_end: int,
++    query_chunk_size: int = 256,
++) -> TemporalAttentionBias:
++    """Build compact log weights without allocating a token-square tensor."""
++    from ltx_core.types import TemporalAttentionBias
++
++    if key_start < num_video_tokens or key_end <= key_start or key_end > latent_state.latent.shape[1]:
++        raise ValueError(
++            f"endpoint guide key range [{key_start}, {key_end}) is invalid for "
++            f"{num_video_tokens} generated and {latent_state.latent.shape[1]} total tokens"
++        )
++    if query_chunk_size < 1:
++        raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
++    sampled = sample_temporal_attention_strengths(strengths, latent_state.positions, num_video_tokens)
++    if not torch.all(torch.isfinite(sampled)) or torch.any((sampled < 0) | (sampled > 1)):
++        raise ValueError("sampled temporal attention strengths must be finite and in [0, 1]")
++    finfo = torch.finfo(latent_state.latent.dtype)
++    log_weights = torch.full_like(sampled, finfo.min, dtype=latent_state.latent.dtype)
++    positive = sampled > 0
++    log_weights[positive] = torch.log(sampled[positive].clamp(min=finfo.tiny)).to(latent_state.latent.dtype)
++    return TemporalAttentionBias(log_weights, key_start, key_end, query_chunk_size)
+--- a/packages/ltx-core/src/ltx_core/conditioning/types/attention_strength_wrapper.py
++++ b/packages/ltx-core/src/ltx_core/conditioning/types/attention_strength_wrapper.py
+@@ -8 +8 @@
+-from ltx_core.conditioning.mask_utils import update_attention_mask
++from ltx_core.conditioning.mask_utils import build_temporal_attention_bias, update_attention_mask
+@@ -38 +38,3 @@
+-        attention_mask: float | torch.Tensor,
++        attention_mask: float | torch.Tensor | None = None,
++        video_query_attention_strengths: torch.Tensor | None = None,
++        query_chunk_size: int = 256,
+@@ -39,0 +42,2 @@
++        if attention_mask is None and video_query_attention_strengths is None:
++            raise ValueError("an attention mask or video-query strength schedule is required")
+@@ -41,0 +46,2 @@
++        self.video_query_attention_strengths = video_query_attention_strengths
++        self.query_chunk_size = query_chunk_size
+@@ -71 +77,19 @@
+-        return replace(new_state, attention_mask=new_attention_mask)
++        temporal_attention_bias = original_state.temporal_attention_bias
++        if self.video_query_attention_strengths is not None:
++            if temporal_attention_bias is not None:
++                raise ValueError("only one temporal endpoint-guide attention schedule is supported")
++            num_video_tokens = latent_tools.target_shape.token_count()
++            temporal_attention_bias = build_temporal_attention_bias(
++                latent_state=new_state,
++                strengths=self.video_query_attention_strengths,
++                num_video_tokens=num_video_tokens,
++                key_start=original_state.latent.shape[1],
++                key_end=new_state.latent.shape[1],
++                query_chunk_size=self.query_chunk_size,
++            )
++
++        return replace(
++            new_state,
++            attention_mask=new_attention_mask,
++            temporal_attention_bias=temporal_attention_bias,
++        )
+--- a/packages/ltx-core/src/ltx_core/model/transformer/modality.py
++++ b/packages/ltx-core/src/ltx_core/model/transformer/modality.py
+@@ -6,0 +7,2 @@
++
++from ltx_core.types import TemporalAttentionBias
+@@ -63,0 +66 @@
++    temporal_attention_bias: TemporalAttentionBias | None = None
+@@ -72,0 +76,2 @@
++            elif isinstance(value, TemporalAttentionBias):
++                split_fields[f.name] = value.split(sizes)
+--- a/packages/ltx-core/src/ltx_core/model/transformer/transformer_args.py
++++ b/packages/ltx-core/src/ltx_core/model/transformer/transformer_args.py
+@@ -5,0 +6 @@
++from ltx_core.types import TemporalAttentionBias
+@@ -61,0 +63 @@
++    temporal_attention_bias: TemporalAttentionBias | None = None
+@@ -302,0 +305 @@
++            temporal_attention_bias=modality.temporal_attention_bias,
+--- a/packages/ltx-core/src/ltx_core/model/transformer/attention.py
++++ b/packages/ltx-core/src/ltx_core/model/transformer/attention.py
+@@ -0,0 +1,2 @@
++from __future__ import annotations
++
+@@ -16,0 +19,55 @@
++from ltx_core.types import TemporalAttentionBias
++
++
++def _slice_attention_mask(mask: torch.Tensor | None, start: int, end: int) -> torch.Tensor | None:
++    if mask is None:
++        return None
++    query_axis = -2
++    if mask.shape[query_axis] == 1:
++        return mask
++    return mask[..., start:end, :]
++
++
++def temporal_attention(
++    attention_function: MaskedAttentionCallable,
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    heads: int,
++    mask: torch.Tensor | None,
++    temporal_bias: TemporalAttentionBias,
++) -> torch.Tensor:
++    """Apply compact endpoint guidance in bounded query chunks."""
++    batch, query_count, _ = q.shape
++    if temporal_bias.query_log_weights.shape[0] not in (1, batch):
++        raise ValueError(
++            f"temporal bias batch must be 1 or {batch}, got {temporal_bias.query_log_weights.shape[0]}"
++        )
++    if temporal_bias.query_log_weights.shape[1] > query_count:
++        raise ValueError("temporal bias has more generated queries than the attention input")
++    if not 0 <= temporal_bias.key_start < temporal_bias.key_end <= k.shape[1]:
++        raise ValueError("temporal endpoint-guide key range is outside the attention input")
++
++    outputs = []
++    query_weights = temporal_bias.query_log_weights.to(device=q.device, dtype=q.dtype).expand(batch, -1)
++    finfo = torch.finfo(q.dtype)
++    for start in range(0, query_count, temporal_bias.query_chunk_size):
++        end = min(start + temporal_bias.query_chunk_size, query_count)
++        chunk_mask = _slice_attention_mask(mask, start, end)
++        if chunk_mask is None:
++            chunk_mask = torch.zeros(
++                (batch, 1, end - start, k.shape[1]),
++                device=q.device,
++                dtype=q.dtype,
++            )
++        else:
++            chunk_mask = chunk_mask.expand(batch, 1, end - start, k.shape[1]).clone()
++
++        guided_end = min(end, query_weights.shape[1])
++        if start < guided_end:
++            weights = query_weights[:, start:guided_end, None]
++            target = chunk_mask[:, :, : guided_end - start, temporal_bias.key_start : temporal_bias.key_end]
++            positive = weights > finfo.min
++            target.copy_(torch.where(positive[:, None], target + weights[:, None], finfo.min))
++        outputs.append(attention_function(q[:, start:end], k, v, heads, chunk_mask))
++    return torch.cat(outputs, dim=1)
+@@ -528,0 +586 @@
++        temporal_attention_bias: TemporalAttentionBias | None = None,
+@@ -567 +625,11 @@
+-            if mask is None:
++            if temporal_attention_bias is not None:
++                out = temporal_attention(
++                    self.masked_attention_function,
++                    q,
++                    k,
++                    v,
++                    self.heads,
++                    mask,
++                    temporal_attention_bias,
++                )
++            elif mask is None:
+--- a/packages/ltx-core/src/ltx_core/model/transformer/transformer.py
++++ b/packages/ltx-core/src/ltx_core/model/transformer/transformer.py
+@@ -281,0 +282 @@
++                temporal_attention_bias=video.temporal_attention_bias,
+--- a/packages/ltx-core/src/ltx_core/model/transformer/cudagraph_capture.py
++++ b/packages/ltx-core/src/ltx_core/model/transformer/cudagraph_capture.py
+@@ -15 +14,0 @@
+-import torch.utils._pytree as pytree
+@@ -29 +28 @@
+-_ShapeKey = tuple[tuple[int, ...], ...]
++_ShapeKey = tuple[Hashable, ...]
+@@ -45,0 +45,25 @@
++def _capture_value_key(value: object) -> Hashable:
++    """Describe graph-relevant structure without keying on mutable tensor values."""
++    if isinstance(value, torch.Tensor):
++        return ("tensor", tuple(value.shape), str(value.dtype), str(value.device))
++    if dataclasses.is_dataclass(value) and not isinstance(value, type):
++        value_type = type(value)
++        return (
++            "dataclass",
++            value_type.__module__,
++            value_type.__qualname__,
++            tuple(
++                (field.name, _capture_value_key(getattr(value, field.name)))
++                for field in dataclasses.fields(value)
++            ),
++        )
++    if isinstance(value, tuple):
++        return ("tuple", tuple(_capture_value_key(item) for item in value))
++    if value is None:
++        return ("none",)
++    if isinstance(value, (bool, int, float, str)):
++        return (type(value).__name__, value)
++    value_type = type(value)
++    return ("object", value_type.__module__, value_type.__qualname__)
++
++
+@@ -47,2 +71 @@
+-    tensors = [*pytree.tree_leaves(video), *pytree.tree_leaves(audio), block_masks]
+-    return tuple(tuple(t.shape) for t in tensors if isinstance(t, torch.Tensor))
++    return tuple(_capture_value_key(value) for value in (video, audio, block_masks))
+@@ -57,0 +81,5 @@
++    if dataclasses.is_dataclass(value) and not isinstance(value, type):
++        return dataclasses.replace(
++            value,
++            **{field.name: _clone_value(getattr(value, field.name)) for field in dataclasses.fields(value)},
++        )
+@@ -68,0 +97,5 @@
++    elif dataclasses.is_dataclass(dst) and not isinstance(dst, type):
++        if not dataclasses.is_dataclass(src) or isinstance(src, type):
++            raise TypeError(f"cannot copy {type(src).__name__} into {type(dst).__name__}")
++        for field in dataclasses.fields(dst):
++            _copy_value(getattr(dst, field.name), getattr(src, field.name))
+--- a/packages/ltx-pipelines/src/ltx_pipelines/utils/denoisers.py
++++ b/packages/ltx-pipelines/src/ltx_pipelines/utils/denoisers.py
+@@ -57,0 +58,3 @@
++        temporal_attention_bias=(
++            state.temporal_attention_bias.repeat(n) if state.temporal_attention_bias is not None else None
++        ),
+--- a/packages/ltx-pipelines/src/ltx_pipelines/utils/helpers.py
++++ b/packages/ltx-pipelines/src/ltx_pipelines/utils/helpers.py
+@@ -490,0 +491 @@
++        temporal_attention_bias=state.temporal_attention_bias,
+--- a/video_fast_gpu.py
++++ b/video_fast_gpu.py
+@@ -52,0 +53,3 @@
++from ltx_core.conditioning.types.attention_strength_wrapper import (
++    ConditioningItemAttentionStrengthWrapper,
++)
+@@ -81,0 +85,46 @@
++
++TEMPORAL_ATTENTION_CAPABILITY_VERSION = "ltx25-temporal-endpoint-v1"
++END_IMAGE_ATTENTION_STRENGTHS = "end_image_attention_strengths"
++
++
++def temporal_attention_capability() -> dict[str, object]:
++    """Report the executable contract consumed by the Arbiter adapters."""
++    return {
++        "version": TEMPORAL_ATTENTION_CAPABILITY_VERSION,
++        "both_stages": True,
++        "asymmetric_video_query_to_endpoint_key": True,
++        "query_chunk_size": 256,
++    }
++
++
++def _validate_attention_strengths(value: object, num_frames: int) -> torch.Tensor | None:
++    if value is None:
++        return None
++    if not isinstance(value, list) or len(value) != num_frames:
++        raise ValueError(
++            f"{END_IMAGE_ATTENTION_STRENGTHS} must contain exactly {num_frames} expanded values"
++        )
++    strengths = torch.tensor(value, dtype=torch.float32)
++    if not torch.all(torch.isfinite(strengths)) or torch.any((strengths < 0) | (strengths > 1)):
++        raise ValueError(f"{END_IMAGE_ATTENTION_STRENGTHS} values must be finite and in [0, 1]")
++    return strengths
++
++
++def _apply_endpoint_attention_strengths(
++    conditionings: list,
++    strengths: torch.Tensor | None,
++    num_frames: int,
++) -> list:
++    if strengths is None:
++        return conditionings
++    endpoint = num_frames - 1
++    matches = [index for index, item in enumerate(conditionings) if getattr(item, "frame_idx", None) == endpoint]
++    if len(matches) != 1:
++        raise ValueError(f"temporal attention requires exactly one endpoint conditioning at frame {endpoint}")
++    result = list(conditionings)
++    result[matches[0]] = ConditioningItemAttentionStrengthWrapper(
++        result[matches[0]],
++        video_query_attention_strengths=strengths,
++        query_chunk_size=256,
++    )
++    return result
+@@ -554,0 +604 @@
++            "ltx25_temporal_attention_capability": temporal_attention_capability(),
+@@ -760,0 +811,3 @@
++        temporal_attention_strengths = _validate_attention_strengths(
++            data.get(END_IMAGE_ATTENTION_STRENGTHS), num_frames
++        )
+@@ -778,0 +832,3 @@
++        )
++        stage_1_conditionings = _apply_endpoint_attention_strengths(
++            stage_1_conditionings, temporal_attention_strengths, num_frames
+@@ -842,0 +899,3 @@
++        stage_2_conditionings = _apply_endpoint_attention_strengths(
++            stage_2_conditionings, temporal_attention_strengths, num_frames
++        )

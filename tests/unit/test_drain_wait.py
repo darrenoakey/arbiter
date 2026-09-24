@@ -1,11 +1,4 @@
-"""Real unit tests for scripts/drain_wait.py (deploy drain-wait verdict).
-
-Feeds /v1/ps snapshots with the exact field names and shapes the Go API
-marshals (cmd/arbiter/api.go updatePSCache over store.Job rows): unix-float
-started_at, non-terminal states queued/scheduled/running/following — shapes
-recorded live from spark 2026-09-20. Asserts the per-job patience verdict.
-No network, no mocks — pure function over recorded shapes.
-"""
+"""Fail-closed tests for the deploy drain protocol parser."""
 
 from __future__ import annotations
 
@@ -13,167 +6,207 @@ import importlib.util
 import json
 import subprocess
 import sys
-import time
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "drain_wait.py"
+DEPLOY_SCRIPT = Path(__file__).resolve().parents[2] / "deploy-to-spark.sh"
 
 spec = importlib.util.spec_from_file_location("drain_wait", SCRIPT)
+assert spec is not None and spec.loader is not None
 drain_wait = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(drain_wait)
 
-NOW = 1_800_000_000.0
 
-
-def started(seconds_ago: float) -> float:
-    # Live wire format: unix-seconds float (store.Job StartedAt *float64).
-    return NOW - seconds_ago
-
-
-def ps(active: int, jobs: list[dict] | None = None) -> dict:
-    snap = {"active_jobs": active, "draining": True}
-    if jobs is not None:
-        snap["active_jobs_detail"] = jobs
-    return snap
-
-
-def running(started_at: float | str | None, job_id: str = "job-1",
-            state: str = "scheduled") -> dict:
-    # "scheduled" is the observed in-flight state: dispatched with started_at
-    # set (recorded live: started_at lands ~60ms after created_at).
-    job = {"job_id": job_id, "type": "ltx25", "model": "ltx25", "state": state}
-    if started_at is not None:
-        job["started_at"] = started_at
-    return job
-
-
-def test_no_active_jobs_is_drained():
-    assert drain_wait.verdict(ps(0, []), 120.0, now=NOW) == (0, 0)
-
-
-def test_young_running_job_is_waitable():
-    # Started 10s ago inside a 120s window: deserves the remaining patience.
-    snap = ps(1, [running(started(10))])
-    assert drain_wait.verdict(snap, 120.0, now=NOW) == (1, 1)
-
-
-def test_job_that_outlived_the_window_is_not_waitable():
-    # Started 400s ago; a 120s patience window is long spent.
-    snap = ps(2, [running(started(400), "a"), running(started(900), "b")])
-    assert drain_wait.verdict(snap, 120.0, now=NOW) == (2, 0)
-
-
-def test_mixed_young_and_old_waits_for_the_young_one():
-    snap = ps(2, [running(started(400), "old"), running(started(30), "young")])
-    assert drain_wait.verdict(snap, 120.0, now=NOW) == (2, 1)
-
-
-def test_boundary_age_just_under_window_is_waitable():
-    # Age 119s of a 120s window (+5s skew grace) — still protected.
-    snap = ps(1, [running(started(119))])
-    assert drain_wait.verdict(snap, 120.0, now=NOW) == (1, 1)
-
-
-def test_age_slightly_past_window_plus_grace_is_not_waitable():
-    snap = ps(1, [running(started(130))])
-    assert drain_wait.verdict(snap, 120.0, now=NOW) == (1, 0)
-
-
-def test_missing_started_at_is_waitable():
-    # Cannot prove the job is long — protect it (old behavior).
-    snap = ps(1, [running(None)])
-    assert drain_wait.verdict(snap, 120.0, now=NOW) == (1, 1)
-
-
-def test_rfc3339_string_started_at_is_tolerated():
-    # Compatibility path: a future panel marshaling time.Time would emit
-    # RFC3339 strings; parsing must still age the job, not silently protect
-    # it forever (that bug shipped briefly on 2026-09-20 and cost the fix).
-    iso = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(NOW - 400))
-    assert drain_wait.verdict(ps(1, [running(iso)]), 120.0, now=NOW) == (1, 0)
-
-
-def test_recorded_live_snapshot_shapes_drive_the_verdict():
-    # Byte-shape recorded from GET /v1/ps on spark 2026-09-20: chat-completion
-    # jobs in state "scheduled" with float started_at ~60ms after float
-    # created_at. Young at snapshot time — one full patience window ahead.
-    live = {
-        "active_jobs": 2,
-        "draining": True,
-        "active_jobs_detail": [
-            {"job_id": "000f9a6290c4", "type": "chat-completion", "model": "local-titler",
-             "state": "scheduled", "created_at": NOW - 10.0, "started_at": NOW - 9.94},
-            {"job_id": "a0f98b1ac7f6", "type": "chat-completion", "model": "local-titler",
-             "state": "scheduled", "created_at": NOW - 9.8, "started_at": NOW - 9.75},
+def recorded_ps(*, draining: bool = True, active: int = 0) -> dict:
+    """Return the production /v1/ps shape recorded from Spark."""
+    return {
+        "vram_budget_gb": 100.0,
+        "vram_used_gb": 37.0,
+        "draining": draining,
+        "active_jobs": active,
+        "models": [
+            {
+                "id": "ltx25-denoise1",
+                "state": "active" if active else "loaded",
+                "memory_gb": 36.0,
+                "active_jobs": active,
+                "queued_jobs": 2,
+                "instances": [
+                    {
+                        "instance_id": "ltx25-denoise1-0",
+                        "state": "active" if active else "loaded",
+                        "active_jobs": active,
+                        "host": "spark",
+                    }
+                ],
+            },
+            {
+                "id": "local-titler",
+                "state": "loaded",
+                "memory_gb": 1.0,
+                "active_jobs": 0,
+                "queued_jobs": 0,
+                "instances": [],
+            },
         ],
+        "queue": {
+            "queued": 2,
+            "scheduled": active,
+            "completed": 57,
+            "failed": 2,
+            "cancelled": 0,
+        },
     }
-    assert drain_wait.verdict(live, 120.0, now=NOW) == (2, 1)
-    # Same jobs 400s later: both outlived the window — cut the wait.
-    assert drain_wait.verdict(live, 120.0, now=NOW + 400) == (2, 0)
 
 
-def test_followers_and_queued_do_not_extend_the_originals_patience():
-    # "following" rows are dedup followers (cmd/arbiter/dedup.go) piggybacking
-    # on an original job's result — the ORIGINAL's running row holds the
-    # worker, so its age alone governs patience; queued work never starts
-    # under drain and is requeued wholesale by the shutdown path.
-    jobs = [
-        running(started(400), "orig"),
-        {"job_id": "f", "type": "following", "state": "following",
-         "started_at": started(50)},
-        {"job_id": "q", "type": "llm-chat", "state": "queued"},
-    ]
-    snap = ps(1, jobs)
-    assert drain_wait.verdict(snap, 120.0, now=NOW) == (1, 0)
-
-
-def test_followers_without_a_running_original_wait():
-    # active>0 but no running row visible: cannot prove the worker is idle of
-    # long jobs (schema drift) — stay conservative and keep waiting.
-    jobs = [{"job_id": "f", "type": "following", "state": "following",
-             "started_at": started(900)}]
-    assert drain_wait.verdict(ps(1, jobs), 120.0, now=NOW) == (1, 1)
-
-
-def test_missing_detail_panel_falls_back_to_waiting():
-    # Older server without active_jobs_detail — never cut the wait short.
-    assert drain_wait.verdict(ps(3), 120.0, now=NOW) == (3, 1)
-
-
-def test_truncated_detail_panel_falls_back_to_waiting():
-    # Panel at the 200-entry cap drops newest jobs first, so the visible ages
-    # cannot prove anything — stay conservative.
-    jobs = [running(started(999), f"old-{i}") for i in range(200)]
-    snap = ps(200, jobs)
-    assert drain_wait.verdict(snap, 120.0, now=NOW) == (200, 1)
-
-
-def test_unparseable_snapshot_reports_drained_like_the_old_loop():
-    assert drain_wait.verdict(None, 120.0, now=NOW) == (0, 0)
-    assert drain_wait.verdict("not-a-dict", 120.0, now=NOW) == (0, 0)
-
-
-def test_cli_prints_tab_separated_verdict():
-    # started_at is computed against the REAL clock the CLI subprocess uses,
-    # in the live unix-float wire format.
-    real = time.time()
-    jobs = [
-        {"job_id": "a", "type": "lora-train", "state": "running",
-         "started_at": real - 400},
-        {"job_id": "b", "type": "lora-train", "state": "scheduled",
-         "started_at": real - 900},
-    ]
-    payload = json.dumps(ps(2, jobs))
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT), "120"],
-        input=payload, capture_output=True, text=True, check=True,
+def run_parser(kind: str, payload: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), kind],
+        input=payload,
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    assert result.stdout.strip() == "2\t0"
 
 
-def test_cli_on_empty_input_matches_legacy_zero_semantics():
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT), "120"],
-        input="", capture_output=True, text=True, check=True,
+def run_recovery_abort(kind: str, detail: str = "") -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(DEPLOY_SCRIPT), "--test-recovery-abort", kind, detail],
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    assert result.stdout.strip() == "0\t0"
+
+
+def test_recorded_ps_proves_drained_with_queued_work_preserved():
+    snapshot = recorded_ps(active=0)
+    assert snapshot["queue"]["queued"] == 2
+    assert drain_wait.ps_state(snapshot) == (True, 0)
+
+
+def test_recorded_ps_reports_active_work_without_calling_it_drained():
+    # Read-only GET /v1/ps on Spark, 2026-09-25. The queue aggregate is DB
+    # cached and can differ from the in-memory active count; deployment safety
+    # therefore uses root active_jobs cross-checked against models, not queue.
+    live = {
+        "draining": False,
+        "active_jobs": 3,
+        "models": [
+            {"id": "llm:qwen3-vl-8b-fp8", "active_jobs": 2},
+            {"id": "moondream", "active_jobs": 1},
+        ],
+        "queue": {"cancelled": 61, "completed": 27623, "failed": 171, "running": 2},
+    }
+    assert drain_wait.ps_state(live) == (False, 3)
+
+
+def test_wait_decision_never_proceeds_with_active_jobs_at_deadline():
+    active = recorded_ps(active=1)
+    assert drain_wait.wait_decision(active, deadline_reached=False) == ("wait", 1)
+    assert drain_wait.wait_decision(active, deadline_reached=True) == ("abort", 1)
+    assert drain_wait.wait_decision(recorded_ps(active=0), deadline_reached=True) == (
+        "drained",
+        0,
+    )
+
+
+def test_wait_decision_rejects_a_lost_drain_lease():
+    with pytest.raises(drain_wait.DrainProtocolError, match="draining=true"):
+        drain_wait.wait_decision(recorded_ps(draining=False), deadline_reached=False)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda value: value.pop("active_jobs"), "active_jobs is missing"),
+        (lambda value: value.__setitem__("active_jobs", False), "non-negative integer"),
+        (lambda value: value.__setitem__("active_jobs", -1), "non-negative integer"),
+        (lambda value: value.pop("models"), "models must be an array"),
+        (lambda value: value.__setitem__("models", {}), "models must be an array"),
+        (lambda value: value["models"][0].pop("active_jobs"), "active_jobs is missing"),
+        (lambda value: value["models"][0].__setitem__("active_jobs", 1), "does not equal"),
+        (lambda value: value.pop("queue"), "queue must be an object"),
+        (lambda value: value["queue"].__setitem__("queued", -1), "non-negative integer"),
+        (lambda value: value.pop("draining"), "draining must be a boolean"),
+    ],
+)
+def test_ps_rejects_missing_malformed_or_inconsistent_counts(mutation, message):
+    snapshot = recorded_ps(active=0)
+    mutation(snapshot)
+    with pytest.raises(drain_wait.DrainProtocolError, match=message):
+        drain_wait.ps_state(snapshot)
+
+
+def test_drain_and_resume_acknowledgements_are_explicit():
+    drain_wait.drain_response(
+        {"draining": True, "active_jobs": 0, "lease_seconds": 300},
+        resumed=False,
+        expected_lease=300,
+    )
+    drain_wait.drain_response({"draining": False}, resumed=True)
+
+
+@pytest.mark.parametrize(
+    ("payload", "resumed"),
+    [
+        ({"draining": True, "active_jobs": 0}, False),
+        ({"draining": True, "active_jobs": "0", "lease_seconds": 300}, False),
+        ({"draining": False, "active_jobs": 0, "lease_seconds": 300}, False),
+        ({"draining": True, "active_jobs": 0, "lease_seconds": 1}, False),
+        ({"draining": True}, True),
+    ],
+)
+def test_drain_acknowledgement_rejects_unproved_state(payload, resumed):
+    with pytest.raises(drain_wait.DrainProtocolError):
+        drain_wait.drain_response(payload, resumed=resumed, expected_lease=300)
+
+
+@pytest.mark.parametrize("payload", ("", "not-json", "[]", "{}"))
+def test_cli_fails_closed_for_empty_malformed_or_incomplete_ps(payload):
+    result = run_parser("ps", payload)
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "invalid Arbiter ps response" in result.stderr
+
+
+def test_cli_emits_only_validated_ps_state():
+    result = run_parser("ps", json.dumps(recorded_ps(draining=False, active=0)))
+    assert result.returncode == 0
+    assert result.stdout == "0\t0\n"
+
+
+def test_closed_port_curl_failure_cannot_feed_a_successful_parse():
+    curl = subprocess.run(
+        ["curl", "-fsS", "--max-time", "1", "http://127.0.0.1:1/v1/ps"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert curl.returncode != 0
+    parsed = run_parser("ps", curl.stdout)
+    assert parsed.returncode == 2
+
+
+def test_replacement_listener_aborts_without_recovery_termination():
+    result = run_recovery_abort("replacement-listener", "48123")
+    assert result.returncode != 0
+    assert "pid 48123" in result.stderr
+    assert "aborted without stopping or signaling it" in result.stderr
+
+
+def test_already_running_start_aborts_without_recovery_termination():
+    result = run_recovery_abort("already-running")
+    assert result.returncode != 0
+    assert "already running" in result.stderr
+    assert "aborted without stopping or signaling the replacement" in result.stderr
+
+
+def test_deploy_has_only_the_drained_stop_and_normal_start():
+    script = DEPLOY_SCRIPT.read_text()
+    assert script.count('auto/run stop arbiter') == 1
+    assert script.count('auto/run start arbiter') == 1
+    assert "auto/run restart arbiter" not in script
+    assert "kill -TERM" not in script
+    assert "pkill" not in script

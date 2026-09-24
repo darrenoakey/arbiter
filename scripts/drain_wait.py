@@ -1,115 +1,140 @@
 #!/usr/bin/env python3
-"""Drain-wait verdict for deploy-to-spark.sh.
-
-Reads one /v1/ps snapshot (JSON on stdin) plus the drain window length in
-seconds (argv[1]) and prints two tab-separated fields:
-
-    <active_jobs> <waitable>
-
-active_jobs — the snapshot's worker-level in-flight count, verbatim.
-
-waitable — 1 while at least one RUNNING job still deserves drain patience.
-The patience policy is per-job, measured from EACH JOB'S OWN start: a job is
-protected until it has run for one full drain window. A job that has already
-outlived the window without finishing is empirically not a short job, and
-waiting for it inside a bounded window whose total equals that same window is
-pure release-time waste (measured 2026-09-20: 2 long training jobs burned ~80s
-of a 209.6s release, then were requeued anyway).
-
-This policy is never less protective than a wall-clock-from-request deadline:
-a job that starts at the request gets the same full window; a job that started
-earlier has already consumed part of its own window, exactly as before. The
-overall deadline in deploy-to-spark.sh still bounds the total wait.
-
-Clock skew between this Mac and spark biases the verdict toward "wait"
-(a 5s grace is added to every age), so skew can only cost wait time, never
-job protection. Anything unparseable or truncated also falls back to "wait",
-which is the pre-2026-09-20 behavior.
-"""
+"""Validate the Arbiter drain protocol responses used by deploy-to-spark.sh."""
 
 from __future__ import annotations
 
-import datetime
+import argparse
 import json
 import sys
-import time
-
-# Matches cmd/arbiter/api.go activeJobsDetailLimit: above this the panel is
-# truncated (newest entries dropped first by created_at ASC ordering), so the
-# ages we can see are incomplete and the verdict must stay conservative.
-DETAIL_PANEL_LIMIT = 200
-
-# LAN NTP skew allowance, biased toward protecting jobs (treat as younger).
-CLOCK_SKEW_GRACE_S = 5.0
+from typing import NoReturn
 
 
-def _started_epoch(value: object) -> float | None:
-    """Parse started_at to a unix epoch, or None when unparseable.
-
-    The live wire format is a unix-seconds FLOAT (store.Job marshals
-    StartedAt *float64 — recorded 2026-09-20 from GET /v1/ps on spark); an
-    RFC3339 string is tolerated in case a future panel marshals time.Time.
-    """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.timestamp()
+class DrainProtocolError(ValueError):
+    """The server response cannot prove the requested drain state."""
 
 
-def verdict(snapshot: object, window_s: float, now: float | None = None) -> tuple[int, int]:
-    """Return (active_jobs, waitable) for one /v1/ps snapshot."""
-    if now is None:
-        now = time.time()
+def _fail(message: str) -> NoReturn:
+    raise DrainProtocolError(message)
+
+
+def _count(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        _fail(f"{field} must be a non-negative integer")
+    return value
+
+
+def ps_state(snapshot: object) -> tuple[bool, int]:
+    """Return the validated global drain state and active-job count."""
     if not isinstance(snapshot, dict):
-        return 0, 0  # unparseable snapshot: pre-existing "drained" semantics
-    active = snapshot.get("active_jobs", 0)
-    if not isinstance(active, int):
-        return 0, 0
+        _fail("/v1/ps response must be an object")
+
+    draining = snapshot.get("draining")
+    if not isinstance(draining, bool):
+        _fail("/v1/ps draining must be a boolean")
+
+    if "active_jobs" not in snapshot:
+        _fail("/v1/ps active_jobs is missing")
+    active = _count(snapshot["active_jobs"], "/v1/ps active_jobs")
+
+    models = snapshot.get("models")
+    if not isinstance(models, list):
+        _fail("/v1/ps models must be an array")
+    model_active = 0
+    for index, model in enumerate(models):
+        if not isinstance(model, dict):
+            _fail(f"/v1/ps models[{index}] must be an object")
+        if "active_jobs" not in model:
+            _fail(f"/v1/ps models[{index}].active_jobs is missing")
+        model_active += _count(
+            model["active_jobs"], f"/v1/ps models[{index}].active_jobs"
+        )
+    if model_active != active:
+        _fail(
+            "/v1/ps active_jobs does not equal the sum of models[].active_jobs"
+        )
+
+    queue = snapshot.get("queue")
+    if not isinstance(queue, dict):
+        _fail("/v1/ps queue must be an object")
+    for state, count in queue.items():
+        if not isinstance(state, str) or not state:
+            _fail("/v1/ps queue keys must be non-empty strings")
+        _count(count, f"/v1/ps queue.{state}")
+
+    return draining, active
+
+
+def wait_decision(snapshot: object, *, deadline_reached: bool) -> tuple[str, int]:
+    """Decide whether a validated owned drain is safe, waiting, or timed out."""
+    draining, active = ps_state(snapshot)
+    if not draining:
+        _fail("/v1/ps no longer confirms draining=true")
     if active == 0:
-        return 0, 0
+        return "drained", active
+    if deadline_reached:
+        return "abort", active
+    return "wait", active
 
-    detail = snapshot.get("active_jobs_detail")
-    if not isinstance(detail, list) or len(detail) >= DETAIL_PANEL_LIMIT:
-        return active, 1  # can't see job ages — keep waiting (old behavior)
 
-    # Worker-holding states: "running" executes; "scheduled" is dispatched
-    # with started_at already set (recorded live 2026-09-20: both in-flight
-    # chat-completion jobs sat in state "scheduled" with started_at ~60ms
-    # after created_at). "following" rows are dedup shadows of an original
-    # and "queued" rows never start under drain — neither holds patience.
-    holding_states = {"scheduled", "running"}
-    holding_started = [
-        _started_epoch(j.get("started_at"))
-        for j in detail
-        if isinstance(j, dict) and j.get("state") in holding_states
-    ]
-    if not holding_started:
-        return active, 1  # no worker-holding row visible — keep waiting
+def drain_response(
+    response: object, *, resumed: bool, expected_lease: int | None = None
+) -> None:
+    """Validate the documented POST /v1/drain acknowledgement."""
+    if not isinstance(response, dict):
+        _fail("/v1/drain response must be an object")
+    expected = not resumed
+    if response.get("draining") is not expected:
+        _fail(f"/v1/drain response must contain draining={str(expected).lower()}")
+    if not resumed:
+        if "active_jobs" not in response:
+            _fail("/v1/drain active_jobs is missing")
+        _count(response["active_jobs"], "/v1/drain active_jobs")
+        if "lease_seconds" not in response:
+            _fail("/v1/drain lease_seconds is missing")
+        lease = _count(response["lease_seconds"], "/v1/drain lease_seconds")
+        if lease == 0:
+            _fail("/v1/drain lease_seconds must be positive")
+        if expected_lease is not None and lease != expected_lease:
+            _fail(
+                f"/v1/drain lease_seconds is {lease}, expected {expected_lease}"
+            )
 
-    waitable = any(
-        started is None or (now - started) < window_s + CLOCK_SKEW_GRACE_S
-        for started in holding_started
-    )
-    return active, int(waitable)
+
+def _read_json() -> object:
+    try:
+        return json.load(sys.stdin)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise DrainProtocolError(f"invalid JSON: {error.msg}") from error
 
 
 def main() -> int:
-    window_s = float(sys.argv[1]) if len(sys.argv) > 1 else 120.0
+    parser = argparse.ArgumentParser()
+    parser.add_argument("kind", choices=("ps", "wait", "drain", "resume"))
+    parser.add_argument("lease_seconds", nargs="?", type=int)
+    arguments = parser.parse_args()
     try:
-        snapshot = json.load(sys.stdin)
-    except (json.JSONDecodeError, ValueError):
-        snapshot = None  # curl failure / empty body → historical "0 0" output
-    active, waitable = verdict(snapshot, window_s)
-    print(f"{active}\t{waitable}")
+        payload = _read_json()
+        if arguments.kind == "ps":
+            draining, active = ps_state(payload)
+            print(f"{int(draining)}\t{active}")
+        elif arguments.kind == "wait":
+            if arguments.lease_seconds not in (0, 1):
+                _fail("wait requires deadline_reached as 0 or 1")
+            decision, active = wait_decision(
+                payload, deadline_reached=bool(arguments.lease_seconds)
+            )
+            print(f"{decision}\t{active}")
+        else:
+            if arguments.kind == "drain" and arguments.lease_seconds is None:
+                _fail("expected lease_seconds argument is missing")
+            drain_response(
+                payload,
+                resumed=arguments.kind == "resume",
+                expected_lease=arguments.lease_seconds,
+            )
+    except DrainProtocolError as error:
+        print(f"invalid Arbiter {arguments.kind} response: {error}", file=sys.stderr)
+        return 2
     return 0
 
 
