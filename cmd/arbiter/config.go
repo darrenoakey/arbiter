@@ -365,6 +365,7 @@ var JobTypeToModel = map[string]string{
 	"tts-clone":               "tts-clone",
 	"tts-design":              "tts-design",
 	"tts-kokoro":              "tts-kokoro",
+	"tts-breeze":              "tts-breeze",
 	"talking-head":            "sonic",
 	"talking-head-sadtalker":  "sadtalker",
 	"lipsync":                 "latentsync",

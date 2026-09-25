@@ -10,6 +10,7 @@ _ADAPTER_MODULES = (
     "tts_clone",
     "tts_design",
     "kokoro_tts",
+    "tts_breeze",
     "latentsync",
     "sadtalker",
     "echomimic",

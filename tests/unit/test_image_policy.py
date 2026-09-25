@@ -202,6 +202,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "sadtalker",
         "sonic",
         "trellis2",
+        "tts-breeze",
         "tts-clone",
         "tts-custom",
         "tts-design",

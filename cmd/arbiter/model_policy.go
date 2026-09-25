@@ -100,6 +100,7 @@ var trustedPythonAdapters = map[string]string{
 	"tts-custom":              "qwentts",
 	"tts-design":              "qwentts",
 	"tts-kokoro":              "kokoro",
+	"tts-breeze":              "breeze",
 	"wan-s2v":                 "",
 	"whisper-large":           "whisper",
 	referenceImageEditModel:   "flux2",

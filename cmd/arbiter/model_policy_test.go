@@ -198,6 +198,7 @@ func TestWorkerPolicyAllowsDocumentedWorkerIdentities(t *testing.T) {
 		config  ModelConfig
 	}{
 		{modelID: "tts-kokoro", config: pythonWorkerConfig(root, "kokoro", "tts-kokoro")},
+		{modelID: "tts-breeze", config: pythonWorkerConfig(root, "breeze", "tts-breeze")},
 		{modelID: "tts-custom", config: pythonWorkerConfig(root, "qwentts", "tts-custom")},
 		{modelID: "tts-clone", config: pythonWorkerConfig(root, "qwentts", "tts-clone")},
 		{modelID: "tts-design", config: pythonWorkerConfig(root, "qwentts", "tts-design")},

@@ -45,6 +45,7 @@ class JobType(str, Enum):
     TTS_CLONE = "tts-clone"
     TTS_DESIGN = "tts-design"
     TTS_KOKORO = "tts-kokoro"
+    TTS_BREEZE = "tts-breeze"
     TALKING_HEAD = "talking-head"
     TALKING_HEAD_SADTALKER = "talking-head-sadtalker"
     LIPSYNC = "lipsync"
@@ -84,6 +85,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "tts-clone": "tts-clone",
     "tts-design": "tts-design",
     "tts-kokoro": "tts-kokoro",
+    "tts-breeze": "tts-breeze",
     "talking-head": "sonic",
     "talking-head-sadtalker": "sadtalker",
     "lipsync": "latentsync",
@@ -244,6 +246,27 @@ class TTSKokoroParams(BaseModel):
     lang_code: str = ""  # "" → derive from voice prefix (a/b/...)
     items: Optional[list[dict]] = None
     gap_seconds: float = 0.0
+
+
+class TTSBreezeParams(BaseModel):
+    # Single-line mode: text (+ instruction for voice design, or
+    # ref_audio+ref_text for cloning, or all three for voice direction).
+    # Batch mode: items=[{text, instruction?, ref_audio?, ref_text?, ...}]
+    # synthesized in one job, returned as one concatenated wav + item_samples.
+    text: str = ""
+    instruction: Optional[str] = None  # natural-language voice design/direction
+    speaker: str = "S0"  # speaker tag prefix the model was trained with
+    ref_audio: Optional[str] = None  # base64 wav reference clip
+    ref_audio_file: Optional[str] = None  # staged path on spark
+    ref_text: Optional[str] = None  # exact transcript of the reference clip
+    cfg_scale: float = 1.0  # ~4 strengthens instruction-following
+    seed: int = 42
+    items: Optional[list[dict]] = None
+    gap_seconds: float = 0.0
+    # Batch-only: shared named reference clips (name -> base64 wav) so every
+    # line from one speaker reuses ONE inline copy; items select via "ref".
+    refs: Optional[dict[str, str]] = None
+    ref_texts: Optional[dict[str, str]] = None  # name -> exact transcript
 
 
 class TalkingHeadParams(BaseModel):
@@ -644,6 +667,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "tts-clone": TTSCloneParams,
     "tts-design": TTSDesignParams,
     "tts-kokoro": TTSKokoroParams,
+    "tts-breeze": TTSBreezeParams,
     "talking-head": TalkingHeadParams,
     "talking-head-sadtalker": TalkingHeadSadTalkerParams,
     "lipsync": LipsyncParams,

@@ -174,3 +174,19 @@ def test_music_generate_format_defaults_to_mp3_but_wav_is_selectable():
 
     assert MusicGenerateParams(prompt="test").format == "mp3"
     assert MusicGenerateParams(prompt="test", format="wav").format == "wav"
+
+
+def test_tts_breeze_job_type_registered():
+    from arbiter.schemas import TTSBreezeParams
+
+    assert JOB_TYPE_TO_MODEL["tts-breeze"] == "tts-breeze"
+    assert "tts-breeze" in JOB_TYPE_PARAMS
+    # Single-line voice design defaults; cloning requires ref_text alongside.
+    params = TTSBreezeParams(text="hello", instruction="A warm old wizard")
+    assert params.cfg_scale == 1.0 and params.speaker == "S0"
+    assert params.ref_audio is None and params.ref_text is None
+    batch = TTSBreezeParams(
+        items=[{"text": "hi", "instruction": "gruff"}, {"text": "yo"}],
+        gap_seconds=0.1,
+    )
+    assert batch.items is not None and len(batch.items) == 2
