@@ -28,9 +28,16 @@ func TestStillImageModelClassification(t *testing.T) {
 	}
 }
 
+func TestCloudMiniMaxH3CannotBeRegistered(t *testing.T) {
+	err := validateModelWorkerPolicy(t.TempDir(), "minimax-h3", ModelConfig{}, false)
+	if err == nil || !strings.Contains(err.Error(), "removed") {
+		t.Fatalf("cloud registration error = %v", err)
+	}
+}
+
 func TestMiniMaxH3VideoAdmissionIsExactAndTopLevel(t *testing.T) {
-	if err := validateJobModelCompatibility("video-generate", "minimax-h3"); err != nil {
-		t.Fatalf("exact MiniMax H3 model rejected: %v", err)
+	if err := validateJobModelCompatibility("video-generate", "minimax-h3"); err == nil {
+		t.Fatal("cloud MiniMax H3 must not be a video-generate model")
 	}
 	for _, modelID := range []string{"minimax-h3-pro", "minimax-h3-copy", "minimax", "MiniMax-H3"} {
 		if err := validateJobModelCompatibility("video-generate", modelID); err == nil {
@@ -90,12 +97,8 @@ func TestMiniMaxH3TopLevelSubmissionAndLTX2Default(t *testing.T) {
 
 	explicit := performRequest(api, "POST", "/v1/jobs",
 		`{"type":"video-generate","model":"minimax-h3","params":{"prompt":"shot","duration":4,"resolution":"768P"}}`)
-	if explicit.Code != 200 {
-		t.Fatalf("explicit MiniMax submission status=%d body=%s", explicit.Code, explicit.Body.String())
-	}
-	explicitJob, err := api.store.GetJob(decodeObject(t, explicit.Body.Bytes())["job_id"].(string))
-	if err != nil || explicitJob.ModelID != "minimax-h3" {
-		t.Fatalf("explicit MiniMax job=%+v error=%v", explicitJob, err)
+	if explicit.Code != 400 {
+		t.Fatalf("cloud MiniMax submission status=%d body=%s", explicit.Code, explicit.Body.String())
 	}
 
 	defaulted := performRequest(api, "POST", "/v1/jobs",

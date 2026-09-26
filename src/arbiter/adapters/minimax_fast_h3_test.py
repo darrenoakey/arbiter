@@ -52,7 +52,7 @@ def test_fasth3_applies_each_scheduler_shift_once() -> None:
 
 def test_fasth3_and_h3_adapters_are_both_registered() -> None:
     registered = list_registered()
-    assert "minimax-h3" in registered
+    assert "minimax-h3" not in registered
     assert "minimax-h3-local" in registered
     assert "minimax-fast-h3" in registered
     assert MinimaxFastH3Adapter.model_id == "minimax-fast-h3"

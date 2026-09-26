@@ -150,16 +150,13 @@ def test_text_only_payload_preserves_every_h3_contract_field():
     }
 
 
-def test_adapter_and_deploy_config_are_discoverable():
+def test_cloud_adapter_is_not_registered_and_has_no_deploy_config():
     registered = list_registered()
-    assert "minimax-h3" in registered
+    assert "minimax-h3" not in registered
     assert "minimax-h3-local" in registered
     assert "minimax-fast-h3" in registered
     root = Path(__file__).parents[3]
-    config = json.loads((root / "config/spark/minimax-h3.model.json").read_text())
-    assert config["max_concurrent"] == 1
-    assert config["max_instances"] == 1
-    assert config["memory_gb"] > 0
+    assert not (root / "config/spark/minimax-h3.model.json").exists()
 
 
 def test_adapter_rejects_noncanonical_frames_before_payload_read(tmp_path):
@@ -247,7 +244,7 @@ def test_registry_imports_in_a_venv_without_httpx():
         import arbiter.adapters
         from arbiter.adapters.registry import list_registered
 
-        assert "minimax-h3" in list_registered(), list_registered()
+        assert "minimax-h3" not in list_registered(), list_registered()
         assert "minimax-h3-local" in list_registered(), list_registered()
         assert "minimax-fast-h3" in list_registered(), list_registered()
         print("registry-ok")

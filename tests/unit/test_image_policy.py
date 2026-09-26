@@ -189,7 +189,6 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "ltx25-denoise1",
         "ltx25-encode",
         "minimax-fast-h3",
-        "minimax-h3",
         "minimax-h3-local",
         "moondream",
         "music-generate",

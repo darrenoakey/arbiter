@@ -65,10 +65,10 @@ def test_adapter_source_uses_nvfp4_not_int8() -> None:
     assert "enable_group_offload" not in src
 
 
-def test_local_and_cloud_adapters_are_both_registered() -> None:
-    """Cloud restore must not erase the local GPU model id the worker looks up."""
+def test_local_adapter_is_registered_and_cloud_is_not() -> None:
+    """H3 means the local GPU adapter. The cloud id must not be selectable."""
     registered = list_registered()
-    assert "minimax-h3" in registered
+    assert "minimax-h3" not in registered
     assert "minimax-h3-local" in registered
     assert MinimaxH3LocalAdapter.model_id == "minimax-h3-local"
 

@@ -13,7 +13,6 @@ from typing import Any
 from urllib.parse import urlparse
 
 from arbiter.adapters.base import InferenceError, ModelAdapter
-from arbiter.adapters.registry import register
 
 
 def _httpx() -> Any:
@@ -350,8 +349,9 @@ def _download_result(url: str, destination: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-@register
 class MiniMaxH3Adapter(ModelAdapter):
+    """Retired cloud client. It must not register, so a job cannot reach MiniMax's API."""
+
     model_id = "minimax-h3"
 
     def load(self, device: str = "cuda") -> None:

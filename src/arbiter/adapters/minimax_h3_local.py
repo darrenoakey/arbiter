@@ -220,9 +220,33 @@ class MinimaxH3LocalAdapter(GroupAdapter):
             )
             # fl2va is the first/last-keyframe partition; loading it by name
             # keeps the omni-reference transformer partition off the box.
+            # routing_decide sets HF_HUB_OFFLINE at import. diffusers then
+            # refuses the cached VAE and leaves pipe.vae as None.
+            import os
+            import huggingface_hub.constants as hf_constants
+            os.environ.pop("HF_HUB_OFFLINE", None)
+            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+            hf_constants.HF_HUB_OFFLINE = False
             self._pipe.load_components(
-                workflow=H3_WORKFLOW, dtype=torch.bfloat16
+                workflow=H3_WORKFLOW,
+                dtype=torch.bfloat16,
             )
+            if self._pipe.vae is None or self._pipe.audio_vae is None:
+                raise LoadError(
+                    "H3 load left vae or audio_vae unset; refusing to call .to on None"
+                )
+            # The hub has no root config.json, so the processor load is refused
+            # offline and keyframe clips die on processor.image_processor.
+            # The processor snapshot is already on disk and loads by itself.
+            if getattr(self._pipe, "processor", None) is None or getattr(self._pipe.processor, "image_processor", None) is None:
+                from transformers import Qwen3VLProcessor
+                hub = Path.home() / ".cache/huggingface/hub/models--MiniMaxAI--MiniMax-H3"
+                revision = (hub / "refs/main").read_text().strip()
+                processor = Qwen3VLProcessor.from_pretrained(
+                    hub / "snapshots" / revision / "processor",
+                    local_files_only=True,
+                )
+                self._pipe.update_components(processor=processor)
             # Freezing removes the one autograd path quantized tensors cannot
             # serve. Keep both large components resident on device: NVFP4 is
             # small enough that group-offload's pin/stream path is unnecessary

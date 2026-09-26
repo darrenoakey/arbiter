@@ -17,7 +17,6 @@ _ADAPTER_MODULES = (
     "wan_s2v",
     "sonic",
     "ltx2",
-    "minimax_h3",
     "minimax_h3_local",
     "minimax_fast_h3",
     "ltx2_encode",

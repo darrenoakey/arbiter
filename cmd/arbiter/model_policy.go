@@ -87,7 +87,6 @@ var trustedPythonAdapters = map[string]string{
 	"minimax-h3-local":        "minimax-h3",
 	"minimax-fast-h3":         "minimax-h3",
 	"moondream":               "moondream",
-	"minimax-h3":              "",
 	"rvc-convert":             "rvc",
 	"rvc-train":               "rvc",
 	"voice-fit":               "voxsmith",
@@ -218,6 +217,9 @@ func disabledStillImageConfig(modelID string, cfg ModelConfig) bool {
 }
 
 func validateModelWorkerPolicy(projectRoot, modelID string, cfg ModelConfig, requiresLocal bool) error {
+	if modelID == "minimax-h3" {
+		return fmt.Errorf("cloud MiniMax-H3 is removed; use minimax-h3-local")
+	}
 	if disabledStillImageConfig(modelID, cfg) {
 		return fmt.Errorf("%s", stillImageDisabledMessage)
 	}
@@ -344,7 +346,7 @@ func validateJobModelCompatibility(jobType, modelID string) error {
 		compatible = modelID == "sonic" || modelID == "echomimic" || modelID == "wan-s2v"
 	case "video-generate":
 		normalized := normalizedPolicyText(modelID)
-		compatible = modelID == "minimax-h3" || strings.HasPrefix(normalized, "ltx2") &&
+		compatible = strings.HasPrefix(normalized, "ltx2") &&
 			!strings.Contains(normalized, "denoise") && !strings.Contains(normalized, "encode")
 	case "video-encode":
 		normalized := normalizedPolicyText(modelID)

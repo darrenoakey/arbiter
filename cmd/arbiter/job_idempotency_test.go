@@ -21,7 +21,7 @@ func openIdempotencyTestAPI(t *testing.T, root, databasePath string) (*API, func
 	}
 	logger := NewEventLogger(filepath.Join(outputDir, "logs"))
 	cfg := &Config{VRAMBudgetGB: 100, Models: map[string]ModelConfig{
-		"minimax-h3": {}, "ltx2": {},
+		"ltx2": {},
 	}}
 	mgr := NewInstanceManager(cfg, "python3", root)
 	scheduler := NewScheduler(cfg, store, mgr, logger, outputDir)
@@ -36,7 +36,7 @@ func TestJobIdempotencyIsConcurrentConflictSafeAndDurable(t *testing.T) {
 	secondAPI, closeSecond := openIdempotencyTestAPI(t, root, databasePath)
 	apis := []*API{firstAPI, secondAPI}
 	key := "h3-concurrent-" + genID()
-	body := fmt.Sprintf(`{"type":"video-generate","model":"minimax-h3","idempotency_key":%q,"params":{"resolution":"768P","duration":4,"prompt":"shot"}}`, key)
+	body := fmt.Sprintf(`{"type":"video-generate","model":"ltx2","idempotency_key":%q,"params":{"resolution":"768P","duration":4,"prompt":"shot"}}`, key)
 
 	const requests = 24
 	ids := make(chan string, requests)
@@ -79,7 +79,7 @@ func TestJobIdempotencyIsConcurrentConflictSafeAndDurable(t *testing.T) {
 		t.Fatalf("persisted keyed job id=%q hash=%q error=%v", persistedJobID, persistedHash, err)
 	}
 
-	conflictBody := fmt.Sprintf(`{"type":"video-generate","model":"minimax-h3","idempotency_key":%q,"params":{"prompt":"different","duration":4,"resolution":"768P"}}`, key)
+	conflictBody := fmt.Sprintf(`{"type":"video-generate","model":"ltx2","idempotency_key":%q,"params":{"prompt":"different","duration":4,"resolution":"768P"}}`, key)
 	conflict := performRequest(secondAPI, "POST", "/v1/jobs", conflictBody)
 	if conflict.Code != 409 {
 		t.Fatalf("conflicting reuse status=%d body=%s", conflict.Code, conflict.Body.String())
@@ -101,11 +101,11 @@ func TestJobIdempotencyIsConcurrentConflictSafeAndDurable(t *testing.T) {
 func TestJobIdempotencyValidatesKeyAndNormalizesJSON(t *testing.T) {
 	api, cleanup := newTestAPI(t)
 	defer cleanup()
-	api.config.Models["minimax-h3"] = ModelConfig{}
+	api.config.Models["ltx2"] = ModelConfig{}
 	api.refreshAliasModels()
 	key := "normalized-" + genID()
-	first := fmt.Sprintf(`{"type":"video-generate","model":"minimax-h3","idempotency_key":%q,"params":{"prompt":"shot","duration":4,"resolution":"768P"}}`, key)
-	second := fmt.Sprintf(`{"params":{"resolution":"768P","duration":4,"prompt":"shot"},"idempotency_key":%q,"model":"minimax-h3","type":"video-generate"}`, key)
+	first := fmt.Sprintf(`{"type":"video-generate","model":"ltx2","idempotency_key":%q,"params":{"prompt":"shot","duration":4,"resolution":"768P"}}`, key)
+	second := fmt.Sprintf(`{"params":{"resolution":"768P","duration":4,"prompt":"shot"},"idempotency_key":%q,"model":"ltx2","type":"video-generate"}`, key)
 	firstResponse := performRequest(api, "POST", "/v1/jobs", first)
 	secondResponse := performRequest(api, "POST", "/v1/jobs", second)
 	if firstResponse.Code != 200 || secondResponse.Code != 200 {
@@ -116,7 +116,7 @@ func TestJobIdempotencyValidatesKeyAndNormalizesJSON(t *testing.T) {
 	}
 	for _, invalid := range []any{nil, "", "   ", string(make([]byte, maxIdempotencyKeyBytes+1))} {
 		encoded, _ := json.Marshal(invalid)
-		response := performRequest(api, "POST", "/v1/jobs", `{"type":"video-generate","model":"minimax-h3","idempotency_key":`+string(encoded)+`,"params":{}}`)
+		response := performRequest(api, "POST", "/v1/jobs", `{"type":"video-generate","model":"ltx2","idempotency_key":`+string(encoded)+`,"params":{}}`)
 		if response.Code != 400 {
 			t.Fatalf("invalid key status=%d body=%s", response.Code, response.Body.String())
 		}
