@@ -3,9 +3,10 @@
 Generates short video clips (5–15s) with MiniMax H3 through the diffusers
 modular pipeline, running natively on the GB10's unified 128 GB pool.
 
-This is a separate adapter from the MiniMax cloud client in minimax_h3.py.
-The cloud restore replaced this registration with model_id "minimax-h3", so
-workers started as "minimax-h3-local" failed with Unknown model.
+The MiniMax cloud client has been deleted and must not be restored.
+A previous restore replaced this registration with model_id "minimax-h3", so
+workers started as "minimax-h3-local" failed with Unknown model. Cloud video
+renderers must not be attempted.
 
 Why not the Unsloth FP8 checkpoint: that export is a Comfy-Org *pruned*
 transformer whose AdaLN modulation is a precomputed curve table

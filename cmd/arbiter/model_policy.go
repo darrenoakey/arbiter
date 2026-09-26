@@ -216,9 +216,26 @@ func disabledStillImageConfig(modelID string, cfg ModelConfig) bool {
 	return false
 }
 
-func validateModelWorkerPolicy(projectRoot, modelID string, cfg ModelConfig, requiresLocal bool) error {
+func cloudVideoRendererDenied(modelID string, cfg ModelConfig) error {
 	if modelID == "minimax-h3" {
-		return fmt.Errorf("cloud MiniMax-H3 is removed; use minimax-h3-local")
+		return fmt.Errorf("cloud MiniMax-H3 is removed; cloud video renderers must not be attempted; use minimax-h3-local")
+	}
+	needle := "minimax." + "io"
+	parts := []string{modelID, cfg.AutoDownload, cfg.ModelPath}
+	parts = append(parts, cfg.WorkerCmd...)
+	parts = append(parts, cfg.Placements...)
+	for key, value := range cfg.AdapterParams {
+		parts = append(parts, key, value)
+	}
+	if strings.Contains(strings.ToLower(strings.Join(parts, "\n")), needle) {
+		return fmt.Errorf("cloud video renderers must not be attempted")
+	}
+	return nil
+}
+
+func validateModelWorkerPolicy(projectRoot, modelID string, cfg ModelConfig, requiresLocal bool) error {
+	if err := cloudVideoRendererDenied(modelID, cfg); err != nil {
+		return err
 	}
 	if disabledStillImageConfig(modelID, cfg) {
 		return fmt.Errorf("%s", stillImageDisabledMessage)

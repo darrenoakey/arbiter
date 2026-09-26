@@ -30,8 +30,92 @@ func TestStillImageModelClassification(t *testing.T) {
 
 func TestCloudMiniMaxH3CannotBeRegistered(t *testing.T) {
 	err := validateModelWorkerPolicy(t.TempDir(), "minimax-h3", ModelConfig{}, false)
-	if err == nil || !strings.Contains(err.Error(), "removed") {
+	if err == nil || !strings.Contains(err.Error(), "removed") || !strings.Contains(err.Error(), "must not be attempted") {
 		t.Fatalf("cloud registration error = %v", err)
+	}
+}
+
+func TestCloudVideoRendererConfigIsRejected(t *testing.T) {
+	host := "https://api." + "minimax." + "io/v1/video"
+	for _, cfg := range []ModelConfig{
+		{ModelPath: host},
+		{AutoDownload: host},
+		{WorkerCmd: []string{"python", host}},
+		{AdapterParams: map[string]string{"endpoint": host}},
+		{Placements: []string{host}},
+	} {
+		err := validateModelWorkerPolicy(t.TempDir(), "ltx2", cfg, false)
+		if err == nil || !strings.Contains(err.Error(), "must not be attempted") {
+			t.Fatalf("cloud video config accepted: %+v err=%v", cfg, err)
+		}
+	}
+	local := ModelConfig{WorkerCmd: []string{"/home/darren/src/arbiter/venvs/minimax-h3/bin/python", "-m", "arbiter.worker_main", "minimax-h3-local"}}
+	if err := cloudVideoRendererDenied("minimax-h3-local", local); err != nil {
+		t.Fatalf("local H3 venv path was treated as cloud access: %v", err)
+	}
+}
+
+func TestCloudMiniMaxClientIsAbsent(t *testing.T) {
+	root := moduleRoot(t)
+	for _, rel := range []string{
+		"src/arbiter/adapters/minimax_h3.py",
+		"src/arbiter/adapters/minimax_h3_test.py",
+		"config/spark/minimax-h3.model.json",
+		"cmd/arbiter/staged_paths.go",
+	} {
+		if _, err := os.Stat(filepath.Join(root, rel)); !os.IsNotExist(err) {
+			t.Fatalf("cloud MiniMax access path still present: %s (%v)", rel, err)
+		}
+	}
+	needles := []string{"minimax." + "io", "get(\"" + "minimax\""}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", ".venv", "venvs", "output", "local_output", "node_modules", "__pycache__":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		switch strings.ToLower(filepath.Ext(path)) {
+		case ".py", ".go", ".md", ".json", ".sh", ".toml", ".yml", ".yaml", ".txt":
+		default:
+			return nil
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		text := strings.ToLower(string(body))
+		for _, needle := range needles {
+			if strings.Contains(text, needle) {
+				t.Errorf("cloud video access %q remains in %s", needle, path)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("go.mod not found")
+		}
+		dir = parent
 	}
 }
 

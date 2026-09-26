@@ -50,16 +50,18 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   uninterruptible database/filesystem I/O. The Spark deploy must wait for the
   old listener to disappear after `auto stop`; auto's ten-second reclaim window
   is shorter than this observed kernel cleanup and an immediate start can fail.
-- MiniMax H3 means the local GPU adapter. The cloud client must not register
-  and must not have `config/spark/minimax-h3.model.json`. Do not restore
-  `model_id="minimax-h3"`; a cloud restore over a GPU module made workers
-  started as `minimax-h3-local` die with `Unknown model`. Keep
-  `minimax_h3_local.py` and `minimax_fast_h3.py` as separate registrations,
-  keep `config/spark/minimax-h3-local.model.json` and
+- Cloud video renderers must not be attempted. That includes MiniMax cloud
+  and any other hosted video API. MiniMax H3 in this repo means the local GPU
+  adapter only. The cloud client file is deleted and must not be restored, and
+  there must be no `config/spark/minimax-h3.model.json`. Do not restore
+  `model_id="minimax-h3"` or a worker config that calls the MiniMax cloud API;
+  a cloud restore over a GPU module made workers started as `minimax-h3-local`
+  die with `Unknown model`. Keep `minimax_h3_local.py` and `minimax_fast_h3.py`
+  as separate registrations, keep `config/spark/minimax-h3-local.model.json` and
   `minimax-fast-h3.model.json`, and merge local config without dropping a
   live `worker_cmd`. Deploy must drop any stale `minimax-h3` config key.
-  Registry tests must assert the cloud id is absent and local plus FastH3
-  stay registered. FastH3 is 4-step only (`video-generate-fast-h3` /
+  Registry tests must assert the cloud id is absent, the cloud client file is
+  absent, and local plus FastH3 stay registered. FastH3 is 4-step only (`video-generate-fast-h3` /
   `minimax-fast-h3`); it reuses the H3 NVFP4 text encoder and the
   `minimax-h3` venv. Preview weights are T2VA-only and require the native
   5-second, 1344x768 operating point. The adapter rejects first- and

@@ -570,10 +570,6 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if err := a.validateMiniMaxFramePaths(req.Type, modelID, req.Params, inboxDir); err != nil {
-		writeError(w, 400, err.Error())
-		return
-	}
 
 	// --- Reject jobs whose declared input files don't exist ---
 	// Bad paths must never reach the queue: a queued job with missing inputs

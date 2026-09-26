@@ -2157,9 +2157,8 @@ All values are from calibration on NVIDIA Grace Blackwell (128 GB VRAM, 100 GB b
 | `sonic`         | 5         | 11 s      | 45 s           | 1              | 600 s      | talking-head                         |
 | `vocal-stem`    | 8         | 3 s       | ~30 s          | 1              | 120 s      | vocal-stem                           |
 || `ltx2`          | 55        | 30 s      | 120 s          | 1              | 600 s      | video-generate                       |
-|| `minimax-h3`    | 0*        | 0 s       | ~2–8 m*        | 1              | 0 s        | video-generate (cloud API)           |
 
-\* `minimax-h3` runs remotely against the MiniMax API; no local VRAM is consumed and load/keep-alive are not applicable.
+Cloud video renderers are not available. Do not attempt MiniMax cloud or any other hosted video API. Local video is `ltx2` / `video-generate`, `minimax-h3-local` / `video-generate-h3`, and `minimax-fast-h3` / `video-generate-fast-h3`.
 
 ### SJF Scheduling
 
