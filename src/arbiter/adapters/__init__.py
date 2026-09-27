@@ -44,6 +44,7 @@ _ADAPTER_MODULES = (
     "yue2",
     "photo_enhance",
     "trellis2",
+    "routing_decide",
 )
 
 for _module_name in _ADAPTER_MODULES:

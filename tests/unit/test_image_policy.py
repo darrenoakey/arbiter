@@ -196,6 +196,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "qwen-image-2.1",
         "qwen-image-2.1-heretic",
         "reference-image-edit",
+        "routing-decide",
         "rvc-convert",
         "rvc-train",
         "sadtalker",

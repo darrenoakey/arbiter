@@ -71,6 +71,7 @@ class JobType(str, Enum):
     MUSIC_GENERATE_YUE2 = "music-generate-yue2"
     PHOTO_ENHANCE = "photo-enhance"
     IMAGE_TO_3D = "image-to-3d"
+    ROUTING_DECIDE_TRAIN = "routing-decide-train"
 
 
 # Maps job type to model_id
@@ -111,6 +112,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "music-generate-yue2": "yue2",
     "photo-enhance": "photo-enhance",
     "image-to-3d": "trellis2",
+    "routing-decide-train": "routing-decide",
 }
 
 
@@ -526,6 +528,18 @@ class PhotoEnhanceParams(BaseModel):
     why: Optional[str] = None
 
 
+class RoutingDecideTrainParams(BaseModel):
+    """Fine-tune GLiNER2.5-Decide on a staged train/test split."""
+
+    dataset_file: str
+    max_len: int = Field(default=256, ge=64, le=512)
+    num_epochs: int = Field(default=1, ge=1, le=2)
+    batch_size: int = Field(default=4, ge=1, le=16)
+    lora_r: int = Field(default=8, ge=1, le=32)
+    lora_alpha: int = Field(default=16, ge=1, le=64)
+    seed: int = Field(default=42, ge=0, le=4294967295)
+
+
 class TTSVoxtralParams(BaseModel):
     text: str
     voice: str = "alloy"
@@ -693,4 +707,5 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "music-generate-yue2": Yue2MusicParams,
     "photo-enhance": PhotoEnhanceParams,
     "image-to-3d": ImageTo3DParams,
+    "routing-decide-train": RoutingDecideTrainParams,
 }

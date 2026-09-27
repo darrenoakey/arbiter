@@ -398,6 +398,7 @@ var JobTypeToModel = map[string]string{
 	"qwen-image-heretic":      qwenImage21HereticModel,
 	"photo-enhance":           "photo-enhance",
 	"image-to-3d":             "trellis2",
+	"routing-decide-train":    "routing-decide",
 }
 
 func LoadConfig(projectRoot string) (*Config, error) {

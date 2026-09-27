@@ -88,6 +88,7 @@ var trustedPythonAdapters = map[string]string{
 	"minimax-fast-h3":         "minimax-h3",
 	"moondream":               "moondream",
 	"rvc-convert":             "rvc",
+	"routing-decide":          "routing-decide",
 	"rvc-train":               "rvc",
 	"voice-fit":               "voxsmith",
 	"music-generate":          "music-generate",

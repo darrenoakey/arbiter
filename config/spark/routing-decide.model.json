@@ -1,0 +1,19 @@
+{
+  "auto_download": "",
+  "avg_inference_ms": 3600000,
+  "group": false,
+  "keep_alive_seconds": 60,
+  "load_ms": 120000,
+  "max_concurrent": 1,
+  "max_instances": 1,
+  "max_runtime_seconds": 14400,
+  "memory_gb": 24,
+  "model_path": "/home/darren/models/gliner2.5-decide",
+  "pressure_index": 1.0,
+  "worker_cmd": [
+    "/home/darren/src/arbiter/venvs/routing-decide/bin/python",
+    "-m",
+    "arbiter.worker_main",
+    "routing-decide"
+  ]
+}
