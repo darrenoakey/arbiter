@@ -74,6 +74,10 @@ class TTSBreezeAdapter(ModelAdapter):
     # load
     # load tokenizer + model + audio tokenizer once; eager attention
     def load(self, device: str = "cuda") -> None:
+        # upstream breeze calls torch.cuda.set_device(device); current torch
+        # rejects a bare "cuda" there (needs an explicit index)
+        if device == "cuda":
+            device = "cuda:0"
         _ensure_breeze_importable()
         from breeze_infer.runtime import (  # type: ignore[import-not-found]
             load_runtime,
