@@ -203,6 +203,27 @@ fi
 drain_deadline=$(( $(date +%s) + DEPLOY_DRAIN_TIMEOUT ))
 echo "==> Drain requested (no new jobs) — in-flight work winds down while we build/test locally"
 
+# The cross-compile is purely local and independent of the remote smoke test,
+# pip install and LTX runtime staging below, so it overlaps them (and the three
+# binaries build concurrently) instead of running after them. Its output is
+# captured and replayed; a build failure still aborts before prod is touched.
+CROSS_LOG="$(mktemp -t arbiter-cross-compile)"
+(
+    set -e
+    GOOS=linux GOARCH=arm64 go build -o arbiter-linux-arm64 ./cmd/arbiter/ &
+    a=$!
+    GOOS=linux GOARCH=arm64 go build -o llm-worker-linux-arm64 ./cmd/llm-worker/ &
+    l=$!
+    GOOS=linux GOARCH=arm64 go build -o vllm-chat-worker-linux-arm64 ./cmd/vllm-chat-worker/ &
+    v=$!
+    rc=0
+    wait "$a" || rc=$?
+    wait "$l" || rc=$?
+    wait "$v" || rc=$?
+    exit "$rc"
+) >"$CROSS_LOG" 2>&1 &
+CROSS_PID=$!
+
 echo "==> Smoke-testing Python adapter package on spark..."
 # This is the exact import sequence that worker_main.py does on startup.
 # If this fails, the deploy is aborted BEFORE we touch the running arbiter —
@@ -236,9 +257,14 @@ mv '$remote_candidate' '$REMOTE/local/ltx25-runtimes/$LTX25_RELEASE'"
 fi
 
 echo "==> Cross-compiling binaries..."
-GOOS=linux GOARCH=arm64 go build -o arbiter-linux-arm64 ./cmd/arbiter/
-GOOS=linux GOARCH=arm64 go build -o llm-worker-linux-arm64 ./cmd/llm-worker/
-GOOS=linux GOARCH=arm64 go build -o vllm-chat-worker-linux-arm64 ./cmd/vllm-chat-worker/
+cross_rc=0
+wait "$CROSS_PID" || cross_rc=$?
+cat "$CROSS_LOG"
+rm -f "$CROSS_LOG"
+if [ "$cross_rc" -ne 0 ]; then
+    echo "ERROR: cross-compile failed (rc=$cross_rc); deploy aborted before touching Arbiter" >&2
+    exit "$cross_rc"
+fi
 echo "    $(md5 -q arbiter-linux-arm64 2>/dev/null || md5sum arbiter-linux-arm64 | awk '{print $1}') arbiter"
 echo "    $(md5 -q llm-worker-linux-arm64 2>/dev/null || md5sum llm-worker-linux-arm64 | awk '{print $1}') llm-worker"
 echo "    $(md5 -q vllm-chat-worker-linux-arm64 2>/dev/null || md5sum vllm-chat-worker-linux-arm64 | awk '{print $1}') vllm-chat-worker"
@@ -272,8 +298,13 @@ while :; do
         echo "ERROR: still ${active} active job(s) after ${DEPLOY_DRAIN_TIMEOUT}s; deploy aborted without stopping Arbiter" >&2
         exit 1
     fi
-    echo "    ${active} job(s) still active; waiting..."
-    sleep 10
+    if [ "$active" != "${last_reported_active:-}" ]; then
+        echo "    ${active} job(s) still active; waiting..."
+        last_reported_active=$active
+    fi
+    # Two cheap local-network HTTP calls per poll; a 10s poll wasted up to
+    # 10s of release time after the last job finished.
+    sleep 2
     if ! drain_request; then
         echo "ERROR: failed to renew the deploy-owned drain; deploy aborted" >&2
         exit 1
