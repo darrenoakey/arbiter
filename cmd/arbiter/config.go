@@ -399,6 +399,7 @@ var JobTypeToModel = map[string]string{
 	"photo-enhance":           "photo-enhance",
 	"image-to-3d":             "trellis2",
 	"routing-decide-train":    "routing-decide",
+	"nimble-score":            "nimble-scorer",
 }
 
 func LoadConfig(projectRoot string) (*Config, error) {

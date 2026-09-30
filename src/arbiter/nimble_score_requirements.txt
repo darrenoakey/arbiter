@@ -1,0 +1,5 @@
+transformers==5.17.0
+peft==0.21.0
+accelerate==1.15.0
+huggingface-hub==1.33.0
+sentencepiece==0.2.2

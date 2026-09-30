@@ -1,0 +1,18 @@
+{
+  "avg_inference_ms": 1000,
+  "group": false,
+  "keep_alive_seconds": 900,
+  "load_ms": 300000,
+  "max_concurrent": 1,
+  "max_instances": 1,
+  "max_runtime_seconds": 14400,
+  "memory_gb": 24,
+  "model_path": "/mnt/t9/models/nimble-scorer-bd792/merged",
+  "pressure_index": 1.0,
+  "worker_cmd": [
+    "/home/darren/src/arbiter/venvs/nimble-scorer/bin/python",
+    "-m",
+    "arbiter.worker_main",
+    "nimble-scorer"
+  ]
+}

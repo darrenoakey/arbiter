@@ -72,6 +72,7 @@ class JobType(str, Enum):
     PHOTO_ENHANCE = "photo-enhance"
     IMAGE_TO_3D = "image-to-3d"
     ROUTING_DECIDE_TRAIN = "routing-decide-train"
+    NIMBLE_SCORE = "nimble-score"
 
 
 # Maps job type to model_id
@@ -113,6 +114,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "photo-enhance": "photo-enhance",
     "image-to-3d": "trellis2",
     "routing-decide-train": "routing-decide",
+    "nimble-score": "nimble-scorer",
 }
 
 
@@ -528,6 +530,11 @@ class PhotoEnhanceParams(BaseModel):
     why: Optional[str] = None
 
 
+class NimbleScoreParams(BaseModel):
+    suite: Literal["decision-v4", "transfer-v4"]
+    dataset_file: str = Field(..., min_length=1)
+
+
 class RoutingDecideTrainParams(BaseModel):
     """Fine-tune GLiNER2.5-Decide on a staged train/test split."""
 
@@ -708,4 +715,5 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "photo-enhance": PhotoEnhanceParams,
     "image-to-3d": ImageTo3DParams,
     "routing-decide-train": RoutingDecideTrainParams,
+    "nimble-score": NimbleScoreParams,
 }

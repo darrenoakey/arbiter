@@ -192,6 +192,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "minimax-h3-local",
         "moondream",
         "music-generate",
+        "nimble-scorer",
         "photo-enhance",
         "qwen-image-2.1",
         "qwen-image-2.1-heretic",

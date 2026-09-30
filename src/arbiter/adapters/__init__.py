@@ -45,6 +45,7 @@ _ADAPTER_MODULES = (
     "photo_enhance",
     "trellis2",
     "routing_decide",
+    "nimble_score",
 )
 
 for _module_name in _ADAPTER_MODULES:
