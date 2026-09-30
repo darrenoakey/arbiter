@@ -19,7 +19,8 @@ from arbiter.adapters.nimble_score import (
 from arbiter.schemas import JOB_TYPE_PARAMS, JOB_TYPE_TO_MODEL, NimbleScoreParams
 
 
-_FIXTURE = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "nimble_score" / "decision-v4-development.json"
+_FIXTURE_ROOT = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "nimble_score"
+_FIXTURE = _FIXTURE_ROOT / "decision-v4-development.json"
 
 
 def test_nimble_score_job_and_checkpoint_pins_are_exact():
@@ -42,6 +43,26 @@ def test_development_fixture_builds_seventy_seven_candidate_prompt_without_label
     assert len(keys) == 77
     assert keys[target] == question["label"]
     assert "label" not in schema["intent"]
+
+
+def test_development_boolean_schema_accepts_real_noul_without_criteria():
+    record = json.loads((_FIXTURE_ROOT / "noul-null.json").read_text())
+    name, question = next(iter(record["questions"].items()))
+    _, schema = _schema_for(record)
+    keys, target = _target(question)
+    assert schema[name]["type"] == "boolean"
+    assert schema[name]["choices"] == [False, True]
+    assert "choice_descriptions" not in schema[name]
+    assert keys == ["false", "true"]
+    assert keys[target] == "true"
+
+
+def test_development_boolean_schema_normalizes_real_noul_descriptions():
+    record = json.loads((_FIXTURE_ROOT / "noul-described.json").read_text())
+    name, question = next(iter(record["questions"].items()))
+    _, schema = _schema_for(record)
+    expected = {str(key).lower(): value for key, value in question["criteria"].items()}
+    assert schema[name]["choice_descriptions"] == expected
 
 
 def test_development_schema_accepts_valid_candidate_probabilities():

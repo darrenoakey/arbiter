@@ -57,11 +57,18 @@ def _schema_for(record: dict) -> tuple[str, dict]:
                 str(key): _serialize(value) if value is not None else str(key)
                 for key, value in criteria.items()
             })
-        elif kind == "noul" and isinstance(criteria, dict):
-            field.update(type="boolean", choices=[False, True], choice_descriptions={
-                str(key): _serialize(value) if value is not None else str(key)
-                for key, value in criteria.items()
-            })
+        elif kind == "noul":
+            field.update(type="boolean", choices=[False, True])
+            if criteria is not None:
+                if not isinstance(criteria, dict):
+                    raise InferenceError(f"Nimble boolean criteria must be an object or null: {name}")
+                descriptions = {str(key).lower(): value for key, value in criteria.items()}
+                if set(descriptions) != {"false", "true"}:
+                    raise InferenceError(f"Nimble boolean criteria must define false and true: {name}")
+                field["choice_descriptions"] = {
+                    key: _serialize(value) if value is not None else key
+                    for key, value in descriptions.items()
+                }
         elif kind == "score" and isinstance(criteria, list):
             field.update(type="enum", choices=[str(index) for index in range(len(criteria))],
                          choice_descriptions={str(index): _serialize(value)
@@ -74,15 +81,19 @@ def _schema_for(record: dict) -> tuple[str, dict]:
 
 def _target(question: dict) -> tuple[list[str], int]:
     kind = question["type"]
-    criteria = question["criteria"]
+    criteria = question.get("criteria")
     target = question["label"]
     if kind == "choice":
+        if not isinstance(criteria, dict):
+            raise InferenceError("Nimble choice question is missing its criteria object")
         keys = list(criteria)
         return keys, keys.index(target)
     if kind == "noul":
         selected = int(target) if isinstance(target, (bool, int, float)) else int(str(target).lower() == "true")
         return ["false", "true"], selected
     if kind == "score":
+        if not isinstance(criteria, list):
+            raise InferenceError("Nimble score question is missing its criteria list")
         return [str(index) for index in range(len(criteria))], int(target)
     raise InferenceError(f"unsupported Nimble label type: {kind}")
 

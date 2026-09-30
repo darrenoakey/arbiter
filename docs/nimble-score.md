@@ -4,6 +4,8 @@ This adapter pins `bespokelabs/Bespoke-Nimble-9B` at `bd792f44ec8e265be861bfcdf4
 
 Only the frozen `decision-v4/development` and `transfer-v4/development` files are accepted. Their SHA-256 and record counts are pinned in `nimble_score.py`; modified input and locked partitions are rejected before inference. Labels are added to saved outputs only after scoring. Never send a locked-test file to this job.
 
+The frozen suites include `noul` boolean questions with no `criteria` field; these use Nimble's default `false`/`true` candidates. When descriptions are present, the adapter requires both boolean keys and maps them to the same canonical candidates.
+
 ## Worker environment
 
 The model is loaded only inside the registered Arbiter worker. Never run a Python/Torch model command directly on Spark. Before registering/releasing this worker, create its isolated environment on Spark from the existing Arbiter CUDA environment so it inherits the working CUDA-enabled Torch wheel:

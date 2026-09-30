@@ -346,21 +346,21 @@ func inferRemoteEmbeddings(t *testing.T, backend *RemoteHTTPBackend, inputs []st
 	return result.Embeddings
 }
 
-// requireReachableOllama requires the owned Mnemos forward and the live model.
-func requireReachableOllama(t *testing.T) {
+// requireReachableOllamaAt verifies a real Ollama endpoint and the requested model.
+func requireReachableOllamaAt(t *testing.T, addr, model, name string) {
 	t.Helper()
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(localOllamaAddr + "/api/tags")
+	resp, err := client.Get(addr + "/api/tags")
 	if err != nil {
-		t.Fatalf("owned Mnemos forward is not reachable: %v", err)
+		t.Fatalf("%s Ollama endpoint is not reachable: %v", name, err)
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			t.Logf("close local ollama response: %v", err)
+			t.Logf("close %s Ollama response: %v", name, err)
 		}
 	}()
 	if resp.StatusCode != 200 {
-		t.Fatalf("owned Mnemos forward /api/tags returned %d", resp.StatusCode)
+		t.Fatalf("%s Ollama /api/tags returned %d", name, resp.StatusCode)
 	}
 	var tags struct {
 		Models []struct {
@@ -368,14 +368,18 @@ func requireReachableOllama(t *testing.T) {
 		} `json:"models"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
-		t.Fatalf("decode Mnemos tags: %v", err)
+		t.Fatalf("decode %s Ollama tags: %v", name, err)
 	}
 	for _, m := range tags.Models {
-		if m.Name == localOllamaTag {
+		if m.Name == model {
 			return
 		}
 	}
-	t.Fatalf("Mnemos is reachable but required model %s is absent", localOllamaTag)
+	t.Fatalf("%s Ollama is reachable but required model %s is absent", name, model)
+}
+
+func requireReachableOllama(t *testing.T) {
+	requireReachableOllamaAt(t, localOllamaAddr, localOllamaTag, "Mnemos")
 }
 
 // deadOllamaAddr returns an addr that will refuse/never-route — a TCP listener
@@ -451,17 +455,19 @@ func pi() *float64 { p := 1.0; return &p }
 
 // (a) A chat job routed to a REMOTE instance returns a real completion.
 func TestRemoteDispatchReturnsRealCompletion(t *testing.T) {
-	requireReachableOllama(t)
+	// Use the Mac mini endpoint so this real model test does not make the laptop's
+	// memory-pressure guard kill its local llama-server subprocess mid-request.
+	requireReachableOllamaAt(t, macminiOllamaAddr, localOllamaTag, "Mac mini")
 	cfg := &Config{
 		VRAMBudgetGB: 100,
 		Hosts: map[string]HostConfig{
-			"mac": {Addr: localOllamaAddr, Kind: "mlx", BudgetGB: 64},
+			"macmini": {Addr: macminiOllamaAddr, Kind: "mlx", BudgetGB: 64},
 		},
 		Models: map[string]ModelConfig{
 			"chat": {
 				MemoryGB: 1, MaxConcurrent: 1, MaxInstances: intPtr(1),
 				PressureIndex: pi(),
-				Placements:    []string{"mac"},
+				Placements:    []string{"macmini"},
 				AdapterParams: map[string]string{"remote_model_tag": localOllamaTag},
 			},
 		},
@@ -506,13 +512,13 @@ func TestRemoteDispatchReturnsRealCompletion(t *testing.T) {
 // (b) CONFIRMED host-absence on the preferred host → the job transparently fails
 // over to a reachable endpoint, NEVER fails, exactly one result.
 func TestRemoteFailoverOnAbsenceCompletesElsewhere(t *testing.T) {
-	requireReachableOllama(t)
+	requireReachableOllamaAt(t, macminiOllamaAddr, localOllamaTag, "Mac mini")
 	dead := deadOllamaAddr(t)
 	cfg := &Config{
 		VRAMBudgetGB: 100,
 		Hosts: map[string]HostConfig{
 			"dead": {Addr: dead, Kind: "mlx", BudgetGB: 64},
-			"live": {Addr: localOllamaAddr, Kind: "mlx", BudgetGB: 64},
+			"live": {Addr: macminiOllamaAddr, Kind: "mlx", BudgetGB: 64},
 		},
 		Models: map[string]ModelConfig{
 			"chat": {

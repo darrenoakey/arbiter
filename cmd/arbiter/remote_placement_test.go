@@ -246,6 +246,16 @@ func TestUnplaceableJobDoesNotBlockSiblings(t *testing.T) {
 	if !sched.isInFlight(jobB.ID) {
 		t.Fatalf("job B was not dispatched; the scan must step past unplaceable A to dispatch B")
 	}
+	// The dispatch runs asynchronously and the configured remote endpoints are
+	// intentionally unreachable. Let that real failed request release its slot
+	// before closing the store/tempdir in cleanup.
+	deadline := time.Now().Add(10 * time.Second)
+	for sched.isInFlight(jobB.ID) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sched.isInFlight(jobB.ID) {
+		t.Fatal("job B's asynchronous dispatch did not finish before test cleanup")
+	}
 }
 
 // T7 — admission-side pressure exemption: a model with reachable remote capacity

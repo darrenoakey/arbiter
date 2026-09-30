@@ -1,0 +1,11 @@
+{
+  "state": "The group winners, Serbia, qualified directly for the 2018 FIFA World Cup. The group runners-up, Republic of Ireland, advanced to the play-offs as one of the best 8 runners-up, where they lost to Denmark and thus failed to qualify.",
+  "questions": {
+    "answer": {
+      "type": "noul",
+      "instructions": "has ireland qualified for the world cup 2018?",
+      "label": true,
+      "src": "boolq"
+    }
+  }
+}
