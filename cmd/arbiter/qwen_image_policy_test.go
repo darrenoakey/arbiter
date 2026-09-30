@@ -176,6 +176,68 @@ func TestQwenImage21HereticExceptionIsNarrow(t *testing.T) {
 	}
 }
 
+func qwenImage21SglangConfig(root string) ModelConfig {
+	return ModelConfig{
+		MemoryGB:      52,
+		MaxConcurrent: 1,
+		MaxInstances:  intPtr(1),
+		AutoDownload:  "Qwen/Qwen-Image-2.1",
+		WorkerCmd: []string{
+			filepath.Join(root, "venvs", "qwenimage-sglang", "bin", "python"),
+			"-m", "arbiter.worker_main", qwenImage21SglangModel,
+		},
+	}
+}
+
+func TestQwenImage21SglangIsAllowedByPolicy(t *testing.T) {
+	if isDisabledStillImageModel(qwenImage21SglangModel) {
+		t.Fatal("qwen-image-2.1-sglang must not be classified as a disabled still-image model")
+	}
+	root := t.TempDir()
+	cfg := qwenImage21SglangConfig(root)
+	if disabledStillImageConfig(qwenImage21SglangModel, cfg) {
+		t.Fatal("qwen-image-2.1-sglang config naming its Qwen checkpoint and venv was refused")
+	}
+	if err := validatePythonWorkerCommand(root, qwenImage21SglangModel, cfg.WorkerCmd); err != nil {
+		t.Fatalf("qwen-image-2.1-sglang worker command rejected: %v", err)
+	}
+	if err := rejectDisabledStillImage(qwenImageSglangJobType, qwenImage21SglangModel); err != nil {
+		t.Fatalf("qwen-image-sglang job type rejected: %v", err)
+	}
+	if err := validateJobModelCompatibility(qwenImageSglangJobType, qwenImage21SglangModel); err != nil {
+		t.Fatalf("qwen-image-sglang routing rejected: %v", err)
+	}
+	if got := JobTypeToModel[qwenImageSglangJobType]; got != qwenImage21SglangModel {
+		t.Fatalf("JobTypeToModel[qwen-image-sglang] = %q, want %q", got, qwenImage21SglangModel)
+	}
+	if venv, ok := trustedPythonAdapters[qwenImage21SglangModel]; !ok || venv != "qwenimage-sglang" {
+		t.Fatalf("trustedPythonAdapters[qwen-image-2.1-sglang] = %q ok=%v, want qwenimage-sglang", venv, ok)
+	}
+}
+
+func TestQwenImage21SglangExceptionIsNarrow(t *testing.T) {
+	root := t.TempDir()
+	for _, modelID := range []string{"qwen-image-2.1-sglang-lora", "qwen-image-sglang"} {
+		if !isDisabledStillImageModel(modelID) {
+			t.Fatalf("%q was not classified as a disabled still-image model", modelID)
+		}
+	}
+	for _, jobType := range []string{"qwen-image", "qwen-image-heretic", "image-generate", "reference-image-edit"} {
+		if err := rejectDisabledStillImage(jobType, qwenImage21SglangModel); err == nil {
+			t.Fatalf("job type %q accepted the sglang adapter as an override", jobType)
+		}
+	}
+	if err := rejectDisabledStillImage(qwenImageSglangJobType, qwenImage21Model); err == nil {
+		t.Fatal("qwen-image-sglang accepted the diffusers adapter as an override")
+	}
+	mismatched := qwenImage21SglangConfig(root)
+	mismatched.WorkerCmd[3] = "flux2"
+	if err := validatePythonWorkerCommand(root, qwenImage21SglangModel, mismatched.WorkerCmd); err == nil ||
+		!strings.Contains(err.Error(), untrustedWorkerCommandMessage) {
+		t.Fatalf("qwen-image-2.1-sglang accepted a worker command selecting flux2: %v", err)
+	}
+}
+
 func TestQwenImage21HereticModelRegistrationRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	cfg := qwenImage21HereticConfig(root)

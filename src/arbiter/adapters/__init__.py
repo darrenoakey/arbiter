@@ -31,6 +31,7 @@ _ADAPTER_MODULES = (
     "aesthetic_scorer",
     "reference_image_edit",
     "qwen_image_21",
+    "qwen_image_21_sglang",
     "fine_tune",
     "lora_train",
     "composite",

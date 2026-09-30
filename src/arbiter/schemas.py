@@ -58,6 +58,7 @@ class JobType(str, Enum):
     REFERENCE_IMAGE_EDIT = "reference-image-edit"
     QWEN_IMAGE = "qwen-image"
     QWEN_IMAGE_HERETIC = "qwen-image-heretic"
+    QWEN_IMAGE_SGLANG = "qwen-image-sglang"
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
     FINE_TUNE = "fine-tune"
@@ -100,6 +101,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "reference-image-edit": "reference-image-edit",
     "qwen-image": "qwen-image-2.1",
     "qwen-image-heretic": "qwen-image-2.1-heretic",
+    "qwen-image-sglang": "qwen-image-2.1-sglang",
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
     "fine-tune": "fine-tune",
@@ -699,6 +701,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "reference-image-edit": ReferenceImageEditParams,
     "qwen-image": QwenImageParams,
     "qwen-image-heretic": QwenImageParams,
+    "qwen-image-sglang": QwenImageParams,
     "tts-voxtral": TTSVoxtralParams,
     "video-generate-h3": VideoGenerateH3Params,
     "video-generate-fast-h3": VideoGenerateH3Params,

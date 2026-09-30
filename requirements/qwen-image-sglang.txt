@@ -1,0 +1,31 @@
+# venvs/qwenimage-sglang — Qwen-Image-2.1 via SGLang-Diffusion
+# (job type `qwen-image-sglang`, model id `qwen-image-2.1-sglang`)
+#
+# The git install clones and builds native extras. Always run it detached
+# (nohup) and sleep the agent turn; do not hold a conversation open on pip.
+#
+# Recreate ON SPARK (venvs/ is spark-only, never deployed; the directory must
+# be real, never a symlink):
+#
+#   cd ~/src/arbiter
+#   python3.12 -m venv --copies venvs/qwenimage-sglang
+#   venvs/qwenimage-sglang/bin/pip install --upgrade pip wheel
+#   venvs/qwenimage-sglang/bin/pip install torch --index-url https://download.pytorch.org/whl/cu130
+#   venvs/qwenimage-sglang/bin/pip install "sglang[diffusion] @ git+https://github.com/sgl-project/sglang.git@7bcfcf5aa#subdirectory=python"
+#   cp venvs/qwenimage/lib/python3.12/site-packages/arbiter.pth \
+#      venvs/qwenimage-sglang/lib/python3.12/site-packages/
+#
+# The SGLang local generator spawns a scheduler process. That child does not
+# inherit torch.cuda.set_per_process_memory_fraction, so site-packages must
+# contain a sitecustomize.py that applies the cap from ARBITER_MEMORY_GB
+# before any CUDA allocation. load() refuses to start without it.
+#
+# Do not `pip install sglang-kernel` without `--no-deps`. Its pin pulls
+# torch==2.13.0 and removes the cu130 2.14 wheel this GB10 needs.
+# Pinned, verified Spark install: SGLang git 7bcfcf5aa (2026-09-29) and
+# torch 2.14.0+cu130. The adapter imports the exact installed runtime entrypoint
+# ``sglang.multimodal_gen.runtime.entrypoints.diffusion_generator`` lazily.
+#
+# attention_backend=torch_sdpa, eager, BF16, no Cache-DiT, no quantization.
+# PyPI SGLang releases that predate Qwen-Image-2.1 are unsuitable; pin the
+# sanctioned git revision rather than tracking an unreviewed moving main.

@@ -41,6 +41,15 @@ def test_image_to_3d_job_type_registered():
     assert params.include_stl is False and params.texture_size == 2048
 
 
+def test_qwen_image_sglang_job_type_registered():
+    from arbiter.schemas import QwenImageParams
+
+    assert JOB_TYPE_TO_MODEL["qwen-image-sglang"] == "qwen-image-2.1-sglang"
+    assert "qwen-image-sglang" in JOB_TYPE_PARAMS
+    params = QwenImageParams(prompt="a panda")
+    assert params.steps == 40 and params.true_cfg_scale == 1.0
+
+
 def test_qwen_image_job_type_registered():
     from arbiter.schemas import QwenImageParams
 

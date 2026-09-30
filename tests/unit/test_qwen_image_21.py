@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -63,6 +64,50 @@ def test_estimate_time_scales_with_steps_and_edit_mode():
     edit = adapter.estimate_time({"prompt": "x", "steps": 40, "image_file": "/i.jpg"})
     assert edit > t2i > 0
     assert adapter.estimate_time({"prompt": "x", "steps": 20}) < t2i
+
+
+def test_sglang_adapter_identity_does_not_import_sglang():
+    from arbiter.adapters.qwen_image_21_sglang import (
+        QWEN_IMAGE_21_SGLANG_MODEL_ID,
+        QwenImage21SglangAdapter,
+    )
+
+    adapter = QwenImage21SglangAdapter()
+    assert adapter.model_id == "qwen-image-2.1-sglang"
+    assert QWEN_IMAGE_21_SGLANG_MODEL_ID == adapter.model_id
+    assert adapter.estimate_time({"prompt": "x", "steps": 40, "image_file": "/i.png"}) > adapter.estimate_time(
+        {"prompt": "x", "steps": 40}
+    )
+
+
+def test_sglang_load_uses_pinned_runtime_entrypoint(monkeypatch):
+    """The benchmark adapter must lazy-load SGLang only inside an Arbiter worker."""
+    import arbiter.adapters.qwen_image_21_sglang as sglang_adapter
+
+    calls: dict[str, object] = {}
+
+    class FakeGenerator:
+        @classmethod
+        def from_pretrained(cls, **kwargs):
+            calls.update(kwargs)
+            return cls()
+
+    def fake_import(name: str):
+        calls["module"] = name
+        return SimpleNamespace(DiffGenerator=FakeGenerator)
+
+    monkeypatch.delenv("ARBITER_MEMORY_GB", raising=False)
+    monkeypatch.setattr(sglang_adapter.importlib, "import_module", fake_import)
+    adapter = sglang_adapter.QwenImage21SglangAdapter()
+    adapter.load()
+
+    assert calls == {
+        "module": "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator",
+        "model_path": "Qwen/Qwen-Image-2.1",
+        "num_gpus": 1,
+        "performance_mode": "speed",
+        "attention_backend": "torch_sdpa",
+    }
 
 
 def test_heretic_adapter_identity():
