@@ -4,12 +4,10 @@
 contract_version = 1
 main_branch = "master"
 
-# Verdict command. cwd = the worktree being gated. Build + vet + full Go test
-# suite (serial — the remote integration tests share inference resources).
-# PRECONDITION: the macmini-ollama-tunnel auto service (localhost:11434 and
-# localhost:11435 -> macmini:11434, the mnemnos ollama with llama3.2:3b +
-# nomic-embed-text) must be up, or the TestRemote* integration
-# tests fail with connection refused.
+# Verdict command. cwd = the worktree being gated. ./run check selects legs
+# from the candidate diff and fails closed to the full suite on an unknown
+# path. The Go leg (build + vet + tests) still needs the macmini-ollama-tunnel
+# auto service (localhost:11434 and :11435) or TestRemote* fails.
 check = "./run check"
 
 # Deploy command. cwd = the canonical checkout. Drain-gated redeploy to spark;

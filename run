@@ -28,57 +28,91 @@ case "$CMD" in
         exec go build -o "$SCRIPT_DIR/arbiter-go" ./cmd/arbiter/
         ;;
     check)
-        # greenline gate: build + vet + full Go test suite (serial; the remote
-        # integration tests share inference resources). SSH forwards
-        # localhost:11434->boringstack and :11435->macmini must be up.
+        # Impact-selected gate. A Python-only diff does not run the Go suite:
+        # on 2026-10-01 that suite cold-downloaded modules three times in
+        # parallel and the check stage took 113s of a 188.8s release. Unknown
+        # paths fail closed to every leg. SSH forwards localhost:11434 and
+        # :11435 must be up when the Go leg runs (TestRemote* uses them).
         export PATH="$PATH:/usr/local/go/bin"
-        unformatted="$(gofmt -l .)"
-        if [ -n "$unformatted" ]; then
-            echo "Unformatted Go files:" >&2
-            echo "$unformatted" >&2
-            exit 1
+        if ! impact="$(python3 "$SCRIPT_DIR/scripts/check_impact.py")"; then
+            echo "check impact selection failed; running the full suite" >&2
+            impact=$'go\npython\ngpu-idle'
         fi
-        # Python and Go suites are independent (different toolchains,
-        # port-0-bound servers, namespaced fixtures), and both are mostly
-        # wall-clock under a contended gate machine. Run them overlapped so
-        # the release pays max(pytest, go) instead of pytest + go (measured
-        # 2026-09-23: ~70s + ~60s serial vs ~60s overlapped).
-        python3 -m unittest scripts/test_gpu_idle_hook.py &
-        py_unittest_pid=$!
-        # Python adapter unit tests. PYTHONPATH=src is mandatory: `arbiter` is
-        # installed in develop mode pointing at the CANONICAL checkout, so
-        # without it a worktree gate would silently test the canonical sources
-        # instead of the candidate. tests/integration is excluded on purpose —
-        # it drives the live spark fleet, which the gate must not depend on.
-        # -n 4: the unit tests are process-independent (tmp_path fixtures);
-        # measured 2026-09-29 under gate load ~530: 36s serial -> 25s.
-        PYTHONPATH="$SCRIPT_DIR/src" python3 -m pytest tests/unit src/arbiter/schemas_test.py src/arbiter/adapters/nimble_score_test.py -q -n 4 &
-        py_pytest_pid=$!
+        if [ -z "$impact" ]; then
+            echo "check impact: none (diff cannot affect tested behavior)"
+            exit 0
+        fi
+        echo "check impact: $(printf '%s' "$impact" | tr '\n' ' ')"
+
+        has_leg() {
+            printf '%s\n' "$impact" | grep -qx "$1"
+        }
+
         py_status=0
         go_status=0
-        # build, vet and test are independent verdicts over the same package
-        # (shared build cache). Overlap them so the Go leg pays max() rather
-        # than build + vet + test (measured 2026-09-29: 11.6s + 2.8s + 35.6s
-        # serial under load). -o /dev/null: validate the link without leaving
-        # a stray binary in the gated worktree.
-        go build -o /dev/null ./cmd/arbiter/ &
-        go_build_pid=$!
-        go vet ./cmd/arbiter/ &
-        go_vet_pid=$!
-        if [ -n "${ARBITER_GO_TEST_SKIP:-}" ]; then
-            go test ./cmd/arbiter/ -count=1 -p 1 -skip "$ARBITER_GO_TEST_SKIP" || go_status=$?
-        else
-            go test ./cmd/arbiter/ -count=1 -p 1 || go_status=$?
+        bg_pids=()
+        cleanup_bg() {
+            local pid
+            for pid in ${bg_pids[@]+"${bg_pids[@]}"}; do
+                kill "$pid" 2>/dev/null || true
+            done
+        }
+        trap cleanup_bg EXIT
+
+        if has_leg gpu-idle; then
+            python3 -m unittest scripts/test_gpu_idle_hook.py &
+            bg_pids+=($!)
+            py_unittest_pid=$!
         fi
-        wait "$go_build_pid" || go_status=$?
-        wait "$go_vet_pid" || go_status=$?
-        wait "$py_unittest_pid" || py_status=$?
-        wait "$py_pytest_pid" || py_status=$?
+        # PYTHONPATH=src is mandatory: `arbiter` is installed in develop mode
+        # pointing at the CANONICAL checkout, so without it a worktree gate
+        # would silently test the canonical sources. tests/integration is
+        # excluded on purpose — it drives the live spark fleet.
+        if has_leg python; then
+            PYTHONPATH="$SCRIPT_DIR/src" python3 -m pytest tests/unit src/arbiter/schemas_test.py src/arbiter/adapters/nimble_score_test.py -q -n 4 &
+            bg_pids+=($!)
+            py_pytest_pid=$!
+        fi
+        if has_leg go; then
+            unformatted="$(gofmt -l .)"
+            if [ -n "$unformatted" ]; then
+                echo "Unformatted Go files:" >&2
+                echo "$unformatted" >&2
+                exit 1
+            fi
+            # One download, then parallel build/vet/test. Three cold `go`
+            # processes each printed `go: downloading` and held the module
+            # lock (measured 2026-10-01: check 113s; warm parallel leg 18s).
+            go mod download
+            go build -o /dev/null ./cmd/arbiter/ &
+            bg_pids+=($!)
+            go_build_pid=$!
+            go vet ./cmd/arbiter/ &
+            bg_pids+=($!)
+            go_vet_pid=$!
+            if [ -n "${ARBITER_GO_TEST_SKIP:-}" ]; then
+                go test ./cmd/arbiter/ -count=1 -p 1 -skip "$ARBITER_GO_TEST_SKIP" || go_status=$?
+            else
+                go test ./cmd/arbiter/ -count=1 -p 1 || go_status=$?
+            fi
+            wait "$go_build_pid" || go_status=$?
+            wait "$go_vet_pid" || go_status=$?
+        fi
+        if [ -n "${py_unittest_pid:-}" ]; then
+            wait "$py_unittest_pid" || py_status=$?
+        fi
+        if [ -n "${py_pytest_pid:-}" ]; then
+            wait "$py_pytest_pid" || py_status=$?
+        fi
+        trap - EXIT
         if [ "$py_status" -ne 0 ]; then
             echo "Python test suite failed (see output above)" >&2
             exit "$py_status"
         fi
         exit "$go_status"
+        ;;
+    check-impact)
+        exec python3 "$SCRIPT_DIR/scripts/check_impact.py" "$@"
         ;;
     deploy)
         # greenline deploy: drain-gated redeploy to spark. NEVER DEPLOY_FORCE=1.
@@ -128,7 +162,8 @@ Usage: ./run <command> [args...]
 Commands:
   server              Start the Arbiter API server
   build               Build the Arbiter Go server
-  check               Run the full Go quality gate
+  check               Run impact-selected tests (full suite if the diff is unknown)
+  check-impact        Print the check legs the current diff selects
   deploy              Drain-gated deploy to spark
   test                Run fast tests (unit + integration, no calibration)
   test-all            Run all tests except calibration
