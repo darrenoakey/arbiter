@@ -15,7 +15,6 @@ from pathlib import Path
 
 from arbiter.adapters.base import InferenceError, LoadError, ModelAdapter
 from arbiter.adapters.registry import register
-from arbiter.config import load_config
 
 log = logging.getLogger(__name__)
 
@@ -218,6 +217,11 @@ class NimbleScoreAdapter(ModelAdapter):
     def load(self, device: str = "cuda") -> None:
         if device != "cuda":
             raise LoadError("Nimble scoring requires the Arbiter CUDA worker")
+        # imported here, not at module level: every worker imports every
+        # adapter module, and per-model venvs (birefnet, moondream, ...) have
+        # no pydantic, so a module-level config import kills their load
+        from arbiter.config import load_config
+
         model = load_config().models.get(self.model_id)
         if model is None or not model.model_path:
             raise LoadError("nimble-scorer requires model_path in Arbiter local config")
