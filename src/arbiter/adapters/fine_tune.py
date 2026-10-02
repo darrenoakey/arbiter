@@ -72,6 +72,10 @@ class FineTuneAdapter(ModelAdapter):
 
         self._check_cancel(cancel_flag)
 
+        merge_from = params.get("merge_from")
+        if merge_from:
+            return self._merge_only(params, Path(merge_from), output_dir, cancel_flag)
+
         data_dir = Path(params["data_dir"])
         model_name = params["model_name"]
         run_name = params.get("run_name", f"ft-{int(time.time())}")
@@ -349,6 +353,54 @@ class FineTuneAdapter(ModelAdapter):
         if merged_path:
             result["merged_model_path"] = merged_path
         return result
+
+    def _merge_only(self, params: dict, adapter_dir: Path, output_dir: Path, cancel_flag) -> dict:
+        """Merge a finished LoRA adapter into its base model and export 16-bit weights.
+
+        Used when a long training job dies near the end (e.g. worker killed at 86%)
+        but its periodic checkpoints contain the full adapter: merge checkpoint-N
+        into the base model without re-running any training steps.
+        """
+        import torch
+
+        adapter_file = adapter_dir / "adapter_model.safetensors"
+        if not adapter_file.is_file():
+            raise InferenceError(f"merge_from adapter missing: {adapter_file}")
+
+        FastLanguageModel = importlib.import_module("unsloth").FastLanguageModel
+        from peft import PeftModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        model_name = params["model_name"]
+        export_dir = Path(params.get("export_dir") or (TRAINING_ROOT / "merged-export"))
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        log.info("Merge-only: base=%s adapter=%s", model_name, adapter_dir)
+        if os.path.exists(model_name):
+            base_path = model_name
+        else:
+            from huggingface_hub import snapshot_download
+            base_path = snapshot_download(model_name)
+        self._check_cancel(cancel_flag)
+
+        # Load base in bf16 (NOT 4bit) so merged weights are full precision.
+        model = AutoModelForCausalLM.from_pretrained(
+            base_path, torch_dtype=torch.bfloat16, device_map={"": 0},
+        )
+        self._check_cancel(cancel_flag)
+        model = PeftModel.from_pretrained(model, str(adapter_dir))
+        model = model.merge_and_unload()
+        self._check_cancel(cancel_flag)
+        model.save_pretrained(str(export_dir))
+        tokenizer = AutoTokenizer.from_pretrained(str(adapter_dir))
+        tokenizer.save_pretrained(str(export_dir))
+        self._cleanup_gpu()
+        log.info("Merge-only complete: %s", export_dir)
+        return {
+            "format": "fine-tune-merge-only",
+            "merged_model_path": str(export_dir),
+            "adapter_path": str(adapter_dir),
+        }
 
     def estimate_time(self, params: dict) -> float:
         max_iters = params.get("max_iters", 0)
