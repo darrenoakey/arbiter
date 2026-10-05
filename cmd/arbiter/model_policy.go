@@ -97,6 +97,7 @@ var trustedPythonAdapters = map[string]string{
 	"minimax-h3-local":        "minimax-h3",
 	"minimax-fast-h3":         "minimax-h3",
 	"moondream":               "moondream",
+	"mini-agi":                "",
 	"rvc-convert":             "rvc",
 	"routing-decide":          "routing-decide",
 	"nimble-scorer":           "nimble-scorer",

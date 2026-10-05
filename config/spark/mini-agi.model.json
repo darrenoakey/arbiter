@@ -1,0 +1,13 @@
+{
+  "auto_download": "",
+  "avg_inference_ms": 1680000,
+  "group": false,
+  "keep_alive_seconds": 30,
+  "load_ms": 30000,
+  "max_concurrent": 1,
+  "max_instances": 1,
+  "max_runtime_seconds": 2100,
+  "memory_gb": 16,
+  "model_path": "/home/darren/training/mini-agi",
+  "pressure_index": 1.0
+}

@@ -69,7 +69,7 @@ case "$CMD" in
         # would silently test the canonical sources. tests/integration is
         # excluded on purpose — it drives the live spark fleet.
         if has_leg python; then
-            PYTHONPATH="$SCRIPT_DIR/src" python3 -m pytest tests/unit src/arbiter/schemas_test.py src/arbiter/adapters/nimble_score_test.py -q -n 4 &
+            PYTHONPATH="$SCRIPT_DIR/src" python3 -m pytest tests/unit src/arbiter/schemas_test.py src/arbiter/adapters/nimble_score_test.py src/arbiter/adapters/mini_agi_test.py -q -n 4 &
             bg_pids+=($!)
             py_pytest_pid=$!
         fi

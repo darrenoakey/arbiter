@@ -46,6 +46,7 @@ _ADAPTER_MODULES = (
     "photo_enhance",
     "trellis2",
     "routing_decide",
+    "mini_agi",
     "nimble_score",
 )
 

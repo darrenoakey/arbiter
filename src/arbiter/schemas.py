@@ -73,6 +73,7 @@ class JobType(str, Enum):
     PHOTO_ENHANCE = "photo-enhance"
     IMAGE_TO_3D = "image-to-3d"
     ROUTING_DECIDE_TRAIN = "routing-decide-train"
+    MINI_AGI_READ = "mini-agi-read"
     NIMBLE_SCORE = "nimble-score"
 
 
@@ -117,6 +118,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "image-to-3d": "trellis2",
     "routing-decide-train": "routing-decide",
     "nimble-score": "nimble-scorer",
+    "mini-agi-read": "mini-agi",
 }
 
 
@@ -549,6 +551,14 @@ class RoutingDecideTrainParams(BaseModel):
     seed: int = Field(default=42, ge=0, le=4294967295)
 
 
+class MiniAgiReadParams(BaseModel):
+    """One bounded mini-AGI reading chunk over a run set up on spark."""
+
+    run: str = Field(default="mnemnos", pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    minutes: float = Field(default=26.0, gt=0, le=30)
+    samples: bool = True
+
+
 class TTSVoxtralParams(BaseModel):
     text: str
     voice: str = "alloy"
@@ -719,4 +729,5 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "image-to-3d": ImageTo3DParams,
     "routing-decide-train": RoutingDecideTrainParams,
     "nimble-score": NimbleScoreParams,
+    "mini-agi-read": MiniAgiReadParams,
 }

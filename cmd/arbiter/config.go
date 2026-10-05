@@ -400,6 +400,7 @@ var JobTypeToModel = map[string]string{
 	"photo-enhance":           "photo-enhance",
 	"image-to-3d":             "trellis2",
 	"routing-decide-train":    "routing-decide",
+	"mini-agi-read":           "mini-agi",
 	"nimble-score":            "nimble-scorer",
 }
 
