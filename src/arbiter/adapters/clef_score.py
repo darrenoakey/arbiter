@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import os
 import statistics
 import sys
 import threading
@@ -179,6 +180,19 @@ def _verified_snapshot(cache_dir: Path, release: dict) -> Path:
     return snapshot
 
 
+def use_sequential_weight_loading() -> None:
+    """Make transformers materialize one tensor at a time while loading.
+
+    Its default thread pool reads shards to host memory faster than the main
+    thread moves them to CUDA. On the GB10 unified pool that kept ~37 GB of
+    host copies alive beside ~51 GB of loaded Clef 27B weights, and the
+    emergency guardian killed the worker at 7.9 GB MemAvailable. This is a
+    fixed library switch, read by transformers at load time; it is not
+    caller configuration.
+    """
+    os.environ["HF_DEACTIVATE_ASYNC_LOAD"] = "1"
+
+
 class _ClefScoreBase(ModelAdapter):
     model_id = ""
 
@@ -207,6 +221,7 @@ class _ClefScoreBase(ModelAdapter):
             raise LoadError(f"{self.model_id} requires model_path in Arbiter local config")
         snapshot = _verified_snapshot(Path(model.model_path).expanduser(), self.release)
         self._module = _load_release_code(snapshot, self.model_id)
+        use_sequential_weight_loading()
         self._model, self._processor = self._module.load_release_model(snapshot, device="cuda",
                                                                        dtype=torch.bfloat16)
         self._runtime = {"torch": torch.__version__, "transformers": transformers.__version__,

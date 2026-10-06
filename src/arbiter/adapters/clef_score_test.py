@@ -110,3 +110,11 @@ def test_release_code_hash_mismatch_is_refused(tmp_path):
     (tmp_path / "joint_schema_model.py").write_text("x = 1\n")
     with pytest.raises(clef_score.LoadError):
         clef_score._load_release_code(tmp_path, "clef-test-scorer")
+
+
+def test_weight_loading_is_forced_sequential(monkeypatch):
+    from transformers.utils import is_env_variable_true
+
+    monkeypatch.delenv("HF_DEACTIVATE_ASYNC_LOAD", raising=False)
+    clef_score.use_sequential_weight_loading()
+    assert is_env_variable_true("HF_DEACTIVATE_ASYNC_LOAD")
