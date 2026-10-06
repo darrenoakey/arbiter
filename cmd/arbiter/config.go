@@ -257,6 +257,16 @@ type Config struct {
 	// effort/classification job queued indefinitely). Resolution stays
 	// admission-time only, exactly like the primary target.
 	LLMAliasFallbacks map[string][]string `json:"llm_alias_fallbacks,omitempty"`
+	// LLMAliasParams holds, per alias, chat-body parameters the role enforces
+	// on every request admitted through it (e.g. local-summariser:
+	// {"reasoning_effort":"none","chat_template_kwargs":{"enable_thinking":false}}).
+	// The role wins over the caller: generation policy is a function of what is
+	// being asked for, not of which client asks (live 2026-10: a bare client
+	// left thinking on and 758 of 1,203 summaries in a week came back empty).
+	// Applied before cache/dedup keys are computed, and still applied when the
+	// alias resolves to a fallback model. Requests naming a concrete model are
+	// untouched.
+	LLMAliasParams map[string]map[string]any `json:"llm_alias_params,omitempty"`
 }
 
 type configFileSnapshot struct {
@@ -517,6 +527,12 @@ func LoadConfig(projectRoot string) (*Config, error) {
 	}
 	if err := validateLLMAliasFallbacks(cfg.LLMAliasFallbacks, cfg.LLMAliases, cfg.Models); err != nil {
 		return nil, fmt.Errorf("llm_alias_fallbacks: %w", err)
+	}
+	if cfg.LLMAliasParams == nil {
+		cfg.LLMAliasParams = map[string]map[string]any{}
+	}
+	if err := validateLLMAliasParams(cfg.LLMAliasParams, cfg.LLMAliases); err != nil {
+		return nil, fmt.Errorf("llm_alias_params: %w", err)
 	}
 
 	return cfg, nil
@@ -965,8 +981,26 @@ func SaveLLMAliasFallbacks(projectRoot string, fallbacks map[string][]string) er
 	return writeConfigData(projectRoot, data)
 }
 
-// DeleteModelConfig removes a model and any supplied dependent aliases in one
-// atomic configuration-file replacement.
+// SaveLLMAliasParams atomically replaces the persisted per-alias enforced chat
+// params while preserving every unrelated mutable configuration key.
+func SaveLLMAliasParams(projectRoot string, params map[string]map[string]any) error {
+	mutableConfigMu.Lock()
+	defer mutableConfigMu.Unlock()
+	data, err := loadMutableConfigData(projectRoot)
+	if err != nil {
+		return err
+	}
+	if len(params) == 0 {
+		delete(data, "llm_alias_params")
+		return writeConfigData(projectRoot, data)
+	}
+	data["llm_alias_params"] = params
+	return writeConfigData(projectRoot, data)
+}
+
+// DeleteModelConfig removes a model and any supplied dependent aliases (with
+// their fallbacks and enforced params) in one atomic configuration-file
+// replacement, so the persisted file always reloads cleanly.
 func DeleteModelConfig(projectRoot, modelID string, aliasesToDrop ...string) error {
 	mutableConfigMu.Lock()
 	defer mutableConfigMu.Unlock()
@@ -979,10 +1013,16 @@ func DeleteModelConfig(projectRoot, modelID string, aliasesToDrop ...string) err
 		delete(models, modelID)
 	}
 	if len(aliasesToDrop) > 0 {
-		rawAliases, ok := data["llm_aliases"].(map[string]any)
-		if ok {
+		for _, key := range []string{"llm_aliases", "llm_alias_fallbacks", "llm_alias_params"} {
+			rawMap, ok := data[key].(map[string]any)
+			if !ok {
+				continue
+			}
 			for _, alias := range aliasesToDrop {
-				delete(rawAliases, alias)
+				delete(rawMap, alias)
+			}
+			if key != "llm_aliases" && len(rawMap) == 0 {
+				delete(data, key)
 			}
 		}
 	}

@@ -538,6 +538,13 @@ func (a *API) submitJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.Params = canonParams
+		// Role-level generation policy (thinking, effort, ...) for alias requests.
+		enforced, err := a.enforceAliasChatParams(req.Params, aliasUsed, modelID)
+		if err != nil {
+			writeError(w, 400, "invalid chat params")
+			return
+		}
+		req.Params = json.RawMessage(enforced)
 	}
 
 	// --- Validate staged file paths ---
@@ -1857,11 +1864,7 @@ func (a *API) removeModel(w http.ResponseWriter, r *http.Request) {
 	killResult := a.mgr.HardKillModel(modelID, false, &cfg)
 	a.config.DeleteModel(modelID)
 	removedJobTypes := removeJobTypeMappings(modelID)
-	aliases := a.aliasSnapshot()
-	for _, alias := range dependentAliases {
-		delete(aliases, alias)
-	}
-	a.replaceAliases(aliases)
+	a.forgetAliases(dependentAliases)
 
 	a.logger.Log("model.removed", map[string]any{
 		"model_id":            modelID,
@@ -2175,11 +2178,7 @@ func (a *API) deregisterLLM(w http.ResponseWriter, r *http.Request) {
 	killResult := a.mgr.HardKillModel(modelID, false, &cfg)
 	a.config.DeleteModel(modelID)
 	delete(JobTypeToModel, "chat-completion:"+name)
-	aliases := a.aliasSnapshot()
-	for _, alias := range dependentAliases {
-		delete(aliases, alias)
-	}
-	a.replaceAliases(aliases)
+	a.forgetAliases(dependentAliases)
 
 	a.logger.Log("llm.deregistered", map[string]any{"model_id": modelID, "name": name, "killed": killResult["killed"]})
 	writeJSON(w, 200, map[string]any{"model_id": modelID, "name": name, "killed_workers": killResult["killed"], "status": "deregistered"})
@@ -2224,6 +2223,13 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 	// and before any worker sees it. This makes alias and concrete-name requests
 	// share cache and dedup keys.
 	canonicalBody, err := canonicalizeChatBody(body, modelID)
+	if err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	// Role-level generation policy (thinking, effort, ...) for alias requests,
+	// applied before the cache key so the key reflects what actually runs.
+	canonicalBody, err = a.enforceAliasChatParams(canonicalBody, aliasUsed, modelID)
 	if err != nil {
 		writeError(w, 400, "invalid request body")
 		return

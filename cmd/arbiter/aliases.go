@@ -278,6 +278,7 @@ func (a *API) listAliases(w http.ResponseWriter, r *http.Request) {
 
 	out := make(map[string]any, len(keys))
 	fallbacks := a.aliasFallbacksSnapshot()
+	params := a.aliasParamsMapSnapshot()
 	for _, alias := range keys {
 		target := aliases[alias]
 		_, configured := models[target]
@@ -294,6 +295,9 @@ func (a *API) listAliases(w http.ResponseWriter, r *http.Request) {
 		if chain := fallbacks[alias]; len(chain) > 0 {
 			entry["fallbacks"] = chain
 		}
+		if values := params[alias]; len(values) > 0 {
+			entry["params"] = values
+		}
 		out[alias] = entry
 	}
 	writeJSON(w, 200, out)
@@ -304,6 +308,9 @@ type aliasUpdateRequest struct {
 	// Fallbacks, when non-nil, replaces this alias's ordered fallback list. An
 	// explicit empty array clears it; omitting the field leaves it untouched.
 	Fallbacks []string `json:"fallbacks"`
+	// Params, when non-nil, replaces this alias's enforced chat parameters. An
+	// explicit empty object clears them; omitting the field leaves them as-is.
+	Params map[string]any `json:"params"`
 }
 
 // putAlias handles PUT /v1/llm/aliases/{alias}.
@@ -318,7 +325,7 @@ func (a *API) putAlias(w http.ResponseWriter, r *http.Request) {
 	}
 	var req aliasUpdateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Target == "" {
-		writeError(w, 400, "body must be {\"target\":\"llm:<model>\",\"fallbacks\":[\"llm:<model>\"]}")
+		writeError(w, 400, "body must be {\"target\":\"llm:<model>\",\"fallbacks\":[\"llm:<model>\"],\"params\":{...}}")
 		return
 	}
 
@@ -349,6 +356,19 @@ func (a *API) putAlias(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	newParams := a.aliasParamsMapSnapshot()
+	if req.Params != nil {
+		if len(req.Params) == 0 {
+			delete(newParams, alias)
+		} else {
+			newParams[alias] = cloneAliasParams(req.Params)
+		}
+	}
+	if err := validateLLMAliasParams(newParams, newAliases); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+
 	if err := SaveLLMAliases(a.projectRoot, newAliases); err != nil {
 		writeError(w, 500, fmt.Sprintf("persist alias: %s", err))
 		return
@@ -357,8 +377,13 @@ func (a *API) putAlias(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, fmt.Sprintf("persist alias fallbacks: %s", err))
 		return
 	}
+	if err := SaveLLMAliasParams(a.projectRoot, newParams); err != nil {
+		writeError(w, 500, fmt.Sprintf("persist alias params: %s", err))
+		return
+	}
 	a.replaceAliases(newAliases)
 	a.replaceAliasFallbacks(newFallbacks)
+	a.replaceAliasParams(newParams)
 
 	_, modelIDs := a.aliasStateSnapshot()
 	resolved := a.aliasTargetOrFallback(alias, req.Target, modelIDs)
@@ -367,6 +392,7 @@ func (a *API) putAlias(w http.ResponseWriter, r *http.Request) {
 		"old_target": oldTarget,
 		"new_target": req.Target,
 		"fallbacks":  newFallbacks[alias],
+		"params":     newParams[alias],
 		"resolved":   resolved,
 		"actor":      r.RemoteAddr,
 	})
@@ -375,6 +401,7 @@ func (a *API) putAlias(w http.ResponseWriter, r *http.Request) {
 		"old_target": oldTarget,
 		"new_target": req.Target,
 		"fallbacks":  newFallbacks[alias],
+		"params":     newParams[alias],
 		"resolved":   resolved,
 	})
 }
@@ -416,6 +443,8 @@ func (a *API) deleteAlias(w http.ResponseWriter, r *http.Request) {
 	delete(newAliases, alias)
 	newFallbacks := a.aliasFallbacksSnapshot()
 	delete(newFallbacks, alias)
+	newParams := a.aliasParamsMapSnapshot()
+	delete(newParams, alias)
 	if err := SaveLLMAliases(a.projectRoot, newAliases); err != nil {
 		writeError(w, 500, fmt.Sprintf("persist alias deletion: %s", err))
 		return
@@ -424,8 +453,13 @@ func (a *API) deleteAlias(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, fmt.Sprintf("persist alias fallback deletion: %s", err))
 		return
 	}
+	if err := SaveLLMAliasParams(a.projectRoot, newParams); err != nil {
+		writeError(w, 500, fmt.Sprintf("persist alias params deletion: %s", err))
+		return
+	}
 	a.replaceAliases(newAliases)
 	a.replaceAliasFallbacks(newFallbacks)
+	a.replaceAliasParams(newParams)
 
 	a.logger.Log("llm.alias_deleted", map[string]any{"alias": alias, "force": force})
 	writeJSON(w, 200, map[string]any{

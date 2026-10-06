@@ -567,7 +567,8 @@ Stream callers must use the three pre-body headers for identity.
 #### GET /v1/llm/aliases
 
 Returns a name-sorted object. Each value contains `target`, `resolved`,
-`target_configured`, and `fallbacks` when any are configured. `resolved` is what
+`target_configured`, `fallbacks` when any are configured, and `params` when the
+alias enforces chat parameters. `resolved` is what
 admission would pick right now, so it differs from `target` while the primary
 has no servable placement.
 
@@ -594,16 +595,42 @@ Resolution stays admission-time only, the primary wins the moment its host is
 reachable again, and an alias with no fallbacks behaves exactly as before.
 Arbiter emits `llm.alias_fallback` whenever a fallback is used.
 
+#### Alias params (role-level generation policy)
+
+An alias names *what the caller wants* (a summary, an extraction), so generation
+policy such as thinking and effort belongs to the role, not to whichever client
+calls it. `llm_alias_params` maps an alias to a JSON object merged into every
+chat body admitted through that alias (both `POST /v1/chat/completions` and
+`chat-completion` jobs). The role wins over the caller; nested objects such as
+`chat_template_kwargs` merge key-by-key, so unrelated caller keys survive. The
+params are applied after alias resolution and before cache/dedup keys are
+computed, they still apply when the alias resolves to a fallback model, and they
+never touch requests that name a concrete model. `model`, `messages`, and
+`stream` are reserved and rejected. When a caller's differing value is
+replaced, Arbiter emits `llm.alias_params_overrode`.
+
+```json
+"llm_alias_params": {
+  "local-summariser": {"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": false}}
+}
+```
+
+(2026-10: a bare client calling `local-summariser` left thinking on; Nemotron
+spent the whole 4,096-token default thinking and 758 of 1,203 summaries in one
+week came back empty.)
+
 #### PUT /v1/llm/aliases/{alias}
 
 Creates or remaps one alias using `{"target":"llm:qwen"}`, optionally with
 `"fallbacks":["llm:other"]` to replace that alias's ordered fallback list (an
-explicit `[]` clears it; omitting the field leaves it untouched). A fallback must
+explicit `[]` clears it; omitting the field leaves it untouched) and/or
+`"params":{...}` to replace its enforced chat params (an explicit `{}` clears
+them; omitting the field leaves them untouched). A fallback must
 be a registered canonical `llm:*` id that is neither an alias nor the primary
 target, and must not repeat. Arbiter validates the complete proposed map,
 atomically persists it, then swaps the live map. Concurrent updates serialize; a
 persistence failure leaves the live map unchanged. The response includes
-`old_target`, `new_target`, `fallbacks`, and the live `resolved` model, and
+`old_target`, `new_target`, `fallbacks`, `params`, and the live `resolved` model, and
 Arbiter emits `llm.alias_updated`.
 
 #### DELETE /v1/llm/aliases/{alias}
