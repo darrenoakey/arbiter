@@ -20,7 +20,7 @@ import time
 import zipfile
 from pathlib import Path
 
-from arbiter.adapters.base import InferenceError, LoadError, ModelAdapter
+from arbiter.adapters.base import HeapTrimGuard, InferenceError, LoadError, ModelAdapter
 from arbiter.adapters.registry import register
 
 log = logging.getLogger(__name__)
@@ -222,8 +222,13 @@ class _ClefScoreBase(ModelAdapter):
         snapshot = _verified_snapshot(Path(model.model_path).expanduser(), self.release)
         self._module = _load_release_code(snapshot, self.model_id)
         use_sequential_weight_loading()
-        self._model, self._processor = self._module.load_release_model(snapshot, device="cuda",
-                                                                       dtype=torch.bfloat16)
+        # glibc otherwise keeps the freed safetensors staging pages, a second
+        # checkpoint-sized allocation in GB10 unified memory: Clef 27B held
+        # ~37-41 GB RSS beside 51 GB of CUDA weights and the emergency guardian
+        # killed every load at 51% of shards.
+        with HeapTrimGuard():
+            self._model, self._processor = self._module.load_release_model(snapshot, device="cuda",
+                                                                           dtype=torch.bfloat16)
         self._runtime = {"torch": torch.__version__, "transformers": transformers.__version__,
                          "device": torch.cuda.get_device_name(0), "dtype": "bfloat16"}
         log.info("%s loaded %s@%s", self.model_id, self.release["repo"], self.release["revision"])
