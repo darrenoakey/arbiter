@@ -179,6 +179,8 @@ def test_adapter_package_import_is_clean_strict_and_complete():
     expected = [
         "aesthetic-scorer",
         "birefnet",
+        "clef-flash-scorer",
+        "clef-scorer",
         "composite",
         "demucs",
         "echomimic",

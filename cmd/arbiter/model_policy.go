@@ -101,6 +101,8 @@ var trustedPythonAdapters = map[string]string{
 	"rvc-convert":             "rvc",
 	"routing-decide":          "routing-decide",
 	"nimble-scorer":           "nimble-scorer",
+	"clef-scorer":             "clef-scorer",
+	"clef-flash-scorer":       "clef-scorer",
 	"rvc-train":               "rvc",
 	"voice-fit":               "voxsmith",
 	"music-generate":          "music-generate",

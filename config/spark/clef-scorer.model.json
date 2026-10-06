@@ -1,0 +1,18 @@
+{
+  "avg_inference_ms": 600,
+  "group": false,
+  "keep_alive_seconds": 900,
+  "load_ms": 900000,
+  "max_concurrent": 1,
+  "max_instances": 1,
+  "max_runtime_seconds": 14400,
+  "memory_gb": 64,
+  "model_path": "/home/darren/clef-models/clef-2f3de3dd",
+  "pressure_index": 1.0,
+  "worker_cmd": [
+    "/home/darren/src/arbiter/venvs/clef-scorer/bin/python",
+    "-m",
+    "arbiter.worker_main",
+    "clef-scorer"
+  ]
+}

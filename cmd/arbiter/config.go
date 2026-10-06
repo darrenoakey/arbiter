@@ -412,6 +412,8 @@ var JobTypeToModel = map[string]string{
 	"routing-decide-train":    "routing-decide",
 	"mini-agi-read":           "mini-agi",
 	"nimble-score":            "nimble-scorer",
+	"clef-score":              "clef-scorer",
+	"clef-flash-score":        "clef-flash-scorer",
 }
 
 func LoadConfig(projectRoot string) (*Config, error) {

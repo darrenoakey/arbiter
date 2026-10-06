@@ -75,6 +75,8 @@ class JobType(str, Enum):
     ROUTING_DECIDE_TRAIN = "routing-decide-train"
     MINI_AGI_READ = "mini-agi-read"
     NIMBLE_SCORE = "nimble-score"
+    CLEF_SCORE = "clef-score"
+    CLEF_FLASH_SCORE = "clef-flash-score"
 
 
 # Maps job type to model_id
@@ -118,6 +120,8 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "image-to-3d": "trellis2",
     "routing-decide-train": "routing-decide",
     "nimble-score": "nimble-scorer",
+    "clef-score": "clef-scorer",
+    "clef-flash-score": "clef-flash-scorer",
     "mini-agi-read": "mini-agi",
 }
 
@@ -539,6 +543,14 @@ class NimbleScoreParams(BaseModel):
     dataset_file: str = Field(..., min_length=1)
 
 
+class ClefScoreParams(BaseModel):
+    """Score a staged JSONL of label-free SystemOne requests with pinned Clef."""
+
+    dataset_file: str = Field(..., min_length=1)
+    dataset_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    max_length: int = Field(default=16384, ge=256, le=65536)
+
+
 class RoutingDecideTrainParams(BaseModel):
     """Fine-tune GLiNER2.5-Decide on a staged train/test split."""
 
@@ -729,5 +741,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "image-to-3d": ImageTo3DParams,
     "routing-decide-train": RoutingDecideTrainParams,
     "nimble-score": NimbleScoreParams,
+    "clef-score": ClefScoreParams,
+    "clef-flash-score": ClefScoreParams,
     "mini-agi-read": MiniAgiReadParams,
 }

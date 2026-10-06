@@ -48,6 +48,7 @@ _ADAPTER_MODULES = (
     "routing_decide",
     "mini_agi",
     "nimble_score",
+    "clef_score",
 )
 
 for _module_name in _ADAPTER_MODULES:

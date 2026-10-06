@@ -123,6 +123,15 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
 
 ## Greenline submit from agents
 
+- The deploy's 120s drain counts dispatched jobs that are still waiting on a
+  model load as active. Back-to-back `mini-agi-read` chunks (~1448s) plus
+  `tts-breeze` jobs (5-9 min) leave almost no drainable gap, and at a chunk
+  boundary the scheduler immediately dispatches queued work. A cold vLLM load
+  such as photo-namer's `qwen3-vl-8b-fp8` takes ~150s, so the drain aborts.
+  Time `greenline submit` so that its drain request (~65s after submit) lands
+  shortly *before* a mini-agi chunk ends, while no recently started tts job is
+  running. Do not fire after the boundary.
+
 - Never hold a turn on `greenline submit`. Start it detached and sleep. The
   10-minute turn wall kills the release mid-check, leaves a dead lock holder,
   and does not deploy. Check output is fully buffered until the process exits,
