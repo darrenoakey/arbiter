@@ -13,6 +13,7 @@ import importlib.util
 import json
 import logging
 import statistics
+import sys
 import threading
 import time
 import zipfile
@@ -143,9 +144,17 @@ def _load_release_code(snapshot: Path, model_id: str):
     code = snapshot / "joint_schema_model.py"
     if file_sha256(code) != _CODE_SHA256:
         raise LoadError("Clef joint_schema_model.py differs from the pinned release code")
-    spec = importlib.util.spec_from_file_location(f"arbiter_clef_release_{model_id.replace('-', '_')}", code)
+    name = f"arbiter_clef_release_{model_id.replace('-', '_')}"
+    spec = importlib.util.spec_from_file_location(name, code)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # @dataclass resolves annotations through sys.modules[cls.__module__];
+    # an unregistered module makes the release file fail at import time.
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
     return module
 
 

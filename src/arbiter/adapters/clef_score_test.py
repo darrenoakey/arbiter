@@ -90,3 +90,23 @@ def test_latency_summary_uses_sorted_percentiles():
     assert summary["mean_ms"] == 25.0
     assert summary["p50_ms"] == 30.0
     assert summary["p95_ms"] == 40.0
+
+
+def test_release_code_with_dataclasses_loads_as_a_registered_module(tmp_path, monkeypatch):
+    code = tmp_path / "joint_schema_model.py"
+    code.write_text(
+        "from __future__ import annotations\n"
+        "from dataclasses import dataclass\n\n"
+        "@dataclass(frozen=True)\n"
+        "class EncodedQuestion:\n"
+        "    question_id: str\n"
+    )
+    monkeypatch.setattr(clef_score, "_CODE_SHA256", clef_score.file_sha256(code))
+    module = clef_score._load_release_code(tmp_path, "clef-test-scorer")
+    assert module.EncodedQuestion("label").question_id == "label"
+
+
+def test_release_code_hash_mismatch_is_refused(tmp_path):
+    (tmp_path / "joint_schema_model.py").write_text("x = 1\n")
+    with pytest.raises(clef_score.LoadError):
+        clef_score._load_release_code(tmp_path, "clef-test-scorer")
