@@ -7,6 +7,7 @@ a post-processing step after SadTalker or other talking-head generators.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -25,6 +26,8 @@ LATENTSYNC_PYTHON = LATENTSYNC_DIR / ".venv" / "bin" / "python"
 LATENTSYNC_UNET_CONFIG = LATENTSYNC_DIR / "configs" / "unet" / "stage2_512.yaml"
 LATENTSYNC_CHECKPOINT = LATENTSYNC_DIR / "checkpoints" / "latentsync_unet.pt"
 LATENTSYNC_WHISPER = LATENTSYNC_DIR / "checkpoints" / "whisper" / "tiny.pt"
+# Runs under LatentSync's venv (insightface + buffalo_l already installed there).
+MOUTH_GUARD_SCRIPT = Path(__file__).resolve().parent / "latentsync_mouth_guard.py"
 
 
 @register
@@ -46,6 +49,8 @@ class LatentSyncAdapter(ModelAdapter):
             raise LoadError(f"LatentSync checkpoint not found: {LATENTSYNC_CHECKPOINT}")
         if not LATENTSYNC_WHISPER.exists():
             raise LoadError(f"LatentSync whisper model not found: {LATENTSYNC_WHISPER}")
+        if not MOUTH_GUARD_SCRIPT.exists():
+            raise LoadError(f"LatentSync mouth guard not found: {MOUTH_GUARD_SCRIPT}")
 
         self._ready = True
         log.info("LatentSync ready (subprocess mode, no persistent GPU usage).")
@@ -162,11 +167,30 @@ class LatentSyncAdapter(ModelAdapter):
 
             self._check_cancel(cancel_flag)
 
+            # Mouth-placement guard: restore the source lower face on frames
+            # where LatentSync pasted the mouth off the face or painted a
+            # closed mouth over an open jaw. Clean clips pass through as is.
+            guarded = os.path.join(tmp_dir, "guarded.mp4")
+            report_path = os.path.join(tmp_dir, "mouth_guard.json")
+            guard = subprocess.run(
+                [str(LATENTSYNC_PYTHON), str(MOUTH_GUARD_SCRIPT), tmp_video, tmp_output, guarded, report_path],
+                cwd=str(LATENTSYNC_DIR), capture_output=True, text=True, timeout=max(600, int(duration_s * 30 + 300)),
+            )
+            if guard.returncode != 0 or not os.path.isfile(guarded):
+                stderr = guard.stderr.strip()[-500:] if guard.stderr else ""
+                raise InferenceError(f"LatentSync mouth guard failed ({guard.returncode}): {stderr}")
+            with open(report_path) as f:
+                mouth_guard = json.load(f)
+            log.info(
+                "LatentSync mouth guard: %d flagged, %d repaired of %d frames",
+                len(mouth_guard.get("flagged", [])), mouth_guard.get("repaired_frames", 0), mouth_guard.get("frames", 0),
+            )
+
             # Copy to arbiter output dir
             output_dir = Path(output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
             output_path = output_dir / "result.mp4"
-            shutil.copy2(tmp_output, str(output_path))
+            shutil.copy2(guarded, str(output_path))
 
             width, height = self._probe_video_dimensions(str(output_path))
 
@@ -175,6 +199,12 @@ class LatentSyncAdapter(ModelAdapter):
                 "width": width,
                 "height": height,
                 "file": "result.mp4",
+                "mouth_guard": {
+                    "frames": mouth_guard.get("frames", 0),
+                    "faces": mouth_guard.get("faces", 0),
+                    "flagged_frames": [item["frame"] for item in mouth_guard.get("flagged", [])],
+                    "repaired_frames": mouth_guard.get("repaired_frames", 0),
+                },
             }
 
         except subprocess.TimeoutExpired:

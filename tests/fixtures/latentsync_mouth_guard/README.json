@@ -1,0 +1,27 @@
+{
+ "jaw_bad": {
+  "origin": "music/twit-outros/industrial-leo-h3/audio_full/lipsync/synced_000.mp4 frame 24",
+  "reasons": [
+   "closed_mouth_on_open_jaw"
+  ],
+  "outside": 0.0,
+  "src_dark": 0.267,
+  "syn_dark": 0.095
+ },
+ "clean": {
+  "origin": "daily-digest/2026-09-07/lipsync/synced_000.mp4 frame 10",
+  "reasons": [],
+  "outside": 0.0,
+  "src_dark": 0.118,
+  "syn_dark": 0.154
+ },
+ "outside_bad": {
+  "origin": "music/twit-outros/patrick-ragtime-h3/audio_full/lipsync/synced_003.mp4 frame 51",
+  "reasons": [
+   "mouth_outside_face"
+  ],
+  "outside": 0.101,
+  "src_dark": 0.002,
+  "syn_dark": 0.0
+ }
+}
