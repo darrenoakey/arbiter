@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -2466,6 +2467,32 @@ func (m *InstanceManager) CreateReservation(memoryGB float64, label string, keep
 	}
 	m.reservedGB += memoryGB
 	slog.Info("reservation created", "id", id, "memory_gb", memoryGB, "label", label)
+	return id, nil
+}
+
+// ErrReservationInsufficient is returned by CreateReservationNoEvict when the
+// budget cannot hold the reservation right now. Nothing was evicted.
+var ErrReservationInsufficient = errors.New("insufficient VRAM budget for non-evicting reservation")
+
+// CreateReservationNoEvict atomically checks the available budget
+// (budget - used - reserved) and records the reservation under a single
+// m.mu.Lock. It never evicts, unloads, or signals any worker; when the budget
+// cannot hold the request it returns ErrReservationInsufficient immediately
+// and leaves all state untouched.
+func (m *InstanceManager) CreateReservationNoEvict(memoryGB float64, label string) (string, error) {
+	if !finitePositive(memoryGB) || memoryGB > m.budgetGB {
+		return "", fmt.Errorf("memory_gb must be finite, > 0, and <= %.3g", m.budgetGB)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	available := m.budgetGB - m.usedGB - m.reservedGB
+	if memoryGB > available {
+		return "", fmt.Errorf("%w: need %.1fGB but only %.1fGB available", ErrReservationInsufficient, memoryGB, available)
+	}
+	id := genID()
+	m.reservations[id] = &Reservation{ID: id, MemoryGB: memoryGB, Label: label, CreatedAt: time.Now()}
+	m.reservedGB += memoryGB
+	slog.Info("reservation created (non-evicting)", "id", id, "memory_gb", memoryGB, "label", label)
 	return id, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -187,6 +188,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/refs/{id}", a.deleteRef)
 	mux.HandleFunc("POST /v1/reserve", a.createReservation)
 	mux.HandleFunc("GET /v1/reserve", a.listReservations)
+	mux.HandleFunc("GET /v1/reserve/capabilities", a.reservationCapabilities)
 	mux.HandleFunc("DELETE /v1/reserve/{id}", a.releaseReservation)
 	mux.HandleFunc("POST /v1/models", a.registerModel)
 	mux.HandleFunc("GET /v1/models", a.listModels)
@@ -1161,6 +1163,7 @@ func (a *API) createReservation(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		MemoryGB float64 `json:"memory_gb"`
 		Label    string  `json:"label"`
+		NoEvict  bool    `json:"no_evict"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid request body")
@@ -1168,6 +1171,25 @@ func (a *API) createReservation(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.MemoryGB <= 0 {
 		writeError(w, 400, "memory_gb must be > 0")
+		return
+	}
+
+	if req.NoEvict {
+		id, err := a.mgr.CreateReservationNoEvict(req.MemoryGB, req.Label)
+		if err != nil {
+			if errors.Is(err, ErrReservationInsufficient) {
+				writeJSON(w, 409, map[string]any{"error": err.Error(), "code": "insufficient", "no_evict": true})
+				return
+			}
+			writeError(w, 400, err.Error())
+			return
+		}
+		a.logger.Log("reservation.create", map[string]any{
+			"id": id, "memory_gb": req.MemoryGB, "label": req.Label, "no_evict": true,
+		})
+		writeJSON(w, 200, map[string]any{
+			"reservation_id": id, "memory_gb": req.MemoryGB, "label": req.Label, "no_evict": true, "evicted": []string{},
+		})
 		return
 	}
 
@@ -1194,6 +1216,13 @@ func (a *API) createReservation(w http.ResponseWriter, r *http.Request) {
 		"memory_gb":      req.MemoryGB,
 		"label":          req.Label,
 	})
+}
+
+// reservationCapabilities lets clients discover atomic non-evicting
+// reservations before posting no_evict; older servers ignore the unknown field
+// and would evict, so clients MUST see atomic_non_evicting:true first.
+func (a *API) reservationCapabilities(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{"atomic_non_evicting": true})
 }
 
 func (a *API) releaseReservation(w http.ResponseWriter, r *http.Request) {

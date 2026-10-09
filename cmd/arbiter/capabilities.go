@@ -20,6 +20,14 @@ type capabilitiesResponse struct {
 	JobTypes     []string               `json:"job_types"`
 	ModelAliases map[string]aliasTarget `json:"model_aliases"`
 	Versioning   capabilitiesVersioning `json:"versioning"`
+	Reservations reservationFeatures    `json:"reservations"`
+}
+
+// reservationFeatures advertises atomic non-evicting reservations. Clients
+// must see no_evict:true here before posting no_evict to POST /v1/reserve.
+type reservationFeatures struct {
+	NoEvict bool `json:"no_evict"`
+	Atomic  bool `json:"atomic"`
 }
 
 type aliasTarget struct {
@@ -68,6 +76,7 @@ func (a *API) capabilitiesPayload() capabilitiesResponse {
 		JobTypes:     liveJobTypes(),
 		ModelAliases: a.liveModelAliases(),
 		Versioning:   capabilitiesVersioningInfo(),
+		Reservations: reservationFeatures{NoEvict: true, Atomic: true},
 	}
 }
 
