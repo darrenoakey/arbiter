@@ -50,6 +50,17 @@ def test_qwen_image_21_sglang_is_the_fourth_sanctioned_exception():
     assert is_disabled_still_image_model("qwen-image-sglang")
 
 
+def test_qwen_image_21_turbo_is_the_fifth_sanctioned_exception():
+    """Owner decision 2026-10-10: the 8-step turbo checkpoint is allowed under its exact id only."""
+    from arbiter.image_policy import QWEN_IMAGE_21_TURBO_MODEL
+
+    assert not is_disabled_still_image_model(QWEN_IMAGE_21_TURBO_MODEL)
+    assert not is_disabled_still_image_model("Qwen.Image.2.1.Turbo")
+    assert is_disabled_still_image_model("qwen-image-2.1-turbo-lora")
+    assert is_disabled_still_image_model("qwen-image-turbo")
+    assert is_disabled_still_image_model("Qwen/Qwen-Image-2.1-Turbo")
+
+
 def test_qwen_image_21_heretic_is_the_third_sanctioned_exception():
     """Owner decision 2026-09-22: the abliterated-text-encoder variant is
     allowed under its exact id only; every near-neighbour alias stays denied."""
@@ -209,6 +220,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "qwen-image-2.1",
         "qwen-image-2.1-heretic",
         "qwen-image-2.1-sglang",
+        "qwen-image-2.1-turbo",
         "reference-image-edit",
         "routing-decide",
         "rvc-convert",

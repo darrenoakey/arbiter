@@ -1161,6 +1161,29 @@ Result: `{"format":"png","mode":"t2i"|"edit","width":W,"height":H,"steps":N,
 "seed":S,"true_cfg_scale":C,"model":"Qwen/Qwen-Image-2.1","file":"result.png"}`
 plus `result_path`.
 
+**Fifth scoped exception — `qwen-image-turbo` (owner decision, 2026-10-10).**
+The official accelerated checkpoint `Qwen/Qwen-Image-2.1-Turbo`, same
+`QwenImage21Pipeline` and same 7B architecture, exposed only through the
+`qwen-image-turbo` job type / `qwen-image-2.1-turbo` model id. The checkpoint
+ships an 8-step `sample_sigmas` schedule; `steps` is recorded as
+`requested_steps` but does not override that grid, and the adapter does not
+pass a call-time `sigmas` list. Prefix KV caching defaults on (`use_kv_cache`).
+It is not wired into `generate_image` / IGS. The worker is
+`venvs/qwenimage-turbo` because the stock diffusers pin predates the schedule
+support (diffusers `da1d3829`, PR #14950). Weights live at
+`/home/darren/nvme-models/Qwen-Image-2.1-Turbo` on Spark — do not set
+`auto_download`; the T9 hub cache cannot hold another 32 GB copy. Declared
+52 GB. See `requirements/qwen-image-turbo.txt`.
+
+```json
+{"type": "qwen-image-turbo",
+ "params": {"prompt": "a red panda in a yellow raincoat, misty cedar forest",
+            "width": 1024, "height": 1024, "seed": 42}}
+```
+
+Result adds `"schedule":"checkpoint-sample-sigmas"`, `"requested_steps"`,
+and `"use_kv_cache"`. `steps` is the actual schedule length (8).
+
 <!-- Retired still-image API reference intentionally hidden; retained only as migration history.
 
 ### 3.1 image-generate

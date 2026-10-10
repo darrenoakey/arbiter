@@ -110,6 +110,69 @@ def test_sglang_load_uses_pinned_runtime_entrypoint(monkeypatch):
     }
 
 
+def test_turbo_spark_model_json_pins_nvme_snapshot_and_venv():
+    """Deploy merges this file into spark local/config.json. It must not
+    auto-download into the full T9 hub cache."""
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    config = json.loads((root / "config/spark/qwen-image-2.1-turbo.model.json").read_text())
+    assert config["memory_gb"] == 52
+    assert config["model_path"] == "/home/darren/nvme-models/Qwen-Image-2.1-Turbo"
+    assert "auto_download" not in config
+    assert config["worker_cmd"] == [
+        "/home/darren/src/arbiter/venvs/qwenimage-turbo/bin/python",
+        "-m",
+        "arbiter.worker_main",
+        "qwen-image-2.1-turbo",
+    ]
+    assert config["adapter_params"]["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    assert config["max_instances"] == 1
+
+
+def test_turbo_uses_checkpoint_schedule_and_kv_cache():
+    """The turbo checkpoint's sample_sigmas grid is authoritative.
+
+    A caller-supplied step count must not be forwarded as an overriding
+    sigma grid, and the stock adapter must not grow a use_kv_cache kwarg
+    that its older diffusers pin would reject.
+    """
+    from arbiter.adapters.qwen_image_21 import (
+        QWEN_IMAGE_21_TURBO_HF_ID,
+        QWEN_IMAGE_21_TURBO_PATH,
+        TURBO_SCHEDULE_STEPS,
+        QwenImage21TurboAdapter,
+    )
+
+    turbo = QwenImage21TurboAdapter()
+    assert turbo.model_id == "qwen-image-2.1-turbo"
+    assert turbo.hf_model_path == QWEN_IMAGE_21_TURBO_PATH
+    assert QWEN_IMAGE_21_TURBO_HF_ID == "Qwen/Qwen-Image-2.1-Turbo"
+    kwargs, steps, requested = turbo.sampling_kwargs(
+        {"prompt": "a red panda in a yellow raincoat", "steps": 40, "seed": 7},
+        None,
+    )
+    assert steps == TURBO_SCHEDULE_STEPS == 8
+    assert requested == 40
+    assert kwargs["num_inference_steps"] == 8
+    assert kwargs["use_kv_cache"] is True
+    assert "sigmas" not in kwargs
+    assert kwargs["width"] == 1024 and kwargs["height"] == 1024
+    assert turbo.estimate_time({"prompt": "x"}) < QwenImage21Adapter().estimate_time(
+        {"prompt": "x", "steps": 40}
+    )
+
+    stock = QwenImage21Adapter()
+    stock_kwargs, stock_steps, stock_requested = stock.sampling_kwargs(
+        {"prompt": "a red panda", "steps": 40},
+        None,
+    )
+    assert stock_steps == stock_requested == 40
+    assert "use_kv_cache" not in stock_kwargs
+    assert "sigmas" not in stock_kwargs
+
+
 def test_heretic_adapter_identity():
     """Exception #3: same pipeline, same behavior, abliterated text encoder
     checkpoint on spark; distinct model id."""

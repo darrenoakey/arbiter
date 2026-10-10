@@ -1,0 +1,57 @@
+# venvs/qwenimage-turbo — Qwen-Image-2.1-Turbo adapter
+# (job type `qwen-image-turbo`, model id `qwen-image-2.1-turbo`)
+#
+# Recreate ON SPARK (venvs/ is spark-only state, never deployed by
+# deploy-to-spark.sh; the venv MUST be a real directory, never a symlink —
+# worker policy rejects symlinked venv paths):
+#
+#   cd ~/src/arbiter
+#   rm -rf venvs/qwenimage-turbo
+#   cp -a venvs/qwenimage venvs/qwenimage-turbo
+#   # cp -a keeps the source shebang. bin/pip would install into the STOCK
+#   # venv. Rewrite shebangs, then install with the copied interpreter:
+#   sed -i 's#/home/darren/src/arbiter/venvs/qwenimage#/home/darren/src/arbiter/venvs/qwenimage-turbo#g' \
+#     venvs/qwenimage-turbo/pyvenv.cfg venvs/qwenimage-turbo/bin/*
+#   venvs/qwenimage-turbo/bin/python -m pip install --upgrade \
+#     "diffusers @ git+https://github.com/huggingface/diffusers.git@da1d3829cf08d4f329b526d89e17cc035c049d8d"
+#
+# Do not hardlink-copy and then upgrade: pip uninstall would delete files the
+# stock qwenimage venv still needs. A real cp -a is required.
+#
+# Notes:
+# - The stock venvs/qwenimage pin (diffusers 80c7ed26, 2026-09-20) predates
+#   pipeline-configured sample_sigmas (diffusers PR #14950, merged 2026-10-05
+#   as da1d3829). Turbo loads with QwenImage21Pipeline only on this newer pin.
+#   Do not upgrade the stock venv just to serve turbo — that would change the
+#   production qwen-image-2.1 worker.
+# - torch 2.14.0+cu130 and transformers 5.17.0 are inherited from the stock
+#   venv copy. The turbo model card asks for transformers>=5.17.0.
+# - Weights are Qwen/Qwen-Image-2.1-Turbo (~32 GB bf16). They are NOT the same
+#   blobs as Qwen-Image-2.1 (different text-encoder packing, different DiT and
+#   VAE hashes), so they cannot be hardlinked from the stock snapshot.
+# - Download onto NVMe, not the Hugging Face cache. ~/.cache/huggingface and
+#   /home/darren/models are symlinks onto /mnt/t9, which was full (2.6 GB free)
+#   on 2026-10-10. A hub download would fail and can fill the disk the other
+#   models depend on:
+#
+#   mkdir -p /home/darren/nvme-models
+#   venvs/qwenimage/bin/python -c 'from huggingface_hub import snapshot_download; snapshot_download("Qwen/Qwen-Image-2.1-Turbo", local_dir="/home/darren/nvme-models/Qwen-Image-2.1-Turbo")'
+#
+# - Always start the download and dependency installation DETACHED with durable
+#   logs, then sleep until completion. The diffusers git install took over
+#   30 minutes on this host; an in-turn tool wait will be killed. Compare live
+#   inference only through Arbiter jobs, never by loading a model directly.
+#
+# - Do not set auto_download on this model. Arbiter's downloader uses the T9
+#   hub cache. The adapter loads the NVMe snapshot path directly.
+# - The checkpoint's saved 8-step sample_sigmas schedule is authoritative.
+#   num_inference_steps does not override it. Prefix KV cache stays on.
+# - Same 52 GB declaration as the other Qwen-Image-2.1 adapters: a 3 MP render
+#   needs about 51 GB with weights resident. expandable_segments is set via
+#   adapter_params in config/spark/qwen-image-2.1-turbo.model.json.
+torch==2.14.0+cu130
+transformers==5.17.0
+accelerate==1.13.0
+pillow
+pydantic>=2,<3
+diffusers @ git+https://github.com/huggingface/diffusers.git@da1d3829cf08d4f329b526d89e17cc035c049d8d

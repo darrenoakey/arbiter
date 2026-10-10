@@ -407,6 +407,7 @@ var JobTypeToModel = map[string]string{
 	"qwen-image":              qwenImage21Model,
 	"qwen-image-heretic":      qwenImage21HereticModel,
 	"qwen-image-sglang":       qwenImage21SglangModel,
+	"qwen-image-turbo":        qwenImage21TurboModel,
 	"photo-enhance":           "photo-enhance",
 	"image-to-3d":             "trellis2",
 	"routing-decide-train":    "routing-decide",

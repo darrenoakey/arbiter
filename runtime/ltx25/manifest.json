@@ -1,9 +1,9 @@
 {
   "capability_version": "ltx25-temporal-endpoint-v1",
-  "release_id": "46172b9-8b350b3f-temporal-085d91d22bd6",
+  "release_id": "46172b9-8b350b3f-temporal-085d91d22bd6-srca22de04797f2",
   "source": {
-    "archive": "ltx25-46172b9-custom-8b350b3f.tar.gz",
-    "archive_sha256": "ee5de2ef67fe98d962d62d5ae59bcd76e9a86e020cd86cdc5803962a9acad27b",
+    "archive": "ltx25-46172b9-custom-8b350b3f-srca22de04797f2.tar.gz",
+    "archive_sha256": "a22de04797f2ed2f7ba4855f27bf68660fc0d9c4bac0fca85ceaf279147423c0",
     "commit": "46172b97612b9b68e98f862f2b13322f608ab009",
     "tree": "cd69b4acf635a012d58fbc1a1fdfbfe4cf337d21",
     "runner_sha256": "8b350b3fc34fa603dadfc6f2d98f7feab7e72fe2d608412702d50d0b5e413bce",

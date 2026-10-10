@@ -59,6 +59,7 @@ class JobType(str, Enum):
     QWEN_IMAGE = "qwen-image"
     QWEN_IMAGE_HERETIC = "qwen-image-heretic"
     QWEN_IMAGE_SGLANG = "qwen-image-sglang"
+    QWEN_IMAGE_TURBO = "qwen-image-turbo"
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
     FINE_TUNE = "fine-tune"
@@ -105,6 +106,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "qwen-image": "qwen-image-2.1",
     "qwen-image-heretic": "qwen-image-2.1-heretic",
     "qwen-image-sglang": "qwen-image-2.1-sglang",
+    "qwen-image-turbo": "qwen-image-2.1-turbo",
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
     "fine-tune": "fine-tune",
@@ -513,6 +515,14 @@ class QwenImageParams(BaseModel):
     output_resolution: int = 1024  # target side for T2I default and edit mode
 
 
+class QwenImageTurboParams(QwenImageParams):
+    """Qwen-Image-2.1-Turbo. The checkpoint schedule is 8 steps; a different
+    ``steps`` value is recorded but does not override ``sample_sigmas``."""
+
+    steps: int = 8
+    use_kv_cache: bool = True
+
+
 class ImageTo3DParams(BaseModel):
     image: Optional[str] = None  # base64; RGBA with real alpha skips BiRefNet
     image_file: Optional[str] = None  # staged path on spark
@@ -724,6 +734,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "qwen-image": QwenImageParams,
     "qwen-image-heretic": QwenImageParams,
     "qwen-image-sglang": QwenImageParams,
+    "qwen-image-turbo": QwenImageTurboParams,
     "tts-voxtral": TTSVoxtralParams,
     "video-generate-h3": VideoGenerateH3Params,
     "video-generate-fast-h3": VideoGenerateH3Params,

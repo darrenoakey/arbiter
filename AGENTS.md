@@ -120,6 +120,12 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   it does not replace endpoint conditioning. Do not deploy this repo while an
   `ltx25-denoise1` job is running — `./run deploy` is drain-gated and the
   greenline release dies at 600s if the drain cannot finish.
+- The checksum-pinned LTX source tarball is gitignored under the canonical
+  checkout `local/ltx25-runtime-sources/`, named by `runtime/ltx25/manifest.json`.
+  Archive `ee5de2ef…` is deleted and unrecoverable. Recreate with
+  `scripts/package_ltx25_source.py` as documented in
+  `runtime/ltx25/SOURCE_ARCHIVE.md`. Do not change runner, patch, or
+  patched-file hashes to make a missing archive pass.
 
 ## Greenline submit from agents
 

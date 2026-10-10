@@ -152,7 +152,7 @@ func TestQwenImage21HereticExceptionIsNarrow(t *testing.T) {
 	}
 	// The heretic adapter cannot be smuggled in under other job types,
 	// including the stock qwen-image job type and legacy image markers.
-	for _, jobType := range []string{"qwen-image", "image-edit", "image-generate", "reference-image-edit"} {
+	for _, jobType := range []string{"qwen-image", "qwen-image-turbo", "image-edit", "image-generate", "reference-image-edit"} {
 		if err := rejectDisabledStillImage(jobType, qwenImage21HereticModel); err == nil {
 			t.Fatalf("job type %q accepted the heretic adapter as an override", jobType)
 		}
@@ -222,7 +222,7 @@ func TestQwenImage21SglangExceptionIsNarrow(t *testing.T) {
 			t.Fatalf("%q was not classified as a disabled still-image model", modelID)
 		}
 	}
-	for _, jobType := range []string{"qwen-image", "qwen-image-heretic", "image-generate", "reference-image-edit"} {
+	for _, jobType := range []string{"qwen-image", "qwen-image-heretic", "qwen-image-turbo", "image-generate", "reference-image-edit"} {
 		if err := rejectDisabledStillImage(jobType, qwenImage21SglangModel); err == nil {
 			t.Fatalf("job type %q accepted the sglang adapter as an override", jobType)
 		}
@@ -235,6 +235,78 @@ func TestQwenImage21SglangExceptionIsNarrow(t *testing.T) {
 	if err := validatePythonWorkerCommand(root, qwenImage21SglangModel, mismatched.WorkerCmd); err == nil ||
 		!strings.Contains(err.Error(), untrustedWorkerCommandMessage) {
 		t.Fatalf("qwen-image-2.1-sglang accepted a worker command selecting flux2: %v", err)
+	}
+}
+
+func qwenImage21TurboConfig(root string) ModelConfig {
+	return ModelConfig{
+		MemoryGB:      52,
+		MaxConcurrent: 1,
+		MaxInstances:  intPtr(1),
+		ModelPath:     "/home/darren/nvme-models/Qwen-Image-2.1-Turbo",
+		WorkerCmd: []string{
+			filepath.Join(root, "venvs", "qwenimage-turbo", "bin", "python"),
+			"-m", "arbiter.worker_main", qwenImage21TurboModel,
+		},
+	}
+}
+
+func TestQwenImage21TurboIsAllowedByPolicy(t *testing.T) {
+	if isDisabledStillImageModel(qwenImage21TurboModel) {
+		t.Fatal("qwen-image-2.1-turbo must not be classified as a disabled still-image model")
+	}
+	root := t.TempDir()
+	cfg := qwenImage21TurboConfig(root)
+	if disabledStillImageConfig(qwenImage21TurboModel, cfg) {
+		t.Fatal("qwen-image-2.1-turbo config naming the NVMe checkpoint and venv was refused")
+	}
+	if err := validatePythonWorkerCommand(root, qwenImage21TurboModel, cfg.WorkerCmd); err != nil {
+		t.Fatalf("qwen-image-2.1-turbo worker command rejected: %v", err)
+	}
+	if err := rejectDisabledStillImage(qwenImageTurboJobType, qwenImage21TurboModel); err != nil {
+		t.Fatalf("qwen-image-turbo job type rejected: %v", err)
+	}
+	if err := validateJobModelCompatibility(qwenImageTurboJobType, qwenImage21TurboModel); err != nil {
+		t.Fatalf("qwen-image-turbo routing rejected: %v", err)
+	}
+	if got := JobTypeToModel[qwenImageTurboJobType]; got != qwenImage21TurboModel {
+		t.Fatalf("JobTypeToModel[qwen-image-turbo] = %q, want %q", got, qwenImage21TurboModel)
+	}
+	if venv, ok := trustedPythonAdapters[qwenImage21TurboModel]; !ok || venv != "qwenimage-turbo" {
+		t.Fatalf("trustedPythonAdapters[qwen-image-2.1-turbo] = %q ok=%v, want qwenimage-turbo", venv, ok)
+	}
+}
+
+func TestQwenImage21TurboExceptionIsNarrow(t *testing.T) {
+	root := t.TempDir()
+	for _, modelID := range []string{"qwen-image-2.1-turbo-lora", "qwen-image-turbo", "Qwen/Qwen-Image-2.1-Turbo"} {
+		if !isDisabledStillImageModel(modelID) {
+			t.Fatalf("%q was not classified as a disabled still-image model", modelID)
+		}
+	}
+	for _, jobType := range []string{"qwen-image", "qwen-image-heretic", "qwen-image-sglang", "image-generate", "reference-image-edit"} {
+		if err := rejectDisabledStillImage(jobType, qwenImage21TurboModel); err == nil {
+			t.Fatalf("job type %q accepted the turbo adapter as an override", jobType)
+		}
+	}
+	for _, modelID := range []string{qwenImage21Model, qwenImage21HereticModel, qwenImage21SglangModel} {
+		if err := rejectDisabledStillImage(qwenImageTurboJobType, modelID); err == nil {
+			t.Fatalf("qwen-image-turbo accepted %q as an override", modelID)
+		}
+	}
+	mismatched := qwenImage21TurboConfig(root)
+	mismatched.WorkerCmd[3] = "flux2"
+	if err := validatePythonWorkerCommand(root, qwenImage21TurboModel, mismatched.WorkerCmd); err == nil ||
+		!strings.Contains(err.Error(), untrustedWorkerCommandMessage) {
+		t.Fatalf("qwen-image-2.1-turbo accepted a worker command selecting flux2: %v", err)
+	}
+}
+
+func TestQwenImage21TurboModelRegistrationRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	cfg := qwenImage21TurboConfig(root)
+	if err := validateModelWorkerPolicy(root, qwenImage21TurboModel, cfg, true); err != nil {
+		t.Fatalf("qwen-image-2.1-turbo model registration rejected: %v", err)
 	}
 }
 

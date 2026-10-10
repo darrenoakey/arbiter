@@ -47,6 +47,12 @@ const qwenImageHereticJobType = "qwen-image-heretic"
 const qwenImage21SglangModel = "qwen-image-2.1-sglang"
 const qwenImageSglangJobType = "qwen-image-sglang"
 
+// qwenImage21TurboModel is sanctioned exception #5 (owner decision,
+// 2026-10-10): the official Qwen-Image-2.1-Turbo 8-step checkpoint
+// (venvs/qwenimage-turbo) through the `qwen-image-turbo` job type only.
+const qwenImage21TurboModel = "qwen-image-2.1-turbo"
+const qwenImageTurboJobType = "qwen-image-turbo"
+
 func isReferenceImageEditModel(modelID string) bool {
 	return normalizedPolicyText(modelID) == referenceImageEditModel
 }
@@ -61,6 +67,10 @@ func isQwenImage21HereticModel(modelID string) bool {
 
 func isQwenImage21SglangModel(modelID string) bool {
 	return normalizedPolicyText(modelID) == normalizedPolicyText(qwenImage21SglangModel)
+}
+
+func isQwenImage21TurboModel(modelID string) bool {
+	return normalizedPolicyText(modelID) == normalizedPolicyText(qwenImage21TurboModel)
 }
 
 const untrustedWorkerCommandMessage = "worker_cmd is not a trusted repository-owned Arbiter adapter/worker identity"
@@ -121,6 +131,7 @@ var trustedPythonAdapters = map[string]string{
 	qwenImage21Model:          "qwenimage",
 	qwenImage21HereticModel:   "qwenimage",
 	qwenImage21SglangModel:    "qwenimage-sglang",
+	qwenImage21TurboModel:     "qwenimage-turbo",
 	"trellis2":                "trellis2",
 }
 
@@ -160,6 +171,9 @@ func isDisabledStillImageModel(modelID string) bool {
 		return false
 	}
 	if isQwenImage21SglangModel(normalized) {
+		return false
+	}
+	if isQwenImage21TurboModel(normalized) {
 		return false
 	}
 	if normalized == "lora-train" || normalized == "fine-tune" || normalized == "ltx2" || strings.HasPrefix(normalized, "ltx2-") ||
@@ -215,9 +229,9 @@ func disabledStillImageConfig(modelID string, cfg ModelConfig) bool {
 		// pinned by validateWorkerCommand to the trusted adapter identity.
 		return false
 	}
-	if isQwenImage21Model(modelID) || isQwenImage21HereticModel(modelID) || isQwenImage21SglangModel(modelID) {
+	if isQwenImage21Model(modelID) || isQwenImage21HereticModel(modelID) || isQwenImage21SglangModel(modelID) || isQwenImage21TurboModel(modelID) {
 		// The sanctioned Qwen adapters legitimately name the Qwen checkpoint
-		// (or its local merged heretic dir) and their pinned interpreter.
+		// (or its local merged heretic / turbo dir) and their pinned interpreter.
 		return false
 	}
 	videoLora := normalizedPolicyText(modelID) == "ltx2" || strings.HasPrefix(normalizedPolicyText(modelID), "ltx2-") ||
@@ -356,6 +370,9 @@ func rejectDisabledStillImage(jobType, modelID string) error {
 		return fmt.Errorf("%s", stillImageDisabledMessage)
 	}
 	if isQwenImage21SglangModel(modelID) && jobType != qwenImageSglangJobType {
+		return fmt.Errorf("%s", stillImageDisabledMessage)
+	}
+	if isQwenImage21TurboModel(modelID) && jobType != qwenImageTurboJobType {
 		return fmt.Errorf("%s", stillImageDisabledMessage)
 	}
 	return nil

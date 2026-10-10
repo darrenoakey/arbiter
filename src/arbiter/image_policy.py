@@ -65,10 +65,16 @@ _DISABLED_MARKERS = (
 #    checkpoint served by SGLang-Diffusion instead of Diffusers, exposed only
 #    through the ``qwen-image-sglang`` job type. See
 #    adapters/qwen_image_21_sglang.py.
+#
+# 5. (owner decision, 2026-10-10) ``qwen-image-2.1-turbo`` — the official
+#    8-step accelerated checkpoint, exposed only through the
+#    ``qwen-image-turbo`` job type. See adapters/qwen_image_21.py
+#    (QwenImage21TurboAdapter).
 REFERENCE_IMAGE_EDIT_MODEL = "reference-image-edit"
 QWEN_IMAGE_21_MODEL = "qwen-image-2.1"
 QWEN_IMAGE_21_HERETIC_MODEL = "qwen-image-2.1-heretic"
 QWEN_IMAGE_21_SGLANG_MODEL = "qwen-image-2.1-sglang"
+QWEN_IMAGE_21_TURBO_MODEL = "qwen-image-2.1-turbo"
 
 
 class StillImageGenerationDisabled(RuntimeError):
@@ -91,6 +97,8 @@ def is_disabled_still_image_model(model_id: str) -> bool:
     if normalized == _normalize(QWEN_IMAGE_21_HERETIC_MODEL):
         return False
     if normalized == _normalize(QWEN_IMAGE_21_SGLANG_MODEL):
+        return False
+    if normalized == _normalize(QWEN_IMAGE_21_TURBO_MODEL):
         return False
     if normalized in ("lora-train", "fine-tune") or normalized.startswith("ltx2-"):
         return False

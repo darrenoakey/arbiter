@@ -50,6 +50,16 @@ def test_qwen_image_sglang_job_type_registered():
     assert params.steps == 40 and params.true_cfg_scale == 1.0
 
 
+def test_qwen_image_turbo_job_type_registered():
+    from arbiter.schemas import QwenImageTurboParams
+
+    assert JOB_TYPE_TO_MODEL["qwen-image-turbo"] == "qwen-image-2.1-turbo"
+    assert "qwen-image-turbo" in JOB_TYPE_PARAMS
+    params = QwenImageTurboParams(prompt="a panda")
+    assert params.steps == 8 and params.true_cfg_scale == 1.0
+    assert params.use_kv_cache is True
+
+
 def test_qwen_image_job_type_registered():
     from arbiter.schemas import QwenImageParams
 

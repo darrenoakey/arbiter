@@ -36,6 +36,15 @@ Sampling notes (from the model card):
   ``true_cfg_scale`` stays 1.0 unless a negative prompt justifies raising it;
 * transparent RGBA output is prompt-driven (no separate flag);
 * supported aspect ratios cap the long side at 2752 px.
+
+Sanctioned still-image exception #5 (owner decision, 2026-10-10):
+``qwen-image-2.1-turbo`` / job type ``qwen-image-turbo`` — the official
+``Qwen/Qwen-Image-2.1-Turbo`` accelerated checkpoint. Same 7B pipeline class,
+but the checkpoint ships an 8-step ``sample_sigmas`` schedule (diffusers PR
+#14950) and is meant to run with prefix KV caching. It does not share the
+stock venv: that pin predates the sigma-schedule support. Weights live on
+Spark NVMe because the T9 Hugging Face cache was full. See
+``requirements/qwen-image-turbo.txt``.
 """
 
 from __future__ import annotations
@@ -60,7 +69,13 @@ QWEN_IMAGE_21_HERETIC_MODEL_ID = "qwen-image-2.1-heretic"
 # Local merged pipeline dir on spark: the stock Qwen-Image-2.1 snapshot with
 # text_encoder/ replaced by pottokao/Qwen-Image-2.1-Text-Encoder-Heretic.
 QWEN_IMAGE_21_HERETIC_PATH = "/mnt/t9/models/qwen-image-2.1-heretic"
-DEFAULT_STEPS = 40  # card default
+QWEN_IMAGE_21_TURBO_MODEL_ID = "qwen-image-2.1-turbo"
+QWEN_IMAGE_21_TURBO_HF_ID = "Qwen/Qwen-Image-2.1-Turbo"
+# Local snapshot on Spark NVMe. /home/darren/models is a symlink onto /mnt/t9,
+# which had 2.6 GB free on 2026-10-10; the 32 GB checkpoint does not fit there.
+QWEN_IMAGE_21_TURBO_PATH = "/home/darren/nvme-models/Qwen-Image-2.1-Turbo"
+TURBO_SCHEDULE_STEPS = 8  # length of the checkpoint sample_sigmas grid
+DEFAULT_STEPS = 40  # card default for the stock checkpoint
 MAX_STEPS = 60
 MAX_SIDE = 2752  # largest supported aspect-ratio side (16:9 / 9:16)
 MIN_SIDE = 256
@@ -84,8 +99,15 @@ def snap_side(value: int) -> int:
 @register
 class QwenImage21Adapter(ModelAdapter):
     model_id = "qwen-image-2.1"
-    #: HF repo id (stock) or local merged pipeline dir (heretic subclass).
+    #: HF repo id (stock) or local merged pipeline dir (heretic/turbo).
     hf_model_path: str = QWEN_IMAGE_21_HF_ID
+    default_steps = DEFAULT_STEPS
+    #: When set, the checkpoint's saved sample_sigmas grid is authoritative.
+    #: Passing num_inference_steps does not override it.
+    checkpoint_schedule_steps: int | None = None
+    #: None means do not pass use_kv_cache. The stock venv's diffusers pin
+    #: predates that argument; only the turbo venv may receive it.
+    use_kv_cache_default: bool | None = None
 
     def __init__(self):
         self._pipe: _Image21Pipeline | None = None
@@ -124,7 +146,7 @@ class QwenImage21Adapter(ModelAdapter):
 
         self._check_cancel(cancel_flag)
         if self._pipe is None:
-            raise InferenceError("qwen-image-2.1 pipeline is not loaded")
+            raise InferenceError(f"{self.model_id} pipeline is not loaded")
 
         prompt = str(params.get("prompt", "")).strip()
         if not prompt:
@@ -132,45 +154,9 @@ class QwenImage21Adapter(ModelAdapter):
 
         has_image = bool(params.get("image") or params.get("image_file"))
         input_image = self._resolve_image(params) if has_image else None
-
-        steps = max(1, min(MAX_STEPS, int(params.get("steps", DEFAULT_STEPS))))
-        true_cfg = float(params.get("true_cfg_scale", 1.0))
-        if true_cfg <= 1.0 and params.get("negative_prompt"):
-            # negative_prompt only has effect alongside true_cfg_scale > 1
-            true_cfg = max(true_cfg, 2.0)
-        negative_prompt = params.get("negative_prompt") or None
         seed = int(params.get("seed", 42))
-        output_resolution = max(
-            MIN_SIDE, min(MAX_SIDE, int(params.get("output_resolution", 1024)))
-        )
-
-        width = params.get("width")
-        height = params.get("height")
-        if width is not None and height is not None:
-            width, height = snap_side(int(width)), snap_side(int(height))
-        elif input_image is None:
-            # Plain text-to-image without explicit dimensions: square at the
-            # requested output resolution.
-            width = height = snap_side(output_resolution)
-        else:
-            # Editing/conditioning: let the pipeline derive height/width from
-            # the condition image's aspect ratio at the target resolution.
-            width = height = None
-
-        call_kwargs: dict = {
-            "prompt": prompt,
-            "num_inference_steps": steps,
-            "true_cfg_scale": true_cfg,
-            "generator": torch.Generator(device=self._device).manual_seed(seed),
-        }
-        if negative_prompt:
-            call_kwargs["negative_prompt"] = negative_prompt
-        if input_image is not None:
-            call_kwargs["image"] = input_image
-            call_kwargs["output_resolution"] = output_resolution
-        if width is not None and height is not None:
-            call_kwargs["width"] = width
-            call_kwargs["height"] = height
+        call_kwargs, steps, requested_steps = self.sampling_kwargs(params, input_image)
+        call_kwargs["generator"] = torch.Generator(device=self._device).manual_seed(seed)
 
         self._check_cancel(cancel_flag)
         result_image = self._pipe(**call_kwargs).images[0]
@@ -194,20 +180,91 @@ class QwenImage21Adapter(ModelAdapter):
         except OSError:
             pass
 
-        return {
+        result = {
             "format": "png",
             "mode": "edit" if input_image is not None else "t2i",
             "width": result_image.width,
             "height": result_image.height,
             "steps": steps,
             "seed": seed,
-            "true_cfg_scale": true_cfg,
+            "true_cfg_scale": call_kwargs["true_cfg_scale"],
             "model": self.hf_model_path,
             "file": "result.png",
         }
+        if self.checkpoint_schedule_steps is not None:
+            result["requested_steps"] = requested_steps
+            result["schedule"] = "checkpoint-sample-sigmas"
+            if "use_kv_cache" in call_kwargs:
+                result["use_kv_cache"] = call_kwargs["use_kv_cache"]
+        return result
+
+    def sampling_kwargs(
+        self, params: dict, input_image: "Image.Image | None"
+    ) -> tuple[dict, int, int]:
+        """Build pipeline kwargs except the torch generator.
+
+        Returns ``(kwargs, actual_steps, requested_steps)``. A checkpoint with
+        saved ``sample_sigmas`` ignores ``num_inference_steps``; those adapters
+        report the schedule length and do not pass an overriding ``sigmas`` grid.
+        """
+        requested_steps = max(
+            1, min(MAX_STEPS, int(params.get("steps", self.default_steps)))
+        )
+        steps = (
+            self.checkpoint_schedule_steps
+            if self.checkpoint_schedule_steps is not None
+            else requested_steps
+        )
+        if (
+            self.checkpoint_schedule_steps is not None
+            and requested_steps != self.checkpoint_schedule_steps
+        ):
+            log.warning(
+                "%s ignores requested steps=%s; checkpoint sample_sigmas "
+                "schedule is %s steps",
+                self.model_id,
+                requested_steps,
+                self.checkpoint_schedule_steps,
+            )
+        true_cfg = float(params.get("true_cfg_scale", 1.0))
+        if true_cfg <= 1.0 and params.get("negative_prompt"):
+            # negative_prompt only has effect alongside true_cfg_scale > 1
+            true_cfg = max(true_cfg, 2.0)
+        negative_prompt = params.get("negative_prompt") or None
+        output_resolution = max(
+            MIN_SIDE, min(MAX_SIDE, int(params.get("output_resolution", 1024)))
+        )
+        width = params.get("width")
+        height = params.get("height")
+        if width is not None and height is not None:
+            width, height = snap_side(int(width)), snap_side(int(height))
+        elif input_image is None:
+            width = height = snap_side(output_resolution)
+        else:
+            width = height = None
+
+        prompt = str(params.get("prompt", "")).strip()
+        call_kwargs: dict = {
+            "prompt": prompt,
+            "num_inference_steps": steps,
+            "true_cfg_scale": true_cfg,
+        }
+        if self.use_kv_cache_default is not None:
+            call_kwargs["use_kv_cache"] = bool(
+                params.get("use_kv_cache", self.use_kv_cache_default)
+            )
+        if negative_prompt:
+            call_kwargs["negative_prompt"] = negative_prompt
+        if input_image is not None:
+            call_kwargs["image"] = input_image
+            call_kwargs["output_resolution"] = output_resolution
+        if width is not None and height is not None:
+            call_kwargs["width"] = width
+            call_kwargs["height"] = height
+        return call_kwargs, steps, requested_steps
 
     def estimate_time(self, params: dict) -> float:
-        steps = int(params.get("steps", DEFAULT_STEPS))
+        steps = int(params.get("steps", self.default_steps))
         edit = 1 if (params.get("image") or params.get("image_file")) else 0
         # 7B DiT at ~1-4 MP; conditioning images add text-encoder vision tokens
         return 6000.0 + 350.0 * steps + 1500.0 * edit
@@ -228,3 +285,25 @@ class QwenImage21HereticAdapter(QwenImage21Adapter):
 
     model_id = QWEN_IMAGE_21_HERETIC_MODEL_ID
     hf_model_path = QWEN_IMAGE_21_HERETIC_PATH
+
+
+@register
+class QwenImage21TurboAdapter(QwenImage21Adapter):
+    """Official 8-step accelerated checkpoint (exception #5, 2026-10-10).
+
+    Same pipeline class as :class:`QwenImage21Adapter`. The checkpoint's saved
+    ``sample_sigmas`` grid fixes the step count at 8; ``steps`` does not
+    override it. Prefix KV caching is on by default. Serves ONLY
+    ``qwen-image-turbo`` under ``qwen-image-2.1-turbo``.
+    """
+
+    model_id = QWEN_IMAGE_21_TURBO_MODEL_ID
+    hf_model_path = QWEN_IMAGE_21_TURBO_PATH
+    default_steps = TURBO_SCHEDULE_STEPS
+    checkpoint_schedule_steps = TURBO_SCHEDULE_STEPS
+    use_kv_cache_default = True
+
+    def estimate_time(self, params: dict) -> float:
+        edit = 1 if (params.get("image") or params.get("image_file")) else 0
+        # Distilled 8-step schedule plus prefix KV cache. Load time is separate.
+        return 4000.0 + 180.0 * TURBO_SCHEDULE_STEPS + 800.0 * edit
