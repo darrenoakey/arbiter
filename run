@@ -28,7 +28,22 @@ case "$CMD" in
         exec go build -o "$SCRIPT_DIR/arbiter-go" ./cmd/arbiter/
         ;;
     check)
-        # Impact-selected gate. A Python-only diff does not run the Go suite:
+        # Impact-selected gate. Interpreter resolution: homebrew moved
+        # `python3` to a new version (2026-10-12: 3.15) while the suite's
+        # deps (pydantic, torch) live in the previous python@3.14 user
+        # site-packages, so a bare `python3` gate run fails every collection
+        # with ImportError. Probe for an interpreter that imports the test
+        # deps; two fast checks, self-heals when the machine standardizes.
+        PY=""
+        for cand in python3 python3.14; do
+            if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import pydantic' >/dev/null 2>&1; then
+                PY="$cand"
+                break
+            fi
+        done
+        [ -n "$PY" ] || PY="python3"
+        echo "check python: $PY ($("$PY" -c 'import sys; print(sys.version.split()[0])'))"
+        # A Python-only diff does not run the Go suite:
         # on 2026-10-01 that suite cold-downloaded modules three times in
         # parallel and the check stage took 113s of a 188.8s release. Unknown
         # paths fail closed to every leg. SSH forwards localhost:11434 and
@@ -43,6 +58,9 @@ case "$CMD" in
             exit 0
         fi
         echo "check impact: $(printf '%s' "$impact" | tr '\n' ' ')"
+        check_start=$SECONDS
+        leg_started() { eval "leg_start_$1=$SECONDS"; }
+        leg_done() { echo "check leg '$1' took $((SECONDS - leg_start_$1))s (wall +$((SECONDS - check_start))s)"; }
 
         has_leg() {
             printf '%s\n' "$impact" | grep -qx "$1"
@@ -60,7 +78,8 @@ case "$CMD" in
         trap cleanup_bg EXIT
 
         if has_leg gpu-idle; then
-            python3 -m unittest scripts/test_gpu_idle_hook.py &
+            leg_started gpu_idle
+            "$PY" -m unittest scripts/test_gpu_idle_hook.py &
             bg_pids+=($!)
             py_unittest_pid=$!
         fi
@@ -69,11 +88,13 @@ case "$CMD" in
         # would silently test the canonical sources. tests/integration is
         # excluded on purpose — it drives the live spark fleet.
         if has_leg python; then
-            PYTHONPATH="$SCRIPT_DIR/src" python3 -m pytest tests/unit src/arbiter/schemas_test.py src/arbiter/adapters/nimble_score_test.py src/arbiter/adapters/clef_score_test.py src/arbiter/adapters/mini_agi_test.py -q -n 4 &
+            leg_started pytest
+            PYTHONPATH="$SCRIPT_DIR/src" "$PY" -m pytest tests/unit src/arbiter/schemas_test.py src/arbiter/adapters/nimble_score_test.py src/arbiter/adapters/clef_score_test.py src/arbiter/adapters/mini_agi_test.py -q -n 4 &
             bg_pids+=($!)
             py_pytest_pid=$!
         fi
         if has_leg go; then
+            leg_started go
             unformatted="$(gofmt -l .)"
             if [ -n "$unformatted" ]; then
                 echo "Unformatted Go files:" >&2
@@ -97,14 +118,18 @@ case "$CMD" in
             fi
             wait "$go_build_pid" || go_status=$?
             wait "$go_vet_pid" || go_status=$?
+            leg_done go
         fi
         if [ -n "${py_unittest_pid:-}" ]; then
             wait "$py_unittest_pid" || py_status=$?
+            leg_done gpu_idle
         fi
         if [ -n "${py_pytest_pid:-}" ]; then
             wait "$py_pytest_pid" || py_status=$?
+            leg_done pytest
         fi
         trap - EXIT
+        echo "check total: $((SECONDS - check_start))s (impact legs run in parallel; wall ≈ slowest leg)"
         if [ "$py_status" -ne 0 ]; then
             echo "Python test suite failed (see output above)" >&2
             exit "$py_status"

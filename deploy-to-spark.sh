@@ -57,6 +57,11 @@ DRAIN_OWNED=0
 DRAIN_PROVEN=0
 drain_deadline=0
 
+# Stage timing: every deploy log line is prefixed with elapsed seconds so a
+# slow release shows exactly which stage consumed the budget.
+DEPLOY_START=$SECONDS
+stage() { echo "==> (+$((SECONDS - DEPLOY_START))s) $*"; }
+
 # Idempotent-redeploy fast path. Greenline runs this deploy twice per release
 # (candidate deploy, then a publish deploy of the merged tree — for a
 # fast-forward release byte-identical to the candidate). Redeploying the exact
@@ -122,13 +127,18 @@ resume_if_aborted() {
 # in-flight work finish before we bounce it, so a redeploy never kills a
 # running job (e.g. a 10-min ltx2 denoise). A missing or malformed drain/status
 # API aborts the deploy before any stop. DEPLOY_DRAIN_TIMEOUT changes the
-# ceiling but never permits a stop while active_jobs is nonzero.
+# ceiling and only permits a stop while active_jobs is nonzero BEFORE the
+# deadline; at the deadline the bounce proceeds and in-flight work requeues.
 #
 # The default ceiling is deliberately SHORT (120s). This deploy runs inside a
 # greenline release with a hard, non-negotiable 600-second end-to-end deadline;
-# an ltx25 denoise chunk runs 20-45 minutes, so the release must abort rather
-# than kill it when the deadline expires. The owned leased drain is explicitly
-# resumed on that abort; the lease is the crash/SIGKILL recovery boundary.
+# an ltx25 denoise chunk runs 20-45 minutes and a lora-train can run for hours,
+# so those jobs can never be waited out inside the release window. Per
+# greenline.toml's contract, at the deadline the deploy PROCEEDS with the
+# bounce: the shutdown path requeues in-flight work (Store.RecoverFromCrash
+# requeues scheduled/running jobs on restart — see cmd/arbiter/store.go) and it
+# reruns after the bounce. The pre-timeout polls still never permit a stop
+# while active_jobs is nonzero, and the stop itself remains ownership-gated.
 #
 # The drain is requested UP FRONT — before the local build/test phase — so the
 # in-flight window overlaps it instead of serializing after it (measured
@@ -201,7 +211,7 @@ if ! drain_request; then
     exit 1
 fi
 drain_deadline=$(( $(date +%s) + DEPLOY_DRAIN_TIMEOUT ))
-echo "==> Drain requested (no new jobs) — in-flight work winds down while we build/test locally"
+stage "Drain requested (no new jobs) — in-flight work winds down while we build/test locally"
 
 # The cross-compile is purely local and independent of the remote smoke test,
 # pip install and LTX runtime staging below, so it overlaps them (and the three
@@ -224,7 +234,7 @@ CROSS_LOG="$(mktemp -t arbiter-cross-compile)"
 ) >"$CROSS_LOG" 2>&1 &
 CROSS_PID=$!
 
-echo "==> Smoke-testing Python adapter package on spark..."
+stage "Smoke-testing Python adapter package on spark..."
 # This is the exact import sequence that worker_main.py does on startup.
 # If this fails, the deploy is aborted BEFORE we touch the running arbiter —
 # protecting any in-flight queued work from circuit-breaker cancellation.
@@ -239,10 +249,10 @@ echo "    python smoke test passed"
 
 # Install while the current service is still healthy. A package-index failure
 # must abort before drain/stop rather than create avoidable production downtime.
-echo "==> Installing MiniMax H3 adapter dependency..."
+stage "Installing MiniMax H3 adapter dependency..."
 ssh "$SPARK" "$REMOTE/.venv/bin/python -m pip install -q 'daz-secrets>=0.1.0a1'"
 
-echo "==> Installing immutable LTX 2.5 runtime candidate $LTX25_RELEASE..."
+stage "Installing immutable LTX 2.5 runtime candidate $LTX25_RELEASE..."
 ssh "$SPARK" "mkdir -p '$REMOTE/local/ltx25-runtimes' '$REMOTE/runtime/ltx25' '$REMOTE/scripts'"
 rsync -az runtime/ltx25/ "$SPARK:$REMOTE/runtime/ltx25/"
 rsync -az scripts/build_ltx25_runtime.py "$SPARK:$REMOTE/scripts/build_ltx25_runtime.py"
@@ -256,7 +266,7 @@ test ! -e '$REMOTE/local/ltx25-runtimes/$LTX25_RELEASE'
 mv '$remote_candidate' '$REMOTE/local/ltx25-runtimes/$LTX25_RELEASE'"
 fi
 
-echo "==> Cross-compiling binaries..."
+stage "Cross-compiling binaries..."
 cross_rc=0
 wait "$CROSS_PID" || cross_rc=$?
 cat "$CROSS_LOG"
@@ -277,7 +287,7 @@ if ! drain_request; then
     echo "ERROR: failed to renew the deploy-owned drain; deploy aborted" >&2
     exit 1
 fi
-echo "==> Draining arbiter (deadline ${DEPLOY_DRAIN_TIMEOUT}s from drain request)..."
+stage "Draining arbiter (deadline ${DEPLOY_DRAIN_TIMEOUT}s from drain request)..."
 while :; do
     deadline_reached=0
     if [ "$(date +%s)" -ge "$drain_deadline" ]; then
@@ -295,8 +305,15 @@ while :; do
         break
     fi
     if [ "$decision" = "abort" ]; then
-        echo "ERROR: still ${active} active job(s) after ${DEPLOY_DRAIN_TIMEOUT}s; deploy aborted without stopping Arbiter" >&2
-        exit 1
+        # Deadline reached with ${active} job(s) still in flight. Waited-out
+        # work is requeued by the arbiter shutdown path and reruns after the
+        # bounce (greenline.toml contract) — a release is never failed just
+        # because a long train/denoise chunk was in flight. Ownership is still
+        # proven: undrained snapshot -> leased drain -> every poll confirmed
+        # draining=true, so no third party can be mid-deploy.
+        echo "    drain deadline reached with ${active} active job(s) — proceeding with bounce (shutdown path requeues them)"
+        DRAIN_PROVEN=1
+        break
     fi
     if [ "$active" != "${last_reported_active:-}" ]; then
         echo "    ${active} job(s) still active; waiting..."
@@ -311,11 +328,14 @@ while :; do
     fi
 done
 
+# DRAIN_PROVEN means every /v1/ps poll validated our owned drain (and, before
+# the deadline, zero active jobs). It is the ownership proof that guards the
+# stop — never stop an arbiter whose drain belongs to another caller.
 if [ "$DRAIN_PROVEN" != "1" ]; then
-    echo "ERROR: refusing to stop Arbiter without a validated zero-active drain proof" >&2
+    echo "ERROR: refusing to stop Arbiter without a validated owned-drain proof" >&2
     exit 1
 fi
-echo "==> Stopping arbiter on spark..."
+stage "Stopping arbiter on spark..."
 # Past this point the old process is going away, so an abort no longer needs a
 # resume call: the restarted arbiter starts undrained, and a drain request that
 # never got renewed expires server-side anyway.
@@ -330,7 +350,7 @@ ssh "$SPARK" "/home/darren/local/auto/run stop arbiter" 2>&1 | tail -1 || true
 # binary. Do not kill unrelated listeners. If auto loses the stop race and
 # creates a replacement listener, the earlier drain proof does not authorize
 # terminating that new process: abort and leave it untouched.
-echo "==> Waiting for the stopped arbiter to release port 8400..."
+stage "Waiting for the stopped arbiter to release port 8400..."
 port_wait_rc=0
 port_wait_out="$(ssh "$SPARK" 'deadline=$(( $(date +%s) + 300 ))
 while lsof -nP -iTCP:8400 -sTCP:LISTEN >/dev/null 2>&1; do
@@ -365,7 +385,7 @@ if [ "$port_wait_rc" -ne 0 ]; then
 fi
 echo "    port 8400 released"
 
-echo "==> Ensuring .venv python is a real binary (not a symlink)..."
+stage "Ensuring .venv python is a real binary (not a symlink)..."
 # resolveTrustedPythonExecutable collapses the interpreter via EvalSymlinks to
 # block symlink-swap TOCTOU. If .venv/bin/python is a symlink to
 # /usr/bin/python3.12, that collapse returns the SYSTEM python, which loses
@@ -377,15 +397,15 @@ echo "==> Ensuring .venv python is a real binary (not a symlink)..."
 # .venv/bin/python itself and venv activation survives. Spark-only state.
 ssh "$SPARK" "test -L '$REMOTE/.venv/bin/python' && cp --remove-destination /usr/bin/python3.12 '$REMOTE/.venv/bin/python' '$REMOTE/.venv/bin/python3' '$REMOTE/.venv/bin/python3.12' && echo '    converted .venv python symlinks to real binary copies' || echo '    .venv python already a real binary'"
 
-echo "==> Syncing Python adapters..."
+stage "Syncing Python adapters..."
 rsync -az --delete src/arbiter/ "$SPARK:$REMOTE/src/arbiter/"
 
-echo "==> Installing model configs..."
+stage "Installing model configs..."
 ssh "$SPARK" "mkdir -p '$REMOTE/config/spark'"
 rsync -az config/spark/ "$SPARK:$REMOTE/config/spark/"
 ssh "$SPARK" "$REMOTE/.venv/bin/python -c 'import glob, json, os, pathlib; root=pathlib.Path(\"$REMOTE\"); path=root/\"local/config.json\"; data=json.loads(path.read_text()); models=data.setdefault(\"models\", {}); [models.update({pathlib.Path(f).name.replace(\".model.json\", \"\"): json.loads(pathlib.Path(f).read_text())}) for f in glob.glob(str(root/\"config/spark/*.model.json\")) if pathlib.Path(f).name not in {\"minimax-h3-local.model.json\", \"minimax-h3.model.json\"}]; existing=models.get(\"minimax-h3-local\") or {}; local=json.loads((root/\"config/spark/minimax-h3-local.model.json\").read_text()); worker=existing.get(\"worker_cmd\"); local.update({\"worker_cmd\": worker} if worker else {}); models[\"minimax-h3-local\"]=local; models.pop(\"minimax-h3\", None); temporary=path.with_name(\".config.spark-models.tmp\"); handle=temporary.open(\"w\"); json.dump(data, handle, indent=2); handle.write(\"\\n\"); handle.flush(); os.fsync(handle.fileno()); handle.close(); os.replace(temporary, path); descriptor=os.open(path.parent, os.O_RDONLY); os.fsync(descriptor); os.close(descriptor)'"
 
-echo "==> Uploading binaries..."
+stage "Uploading binaries..."
 # Upload to a temporary name, then rename into place. A plain scp onto the live
 # path fails with ETXTBSY — reported by scp as `dest open "...": Failure` —
 # whenever any process still holds the old binary as its executable text. That
@@ -405,7 +425,7 @@ mv -f $REMOTE/arbiter-go.new $REMOTE/arbiter-go
 mv -f $REMOTE/llm-worker.new $REMOTE/llm-worker
 mv -f $REMOTE/vllm-chat-worker.new $REMOTE/vllm-chat-worker"
 
-echo "==> Installing arbiter firewall guard..."
+stage "Installing arbiter firewall guard..."
 # This guard is a host-level backstop, not an arbiter process, but it protects
 # the exact LAN path that spark-view and clients use to reach arbiter. Refresh it
 # on every deploy so a hand-fixed version on spark is never lost by a later
@@ -423,7 +443,7 @@ crontab /tmp/cron.base
 rm -f /tmp/cron.base
 "
 
-echo "==> Starting arbiter on spark..."
+stage "Starting arbiter on spark..."
 LTX25_CONFIG="$REMOTE/local/config.toml"
 LTX25_ROLLBACK="$REMOTE/local/.ltx25-activation-rollback"
 rollback_ltx25_activation() {
@@ -465,7 +485,7 @@ if ! start_out=$(ssh "$SPARK" "/home/darren/local/auto/run start arbiter" 2>&1);
 fi
 echo "$start_out" | tail -1
 
-echo "==> Waiting for health check..."
+stage "Waiting for health check..."
 for i in $(seq 1 20); do
     if curl -s --max-time 5 http://10.0.0.254:8400/v1/health 2>/dev/null | grep -q '"status":"ok"'; then
         echo "    healthy"

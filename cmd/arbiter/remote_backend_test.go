@@ -455,6 +455,12 @@ func pi() *float64 { p := 1.0; return &p }
 
 // (a) A chat job routed to a REMOTE instance returns a real completion.
 func TestRemoteDispatchReturnsRealCompletion(t *testing.T) {
+	// Parallel with TestRemoteFailoverOnAbsenceCompletesElsewhere: each test has
+	// its own scheduler/store/tempdir, the reachability check is read-only, and
+	// the only shared resource (the Mac mini Ollama) serializes concurrent
+	// requests on the model. Model load dominates both (~10s each serially),
+	// so parallel halves that cost on the release critical path.
+	t.Parallel()
 	// Use the Mac mini endpoint so this real model test does not make the laptop's
 	// memory-pressure guard kill its local llama-server subprocess mid-request.
 	requireReachableOllamaAt(t, macminiOllamaAddr, localOllamaTag, "Mac mini")
@@ -512,6 +518,9 @@ func TestRemoteDispatchReturnsRealCompletion(t *testing.T) {
 // (b) CONFIRMED host-absence on the preferred host → the job transparently fails
 // over to a reachable endpoint, NEVER fails, exactly one result.
 func TestRemoteFailoverOnAbsenceCompletesElsewhere(t *testing.T) {
+	// See TestRemoteDispatchReturnsRealCompletion: parallel-safe, shares only the
+	// Mac mini model load.
+	t.Parallel()
 	requireReachableOllamaAt(t, macminiOllamaAddr, localOllamaTag, "Mac mini")
 	dead := deadOllamaAddr(t)
 	cfg := &Config{
