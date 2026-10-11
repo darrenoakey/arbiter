@@ -52,7 +52,7 @@ def classify(path: str) -> set[str] | None:
     name = Path(path).name
     if path in GLOBAL or name in GLOBAL:
         return set(LEGS)
-    if path.startswith("docs/") or Path(path).suffix.lower() in INERT_SUFFIXES:
+    if path.startswith("docs/") or path.startswith("requirements/") or Path(path).suffix.lower() in INERT_SUFFIXES:
         return set()
     if path == "scripts/gpu_idle_hook.py" or path == "scripts/test_gpu_idle_hook.py":
         return {"gpu-idle"}

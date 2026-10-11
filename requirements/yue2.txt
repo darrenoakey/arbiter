@@ -1,0 +1,44 @@
+# venvs/yue2 — YuE2-3B music generation adapter
+# (job type `music-generate-yue2`, model id `yue2`)
+#
+# Recreate ON SPARK (venvs/ is spark-only state, never deployed by
+# deploy-to-spark.sh; the venv MUST be a real directory, never a symlink —
+# worker policy rejects symlinked venv paths):
+#
+#   cd ~/src/arbiter
+#   rm -rf venvs/yue2
+#   python3.12 -m venv venvs/yue2
+#   venvs/yue2/bin/pip install --upgrade pip
+#   # torch first, from the CUDA 13.0 wheel index (the +cu130 local version
+#   # does not exist on PyPI; installing plain `torch` gives a CPU-only build):
+#   venvs/yue2/bin/pip install torch==2.10.0+cu130 --index-url https://download.pytorch.org/whl/cu130
+#   venvs/yue2/bin/pip install -r requirements/yue2.txt
+#   # the worker venv must be able to `import arbiter` (copied .pth, not a
+#   # path hack — PYTHONPATH is forbidden as an adapter param):
+#   cp venvs/qwentts/lib/python3.12/site-packages/arbiter.pth venvs/yue2/lib/python3.12/site-packages/
+#
+# yue2-infer is NOT on PyPI. The production pin 0.1.5 was installed from a
+# wheel kept on the host at ~/yue2-pkg/yue2_infer-0.1.5-py3-none-any.whl:
+#
+#   venvs/yue2/bin/pip install ~/yue2-pkg/yue2_infer-0.1.5-py3-none-any.whl
+#
+# Upstream's current release is 0.1.6
+# (https://github.com/multimodal-art-projection/YuE/releases/download/yue2-v0.1.6/yue2_infer-0.1.6-py3-none-any.whl).
+# Do NOT upgrade the worker pin without a real arbiter job proving the new
+# package — the adapter depends on the pipeline call surface
+# (style/lyrics/cot/seed/cfg_scale/abc, SongResult.audio/sample_rate/timing).
+#
+# Weights m-a-p/YuE2-3B + m-a-p/YuE2-Vae resolve from the shared HF cache at
+# /mnt/t9/hf-cache (symlinked into ~/.cache/huggingface/hub). Do not set
+# auto_download here: the T9 hub cache is the download path, and a re-download
+# belongs inside the audited worker, never a shell snapshot_download.
+#
+# Long installs (torch ~2 GB, first weight download ~8 GB) must run DETACHED
+# with durable logs, then sleep — never an in-turn tool wait.
+torch==2.10.0+cu130
+transformers==4.57.6
+accelerate==1.13.0
+numpy==2.2.6
+soundfile==0.13.1
+tiktoken==0.12.0
+yue2-infer==0.1.5
