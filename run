@@ -68,20 +68,16 @@ case "$CMD" in
 
         py_status=0
         go_status=0
-        bg_pids=()
-        cleanup_bg() {
-            local pid
-            for pid in ${bg_pids[@]+"${bg_pids[@]}"}; do
-                kill "$pid" 2>/dev/null || true
-            done
-        }
-        trap cleanup_bg EXIT
+        # Legs run SEQUENTIALLY, not concurrently. Measured 2026-10-12
+        # (gl/iris-ming-compare, 10-core box under fleet load): legs measured
+        # 41s (go test) and 64s (pytest -n 4) each alone, but the concurrent
+        # wall was 266s for both — CPU oversubscription made "parallel" legs
+        # ~2.5x slower than their serial sum. Sequential wall = sum of legs.
 
         if has_leg gpu-idle; then
             leg_started gpu_idle
-            "$PY" -m unittest scripts/test_gpu_idle_hook.py &
-            bg_pids+=($!)
-            py_unittest_pid=$!
+            "$PY" -m unittest scripts/test_gpu_idle_hook.py || py_status=$?
+            leg_done gpu_idle
         fi
         # PYTHONPATH=src is mandatory: `arbiter` is installed in develop mode
         # pointing at the CANONICAL checkout, so without it a worktree gate
@@ -89,9 +85,8 @@ case "$CMD" in
         # excluded on purpose — it drives the live spark fleet.
         if has_leg python; then
             leg_started pytest
-            PYTHONPATH="$SCRIPT_DIR/src" "$PY" -m pytest tests/unit src/arbiter/schemas_test.py src/arbiter/adapters/nimble_score_test.py src/arbiter/adapters/clef_score_test.py src/arbiter/adapters/mini_agi_test.py -q -n 4 &
-            bg_pids+=($!)
-            py_pytest_pid=$!
+            PYTHONPATH="$SCRIPT_DIR/src" "$PY" -m pytest tests/unit src/arbiter/schemas_test.py src/arbiter/adapters/nimble_score_test.py src/arbiter/adapters/clef_score_test.py src/arbiter/adapters/mini_agi_test.py -q -n 4 || py_status=$?
+            leg_done pytest
         fi
         if has_leg go; then
             leg_started go
@@ -101,15 +96,14 @@ case "$CMD" in
                 echo "$unformatted" >&2
                 exit 1
             fi
-            # One download, then parallel build/vet/test. Three cold `go`
-            # processes each printed `go: downloading` and held the module
-            # lock (measured 2026-10-01: check 113s; warm parallel leg 18s).
+            # One download, then parallel build/vet/test within the leg.
+            # Three cold `go` processes each printed `go: downloading` and
+            # held the module lock (measured 2026-10-01: check 113s; warm
+            # parallel leg 18s). Cross-LEG backgrounding is what cost 266s.
             go mod download
             go build -o /dev/null ./cmd/arbiter/ &
-            bg_pids+=($!)
             go_build_pid=$!
             go vet ./cmd/arbiter/ &
-            bg_pids+=($!)
             go_vet_pid=$!
             if [ -n "${ARBITER_GO_TEST_SKIP:-}" ]; then
                 go test ./cmd/arbiter/ -count=1 -p 1 -skip "$ARBITER_GO_TEST_SKIP" || go_status=$?
@@ -120,16 +114,7 @@ case "$CMD" in
             wait "$go_vet_pid" || go_status=$?
             leg_done go
         fi
-        if [ -n "${py_unittest_pid:-}" ]; then
-            wait "$py_unittest_pid" || py_status=$?
-            leg_done gpu_idle
-        fi
-        if [ -n "${py_pytest_pid:-}" ]; then
-            wait "$py_pytest_pid" || py_status=$?
-            leg_done pytest
-        fi
-        trap - EXIT
-        echo "check total: $((SECONDS - check_start))s (impact legs run in parallel; wall ≈ slowest leg)"
+        echo "check total: $((SECONDS - check_start))s (impact legs run sequentially; wall = sum of legs)"
         if [ "$py_status" -ne 0 ]; then
             echo "Python test suite failed (see output above)" >&2
             exit "$py_status"
