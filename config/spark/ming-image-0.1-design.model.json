@@ -1,0 +1,22 @@
+{
+  "adapter_params": {
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+  },
+  "avg_inference_ms": 90000,
+  "group": false,
+  "keep_alive_seconds": 900,
+  "load_ms": 480000,
+  "max_concurrent": 1,
+  "max_instances": 1,
+  "max_runtime_seconds": 3600,
+  "memory_gb": 80,
+  "model_path": "/home/darren/nvme-models/Ming-Image-0.1-Design",
+  "placements": ["spark"],
+  "pressure_index": 1,
+  "worker_cmd": [
+    "/home/darren/src/arbiter/venvs/mingimage/bin/python",
+    "-m",
+    "arbiter.worker_main",
+    "ming-image-0.1-design"
+  ]
+}

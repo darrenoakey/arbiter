@@ -50,6 +50,17 @@ def test_qwen_image_sglang_job_type_registered():
     assert params.steps == 40 and params.true_cfg_scale == 1.0
 
 
+def test_iris_and_ming_job_types_registered():
+    from arbiter.schemas import Iris3BParams, MingImageDesignParams
+
+    assert JOB_TYPE_TO_MODEL["iris-3b"] == "iris-3b"
+    assert JOB_TYPE_TO_MODEL["ming-image-design"] == "ming-image-0.1-design"
+    iris = Iris3BParams(prompt="a red fox")
+    ming = MingImageDesignParams(prompt="a poster")
+    assert iris.steps == 100 and iris.cfg_scale == 3.0
+    assert ming.steps == 12 and ming.cfg_scale == 1.0
+
+
 def test_qwen_image_turbo_job_type_registered():
     from arbiter.schemas import QwenImageTurboParams
 

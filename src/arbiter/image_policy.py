@@ -70,11 +70,16 @@ _DISABLED_MARKERS = (
 #    8-step accelerated checkpoint, exposed only through the
 #    ``qwen-image-turbo`` job type. See adapters/qwen_image_21.py
 #    (QwenImage21TurboAdapter).
+#
+# 6. (owner request, 2026-10-11) ``iris-3b`` and ``ming-image-0.1-design``
+#    — comparison adapters only. Exact ids, not IGS fallbacks.
 REFERENCE_IMAGE_EDIT_MODEL = "reference-image-edit"
 QWEN_IMAGE_21_MODEL = "qwen-image-2.1"
 QWEN_IMAGE_21_HERETIC_MODEL = "qwen-image-2.1-heretic"
 QWEN_IMAGE_21_SGLANG_MODEL = "qwen-image-2.1-sglang"
 QWEN_IMAGE_21_TURBO_MODEL = "qwen-image-2.1-turbo"
+IRIS_3B_MODEL = "iris-3b"
+MING_IMAGE_DESIGN_MODEL = "ming-image-0.1-design"
 
 
 class StillImageGenerationDisabled(RuntimeError):
@@ -99,6 +104,10 @@ def is_disabled_still_image_model(model_id: str) -> bool:
     if normalized == _normalize(QWEN_IMAGE_21_SGLANG_MODEL):
         return False
     if normalized == _normalize(QWEN_IMAGE_21_TURBO_MODEL):
+        return False
+    if normalized == _normalize(IRIS_3B_MODEL):
+        return False
+    if normalized == _normalize(MING_IMAGE_DESIGN_MODEL):
         return False
     if normalized in ("lora-train", "fine-tune") or normalized.startswith("ltx2-"):
         return False

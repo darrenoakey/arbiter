@@ -60,6 +60,8 @@ class JobType(str, Enum):
     QWEN_IMAGE_HERETIC = "qwen-image-heretic"
     QWEN_IMAGE_SGLANG = "qwen-image-sglang"
     QWEN_IMAGE_TURBO = "qwen-image-turbo"
+    IRIS_3B = "iris-3b"
+    MING_IMAGE_DESIGN = "ming-image-design"
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
     FINE_TUNE = "fine-tune"
@@ -107,6 +109,8 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "qwen-image-heretic": "qwen-image-2.1-heretic",
     "qwen-image-sglang": "qwen-image-2.1-sglang",
     "qwen-image-turbo": "qwen-image-2.1-turbo",
+    "iris-3b": "iris-3b",
+    "ming-image-design": "ming-image-0.1-design",
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
     "fine-tune": "fine-tune",
@@ -523,6 +527,29 @@ class QwenImageTurboParams(QwenImageParams):
     use_kv_cache: bool = True
 
 
+class Iris3BParams(BaseModel):
+    """Iris-3B pixel-space text-to-image. Card defaults are 100 steps and CFG 3."""
+
+    prompt: str
+    negative_prompt: Optional[str] = None
+    steps: int = 100
+    cfg_scale: float = 3.0
+    seed: int = 42
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+
+class MingImageDesignParams(BaseModel):
+    """Ming-Image-0.1-Design. Card defaults are 12 steps and CFG 1.0."""
+
+    prompt: str
+    steps: int = 12
+    cfg_scale: float = 1.0
+    seed: int = 42
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+
 class ImageTo3DParams(BaseModel):
     image: Optional[str] = None  # base64; RGBA with real alpha skips BiRefNet
     image_file: Optional[str] = None  # staged path on spark
@@ -735,6 +762,8 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "qwen-image-heretic": QwenImageParams,
     "qwen-image-sglang": QwenImageParams,
     "qwen-image-turbo": QwenImageTurboParams,
+    "iris-3b": Iris3BParams,
+    "ming-image-design": MingImageDesignParams,
     "tts-voxtral": TTSVoxtralParams,
     "video-generate-h3": VideoGenerateH3Params,
     "video-generate-fast-h3": VideoGenerateH3Params,

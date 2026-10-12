@@ -55,6 +55,10 @@ def test_qwen_image_21_turbo_is_the_fifth_sanctioned_exception():
     from arbiter.image_policy import QWEN_IMAGE_21_TURBO_MODEL
 
     assert not is_disabled_still_image_model(QWEN_IMAGE_21_TURBO_MODEL)
+    assert not is_disabled_still_image_model("iris-3b")
+    assert not is_disabled_still_image_model("ming-image-0.1-design")
+    assert is_disabled_still_image_model("iris-3b-lora")
+    assert is_disabled_still_image_model("ming-image-0.1-design-lora")
     assert not is_disabled_still_image_model("Qwen.Image.2.1.Turbo")
     assert is_disabled_still_image_model("qwen-image-2.1-turbo-lora")
     assert is_disabled_still_image_model("qwen-image-turbo")
@@ -200,6 +204,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "face-restore-codeformer",
         "fine-tune",
         "insightface",
+        "iris-3b",
         "latentsync",
         "lora-train",
         "ltx2",
@@ -210,6 +215,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "ltx2-encode",
         "ltx25-denoise1",
         "ltx25-encode",
+        "ming-image-0.1-design",
         "mini-agi",
         "minimax-fast-h3",
         "minimax-h3-local",

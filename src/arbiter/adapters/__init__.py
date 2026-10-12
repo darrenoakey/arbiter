@@ -32,6 +32,8 @@ _ADAPTER_MODULES = (
     "reference_image_edit",
     "qwen_image_21",
     "qwen_image_21_sglang",
+    "iris_3b",
+    "ming_image_design",
     "fine_tune",
     "lora_train",
     "composite",
