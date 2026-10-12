@@ -51,7 +51,7 @@ LTX25_RUNTIME="$(python3 scripts/build_ltx25_runtime.py build | tail -1)"
 LTX25_RELEASE="$(basename "$LTX25_RUNTIME")"
 
 ARBITER_URL="http://10.0.0.254:8400"
-DEPLOY_DRAIN_TIMEOUT="${DEPLOY_DRAIN_TIMEOUT:-120}"
+DEPLOY_DRAIN_TIMEOUT="${DEPLOY_DRAIN_TIMEOUT:-60}"
 DEPLOY_DRAIN_LEASE="${DEPLOY_DRAIN_LEASE:-300}"
 DRAIN_OWNED=0
 DRAIN_PROVEN=0
@@ -130,10 +130,18 @@ resume_if_aborted() {
 # ceiling and only permits a stop while active_jobs is nonzero BEFORE the
 # deadline; at the deadline the bounce proceeds and in-flight work requeues.
 #
-# The default ceiling is deliberately SHORT (120s). This deploy runs inside a
-# greenline release with a hard, non-negotiable 600-second end-to-end deadline;
-# an ltx25 denoise chunk runs 20-45 minutes and a lora-train can run for hours,
-# so those jobs can never be waited out inside the release window. Per
+# The default ceiling is deliberately SHORT (60s). This deploy runs inside a
+# greenline release with a hard, non-negotiable 600-second end-to-end deadline
+# and a 180-second target; an ltx25 denoise chunk runs 20-45 minutes and a
+# lora-train can run for hours, so those jobs can never be waited out inside
+# the release window. Measured 2026-10-12: two consecutive releases each
+# burned the FULL old 120s deadline with one long job active (deploy 151s and
+# 136s of 428s/220s totals) — the deadline is the deploy floor whenever the
+# fleet has an uninterruptible chunk in flight, which is most releases. With
+# check now ~77s, the 180s target leaves deploy ~100s; 60s deadline + ~16s
+# bounce fits with headroom. Jobs that would finish in the 60-120s band are
+# requeued and rerun instead of being waited out — the same lossless path
+# multi-minute jobs already take at any deadline. Per
 # greenline.toml's contract, at the deadline the deploy PROCEEDS with the
 # bounce: the shutdown path requeues in-flight work (Store.RecoverFromCrash
 # requeues scheduled/running jobs on restart — see cmd/arbiter/store.go) and it
