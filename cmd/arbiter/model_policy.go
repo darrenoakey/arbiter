@@ -60,6 +60,26 @@ const iris3BJobType = "iris-3b"
 const mingImageDesignModel = "ming-image-0.1-design"
 const mingImageDesignJobType = "ming-image-design"
 
+// flux3KleinModels are the owner-directed FLUX 3 Image Klein benchmark
+// adapters (2026-10-16): the distilled DiT at three exact precisions, each
+// served only through its identically named job type from venvs/flux3. They
+// are benchmark adapters, never wired into generate_image / the SDK / IGS and
+// never a fallback. Every other flux* id (flux3, flux3-klein, base, LoRA,
+// renamed copies) stays denied by the generic markers.
+const flux3KleinBF16Model = "flux3-klein-bf16"
+const flux3KleinFP8Model = "flux3-klein-fp8"
+const flux3KleinNVFP4Model = "flux3-klein-nvfp4"
+
+var flux3KleinModels = map[string]bool{
+	flux3KleinBF16Model:  true,
+	flux3KleinFP8Model:   true,
+	flux3KleinNVFP4Model: true,
+}
+
+// flux3WeightsRootParam is the only extra adapter param the flux3 workers
+// accept: the absolute snapshot root holding flux-3-image-klein/.
+const flux3WeightsRootParam = "FLUX3_WEIGHTS_ROOT"
+
 func isReferenceImageEditModel(modelID string) bool {
 	return normalizedPolicyText(modelID) == referenceImageEditModel
 }
@@ -86,6 +106,10 @@ func isIris3BModel(modelID string) bool {
 
 func isMingImageDesignModel(modelID string) bool {
 	return normalizedPolicyText(modelID) == normalizedPolicyText(mingImageDesignModel)
+}
+
+func isFlux3KleinModel(modelID string) bool {
+	return flux3KleinModels[normalizedPolicyText(modelID)]
 }
 
 const untrustedWorkerCommandMessage = "worker_cmd is not a trusted repository-owned Arbiter adapter/worker identity"
@@ -149,6 +173,9 @@ var trustedPythonAdapters = map[string]string{
 	qwenImage21TurboModel:     "qwenimage-turbo",
 	iris3BModel:               "iris3b",
 	mingImageDesignModel:      "mingimage",
+	flux3KleinBF16Model:       "flux3",
+	flux3KleinFP8Model:        "flux3",
+	flux3KleinNVFP4Model:      "flux3",
 	"trellis2":                "trellis2",
 }
 
@@ -197,6 +224,9 @@ func isDisabledStillImageModel(modelID string) bool {
 		return false
 	}
 	if isMingImageDesignModel(normalized) {
+		return false
+	}
+	if isFlux3KleinModel(normalized) {
 		return false
 	}
 	if normalized == "lora-train" || normalized == "fine-tune" || normalized == "ltx2" || strings.HasPrefix(normalized, "ltx2-") ||
@@ -252,7 +282,7 @@ func disabledStillImageConfig(modelID string, cfg ModelConfig) bool {
 		// pinned by validateWorkerCommand to the trusted adapter identity.
 		return false
 	}
-	if isQwenImage21Model(modelID) || isQwenImage21HereticModel(modelID) || isQwenImage21SglangModel(modelID) || isQwenImage21TurboModel(modelID) || isIris3BModel(modelID) || isMingImageDesignModel(modelID) {
+	if isQwenImage21Model(modelID) || isQwenImage21HereticModel(modelID) || isQwenImage21SglangModel(modelID) || isQwenImage21TurboModel(modelID) || isIris3BModel(modelID) || isMingImageDesignModel(modelID) || isFlux3KleinModel(modelID) {
 		// The sanctioned Qwen adapters legitimately name the Qwen checkpoint
 		// (or its local merged heretic / turbo dir) and their pinned interpreter.
 		return false
@@ -402,6 +432,11 @@ func rejectDisabledStillImage(jobType, modelID string) error {
 		return fmt.Errorf("%s", stillImageDisabledMessage)
 	}
 	if isMingImageDesignModel(modelID) && jobType != mingImageDesignJobType {
+		return fmt.Errorf("%s", stillImageDisabledMessage)
+	}
+	if isFlux3KleinModel(modelID) && jobType != normalizedPolicyText(modelID) {
+		// Each precision is reachable only through its own job type, so a
+		// benchmark row can never be served by another variant.
 		return fmt.Errorf("%s", stillImageDisabledMessage)
 	}
 	return nil

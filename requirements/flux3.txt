@@ -1,0 +1,68 @@
+# venvs/flux3 — FLUX 3 Image Klein distilled benchmark adapters
+# (job types / model ids `flux3-klein-bf16`, `flux3-klein-fp8`,
+#  `flux3-klein-nvfp4`; one shared venv, one exact model per precision)
+#
+# Owner-directed benchmark (2026-10-16). NOT wired into generate_image /
+# daz-agent-sdk / Codex IGS and never a fallback. See docs/flux3-klein.md.
+#
+# Recreate ON SPARK (venvs/ is spark-only state, never deployed by
+# deploy-to-spark.sh; the venv MUST be a real directory, never a symlink —
+# worker policy rejects symlinked venv paths). Built 2026-10-16 exactly so.
+# Run every install DETACHED with a durable log and sleep on it; torch +
+# flashinfer take many minutes:
+#
+#   cd ~/src/arbiter
+#   python3.12 -m venv --copies venvs/flux3
+#   venvs/flux3/bin/pip install --upgrade pip
+#   venvs/flux3/bin/pip install -r requirements/flux3.txt \
+#     --extra-index-url https://download.pytorch.org/whl/cu130 \
+#     --extra-index-url https://flashinfer.ai/whl/cu130
+#   # The reference package itself, WITHOUT its declared deps (they pull
+#   # vllm/gradio for the prompt upsampler + demo UI, which this adapter never
+#   # imports). Installing from the pinned git commit records it in
+#   # direct_url.json; the adapter refuses to load any other commit:
+#   venvs/flux3/bin/pip install --no-deps \
+#     "flux3 @ git+https://github.com/black-forest-labs/flux-3-image-klein@45e57c9fb06f9751cdced29a65c5d2171003be05"
+#   # the worker venv must be able to `import arbiter` (copied .pth, not a
+#   # path hack — PYTHONPATH is forbidden as an adapter param):
+#   cp venvs/qwentts/lib/python3.12/site-packages/arbiter.pth venvs/flux3/lib/python3.12/site-packages/
+#
+# Do NOT `pip install -e` the reference checkout: an editable install records
+# `dir_info`, not a commit, and the adapter fails closed on it.
+#
+# Weights (snapshot_download into a local_dir so the per-file
+# .cache/huggingface/download/*.metadata exists — the adapter verifies every
+# file it reads against that revision + content hash on every load, ~7-12 s):
+#
+#   snapshot_download("black-forest-labs/flux-3-image-klein",
+#       revision="8454017f9ebaada30c998fccd9f67a80c7580f68",
+#       local_dir="/home/darren/nvme-models/flux3/flux-3-image-klein",
+#       ignore_patterns=["transformer/*", "vae/*"])
+#
+# (the diffusers transformer/ and vae/ duplicates are not used). The token is
+# daz-secrets huggingface/token. Never set auto_download for these models.
+#
+# Pins: the reference pyproject asks for torch 2.11.0; this venv uses the GB10
+# machine-standard torch 2.14.0+cu130 instead, with the reference's
+# transformers/tokenizers/accelerate pins. vllm and gradio are deliberately
+# absent.
+#
+# NVFP4 on GB10 (sm_121): flashinfer is at the reference pin 0.6.8.post1. The
+# prebuilt sm121a jit-cache kernels are reported to ship only from flashinfer
+# 0.7.0 (unverified here). If the first flux3-klein-nvfp4 Arbiter job fails in
+# FlashInfer, upgrade these three packages together in venvs/flux3 and record
+# the new pins here. The failure surfaces as a catchable worker load/infer
+# error, never a silent fallback to another precision.
+torch==2.14.0+cu130
+torchvision==0.29.1+cu130
+triton==3.8.0
+transformers==5.8.1
+tokenizers==0.22.2
+accelerate==1.13.0
+safetensors==0.8.0
+pillow==12.3.0
+numpy==2.5.2
+pydantic>=2,<3
+flashinfer-python==0.6.8.post1
+flashinfer-cubin==0.6.8.post1
+flashinfer-jit-cache==0.6.8.post1+cu130

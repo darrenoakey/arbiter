@@ -73,6 +73,14 @@ _DISABLED_MARKERS = (
 #
 # 6. (owner request, 2026-10-11) ``iris-3b`` and ``ming-image-0.1-design``
 #    — comparison adapters only. Exact ids, not IGS fallbacks.
+#
+# 7. (owner-directed benchmark, 2026-10-16) FLUX 3 Image Klein distilled at
+#    three exact precisions: ``flux3-klein-bf16``, ``flux3-klein-fp8`` and
+#    ``flux3-klein-nvfp4``, each reachable only through its identically named
+#    job type. Benchmark adapters, never wired into generate_image / the SDK /
+#    IGS and never a fallback. Every other ``flux*`` id (``flux3``,
+#    ``flux3-klein``, base, LoRA, renamed copies) stays denied. See
+#    adapters/flux3_klein.py.
 REFERENCE_IMAGE_EDIT_MODEL = "reference-image-edit"
 QWEN_IMAGE_21_MODEL = "qwen-image-2.1"
 QWEN_IMAGE_21_HERETIC_MODEL = "qwen-image-2.1-heretic"
@@ -80,6 +88,7 @@ QWEN_IMAGE_21_SGLANG_MODEL = "qwen-image-2.1-sglang"
 QWEN_IMAGE_21_TURBO_MODEL = "qwen-image-2.1-turbo"
 IRIS_3B_MODEL = "iris-3b"
 MING_IMAGE_DESIGN_MODEL = "ming-image-0.1-design"
+FLUX3_KLEIN_MODELS = ("flux3-klein-bf16", "flux3-klein-fp8", "flux3-klein-nvfp4")
 
 
 class StillImageGenerationDisabled(RuntimeError):
@@ -108,6 +117,8 @@ def is_disabled_still_image_model(model_id: str) -> bool:
     if normalized == _normalize(IRIS_3B_MODEL):
         return False
     if normalized == _normalize(MING_IMAGE_DESIGN_MODEL):
+        return False
+    if normalized in FLUX3_KLEIN_MODELS:
         return False
     if normalized in ("lora-train", "fine-tune") or normalized.startswith("ltx2-"):
         return False

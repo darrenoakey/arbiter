@@ -1184,6 +1184,21 @@ support (diffusers `da1d3829`, PR #14950). Weights live at
 Result adds `"schedule":"checkpoint-sample-sigmas"`, `"requested_steps"`,
 and `"use_kv_cache"`. `steps` is the actual schedule length (8).
 
+**Owner-directed benchmark — `flux3-klein-bf16` / `flux3-klein-fp8` /
+`flux3-klein-nvfp4` (2026-10-16).** FLUX 3 Image Klein distilled
+(`black-forest-labs/flux-3-image-klein` rev `8454017…`, reference code
+`45e57c9…`, `venvs/flux3`) at three exact precisions, each served only
+through its identically named job type. Text-to-image only: 16 steps, no CFG,
+no prompt upsampler, default 1024x1024, explicit seed. Unknown params are
+rejected. Not wired into `generate_image` / IGS and never a fallback; every
+other `flux*` id stays denied. Results add `precision`, `provenance`,
+`timings` and peak `memory`. See `docs/flux3-klein.md`.
+
+```json
+{"type": "flux3-klein-nvfp4",
+ "params": {"prompt": "a red fox in fresh snow, golden hour", "seed": 7}}
+```
+
 <!-- Retired still-image API reference intentionally hidden; retained only as migration history.
 
 ### 3.1 image-generate

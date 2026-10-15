@@ -166,6 +166,13 @@ func adapterParamPolicy(modelID string, config ModelConfig) map[string]adapterVa
 	if strings.HasPrefix(modelID, "llm:") && config.AdapterParams["LLM_BACKEND"] == "llamacpp" {
 		return llamaAdapterParams
 	}
+	if isFlux3KleinModel(modelID) {
+		// Scoped to the three exact flux3 benchmark ids; no other torch
+		// worker may receive the flux3 weights root.
+		allowed := maps.Clone(torchWorkerAdapterParams)
+		allowed[flux3WeightsRootParam] = absoluteDirectoryAdapterValue
+		return allowed
+	}
 	return torchWorkerAdapterParams
 }
 
@@ -277,6 +284,22 @@ func absoluteDataPathAdapterValue(_ string, value string) error {
 	}
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("data path must be a regular file")
+	}
+	return nil
+}
+
+// absoluteDirectoryAdapterValue accepts an existing real directory at an
+// absolute canonical path (never a symlink) — a weights snapshot root.
+func absoluteDirectoryAdapterValue(_ string, value string) error {
+	if err := validateResolvedPath(value, false); err != nil {
+		return err
+	}
+	info, err := os.Lstat(value)
+	if err != nil {
+		return fmt.Errorf("inspect directory path: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("path must be a directory")
 	}
 	return nil
 }

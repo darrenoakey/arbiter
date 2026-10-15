@@ -6,7 +6,7 @@ import math
 from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def _strict_attention_strengths(value: object) -> list[float] | None:
@@ -62,6 +62,9 @@ class JobType(str, Enum):
     QWEN_IMAGE_TURBO = "qwen-image-turbo"
     IRIS_3B = "iris-3b"
     MING_IMAGE_DESIGN = "ming-image-design"
+    FLUX3_KLEIN_BF16 = "flux3-klein-bf16"
+    FLUX3_KLEIN_FP8 = "flux3-klein-fp8"
+    FLUX3_KLEIN_NVFP4 = "flux3-klein-nvfp4"
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
     FINE_TUNE = "fine-tune"
@@ -111,6 +114,9 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "qwen-image-turbo": "qwen-image-2.1-turbo",
     "iris-3b": "iris-3b",
     "ming-image-design": "ming-image-0.1-design",
+    "flux3-klein-bf16": "flux3-klein-bf16",
+    "flux3-klein-fp8": "flux3-klein-fp8",
+    "flux3-klein-nvfp4": "flux3-klein-nvfp4",
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
     "fine-tune": "fine-tune",
@@ -550,6 +556,21 @@ class MingImageDesignParams(BaseModel):
     height: Optional[int] = None
 
 
+class Flux3KleinParams(BaseModel):
+    """FLUX 3 Image Klein distilled text-to-image (owner benchmark, exact
+    precision per job type). 16 steps, no CFG, no prompt upsampler. Unknown
+    keys are rejected so a CFG/upsampler/reference request can never be
+    silently run as a different benchmark condition."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: str = Field(..., min_length=1, max_length=16000)
+    seed: int = Field(default=42, ge=0, le=2**63 - 1)
+    width: int = Field(default=1024, ge=64, le=4096, multiple_of=16)
+    height: int = Field(default=1024, ge=64, le=4096, multiple_of=16)
+    steps: int = Field(default=16, ge=1, le=64)
+
+
 class ImageTo3DParams(BaseModel):
     image: Optional[str] = None  # base64; RGBA with real alpha skips BiRefNet
     image_file: Optional[str] = None  # staged path on spark
@@ -764,6 +785,9 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "qwen-image-turbo": QwenImageTurboParams,
     "iris-3b": Iris3BParams,
     "ming-image-design": MingImageDesignParams,
+    "flux3-klein-bf16": Flux3KleinParams,
+    "flux3-klein-fp8": Flux3KleinParams,
+    "flux3-klein-nvfp4": Flux3KleinParams,
     "tts-voxtral": TTSVoxtralParams,
     "video-generate-h3": VideoGenerateH3Params,
     "video-generate-fast-h3": VideoGenerateH3Params,
