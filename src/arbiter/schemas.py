@@ -83,6 +83,9 @@ class JobType(str, Enum):
     NIMBLE_SCORE = "nimble-score"
     CLEF_SCORE = "clef-score"
     CLEF_FLASH_SCORE = "clef-flash-score"
+    VOICE_BENCH_MOSHI = "voice-bench-moshi"
+    VOICE_BENCH_KYUTAI = "voice-bench-kyutai"
+    VOICE_BENCH_MINICPMO = "voice-bench-minicpmo"
 
 
 # Maps job type to model_id
@@ -135,6 +138,9 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "clef-score": "clef-scorer",
     "clef-flash-score": "clef-flash-scorer",
     "mini-agi-read": "mini-agi",
+    "voice-bench-moshi": "voice-bench-moshi",
+    "voice-bench-kyutai": "voice-bench-kyutai",
+    "voice-bench-minicpmo": "voice-bench-minicpmo",
 }
 
 
@@ -707,6 +713,27 @@ class RvcTrainParams(BaseModel):
     f0_method: str = "rmvpe"
 
 
+class VoiceBenchParams(BaseModel):
+    """Controlled voice-benchmark scenario (MiniCPM-o vs Moshi vs Kyutai cascade).
+
+    The scripted utterances u1..u4 are 24 kHz 16-bit mono wavs staged through
+    the arbiter inbox (`*_file` params). The adapter streams them at real time
+    into the model path and measures latencies with in-process monotonic clocks.
+    """
+
+    scenario: Literal["eou", "interrupt", "talkover"] = "eou"
+    run_index: int = 0
+    u1_file: str
+    u2_file: str
+    u3_file: str
+    u4_file: str
+    interrupt_after_s: float = 1.5
+    talkover_after_s: float = 1.0
+    max_response_s: float = 45.0
+    vad_head: int = 0  # kyutai cascade: semantic-VAD pause head (0=0.5s)
+    flush_s: float = 0.6  # kyutai cascade: drain time after endpoint
+
+
 class VoiceFitParams(BaseModel):
     name: str  # voice id -> /home/darren/voice-models/<name>.pt
     targets_dir: Optional[str] = None  # spark-local dir of *.wav + sibling *.txt
@@ -808,4 +835,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "clef-score": ClefScoreParams,
     "clef-flash-score": ClefScoreParams,
     "mini-agi-read": MiniAgiReadParams,
+    "voice-bench-moshi": VoiceBenchParams,
+    "voice-bench-kyutai": VoiceBenchParams,
+    "voice-bench-minicpmo": VoiceBenchParams,
 }

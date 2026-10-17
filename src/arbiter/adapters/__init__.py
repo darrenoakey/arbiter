@@ -50,8 +50,14 @@ _ADAPTER_MODULES = (
     "trellis2",
     "routing_decide",
     "mini_agi",
+    "voice_bench_moshi",
+    "voice_bench_kyutai",
+    "voice_bench_minicpmo",
     "nimble_score",
     "clef_score",
+    "voice_bench_minicpmo",
+    "voice_bench_moshi",
+    "voice_bench_kyutai",
 )
 
 for _module_name in _ADAPTER_MODULES:
