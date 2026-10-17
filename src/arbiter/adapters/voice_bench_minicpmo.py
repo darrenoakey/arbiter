@@ -78,6 +78,17 @@ class VoiceBenchMiniCPMOAdapter(ModelAdapter):
         )
         self._model.eval()
         self._model.to(device)
+        # torchaudio 2.9 hard-requires torchcodec, but no torchcodec wheel
+        # loads against torch 2.9 (needs 2.10 symbols) — patch torchaudio.load
+        # to a soundfile implementation for the plain-PCM wavs this stack reads.
+        import soundfile as _sf
+        import torchaudio
+
+        def _sf_load(uri, *args, **kwargs):
+            data, sr = _sf.read(str(uri), dtype="float32", always_2d=True)
+            return torch.from_numpy(data.T), sr
+
+        torchaudio.load = _sf_load
         self._model.init_tts()
         self._dm = self._model.as_duplex()
         self._device = device
