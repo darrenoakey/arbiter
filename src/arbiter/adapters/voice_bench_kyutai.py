@@ -163,7 +163,14 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
         t_endpoint = None
         padded = [vc.pad_to(f, vc.FRAME_24K) for f in frames]
         silence = [np.zeros(vc.FRAME_24K, dtype=np.float32)] * 50  # up to 4 s
-        vad_debug = None
+        # Semantic VAD note: kyutai/stt-1b-en_fr's HF/pytorch checkpoint does
+        # NOT ship the pause-prediction head weights (they exist only in the
+        # candle/rust serving stack), so step_with_extra_heads returns empty
+        # heads. Endpointing here is therefore the classic energy gate with a
+        # 320 ms hangover — the standard non-semantic cascade endpoint.
+        hangover = 4  # 320 ms of quiet after speech
+        quiet = 0
+        t_endpoint = None
         for f in itertools.chain(padded, silence):
             self._check_cancel(cancel)
             t_start = time.monotonic()
@@ -171,14 +178,15 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
             transcript += piece
             if vc.is_active(f) and np.any(f):
                 speech_seen = True
+                quiet = 0
                 t_user_end = t_start + FRAME_DUR_S
-            fired = bool(vad_ps and max(vad_ps) > VAD_THRESHOLD)
-            if speech_seen and fired:
+            elif speech_seen:
+                quiet += 1
+            if speech_seen and quiet >= hangover:
                 t_endpoint = t_start
-                vad_debug = [round(p, 3) for p in vad_ps]
-                ev.add("stt_endpoint", vad_ps=vad_debug)
+                ev.add("stt_endpoint", method="energy_320ms")
                 break
-        return transcript, t_endpoint, t_user_end, vad_debug
+        return transcript, t_endpoint, t_user_end, None
 
     def _stt_warp_flush(self, cancel) -> str:
         """Feed ~0.6 s of silence as fast as possible to drain delayed tokens."""

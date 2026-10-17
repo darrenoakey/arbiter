@@ -81,6 +81,25 @@ class VoiceBenchMiniCPMOAdapter(ModelAdapter):
         self._model.init_tts()
         self._dm = self._model.as_duplex()
         self._device = device
+        # Reference voice for the duplex stream: without it prepare() never
+        # initialises the token2wav voice cache and generate() stays silent.
+        import soundfile as sf
+
+        ref_candidates = sorted(
+            glob.glob(f"{model_path}assets/*ref_audio*.wav")
+            + glob.glob(f"{model_path}assets/*.wav")
+        )
+        self._ref_audio = None
+        self._ref_wav_path = None
+        if ref_candidates:
+            ref, sr = sf.read(ref_candidates[0], dtype="float32")
+            self._ref_audio = vc.resample_linear(
+                np.asarray(ref, dtype=np.float32).reshape(-1), sr, vc.SR_IN_MINICPMO
+            )
+            self._ref_wav_path = ref_candidates[0]
+            log.info("Using reference voice %s", ref_candidates[0])
+        else:
+            log.warning("No reference wav found in snapshot assets")
         log.info("MiniCPM-o-4.5 ready.")
 
     def unload(self) -> None:
@@ -92,7 +111,13 @@ class VoiceBenchMiniCPMOAdapter(ModelAdapter):
     # ------------------------------------------------------------------ core
 
     def _reset_session(self) -> None:
-        self._dm.prepare(prefix_system_prompt=SYSTEM_PROMPT)
+        # ref_audio embeds the voice prompt; prompt_wav_path initialises the
+        # token2wav cache — without the cache the duplex stream stays silent.
+        self._dm.prepare(
+            prefix_system_prompt=SYSTEM_PROMPT,
+            ref_audio=self._ref_audio,
+            prompt_wav_path=self._ref_wav_path,
+        )
 
     def _slice(self, pcm16k: np.ndarray):
         """Feed one 1-second 16 kHz slice and pull one 1-second output slice.
@@ -150,7 +175,11 @@ class VoiceBenchMiniCPMOAdapter(ModelAdapter):
                 break
         else:
             if t_first_audio is None:
-                return {"error": "model never produced audio after EOU"}
+                return {
+                    "error": "model never produced audio after EOU",
+                    "transcript": transcript.strip(),
+                    "slices_watched": max_silence,
+                }
 
         # Let the response finish (bounded).
         for i in range(40):
