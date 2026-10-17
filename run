@@ -71,11 +71,45 @@ case "$CMD" in
 
         py_status=0
         go_status=0
-        # Legs run SEQUENTIALLY, not concurrently. Measured 2026-10-12
-        # (gl/iris-ming-compare, 10-core box under fleet load): legs measured
-        # 41s (go test) and 64s (pytest -n 4) each alone, but the concurrent
-        # wall was 266s for both — CPU oversubscription made "parallel" legs
-        # ~2.5x slower than their serial sum. Sequential wall = sum of legs.
+        # CPU-bound legs run SEQUENTIALLY, not concurrently. Measured
+        # 2026-10-12 (gl/iris-ming-compare, 10-core box under fleet load):
+        # legs measured 41s (go test) and 64s (pytest -n 4) each alone, but
+        # the concurrent wall was 266s for both — CPU oversubscription made
+        # "parallel" legs ~2.5x slower than their serial sum.
+        #
+        # The ONE exception is the network-bound TestRemote* Go tests: they
+        # spend their wall waiting on real Mac mini / Boringstack Ollama
+        # completions (user CPU 0.6s for 15s wall). Measured 2026-10-17
+        # (gl/voice-bench, release 182.3s): they were 28s of the 40s go test
+        # run, serialized behind the CPU-bound tests. They run in their own
+        # process, overlapping pytest, and the main Go run skips exactly them.
+        # Every test still runs, against the same real endpoints.
+        go_remote_pid=""
+        go_remote_log=""
+        go_skip='^TestRemote'
+        if [ -n "${ARBITER_GO_TEST_SKIP:-}" ]; then
+            # Top-level alternation: the knob's pattern joins the remote split.
+            go_skip="^TestRemote|${ARBITER_GO_TEST_SKIP}"
+        fi
+        if has_leg go; then
+            unformatted="$(gofmt -l .)"
+            if [ -n "$unformatted" ]; then
+                echo "Unformatted Go files:" >&2
+                echo "$unformatted" >&2
+                exit 1
+            fi
+            # One download, before any concurrent `go` process. Three cold
+            # `go` processes each printed `go: downloading` and held the
+            # module lock (measured 2026-10-01: check 113s).
+            go mod download
+            go_remote_log="$(mktemp -t arbiter-go-remote.XXXXXX)"
+            go_remote_start=$SECONDS
+            (
+                go test ./cmd/arbiter/ -count=1 -p 1 -run '^TestRemote' ${ARBITER_GO_TEST_SKIP:+-skip "$ARBITER_GO_TEST_SKIP"}
+                echo "go remote exit $?"
+            ) >"$go_remote_log" 2>&1 &
+            go_remote_pid=$!
+        fi
 
         if has_leg gpu-idle; then
             leg_started gpu_idle
@@ -93,31 +127,27 @@ case "$CMD" in
         fi
         if has_leg go; then
             leg_started go
-            unformatted="$(gofmt -l .)"
-            if [ -n "$unformatted" ]; then
-                echo "Unformatted Go files:" >&2
-                echo "$unformatted" >&2
-                exit 1
-            fi
-            # One download, then parallel build/vet/test within the leg.
-            # Three cold `go` processes each printed `go: downloading` and
-            # held the module lock (measured 2026-10-01: check 113s; warm
-            # parallel leg 18s). Cross-LEG backgrounding is what cost 266s.
-            go mod download
+            # Parallel build/vet/test within the leg (warm parallel leg 18s).
             go build -o /dev/null ./cmd/arbiter/ &
             go_build_pid=$!
             go vet ./cmd/arbiter/ &
             go_vet_pid=$!
-            if [ -n "${ARBITER_GO_TEST_SKIP:-}" ]; then
-                go test ./cmd/arbiter/ -count=1 -p 1 -skip "$ARBITER_GO_TEST_SKIP" || go_status=$?
-            else
-                go test ./cmd/arbiter/ -count=1 -p 1 || go_status=$?
-            fi
+            go test ./cmd/arbiter/ -count=1 -p 1 -skip "$go_skip" || go_status=$?
             wait "$go_build_pid" || go_status=$?
             wait "$go_vet_pid" || go_status=$?
             leg_done go
+            wait "$go_remote_pid" || true
+            echo "--- go remote tests (started +$((go_remote_start - check_start))s, overlapped):"
+            cat "$go_remote_log"
+            remote_exit="$(sed -n 's/^go remote exit \([0-9][0-9]*\)$/\1/p' "$go_remote_log" | tail -n 1)"
+            rm -f "$go_remote_log"
+            if [ "$remote_exit" != "0" ]; then
+                echo "Go remote tests failed (exit ${remote_exit:-unknown})" >&2
+                go_status=1
+            fi
+            echo "check leg 'go-remote' done (wall +$((SECONDS - check_start))s)"
         fi
-        echo "check total: $((SECONDS - check_start))s (impact legs run sequentially; wall = sum of legs)"
+        echo "check total: $((SECONDS - check_start))s (CPU legs sequential; Go network tests overlapped)"
         if [ "$py_status" -ne 0 ]; then
             echo "Python test suite failed (see output above)" >&2
             exit "$py_status"
