@@ -721,7 +721,7 @@ class VoiceBenchParams(BaseModel):
     into the model path and measures latencies with in-process monotonic clocks.
     """
 
-    scenario: Literal["eou", "interrupt", "talkover"] = "eou"
+    scenario: Literal["eou", "interrupt", "talkover", "vadprobe"] = "eou"
     run_index: int = 0
     u1_file: str
     u2_file: str

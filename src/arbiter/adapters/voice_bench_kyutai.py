@@ -274,6 +274,37 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
 
     # ------------------------------------------------------------- scenarios
 
+    def _run_vadprobe(self, utts: dict, ev: vc.Events, cancel) -> dict:
+        """Diagnostic: feed u1 then 6 s of silence; record all VAD head probs
+        per frame to calibrate the endpointing threshold."""
+        frames = list(vc.frames_of(utts["u1"], vc.FRAME_24K))
+        trace = []
+        with self._stt_session():
+            self._stt_prime()
+            padded = [vc.pad_to(f, vc.FRAME_24K) for f in frames]
+            silence = [np.zeros(vc.FRAME_24K, dtype=np.float32)] * 75
+            for i, f in enumerate(itertools.chain(padded, silence)):
+                self._check_cancel(cancel)
+                t0 = time.monotonic()
+                import torch
+
+                x = torch.from_numpy(f).to(self._device)[None, None, :]
+                codes = self._stt_mimi.encode(x)
+                text_tokens, vad_heads = self._stt_lm_gen.step_with_extra_heads(codes)
+                tid = int(text_tokens[0, 0, 0].item())
+                piece = ""
+                if tid not in (0, 3):
+                    piece = self._stt_tok.id_to_piece(tid).replace("▁", " ")
+                probs = (
+                    [round(float(h[0, 0, 0].item()), 3) for h in vad_heads[:4]]
+                    if vad_heads
+                    else None
+                )
+                if i % 3 == 0 or (probs and max(probs) > 0.3):
+                    trace.append({"frame": i, "t_s": round(i * FRAME_DUR_S, 2), "vad": probs, "piece": piece})
+                vc.pace(t0, FRAME_DUR_S)
+        return {"trace": trace[:200], "_audio": None, "_sr": 24000}
+
     def _run_eou(self, utts: dict, ev: vc.Events, cancel) -> dict:
         frames = list(vc.frames_of(utts["u1"], vc.FRAME_24K))
         with self._stt_session():
@@ -453,6 +484,8 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
             out = self._run_interrupt(utts, ev, cancel_flag)
         elif scenario == "talkover":
             out = self._run_talkover(utts, ev, cancel_flag)
+        elif scenario == "vadprobe":
+            out = self._run_vadprobe(utts, ev, cancel_flag)
         else:
             raise InferenceError(f"unknown scenario: {scenario}")
 
