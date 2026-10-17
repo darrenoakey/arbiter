@@ -15,7 +15,7 @@ when IGS is unavailable.
 | HF repo / revision | `OpenMOSS-Team/MOSS-Image-SFT` @ `fc5de0d` |
 | Weights | `/home/darren/nvme-models/moss-image/MOSS-Image-SFT` (spark NVMe) |
 | Worker venv | `venvs/mossimage` (torch 2.14.0+cu130, diffusers 0.38.0, transformers 5.20.1) |
-| Declared `memory_gb` | 40 (worker CUDA cap is `memory_gb × 1.15`; retune from measured `memory.peak_reserved_gb` after the first renders) |
+| Declared `memory_gb` | 36 (retuned from the measured 28.8 GB peak reserved on 2026-10-17; worker cap is `memory_gb × 1.15`) |
 
 Policy: the model id is reachable only through the identically named job
 type family (`moss-image` → `moss-image-sft`), pinned in Python
@@ -93,3 +93,28 @@ Matched-prompt comparison with the other image models uses the house set
 render as an Arbiter job with `force: true` and label outputs
 `moss-image-sft`; see the skill's still-image policy section for the
 comparison-sheet convention.
+
+## Measured on GB10 (2026-10-17, first run, 1024², house prompts)
+
+| prompt (seed) | moss-image-sft (50 steps, CFG 3.0, skip 22) | flux3-klein-bf16 (16 steps) | qwen-image-2.1-turbo (8 steps) |
+|---|---|---|---|
+| botanist (42001) | 242.7 s | 19.7 s | 28.8 s |
+| Sydney poster (42002) | 329.0 s | 18.1 s | 26.6 s |
+| LUMEN perfume (42003) | 341.8 s | 33.3 s | 20.7 s |
+
+- Cold load 51.9 s total: 36.1 s hash verification of every snapshot file
+  (including the remote-code pipeline module) + ~15.8 s pipeline load and
+  GB10 mmap-clone→CUDA move. Declared `memory_gb` retuned 40 → 36 from the
+  measured 28.8 GB peak reserved (worker cap 36 × 1.15 = 41.4 GB).
+- Text rendering: `SYDNEY`, `HARBOUR NIGHTS` and `LUMEN` all spelled
+  correctly, composition on-brief and in the same family as the
+  flux3-klein renders; moss favours a more designed/posterised layout.
+- Throughput context: moss runs CFG with two transformer forwards per step
+  (cond + uncond-with-skip) at 50 steps — ~7.3× the DiT forwards of the
+  distilled 16-step flux3-klein — so the 10-18× wall-time gap is
+  architecture-expected, not a regression.
+
+Jobs: moss `b2e86defcbe0` (botanist), `e79d87047fd4` (Sydney),
+`e524777631f0` (LUMEN); flux3-klein-bf16 `7dcb359169dc`, `d94cedb5421a`,
+`fb642fed9556`; qwen-image-turbo `31a4b1af3547`, `c46b3d8d4740`,
+`b78fdc82880f`. Outputs under `/mnt/arbiter-store/output/jobs/<id>/`.
