@@ -65,6 +65,7 @@ class JobType(str, Enum):
     FLUX3_KLEIN_BF16 = "flux3-klein-bf16"
     FLUX3_KLEIN_FP8 = "flux3-klein-fp8"
     FLUX3_KLEIN_NVFP4 = "flux3-klein-nvfp4"
+    MOSS_IMAGE = "moss-image"
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
     FINE_TUNE = "fine-tune"
@@ -120,6 +121,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "flux3-klein-bf16": "flux3-klein-bf16",
     "flux3-klein-fp8": "flux3-klein-fp8",
     "flux3-klein-nvfp4": "flux3-klein-nvfp4",
+    "moss-image": "moss-image-sft",
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
     "fine-tune": "fine-tune",
@@ -577,6 +579,40 @@ class Flux3KleinParams(BaseModel):
     steps: int = Field(default=16, ge=1, le=64)
 
 
+class MossImageParams(BaseModel):
+    """MOSS-Image-5B (OpenMOSS MOSS-Image-SFT) text-to-image (owner-requested
+    comparison adapter, 2026-10-17). Card-exact defaults: 50 steps, CFG
+    guidance_scale 3.0, negative-branch skip-layer guidance on layer 22,
+    sides multiples of 16 with a 4M total-pixel cap. T2I only — image
+    conditioning and CFG aliases are rejected so a comparison row can never
+    be silently run under a different condition."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: str = Field(..., min_length=1, max_length=16000)
+    negative_prompt: str = Field(default="", max_length=16000)
+    seed: int = Field(default=42, ge=0, le=2**63 - 1)
+    width: int = Field(default=1024, ge=256, le=2048, multiple_of=16)
+    height: int = Field(default=1024, ge=256, le=2048, multiple_of=16)
+    steps: int = Field(default=50, ge=1, le=100)
+    guidance_scale: float = Field(default=3.0, ge=0.0, le=10.0)
+    uncond_skip_layers: Optional[list[int]] = None  # default [22]; [] disables
+
+    @field_validator("uncond_skip_layers", mode="before")
+    @classmethod
+    def _strict_skip_layers(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise ValueError("uncond_skip_layers must be a JSON list or null")
+        for entry in value:
+            if isinstance(entry, bool) or not isinstance(entry, int):
+                raise ValueError("uncond_skip_layers entries must be integers")
+            if not 0 <= entry <= 41:
+                raise ValueError("uncond_skip_layers entries must be in [0, 41]")
+        return value
+
+
 class ImageTo3DParams(BaseModel):
     image: Optional[str] = None  # base64; RGBA with real alpha skips BiRefNet
     image_file: Optional[str] = None  # staged path on spark
@@ -815,6 +851,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "flux3-klein-bf16": Flux3KleinParams,
     "flux3-klein-fp8": Flux3KleinParams,
     "flux3-klein-nvfp4": Flux3KleinParams,
+    "moss-image": MossImageParams,
     "tts-voxtral": TTSVoxtralParams,
     "video-generate-h3": VideoGenerateH3Params,
     "video-generate-fast-h3": VideoGenerateH3Params,

@@ -35,6 +35,7 @@ _ADAPTER_MODULES = (
     "iris_3b",
     "ming_image_design",
     "flux3_klein",
+    "moss_image",
     "fine_tune",
     "lora_train",
     "composite",

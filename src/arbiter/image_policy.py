@@ -35,6 +35,8 @@ _DISABLED_MARKERS = (
     "realvis",
     "juggernaut",
     "image-generator",
+    "moss-image",
+    "mossimage",
 )
 
 
@@ -81,6 +83,14 @@ _DISABLED_MARKERS = (
 #    IGS and never a fallback. Every other ``flux*`` id (``flux3``,
 #    ``flux3-klein``, base, LoRA, renamed copies) stays denied. See
 #    adapters/flux3_klein.py.
+#
+# 8. (owner request, 2026-10-17) ``moss-image-sft`` — the OpenMOSS MOSS-Image-SFT
+#    (~5B DiT + Qwen3.5 text encoder, Apache 2.0) comparison adapter, exposed
+#    only through the ``moss-image`` job type. Head-to-head comparison against
+#    the other image models only; not wired into generate_image / the SDK /
+#    IGS and never a fallback. Every other moss id (MOSS-Image-Base,
+#    quantized community builds, LoRA variants, renamed copies) stays denied.
+#    See adapters/moss_image.py.
 REFERENCE_IMAGE_EDIT_MODEL = "reference-image-edit"
 QWEN_IMAGE_21_MODEL = "qwen-image-2.1"
 QWEN_IMAGE_21_HERETIC_MODEL = "qwen-image-2.1-heretic"
@@ -89,6 +99,7 @@ QWEN_IMAGE_21_TURBO_MODEL = "qwen-image-2.1-turbo"
 IRIS_3B_MODEL = "iris-3b"
 MING_IMAGE_DESIGN_MODEL = "ming-image-0.1-design"
 FLUX3_KLEIN_MODELS = ("flux3-klein-bf16", "flux3-klein-fp8", "flux3-klein-nvfp4")
+MOSS_IMAGE_SFT_MODEL = "moss-image-sft"
 
 
 class StillImageGenerationDisabled(RuntimeError):
@@ -119,6 +130,8 @@ def is_disabled_still_image_model(model_id: str) -> bool:
     if normalized == _normalize(MING_IMAGE_DESIGN_MODEL):
         return False
     if normalized in FLUX3_KLEIN_MODELS:
+        return False
+    if normalized == _normalize(MOSS_IMAGE_SFT_MODEL):
         return False
     if normalized in ("lora-train", "fine-tune") or normalized.startswith("ltx2-"):
         return False

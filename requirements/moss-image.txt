@@ -1,0 +1,46 @@
+# venvs/mossimage — MOSS-Image-5B (OpenMOSS MOSS-Image-SFT) comparison adapter
+# (job type / model id `moss-image` / `moss-image-sft`; one exact checkpoint)
+#
+# Owner-requested comparison adapter (2026-10-17) against the other image
+# models. NOT wired into generate_image / daz-agent-sdk / Codex IGS and never
+# a fallback. See docs/moss-image.md.
+#
+# Recreate ON SPARK (venvs/ is spark-only state, never deployed by
+# deploy-to-spark.sh; the venv MUST be a real directory, never a symlink —
+# worker policy rejects symlinked venv paths). Built 2026-10-17 exactly so.
+# Run the installs DETACHED with a durable log and sleep on them; torch takes
+# many minutes:
+#
+#   cd ~/src/arbiter
+#   python3.12 -m venv --copies venvs/mossimage
+#   venvs/mossimage/bin/pip install --upgrade pip
+#   venvs/mossimage/bin/pip install -r requirements/moss-image.txt \
+#     --extra-index-url https://download.pytorch.org/whl/cu130
+#   # the worker venv must be able to `import arbiter` (copied .pth, not a
+#   # path hack — PYTHONPATH is forbidden as an adapter param):
+#   cp venvs/qwentts/lib/python3.12/site-packages/arbiter.pth venvs/mossimage/lib/python3.12/site-packages/
+#
+# Weights (snapshot_download into a local_dir so the per-file
+# .cache/huggingface/download/*.metadata exists — the adapter verifies every
+# file it reads, including the remote-code pipeline module, against that
+# revision + content hash on every load). The token is daz-secrets
+# huggingface/token. Never set auto_download for this model:
+#
+#   snapshot_download("OpenMOSS-Team/MOSS-Image-SFT",
+#       revision="fc5de0d56fc910cbca6f6625a70f5f582b26deb1",
+#       local_dir="/home/darren/nvme-models/moss-image/MOSS-Image-SFT")
+#
+# Pins: the model card asks for torch>=2.9, diffusers>=0.38, transformers>=5.3;
+# this venv uses the GB10 machine-standard torch 2.14.0+cu130 and the current
+# diffusers/transformers releases below. MOSS ships its own pipeline code
+# (pipeline_moss_image.py); the adapter hash-pins it to revision fc5de0d.
+torch==2.14.0+cu130
+torchvision==0.29.1+cu130
+triton==3.8.0
+diffusers==0.38.0
+transformers==5.20.1
+accelerate==1.15.0
+safetensors>=0.6
+pillow>=10
+numpy>=2,<3
+pydantic>=2,<3

@@ -77,6 +77,22 @@ def test_qwen_image_21_heretic_is_the_third_sanctioned_exception():
     assert is_disabled_still_image_model("qwen-image-2.1-uncensored")
 
 
+def test_moss_image_sft_is_the_eighth_sanctioned_exception():
+    """Owner request 2026-10-17: the MOSS-Image-5B comparison adapter is allowed
+    under its exact id only; the Base checkpoint, quantized community builds,
+    LoRA variants and renamed copies all stay denied."""
+    from arbiter.image_policy import MOSS_IMAGE_SFT_MODEL
+
+    assert not is_disabled_still_image_model(MOSS_IMAGE_SFT_MODEL)
+    assert not is_disabled_still_image_model("MOSS.Image.SFT")
+    assert is_disabled_still_image_model("moss-image-sft-lora")
+    assert is_disabled_still_image_model("moss-image")
+    assert is_disabled_still_image_model("moss-image-base")
+    assert is_disabled_still_image_model("OpenMOSS-Team/MOSS-Image-SFT")
+    assert is_disabled_still_image_model("OpenMOSS-Team/MOSS-Image-Base")
+    assert is_disabled_still_image_model("mossimage")
+
+
 def test_reference_image_edit_requires_an_input_image(tmp_path):
     """No text-to-image path exists: a prompt without an image fails before any model call."""
     from arbiter.adapters.base import InferenceError
@@ -223,6 +239,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "minimax-fast-h3",
         "minimax-h3-local",
         "moondream",
+        "moss-image-sft",
         "music-generate",
         "nimble-scorer",
         "photo-enhance",
