@@ -122,9 +122,11 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
 
     @contextmanager
     def _stt_session(self):
-        self._stt_mimi.reset_streaming()
-        self._stt_lm_gen.reset_streaming()
+        # reset_streaming() asserts a live streaming state, so reset inside the
+        # context (the python server resets between connections the same way).
         with self._stt_mimi.streaming(1), self._stt_lm_gen.streaming(1):
+            self._stt_mimi.reset_streaming()
+            self._stt_lm_gen.reset_streaming()
             yield
 
     def _stt_step(self, frame: np.ndarray):

@@ -78,9 +78,11 @@ class VoiceBenchMoshiAdapter(ModelAdapter):
     def _session(self):
         import torch
 
-        self._mimi.reset_streaming()
-        self._lm_gen.reset_streaming()
+        # reset_streaming() asserts a live streaming state, so reset inside
+        # the context (freshly loaded model has no state yet).
         with torch.no_grad(), self._mimi.streaming(1), self._lm_gen.streaming(1):
+            self._mimi.reset_streaming()
+            self._lm_gen.reset_streaming()
             yield
 
     def _step(self, frame: np.ndarray):
