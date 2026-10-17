@@ -10,9 +10,16 @@ Benchmark scenarios (see voice_bench_common): eou / interrupt / talkover.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from pathlib import Path
+
+# Workers inherit HF_HOME=/mnt/t9/cache/huggingface from the arbiter service
+# env (full disk, partial snapshot). huggingface_hub freezes HF_HOME at import
+# time, so this MUST run at module import — before any hub import — not inside
+# load(). The complete MiniCPM-o-4_5 snapshot lives in the default root cache.
+os.environ["HF_HOME"] = "/home/darren/.cache/huggingface"
 
 import numpy as np
 
@@ -40,17 +47,27 @@ class VoiceBenchMiniCPMOAdapter(ModelAdapter):
         self._device = "cuda"
 
     def load(self, device: str = "cuda") -> None:
-        import os
+        import glob
 
-        # MiniCPM-o snapshot lives in the default root-disk hub cache; force
-        # HF_HOME there because the login shell points at the (full) T9 cache.
-        os.environ["HF_HOME"] = "/home/darren/.cache/huggingface"
         import torch
         from transformers import AutoModel
 
         log.info("Loading MiniCPM-o-4.5 (audio-only, sdpa, bf16) ...")
+        # Load from the local root-disk snapshot: the full repo including
+        # assets/token2wav is already there, so init_tts()'s _ensure_asset_dir
+        # resolves locally and never touches the hub (the login-shell HF_HOME
+        # points at the full /mnt/t9 volume).
+        snaps = sorted(
+            glob.glob(
+                "/home/darren/.cache/huggingface/hub/models--openbmb--MiniCPM-o-4_5/snapshots/*/"
+            )
+        )
+        if not snaps:
+            raise InferenceError("MiniCPM-o-4_5 snapshot not found on spark")
+        model_path = snaps[-1]
+        log.info("Using MiniCPM-o snapshot %s", model_path)
         self._model = AutoModel.from_pretrained(
-            HF_REPO,
+            model_path,
             trust_remote_code=True,
             attn_implementation="sdpa",
             torch_dtype=torch.bfloat16,
@@ -186,8 +203,10 @@ class VoiceBenchMiniCPMOAdapter(ModelAdapter):
             audio = self._res_audio(res)
             if audio is not None and vc.is_active(audio):
                 spoken_slices += 1
-        while spoken_slices < 3:
+        for _wait in range(30):  # 30 s cap; model may stay silent
             self._check_cancel(cancel)
+            if spoken_slices >= 3:
+                break
             res, t0, t1 = self._slice(SILENCE_1S)
             audio = self._res_audio(res)
             if audio is not None and vc.is_active(audio):
@@ -266,8 +285,10 @@ class VoiceBenchMiniCPMOAdapter(ModelAdapter):
             audio = self._res_audio(res)
             if audio is not None and vc.is_active(audio):
                 spoken += 1
-        while spoken < 3:
+        for _wait in range(30):  # 30 s cap; model may stay silent
             self._check_cancel(cancel)
+            if spoken >= 3:
+                break
             res, t0, t1 = self._slice(SILENCE_1S)
             audio = self._res_audio(res)
             if audio is not None and vc.is_active(audio):

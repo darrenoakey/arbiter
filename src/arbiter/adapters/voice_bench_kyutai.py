@@ -326,12 +326,11 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
                 t_barge = t_frame
                 ev.add("barge_in", frame=i)
                 break
-            # Fill the playback buffer.
+            # Fill the playback buffer (chunks may be torch tensors or numpy).
             while tts_buf.size < PLAY_CHUNK and not tts_done:
                 try:
-                    tts_buf = np.concatenate(
-                        [tts_buf, next(tts_gen).float().cpu().numpy().reshape(-1)]
-                    )
+                    nxt = np.asarray(next(tts_gen)).reshape(-1).astype(np.float32)
+                    tts_buf = np.concatenate([tts_buf, nxt])
                 except StopIteration:
                     tts_done = True
             # Schedule one 40 ms piece at real time.

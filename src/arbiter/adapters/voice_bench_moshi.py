@@ -172,8 +172,10 @@ class VoiceBenchMoshiAdapter(ModelAdapter):
                     ev.add("response_start")
             # Let the response run ~2 s.
             spoken_frames = 1
-            while spoken_frames < 25:
+            for _wait in range(400):  # ~32 s cap; model may stay silent
                 self._check_cancel(cancel)
+                if spoken_frames >= 25:
+                    break
                 piece, wav = self._step(np.zeros(vc.FRAME_24K, dtype=np.float32))
                 if wav is not None and vc.is_active(wav):
                     spoken_frames += 1
@@ -237,8 +239,10 @@ class VoiceBenchMoshiAdapter(ModelAdapter):
                     t_resp = t_start
                     break
             spoken_frames = 1
-            while spoken_frames < 25:
+            for _wait in range(400):  # ~32 s cap; model may stay silent
                 self._check_cancel(cancel)
+                if spoken_frames >= 25:
+                    break
                 piece, wav = self._step(np.zeros(vc.FRAME_24K, dtype=np.float32))
                 if wav is not None and vc.is_active(wav):
                     spoken_frames += 1
