@@ -142,11 +142,11 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
         tid = int(text_tokens[0, 0, 0].item())
         if tid not in (0, 3):
             piece = self._stt_tok.id_to_piece(tid).replace("▁", " ")
-        vad_p = None
+        vad_ps = None
         if vad_heads:
-            vad_p = float(vad_heads[VAD_HEAD][0, 0, 0].item())
+            vad_ps = [float(h[0, 0, 0].item()) for h in vad_heads[:4]]
         vc.pace(t0, FRAME_DUR_S)
-        return piece, vad_p
+        return piece, vad_ps
 
     def _stt_prime(self) -> None:
         sil = np.zeros(vc.FRAME_24K, dtype=np.float32)
@@ -163,19 +163,22 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
         t_endpoint = None
         padded = [vc.pad_to(f, vc.FRAME_24K) for f in frames]
         silence = [np.zeros(vc.FRAME_24K, dtype=np.float32)] * 50  # up to 4 s
+        vad_debug = None
         for f in itertools.chain(padded, silence):
             self._check_cancel(cancel)
             t_start = time.monotonic()
-            piece, vad_p = self._stt_step(f)
+            piece, vad_ps = self._stt_step(f)
             transcript += piece
             if vc.is_active(f) and np.any(f):
                 speech_seen = True
                 t_user_end = t_start + FRAME_DUR_S
-            if speech_seen and vad_p is not None and vad_p > VAD_THRESHOLD:
+            fired = bool(vad_ps and max(vad_ps) > VAD_THRESHOLD)
+            if speech_seen and fired:
                 t_endpoint = t_start
-                ev.add("stt_endpoint", vad_p=round(vad_p, 3))
+                vad_debug = [round(p, 3) for p in vad_ps]
+                ev.add("stt_endpoint", vad_ps=vad_debug)
                 break
-        return transcript, t_endpoint, t_user_end
+        return transcript, t_endpoint, t_user_end, vad_debug
 
     def _stt_warp_flush(self, cancel) -> str:
         """Feed ~0.6 s of silence as fast as possible to drain delayed tokens."""
@@ -275,7 +278,7 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
         frames = list(vc.frames_of(utts["u1"], vc.FRAME_24K))
         with self._stt_session():
             self._stt_prime()
-            transcript, t_endpoint, t_user_end = self._stt_transcribe_until_endpoint(
+            transcript, t_endpoint, t_user_end, vad_dbg = self._stt_transcribe_until_endpoint(
                 frames, cancel, ev
             )
             transcript += self._stt_warp_flush(cancel)
@@ -295,6 +298,7 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
             "endpoint_delay_ms": round((t_endpoint - t_user_end) * 1000.0, 1)
             if t_endpoint
             else None,
+            "vad_head_probs": vad_dbg,
             "llm_ttft_ms": round(ttft * 1000.0, 1),
             "tts_ttfa_ms": round(tts_ttfa * 1000.0, 1),
             "transcript": transcript.strip(),
@@ -349,7 +353,7 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
         frames2 = list(vc.frames_of(utts["u2"], vc.FRAME_24K))
         with self._stt_session():
             self._stt_prime()
-            transcript, _, _ = self._stt_transcribe_until_endpoint(frames2, cancel, ev)
+            transcript, _, _, vad_dbg = self._stt_transcribe_until_endpoint(frames2, cancel, ev)
             transcript += self._stt_warp_flush(cancel)
         sentence, _ = self._llm_reply(transcript.strip(), ev)
         first, gen, _ = self._tts_first_chunk(sentence, ev)
@@ -369,7 +373,7 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
         remaining = u3_frames[max(0, used - len(sil_frames)) :]
         with self._stt_session():
             self._stt_prime()
-            t2, _, _ = self._stt_transcribe_until_endpoint(remaining, cancel, ev)
+            t2, _, _, vad_dbg2 = self._stt_transcribe_until_endpoint(remaining, cancel, ev)
             t2 += self._stt_warp_flush(cancel)
         sentence2, _ = self._llm_reply(t2.strip(), ev)
         first2, gen2, _ = self._tts_first_chunk(sentence2, ev)
@@ -381,6 +385,7 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
             "interrupt_latency_ms": round((t_stop - t_barge) * 1000.0, 1),
             "respond_latency_ms": round((t_new_audio - t_barge) * 1000.0, 1),
             "transcript_after": t2.strip(),
+            "vad_head_probs_turn2": vad_dbg2,
             "_audio": audio,
             "_sr": 24000,
         }
@@ -389,7 +394,7 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
         frames2 = list(vc.frames_of(utts["u2"], vc.FRAME_24K))
         with self._stt_session():
             self._stt_prime()
-            transcript, _, _ = self._stt_transcribe_until_endpoint(frames2, cancel, ev)
+            transcript, _, _, vad_dbg = self._stt_transcribe_until_endpoint(frames2, cancel, ev)
             transcript += self._stt_warp_flush(cancel)
         sentence, _ = self._llm_reply(transcript.strip(), ev)
         first, gen, _ = self._tts_first_chunk(sentence, ev)
@@ -419,7 +424,7 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
         if remaining:
             with self._stt_session():
                 self._stt_prime()
-                t4, _, _ = self._stt_transcribe_until_endpoint(remaining, cancel, ev)
+                t4, _, _, _ = self._stt_transcribe_until_endpoint(remaining, cancel, ev)
                 t4 += self._stt_warp_flush(cancel)
             reply2, _ = self._llm_reply(t4.strip(), ev)
         return {

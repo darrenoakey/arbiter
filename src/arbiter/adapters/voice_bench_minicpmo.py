@@ -18,8 +18,9 @@ from pathlib import Path
 # Workers inherit HF_HOME=/mnt/t9/cache/huggingface from the arbiter service
 # env (full disk, partial snapshot). huggingface_hub freezes HF_HOME at import
 # time, so this MUST run at module import — before any hub import — not inside
-# load(). The complete MiniCPM-o-4_5 snapshot lives in the default root cache.
-os.environ["HF_HOME"] = "/home/darren/.cache/huggingface"
+# load(). The complete MiniCPM-o-4_5 snapshot lives in the root-disk
+# voice-bench cache (the default ~/.cache/huggingface copy was wiped).
+os.environ["HF_HOME"] = "/home/darren/hf-voicebench"
 
 import numpy as np
 
@@ -59,7 +60,7 @@ class VoiceBenchMiniCPMOAdapter(ModelAdapter):
         # points at the full /mnt/t9 volume).
         snaps = sorted(
             glob.glob(
-                "/home/darren/.cache/huggingface/hub/models--openbmb--MiniCPM-o-4_5/snapshots/*/"
+                "/home/darren/hf-voicebench/hub/models--openbmb--MiniCPM-o-4_5/snapshots/*/"
             )
         )
         if not snaps:
