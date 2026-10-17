@@ -17,6 +17,7 @@ Benchmark scenarios (see voice_bench_common): eou / interrupt / talkover.
 from __future__ import annotations
 
 import logging
+import itertools
 import threading
 import time
 from contextlib import contextmanager
@@ -153,21 +154,23 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
             self._stt_step(sil)
 
     def _stt_transcribe_until_endpoint(self, frames, cancel, ev: vc.Events):
-        """Feed frames at real time until the VAD fires. Returns
-        (transcript, t_endpoint, t_user_audio_end)."""
+        """Feed frames at real time; after the utterance ends keep feeding
+        silence (as a real always-open mic would) until the VAD endpoint
+        fires. Returns (transcript, t_endpoint, t_user_audio_end)."""
         transcript = ""
         speech_seen = False
         t_user_end = None
         t_endpoint = None
-        for i, f in enumerate(frames):
+        padded = [vc.pad_to(f, vc.FRAME_24K) for f in frames]
+        silence = [np.zeros(vc.FRAME_24K, dtype=np.float32)] * 50  # up to 4 s
+        for f in itertools.chain(padded, silence):
             self._check_cancel(cancel)
-            f = vc.pad_to(f, vc.FRAME_24K)
             t_start = time.monotonic()
             piece, vad_p = self._stt_step(f)
             transcript += piece
-            if vc.is_active(f):
+            if vc.is_active(f) and np.any(f):
                 speech_seen = True
-            t_user_end = t_start + FRAME_DUR_S
+                t_user_end = t_start + FRAME_DUR_S
             if speech_seen and vad_p is not None and vad_p > VAD_THRESHOLD:
                 t_endpoint = t_start
                 ev.add("stt_endpoint", vad_p=round(vad_p, 3))
@@ -195,7 +198,12 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
     # ------------------------------------------------------------------ LLM
 
     def _llm_reply(self, user_text: str, ev: vc.Events) -> tuple[str, float]:
-        """Stream a reply; returns (first_sentence, ttft_s)."""
+        """Stream a reply; returns (first_sentence, ttft_s).
+
+        Thinking is disabled (Qwen3 non-thinking mode) and the streamer loop
+        stops at the first sentence terminator so TTS starts as early as a
+        production cascade would.
+        """
         import torch
         from transformers import TextIteratorStreamer
 
@@ -203,16 +211,22 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_text},
         ]
-        prompt = self._llm_tok.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True
-        )
+        try:
+            prompt = self._llm_tok.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            prompt = self._llm_tok.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True
+            )
         ids = self._llm_tok(prompt, return_tensors="pt").to(self._device)
         streamer = TextIteratorStreamer(
             self._llm_tok, skip_prompt=True, skip_special_tokens=True
         )
         kwargs = dict(
             **ids,
-            max_new_tokens=80,
+            max_new_tokens=60,
             do_sample=False,
             temperature=None,
             top_p=None,
@@ -223,19 +237,22 @@ class VoiceBenchKyutaiAdapter(ModelAdapter):
         thread.start()
         full = ""
         ttft = None
+        done = False
         for piece in streamer:
             if ttft is None:
                 ttft = time.monotonic() - t0
                 ev.add("llm_first_token")
             full += piece
-        thread.join(timeout=30)
-        sentence = full.strip()
-        for sep in (".", "!", "?", "\n"):
-            idx = sentence.find(sep)
-            if 0 < idx < len(sentence) - 1:
-                sentence = sentence[: idx + 1]
+            for sep in (".", "!", "?", "\n"):
+                idx = full.find(sep)
+                if 0 < idx < len(full) - 1:
+                    full = full[: idx + 1]
+                    done = True
+                    break
+            if done:
                 break
-        return sentence or "Let me think about that.", ttft or 0.0
+        thread.join(timeout=15)
+        return full.strip() or "Let me think about that.", ttft or 0.0
 
     # ------------------------------------------------------------------ TTS
 
