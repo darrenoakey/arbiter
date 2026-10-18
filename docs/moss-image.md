@@ -118,3 +118,15 @@ Jobs: moss `b2e86defcbe0` (botanist), `e79d87047fd4` (Sydney),
 `e524777631f0` (LUMEN); flux3-klein-bf16 `7dcb359169dc`, `d94cedb5421a`,
 `fb642fed9556`; qwen-image-turbo `31a4b1af3547`, `c46b3d8d4740`,
 `b78fdc82880f`. Outputs under `/mnt/arbiter-store/output/jobs/<id>/`.
+
+## Content policy — none (measured 2026-10-18)
+
+The MOSS pipeline ships no safety classifier (contrast the flux3 reference,
+which loads one — the klein adapters deliberately bypass it), and the SFT
+checkpoint renders explicit prompts without refusal or output degradation.
+Probe: an unambiguous hardcore adult prompt (job `2039ac2e1abe`, seed 77001,
+143.7 s) produced fully explicit photorealistic output. There is no refusal
+text, blank-image, or soft-degradation mode — anything submitted renders.
+Treat this adapter like `qwen-image-heretic`: owner/programmatic direct use
+only, never agent-facing asset generation (that stays on IGS regardless),
+and never assume a prompt was filtered after the fact.
