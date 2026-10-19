@@ -51,7 +51,7 @@ LTX25_RUNTIME="$(python3 scripts/build_ltx25_runtime.py build | tail -1)"
 LTX25_RELEASE="$(basename "$LTX25_RUNTIME")"
 
 ARBITER_URL="http://10.0.0.254:8400"
-DEPLOY_DRAIN_TIMEOUT="${DEPLOY_DRAIN_TIMEOUT:-60}"
+DEPLOY_DRAIN_TIMEOUT="${DEPLOY_DRAIN_TIMEOUT:-30}"
 DEPLOY_DRAIN_LEASE="${DEPLOY_DRAIN_LEASE:-300}"
 DRAIN_OWNED=0
 DRAIN_PROVEN=0
@@ -130,18 +130,20 @@ resume_if_aborted() {
 # ceiling and only permits a stop while active_jobs is nonzero BEFORE the
 # deadline; at the deadline the bounce proceeds and in-flight work requeues.
 #
-# The default ceiling is deliberately SHORT (60s). This deploy runs inside a
+# The default ceiling is deliberately SHORT (30s). This deploy runs inside a
 # greenline release with a hard, non-negotiable 600-second end-to-end deadline
 # and a 180-second target; an ltx25 denoise chunk runs 20-45 minutes and a
 # lora-train can run for hours, so those jobs can never be waited out inside
 # the release window. Measured 2026-10-12: two consecutive releases each
 # burned the FULL old 120s deadline with one long job active (deploy 151s and
-# 136s of 428s/220s totals) — the deadline is the deploy floor whenever the
-# fleet has an uninterruptible chunk in flight, which is most releases. With
-# check now ~77s, the 180s target leaves deploy ~100s; 60s deadline + ~16s
-# bounce fits with headroom. Jobs that would finish in the 60-120s band are
-# requeued and rerun instead of being waited out — the same lossless path
-# multi-minute jobs already take at any deadline. Per
+# 136s of 428s/220s totals), and 2026-10-19 (gl/vllm-worker-exit-detect,
+# release 181.3s): the 60s deadline burned 56s idle waiting out one job before
+# the same lossless requeue bounce — the deadline is the deploy floor whenever
+# the fleet has an uninterruptible chunk in flight, which is most releases.
+# With check now ~95s under load, the 180s target leaves deploy ~75s; a 30s
+# deadline + ~16s bounce fits with headroom. Jobs that would finish in the
+# 30-120s band are requeued and rerun instead of being waited out — the same
+# lossless path multi-minute jobs already take at any deadline. Per
 # greenline.toml's contract, at the deadline the deploy PROCEEDS with the
 # bounce: the shutdown path requeues in-flight work (Store.RecoverFromCrash
 # requeues scheduled/running jobs on restart — see cmd/arbiter/store.go) and it
@@ -294,6 +296,19 @@ echo "    $(md5 -q llm-worker-linux-arm64 2>/dev/null || md5sum llm-worker-linux
 echo "    $(md5 -q vllm-chat-worker-linux-arm64 2>/dev/null || md5sum vllm-chat-worker-linux-arm64 | awk '{print $1}') vllm-chat-worker"
 echo "    $(md5 -q vllm-worker-linux-arm64 2>/dev/null || md5sum vllm-worker-linux-arm64 | awk '{print $1}') vllm-worker"
 
+# Stage the binary uploads BEFORE the drain rejoin so the scp rides inside
+# the drain window instead of serializing after the bounce (measured
+# 2026-10-19: the four scp's cost ~4s after the port wait). Staging writes
+# only *.new names — nothing on the live path changes, the running arbiter
+# and its workers are untouched, and an abort here leaves inert .new files
+# the next deploy overwrites. The rename into place stays AFTER the stop for
+# the ETXTBSY/zombie reason documented below.
+stage "Staging binaries on spark..."
+scp -q arbiter-linux-arm64 "$SPARK:$REMOTE/arbiter-go.new"
+scp -q llm-worker-linux-arm64 "$SPARK:$REMOTE/llm-worker.new"
+scp -q vllm-chat-worker-linux-arm64 "$SPARK:$REMOTE/vllm-chat-worker.new"
+scp -q vllm-worker-linux-arm64 "$SPARK:$REMOTE/vllm-worker.new"
+
 # Rejoin the drain requested before the build/test phase. Existing queued work
 # is deliberately allowed to remain: drain pauses dispatch, and the queue is
 # persistent across the bounce. Only validated root active_jobs==0 proves that
@@ -420,8 +435,9 @@ ssh "$SPARK" "mkdir -p '$REMOTE/config/spark'"
 rsync -az config/spark/ "$SPARK:$REMOTE/config/spark/"
 ssh "$SPARK" "$REMOTE/.venv/bin/python -c 'import glob, json, os, pathlib; root=pathlib.Path(\"$REMOTE\"); path=root/\"local/config.json\"; data=json.loads(path.read_text()); models=data.setdefault(\"models\", {}); [models.update({pathlib.Path(f).name.replace(\".model.json\", \"\"): json.loads(pathlib.Path(f).read_text())}) for f in glob.glob(str(root/\"config/spark/*.model.json\")) if pathlib.Path(f).name not in {\"minimax-h3-local.model.json\", \"minimax-h3.model.json\"}]; existing=models.get(\"minimax-h3-local\") or {}; local=json.loads((root/\"config/spark/minimax-h3-local.model.json\").read_text()); worker=existing.get(\"worker_cmd\"); local.update({\"worker_cmd\": worker} if worker else {}); models[\"minimax-h3-local\"]=local; models.pop(\"minimax-h3\", None); temporary=path.with_name(\".config.spark-models.tmp\"); handle=temporary.open(\"w\"); json.dump(data, handle, indent=2); handle.write(\"\\n\"); handle.flush(); os.fsync(handle.fileno()); handle.close(); os.replace(temporary, path); descriptor=os.open(path.parent, os.O_RDONLY); os.fsync(descriptor); os.close(descriptor)'"
 
-stage "Uploading binaries..."
-# Upload to a temporary name, then rename into place. A plain scp onto the live
+stage "Activating staged binaries..."
+# The scp staging happened before the drain wait. Rename into place only now,
+# after the stop. A plain scp onto the live
 # path fails with ETXTBSY — reported by scp as `dest open "...": Failure` —
 # whenever any process still holds the old binary as its executable text. That
 # includes a stopped-but-unreaped process whose threads are wedged in
@@ -431,10 +447,6 @@ stage "Uploading binaries..."
 # entry regardless and the old inode stays alive for whatever still references
 # it. Without this, the deploy stops arbiter, fails to upload, and cannot even
 # roll back — leaving production down until the host is power-cycled.
-scp -q arbiter-linux-arm64 "$SPARK:$REMOTE/arbiter-go.new"
-scp -q llm-worker-linux-arm64 "$SPARK:$REMOTE/llm-worker.new"
-scp -q vllm-chat-worker-linux-arm64 "$SPARK:$REMOTE/vllm-chat-worker.new"
-scp -q vllm-worker-linux-arm64 "$SPARK:$REMOTE/vllm-worker.new"
 ssh "$SPARK" "set -e
 chmod +x $REMOTE/arbiter-go.new $REMOTE/llm-worker.new $REMOTE/vllm-chat-worker.new $REMOTE/vllm-worker.new
 mv -f $REMOTE/arbiter-go.new $REMOTE/arbiter-go
