@@ -51,6 +51,7 @@ type API struct {
 	statsMu         sync.Mutex
 	statsAt         time.Time
 	statsRefreshing bool
+	statsWG         sync.WaitGroup            // in-flight refreshStatsAsync goroutines
 	statsCounts     map[string]map[string]int // model_id -> state -> count
 	statsGlobalCt   map[string]int            // state -> count (global)
 	statsModel      map[string]JobStats       // model_id -> completed stats
@@ -250,12 +251,23 @@ func (a *API) refreshStats() {
 		return
 	}
 	a.statsRefreshing = true
+	a.statsWG.Add(1)
 	a.statsMu.Unlock()
 
 	go a.refreshStatsAsync()
 }
 
+// WaitBackground blocks until every in-flight async stats refresh has
+// returned. Call it before closing the store: a refresh still mid-query keeps
+// a SQLite connection open past Store.Close, and that connection's deferred
+// close then touches the WAL/SHM files after the owner thinks the store is
+// gone (this made test TempDir cleanup fail with "directory not empty").
+func (a *API) WaitBackground() {
+	a.statsWG.Wait()
+}
+
 func (a *API) refreshStatsAsync() {
+	defer a.statsWG.Done()
 	defer func() {
 		a.statsMu.Lock()
 		a.statsRefreshing = false

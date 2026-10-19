@@ -222,7 +222,7 @@ drain_deadline=$(( $(date +%s) + DEPLOY_DRAIN_TIMEOUT ))
 stage "Drain requested (no new jobs) — in-flight work winds down while we build/test locally"
 
 # The cross-compile is purely local and independent of the remote smoke test,
-# pip install and LTX runtime staging below, so it overlaps them (and the three
+# pip install and LTX runtime staging below, so it overlaps them (and the four
 # binaries build concurrently) instead of running after them. Its output is
 # captured and replayed; a build failure still aborts before prod is touched.
 CROSS_LOG="$(mktemp -t arbiter-cross-compile)"
@@ -234,10 +234,16 @@ CROSS_LOG="$(mktemp -t arbiter-cross-compile)"
     l=$!
     GOOS=linux GOARCH=arm64 go build -o vllm-chat-worker-linux-arm64 ./cmd/vllm-chat-worker/ &
     v=$!
+    # vllm-worker is the tts-voxtral worker_cmd (`vllm serve --omni`). It was
+    # never shipped, so tts-voxtral failed every load with `lstat
+    # .../vllm-worker: no such file or directory` (found by praxis 196).
+    GOOS=linux GOARCH=arm64 go build -o vllm-worker-linux-arm64 ./cmd/vllm-worker/ &
+    t=$!
     rc=0
     wait "$a" || rc=$?
     wait "$l" || rc=$?
     wait "$v" || rc=$?
+    wait "$t" || rc=$?
     exit "$rc"
 ) >"$CROSS_LOG" 2>&1 &
 CROSS_PID=$!
@@ -286,6 +292,7 @@ fi
 echo "    $(md5 -q arbiter-linux-arm64 2>/dev/null || md5sum arbiter-linux-arm64 | awk '{print $1}') arbiter"
 echo "    $(md5 -q llm-worker-linux-arm64 2>/dev/null || md5sum llm-worker-linux-arm64 | awk '{print $1}') llm-worker"
 echo "    $(md5 -q vllm-chat-worker-linux-arm64 2>/dev/null || md5sum vllm-chat-worker-linux-arm64 | awk '{print $1}') vllm-chat-worker"
+echo "    $(md5 -q vllm-worker-linux-arm64 2>/dev/null || md5sum vllm-worker-linux-arm64 | awk '{print $1}') vllm-worker"
 
 # Rejoin the drain requested before the build/test phase. Existing queued work
 # is deliberately allowed to remain: drain pauses dispatch, and the queue is
@@ -427,11 +434,13 @@ stage "Uploading binaries..."
 scp -q arbiter-linux-arm64 "$SPARK:$REMOTE/arbiter-go.new"
 scp -q llm-worker-linux-arm64 "$SPARK:$REMOTE/llm-worker.new"
 scp -q vllm-chat-worker-linux-arm64 "$SPARK:$REMOTE/vllm-chat-worker.new"
+scp -q vllm-worker-linux-arm64 "$SPARK:$REMOTE/vllm-worker.new"
 ssh "$SPARK" "set -e
-chmod +x $REMOTE/arbiter-go.new $REMOTE/llm-worker.new $REMOTE/vllm-chat-worker.new
+chmod +x $REMOTE/arbiter-go.new $REMOTE/llm-worker.new $REMOTE/vllm-chat-worker.new $REMOTE/vllm-worker.new
 mv -f $REMOTE/arbiter-go.new $REMOTE/arbiter-go
 mv -f $REMOTE/llm-worker.new $REMOTE/llm-worker
-mv -f $REMOTE/vllm-chat-worker.new $REMOTE/vllm-chat-worker"
+mv -f $REMOTE/vllm-chat-worker.new $REMOTE/vllm-chat-worker
+mv -f $REMOTE/vllm-worker.new $REMOTE/vllm-worker"
 
 stage "Installing arbiter firewall guard..."
 # This guard is a host-level backstop, not an arbiter process, but it protects

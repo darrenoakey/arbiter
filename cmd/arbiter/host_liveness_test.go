@@ -324,6 +324,7 @@ func TestKillSwitchFlipsRoutingAndPersists(t *testing.T) {
 	setupInstances(cfg, mgr, "python3", projectRoot)
 	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
 	api := NewAPI(cfg, store, mgr, sched, logger, outputDir, projectRoot)
+	defer api.WaitBackground()
 
 	// Before flip: remote1 is preferred.
 	job := &Job{ID: "pre", ModelID: "chat", State: "queued"}
@@ -410,6 +411,7 @@ func TestGlobalKillSwitchPinsAllToSpark(t *testing.T) {
 	setupInstances(cfg, mgr, "python3", projectRoot)
 	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
 	api := NewAPI(cfg, store, mgr, sched, logger, outputDir, projectRoot)
+	defer api.WaitBackground()
 
 	body, _ := json.Marshal(map[string]any{"enabled": false})
 	req := httptest.NewRequest(http.MethodPatch, "/v1/remote", bytes.NewReader(body))
@@ -470,6 +472,7 @@ func TestPSExposesHostPlacementAndRemotePanel(t *testing.T) {
 	setupInstances(cfg, mgr, "python3", projectRoot)
 	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
 	api := NewAPI(cfg, store, mgr, sched, logger, outputDir, projectRoot)
+	defer api.WaitBackground()
 	hm := NewHostMonitor(cfg, mgr, logger, sched)
 	mgr.SetReachabilityFunc(hm.IsReachable)
 	api.SetHostMonitor(hm)

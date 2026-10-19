@@ -27,3 +27,5 @@ benchmark_report.json
 /vllm-chat-worker
 .publish_config
 /vllm-chat-worker-linux-arm64
+/vllm-worker
+/vllm-worker-linux-arm64

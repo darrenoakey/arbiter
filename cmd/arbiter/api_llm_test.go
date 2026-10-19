@@ -43,6 +43,7 @@ func newTestAPI(t *testing.T) (*API, func()) {
 	api := NewAPI(cfg, store, mgr, sched, logger, outputDir, projectRoot)
 
 	cleanup := func() {
+		api.WaitBackground()
 		logger.Close()
 		store.Close()
 		mgr.KillAll()
@@ -961,6 +962,7 @@ func newTestAPIWithHosts(t *testing.T, hosts map[string]HostConfig) (*API, func(
 	sched := NewScheduler(cfg, store, mgr, logger, outputDir)
 	api := NewAPI(cfg, store, mgr, sched, logger, outputDir, projectRoot)
 	cleanup := func() {
+		api.WaitBackground()
 		logger.Close()
 		store.Close()
 		mgr.KillAll()

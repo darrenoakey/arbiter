@@ -26,7 +26,7 @@ func openIdempotencyTestAPI(t *testing.T, root, databasePath string) (*API, func
 	mgr := NewInstanceManager(cfg, "python3", root)
 	scheduler := NewScheduler(cfg, store, mgr, logger, outputDir)
 	api := NewAPI(cfg, store, mgr, scheduler, logger, outputDir, root)
-	return api, func() { logger.Close(); store.Close(); mgr.KillAll() }
+	return api, func() { api.WaitBackground(); logger.Close(); store.Close(); mgr.KillAll() }
 }
 
 func TestJobIdempotencyIsConcurrentConflictSafeAndDurable(t *testing.T) {
