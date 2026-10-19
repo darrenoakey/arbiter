@@ -51,7 +51,11 @@ type Response struct {
 }
 
 var (
-	vllmCmd    *exec.Cmd
+	vllmCmd *exec.Cmd
+	// vllmExited is closed by the single goroutine that reaps vllmCmd, so both
+	// the readiness wait and stopVLLM observe an exit without a second Wait.
+	vllmExited chan struct{}
+	vllmErr    error
 	vllmPort   int
 	cancelFlag bool
 	mode       string
@@ -150,27 +154,53 @@ func startVLLM() error {
 	if err := vllmCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start vllm: %w", err)
 	}
+	vllmExited = reapInBackground(vllmCmd, &vllmErr)
 
 	// Wait for vllm to be ready (health check) — omni models take longer
-	deadline := time.Now().Add(15 * time.Minute)
 	url := fmt.Sprintf("http://127.0.0.1:%d/health", vllmPort)
+	if err := waitReady(url, vllmExited, &vllmErr, 15*time.Minute, 2*time.Second); err != nil {
+		return err
+	}
+	log.Printf("vllm ready on port %d", vllmPort)
+	return nil
+}
+
+// reapInBackground waits for cmd in one goroutine and closes the returned
+// channel when it exits, storing the Wait error in *exitErr first. Without a
+// waiter, exec.Cmd.ProcessState stays nil for a dead child, so a vllm that
+// crashed at import (e.g. `No module named 'vllm'`) left a zombie and the load
+// hung for the full 15-minute readiness deadline.
+func reapInBackground(cmd *exec.Cmd, exitErr *error) chan struct{} {
+	exited := make(chan struct{})
+	go func() {
+		*exitErr = cmd.Wait()
+		close(exited)
+	}()
+	return exited
+}
+
+// waitReady polls url until it returns 200, the process behind exited dies,
+// or timeout elapses.
+func waitReady(url string, exited <-chan struct{}, exitErr *error, timeout, interval time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 5 * time.Second}
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(url)
+		resp, err := client.Get(url)
 		if err == nil {
 			if err := resp.Body.Close(); err != nil {
 				log.Printf("close health response: %v", err)
 			}
 			if resp.StatusCode == 200 {
-				log.Printf("vllm ready on port %d", vllmPort)
 				return nil
 			}
 		}
-		if vllmCmd.ProcessState != nil {
-			return fmt.Errorf("vllm exited prematurely")
+		select {
+		case <-exited:
+			return fmt.Errorf("vllm exited prematurely: %v", *exitErr)
+		case <-time.After(interval):
 		}
-		time.Sleep(2 * time.Second)
 	}
-	return fmt.Errorf("vllm did not become ready within 15 minutes")
+	return fmt.Errorf("vllm did not become ready within %s", timeout)
 }
 
 func appendVllmTuning(args []string) []string {
@@ -198,14 +228,13 @@ func stopVLLM() {
 		if err := vllmCmd.Process.Signal(syscall.SIGTERM); err != nil {
 			log.Printf("signal vllm: %v", err)
 		}
-		done := make(chan error, 1)
-		go func() { done <- vllmCmd.Wait() }()
 		select {
-		case <-done:
+		case <-vllmExited:
 		case <-time.After(15 * time.Second):
 			if err := vllmCmd.Process.Kill(); err != nil {
 				log.Printf("kill vllm: %v", err)
 			}
+			<-vllmExited
 		}
 		vllmCmd = nil
 		log.Printf("vllm stopped")
