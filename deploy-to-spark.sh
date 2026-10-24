@@ -227,19 +227,63 @@ stage "Drain requested (no new jobs) — in-flight work winds down while we buil
 # pip install and LTX runtime staging below, so it overlaps them (and the four
 # binaries build concurrently) instead of running after them. Its output is
 # captured and replayed; a build failure still aborts before prod is touched.
+#
+# 2026-10-24 (gl/id-lora speed-up, release 206.3s): the four builds took 110s
+# of the deploy because the linux/arm64 side of the trimmed 13G GOCACHE was
+# cold — a full from-scratch cross-compile, while the same four warm builds
+# measure ~2s. A binary whose inputs are bit-identical rebuilds to the same
+# artifact (Go reproducible builds; module content pinned by go.sum), so each
+# binary records an inputs hash and skips the compile when unchanged: a cold
+# cache turns into ~3s of hashing instead of ~110s of compiling. Any doubt
+# (missing sidecar, changed hash) rebuilds, so this can never ship a stale
+# binary. The hash covers the toolchain, go.mod/go.sum, and every local-module
+# source/embed file reported by `go list -deps` (module deps are content-pinned
+# by go.sum; stdlib by the toolchain version).
+MODPATH="$(go list -m -f '{{.Path}}')"
+binary_inputs_hash() {
+    local pkg="$1" line dir files gos rest cgo embed f
+    {
+        go version
+        shasum -a 256 go.mod go.sum
+        go list -deps -f "{{if .Module}}{{if eq .Module.Path \"$MODPATH\"}}{{.Dir}}|{{.GoFiles}}|{{.CgoFiles}}|{{.EmbedFiles}}{{end}}{{end}}" "$pkg" |
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            dir="${line%%|*}"
+            files="${line#*|}"
+            gos="${files%%|*}"
+            rest="${files#*|}"
+            cgo="${rest%%|*}"
+            embed="${rest#*|}"
+            # Strip the [ ] list brackets; filenames here never contain spaces.
+            for f in $(echo "$gos $cgo $embed" | tr -d '[]'); do
+                [ -n "$f" ] && shasum -a 256 "$dir/$f"
+            done
+        done
+    } | shasum -a 256 | awk '{print $1}'
+}
+build_binary() {
+    local out="$1" pkg="$2" hash
+    hash="$(binary_inputs_hash "$pkg")"
+    if [ -f "$out" ] && [ -f "$out.inputs-hash" ] && [ "$(cat "$out.inputs-hash")" = "$hash" ]; then
+        echo "    $out: inputs unchanged, reusing staged binary"
+        return 0
+    fi
+    GOOS=linux GOARCH=arm64 go build -o "$out" "$pkg"
+    printf '%s\n' "$hash" > "$out.inputs-hash"
+}
 CROSS_LOG="$(mktemp -t arbiter-cross-compile)"
 (
     set -e
-    GOOS=linux GOARCH=arm64 go build -o arbiter-linux-arm64 ./cmd/arbiter/ &
+    build_binary arbiter-linux-arm64 ./cmd/arbiter/ &
     a=$!
-    GOOS=linux GOARCH=arm64 go build -o llm-worker-linux-arm64 ./cmd/llm-worker/ &
+    build_binary llm-worker-linux-arm64 ./cmd/llm-worker/ &
     l=$!
-    GOOS=linux GOARCH=arm64 go build -o vllm-chat-worker-linux-arm64 ./cmd/vllm-chat-worker/ &
+    build_binary vllm-chat-worker-linux-arm64 ./cmd/vllm-chat-worker/ &
     v=$!
     # vllm-worker is the tts-voxtral worker_cmd (`vllm serve --omni`). It was
     # never shipped, so tts-voxtral failed every load with `lstat
     # .../vllm-worker: no such file or directory` (found by praxis 196).
-    GOOS=linux GOARCH=arm64 go build -o vllm-worker-linux-arm64 ./cmd/vllm-worker/ &
+    build_binary vllm-worker-linux-arm64 ./cmd/vllm-worker/ &
     t=$!
     rc=0
     wait "$a" || rc=$?

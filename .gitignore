@@ -14,8 +14,11 @@ arbiter-go
 /arbiter-go-backup
 /arbiter-go-new
 /arbiter-linux-arm64
+/arbiter-linux-arm64.inputs-hash
+/*.inputs-hash
 /llm-worker
 /llm-worker-linux-arm64
+/llm-worker-linux-arm64.inputs-hash
 /vllm-worker
 cmd/arbiter/arbiter
 _unsloth_temporary_saved_buffers/
