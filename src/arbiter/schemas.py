@@ -49,6 +49,8 @@ class JobType(str, Enum):
     TALKING_HEAD = "talking-head"
     TALKING_HEAD_SADTALKER = "talking-head-sadtalker"
     LIPSYNC = "lipsync"
+    VIDEO_ID_LORA_ENCODE = "video-id-lora-encode"
+    VIDEO_ID_LORA = "video-id-lora"
     VIDEO_GENERATE = "video-generate"
     VIDEO_GENERATE_H3 = "video-generate-h3"
     VIDEO_GENERATE_FAST_H3 = "video-generate-fast-h3"
@@ -106,6 +108,8 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "talking-head": "sonic",
     "talking-head-sadtalker": "sadtalker",
     "lipsync": "latentsync",
+    "video-id-lora-encode": "id-lora-encode",
+    "video-id-lora": "id-lora",
     "video-generate": "ltx2",
     "video-generate-h3": "minimax-h3-local",
     "video-generate-fast-h3": "minimax-fast-h3",
@@ -340,6 +344,37 @@ class VideoSegmentParams(BaseModel):
     end_time: float = 0.0
     start_image_b64: str = ""
     end_image_b64: str = ""
+
+
+class IDLoraEncodeParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    prompt: str = Field(min_length=1, max_length=12000)
+    force: bool = False
+
+    @field_validator("prompt")
+    @classmethod
+    def structured_prompt(cls, value: str) -> str:
+        if not all(marker in value for marker in ("[VISUAL]:", "[SPEECH]:", "[SOUNDS]:")):
+            raise ValueError("ID-LoRA prompt requires [VISUAL]:, [SPEECH]:, and [SOUNDS]: sections")
+        return value
+
+
+class IDLoraParams(IDLoraEncodeParams):
+    encoded_file: str = Field(min_length=1)
+    image_file: str = Field(min_length=1)
+    ref_audio_file: str = Field(min_length=1)
+    width: int = Field(default=512, ge=256, le=1024, multiple_of=32)
+    height: int = Field(default=512, ge=256, le=1024, multiple_of=32)
+    num_frames: int = Field(default=121, ge=9, le=241)
+    seed: int = Field(default=42, ge=0, le=2147483647)
+    steps: int = Field(default=30, ge=1, le=50)
+
+    @field_validator("num_frames")
+    @classmethod
+    def frame_clock(cls, value: int) -> int:
+        if (value - 1) % 8:
+            raise ValueError("ID-LoRA num_frames must be 8*n+1")
+        return value
 
 
 class VideoGenerateParams(BaseModel):
@@ -853,6 +888,8 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "talking-head": TalkingHeadParams,
     "talking-head-sadtalker": TalkingHeadSadTalkerParams,
     "lipsync": LipsyncParams,
+    "video-id-lora-encode": IDLoraEncodeParams,
+    "video-id-lora": IDLoraParams,
     "video-generate": VideoGenerateParams,
     "ltx25-encode": LTX25EncodeParams,
     "ltx25-denoise1": LTX25Denoise1Params,

@@ -379,6 +379,8 @@ var JobTypeToModel = map[string]string{
 	"talking-head":            "sonic",
 	"talking-head-sadtalker":  "sadtalker",
 	"lipsync":                 "latentsync",
+	"video-id-lora-encode":    "id-lora-encode",
+	"video-id-lora":           "id-lora",
 	"video-generate":          "ltx2",
 	"video-generate-h3":       "minimax-h3-local",
 	"video-generate-fast-h3":  "minimax-fast-h3",

@@ -1,0 +1,17 @@
+{
+  "memory_gb": 82,
+  "max_concurrent": 1,
+  "max_instances": 1,
+  "keep_alive_seconds": 1800,
+  "max_runtime_seconds": 14400,
+  "avg_inference_ms": 1800000,
+  "load_ms": 300000,
+  "pressure_index": 1,
+  "group": true,
+  "worker_cmd": [
+    "/home/darren/src/arbiter/venvs/id-lora/bin/python",
+    "-m",
+    "arbiter.worker_main",
+    "id-lora"
+  ]
+}

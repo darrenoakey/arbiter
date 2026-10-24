@@ -222,6 +222,8 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "flux3-klein-bf16",
         "flux3-klein-fp8",
         "flux3-klein-nvfp4",
+        "id-lora",
+        "id-lora-encode",
         "insightface",
         "iris-3b",
         "latentsync",

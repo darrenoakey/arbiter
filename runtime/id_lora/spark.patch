@@ -1,0 +1,127 @@
+diff --git a/ID-LoRA-2.3/packages/ltx-core/src/ltx_core/loader/sft_loader.py b/ID-LoRA-2.3/packages/ltx-core/src/ltx_core/loader/sft_loader.py
+index 859da80..1071ccc 100644
+--- a/ID-LoRA-2.3/packages/ltx-core/src/ltx_core/loader/sft_loader.py
++++ b/ID-LoRA-2.3/packages/ltx-core/src/ltx_core/loader/sft_loader.py
+@@ -27,13 +27,16 @@ class SafetensorsStateDictLoader(StateDictLoader):
+         device = device or torch.device("cpu")
+         model_paths = path if isinstance(path, list) else [path]
+         for shard_path in model_paths:
+-            with safetensors.safe_open(shard_path, framework="pt", device=str(device)) as f:
++            with safetensors.safe_open(shard_path, framework="pt", device="cpu") as f:
+                 safetensor_keys = f.keys()
+                 for name in safetensor_keys:
+                     expected_name = name if sd_ops is None else sd_ops.apply_to_key(name)
+                     if expected_name is None:
+                         continue
+-                    value = f.get_tensor(name).to(device=device, non_blocking=True, copy=False)
++                    tensor = f.get_tensor(name)
++                    if device.type != "cpu":
++                        tensor = tensor.clone()  # GB10 mmap-to-heap staging before CUDA.
++                    value = tensor.to(device=device, non_blocking=True, copy=False)
+                     key_value_pairs = ((expected_name, value),)
+                     if sd_ops is not None:
+                         key_value_pairs = sd_ops.apply_to_key_value(expected_name, value)
+diff --git a/ID-LoRA-2.3/packages/ltx-core/src/ltx_core/loader/single_gpu_model_builder.py b/ID-LoRA-2.3/packages/ltx-core/src/ltx_core/loader/single_gpu_model_builder.py
+index 30f432f..9257f5b 100644
+--- a/ID-LoRA-2.3/packages/ltx-core/src/ltx_core/loader/single_gpu_model_builder.py
++++ b/ID-LoRA-2.3/packages/ltx-core/src/ltx_core/loader/single_gpu_model_builder.py
+@@ -94,7 +94,13 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
+         if not lora_strengths or (min(lora_strengths) == 0 and max(lora_strengths) == 0):
+             sd = model_state_dict.sd
+             if dtype is not None:
+-                sd = {key: value.to(dtype=dtype) for key, value in model_state_dict.sd.items()}
++                if not isinstance(self.registry, DummyRegistry):
++                    sd = dict(sd)
++                for key in list(sd):
++                    tensor = sd[key]
++                    if tensor.dtype != dtype:
++                        sd[key] = tensor.to(dtype=dtype)
++                    del tensor
+             meta_model.load_state_dict(sd, strict=False, assign=True)
+             return self._return_model(meta_model, device)
+ 
+diff --git a/ID-LoRA-2.3/packages/ltx-pipelines/src/ltx_pipelines/utils/model_ledger.py b/ID-LoRA-2.3/packages/ltx-pipelines/src/ltx_pipelines/utils/model_ledger.py
+index b5f6fc2..960c690 100644
+--- a/ID-LoRA-2.3/packages/ltx-pipelines/src/ltx_pipelines/utils/model_ledger.py
++++ b/ID-LoRA-2.3/packages/ltx-pipelines/src/ltx_pipelines/utils/model_ledger.py
+@@ -170,7 +170,10 @@ class ModelLedger:
+             if self.gemma_root_path is not None:
+                 module_ops = module_ops_from_gemma_root(self.gemma_root_path)
+                 model_folder = find_matching_file(self.gemma_root_path, "model*.safetensors").parent
+-                weight_paths = [str(p) for p in model_folder.rglob("*.safetensors")]
++                import json
++                index_path = model_folder / "model.safetensors.index.json"
++                index = json.loads(index_path.read_text())
++                weight_paths = [str(model_folder / name) for name in sorted(set(index["weight_map"].values()))]
+ 
+                 self.text_encoder_builder = Builder(
+                     model_path=tuple(weight_paths),
+diff --git a/ID-LoRA-2.3/scripts/inference_one_stage.py b/ID-LoRA-2.3/scripts/inference_one_stage.py
+index a612652..ec7d8e7 100644
+--- a/ID-LoRA-2.3/scripts/inference_one_stage.py
++++ b/ID-LoRA-2.3/scripts/inference_one_stage.py
+@@ -264,15 +264,11 @@ class IDLoraOneStagePipeline:
+             noiser=noiser,
+         )
+ 
+-        if self._video_encoder is not None:
+-            self._video_encoder.cpu()
+-            del self._video_encoder
+-            self._video_encoder = None
+-            cleanup_memory()
+-
+         total_steps = len(sigmas) - 1
+ 
+         def denoising_func(video_state, audio_state, sigmas, step_idx):
++            if hasattr(self, "cancel_check"):
++                self.cancel_check()
+             sigma = sigmas[step_idx]
+             print(f"  Step {step_idx + 1}/{total_steps} (sigma={sigma.item():.4f})", flush=True)
+ 
+@@ -349,25 +345,24 @@ class IDLoraOneStagePipeline:
+         video_state = video_tools.clear_conditioning(video_state)
+         video_state = video_tools.unpatchify(video_state)
+ 
+-        torch.cuda.synchronize()
+-        self._transformer.to("cpu")
+-        torch.cuda.synchronize()
+-        cleanup_memory()
+-
+-        print("Loading video decoder...")
+-        video_decoder = self.model_ledger.video_decoder()
+-        video_latent = video_state.latent.to(dtype=torch.bfloat16)
+-        decoded_video = video_decoder(video_latent)
+-        decoded_video = ((decoded_video + 1.0) / 2.0).clamp(0.0, 1.0)
+-        video_tensor = decoded_video[0].float().cpu()
+-        del video_latent, decoded_video, video_decoder
++        from ltx_core.model.video_vae import TilingConfig, decode_video
++        if not hasattr(self, "_video_decoder"):
++            self._video_decoder = self.model_ledger.video_decoder()
++        decoded = decode_video(video_state.latent.to(dtype=torch.bfloat16),
++                               self._video_decoder, TilingConfig.default(), generator)
++        frames = torch.cat([tile.cpu() for tile in decoded], dim=0)
++        video_tensor = frames.permute(3, 0, 1, 2).float() / 255.0
++        del frames
+ 
+         audio_state = audio_tools.clear_conditioning(audio_state)
+         audio_state = audio_tools.unpatchify(audio_state)
+ 
+         print("Loading audio decoder...")
+-        audio_decoder = self.model_ledger.audio_decoder()
+-        vocoder = self.model_ledger.vocoder()
++        if not hasattr(self, "_audio_decoder"):
++            self._audio_decoder = self.model_ledger.audio_decoder()
++            self._vocoder = self.model_ledger.vocoder()
++        audio_decoder = self._audio_decoder
++        vocoder = self._vocoder
+         decoded_audio = vae_decode_audio(audio_state.latent, audio_decoder, vocoder)
+         audio_output = decoded_audio.waveform.cpu()
+         self._vocoder_sr = decoded_audio.sampling_rate
+@@ -376,7 +371,6 @@ class IDLoraOneStagePipeline:
+         gc.collect()
+         torch.cuda.empty_cache()
+ 
+-        self._transformer.to(self.device)
+         torch.cuda.synchronize()
+         cleanup_memory()
+ 

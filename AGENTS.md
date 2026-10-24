@@ -144,3 +144,18 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   so a killed log can look like a hang after pytest even when Go tests are fine.
 
 
+
+## ID-LoRA LTX-2.3
+
+- `video-id-lora-encode` prepares CPU prompt bundles using the existing optimized
+  FastPipeline encoder lifecycle; queue all prompts before `video-id-lora`
+  renders so Gemma and the dev transformer stay in separate workers.
+- The ID-LoRA runtime has a pinned upstream commit plus `runtime/id_lora/spark.patch`
+  and a per-file hash manifest. Preserve the Spark mmap-to-heap CUDA loader,
+  in-place dtype cast, indexed Gemma shards, resident models and tiled decode.
+  Never switch this adapter to an unpatched generic upstream pipeline.
+- Existing `denoise_video_only` freezes audio and is not an identity-voice
+  generator. ID-LoRA needs joint target audio denoising with reference tokens.
+- Adapter registry import must not require Pydantic: import schemas inside
+  `infer`, not at module scope. Update the exact registry expectations when
+  adding adapters. See `docs/id-lora.md` for contracts and runtime recreation.

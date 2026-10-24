@@ -133,7 +133,7 @@ def is_disabled_still_image_model(model_id: str) -> bool:
         return False
     if normalized == _normalize(MOSS_IMAGE_SFT_MODEL):
         return False
-    if normalized in ("lora-train", "fine-tune") or normalized.startswith("ltx2-"):
+    if normalized in ("lora-train", "fine-tune", "id-lora", "id-lora-encode") or normalized.startswith("ltx2-"):
         return False
     return "lora" in normalized.split("-") or any(
         marker in normalized for marker in _DISABLED_MARKERS

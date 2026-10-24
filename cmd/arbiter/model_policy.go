@@ -162,6 +162,8 @@ var trustedPythonAdapters = map[string]string{
 	"ltx2-encode":             "",
 	"ltx25-denoise1":          "ltx25",
 	"ltx25-encode":            "ltx25",
+	"id-lora-encode":          "id-lora",
+	"id-lora":                 "id-lora",
 	"minimax-h3-local":        "minimax-h3",
 	"minimax-fast-h3":         "minimax-h3",
 	"moondream":               "moondream",
@@ -253,7 +255,7 @@ func isDisabledStillImageModel(modelID string) bool {
 	if isMossImageSftModel(normalized) {
 		return false
 	}
-	if normalized == "lora-train" || normalized == "fine-tune" || normalized == "ltx2" || strings.HasPrefix(normalized, "ltx2-") ||
+	if normalized == "id-lora" || normalized == "id-lora-encode" || normalized == "lora-train" || normalized == "fine-tune" || normalized == "ltx2" || strings.HasPrefix(normalized, "ltx2-") ||
 		normalized == "ltx25" || strings.HasPrefix(normalized, "ltx25-") {
 		return false
 	}
@@ -311,7 +313,7 @@ func disabledStillImageConfig(modelID string, cfg ModelConfig) bool {
 		// (or its local merged heretic / turbo dir) and their pinned interpreter.
 		return false
 	}
-	videoLora := normalizedPolicyText(modelID) == "ltx2" || strings.HasPrefix(normalizedPolicyText(modelID), "ltx2-") ||
+	videoLora := normalizedPolicyText(modelID) == "id-lora" || normalizedPolicyText(modelID) == "id-lora-encode" || normalizedPolicyText(modelID) == "ltx2" || strings.HasPrefix(normalizedPolicyText(modelID), "ltx2-") ||
 		normalizedPolicyText(modelID) == "ltx25" || strings.HasPrefix(normalizedPolicyText(modelID), "ltx25-")
 	values := []string{cfg.AutoDownload, cfg.ModelPath}
 	values = append(values, cfg.WorkerCmd...)
