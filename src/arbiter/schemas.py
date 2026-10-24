@@ -84,6 +84,7 @@ class JobType(str, Enum):
     NIMBLE_SCORE = "nimble-score"
     CLEF_SCORE = "clef-score"
     CLEF_FLASH_SCORE = "clef-flash-score"
+    QLABS_NOISE_TRAIN = "qlabs-noise-train"
     VOICE_BENCH_MOSHI = "voice-bench-moshi"
     VOICE_BENCH_KYUTAI = "voice-bench-kyutai"
     VOICE_BENCH_MINICPMO = "voice-bench-minicpmo"
@@ -139,6 +140,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "nimble-score": "nimble-scorer",
     "clef-score": "clef-scorer",
     "clef-flash-score": "clef-flash-scorer",
+    "qlabs-noise-train": "qlabs-noise-train",
     "mini-agi-read": "mini-agi",
     "voice-bench-moshi": "voice-bench-moshi",
     "voice-bench-kyutai": "voice-bench-kyutai",
@@ -671,6 +673,20 @@ class MiniAgiReadParams(BaseModel):
     samples: bool = True
 
 
+class QlabsNoiseTrainParams(BaseModel):
+    """Train the fixed 37.7M qlabs noise model (D512 L8 H8 vocab4096).
+
+    Only the run schedule is caller-tunable; the architecture, data, and
+    kernels are owned by the pinned qlabs-noise-spark experiment file.
+    Sequence must be a kernel-grid multiple of 64.
+    """
+
+    steps: int = Field(default=100, ge=1, le=500)
+    batch: int = Field(default=2, ge=1, le=4)
+    sequence: Literal[64, 128, 256] = 64
+    seed: int = Field(default=0, ge=0, le=9999)
+
+
 class TTSVoxtralParams(BaseModel):
     text: str
     voice: str = "alloy"
@@ -871,6 +887,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "nimble-score": NimbleScoreParams,
     "clef-score": ClefScoreParams,
     "clef-flash-score": ClefScoreParams,
+    "qlabs-noise-train": QlabsNoiseTrainParams,
     "mini-agi-read": MiniAgiReadParams,
     "voice-bench-moshi": VoiceBenchParams,
     "voice-bench-kyutai": VoiceBenchParams,

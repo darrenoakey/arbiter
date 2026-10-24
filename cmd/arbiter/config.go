@@ -401,6 +401,7 @@ var JobTypeToModel = map[string]string{
 	"rvc-train":               "rvc-train",
 	"rvc-convert":             "rvc-convert",
 	"voice-fit":               "voice-fit",
+	"qlabs-noise-train":       "qlabs-noise-train",
 	"music-generate":          "music-generate",
 	"music-generate-yue2":     "yue2",
 	"reference-image-edit":    referenceImageEditModel,

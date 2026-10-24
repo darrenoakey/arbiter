@@ -56,6 +56,7 @@ _ADAPTER_MODULES = (
     "voice_bench_minicpmo",
     "nimble_score",
     "clef_score",
+    "qlabs_noise_train",
     "voice_bench_minicpmo",
     "voice_bench_moshi",
     "voice_bench_kyutai",

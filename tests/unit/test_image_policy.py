@@ -243,6 +243,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "music-generate",
         "nimble-scorer",
         "photo-enhance",
+        "qlabs-noise-train",
         "qwen-image-2.1",
         "qwen-image-2.1-heretic",
         "qwen-image-2.1-sglang",
