@@ -173,6 +173,7 @@ var trustedPythonAdapters = map[string]string{
 	"clef-flash-scorer":       "clef-scorer",
 	"rvc-train":               "rvc",
 	"voice-fit":               "voxsmith",
+	"qlabs-noise-train":       "qlabsnoise",
 	"music-generate":          "music-generate",
 	"yue2":                    "yue2",
 	"photo-enhance":           "photo-enhance",
