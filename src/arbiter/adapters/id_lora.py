@@ -60,6 +60,18 @@ def load_runtime():
 # Runtime: executed only inside the audited worker after CUDA containment.
 
 
+def parse_request(params, schema, job_type):
+    supplied = params.get("_job_type", job_type)
+    if supplied != job_type:
+        raise ValueError(f"ID-LoRA worker requires {job_type}, received {supplied}")
+    return schema.model_validate(
+        {key: value for key, value in params.items() if key != "_job_type"}
+    )
+
+
+# Request: validate dispatcher identity and remove only its known private metadata.
+
+
 @register
 class IDLoraEncodeAdapter(GroupAdapter):
     model_id = "id-lora-encode"
@@ -97,7 +109,7 @@ class IDLoraEncodeAdapter(GroupAdapter):
     def infer(self, params, output_dir, cancel_flag):
         from arbiter.schemas import IDLoraEncodeParams
 
-        values = IDLoraEncodeParams.model_validate(params)
+        values = parse_request(params, IDLoraEncodeParams, "video-id-lora-encode")
         self._check_cancel(cancel_flag)
         with (
             contextlib.redirect_stdout(sys.stderr),
@@ -169,7 +181,7 @@ class IDLoraAdapter(GroupAdapter):
     def infer(self, params, output_dir, cancel_flag):
         from arbiter.schemas import IDLoraParams
 
-        values = IDLoraParams.model_validate(params)
+        values = parse_request(params, IDLoraParams, "video-id-lora")
         self._check_cancel(cancel_flag)
         output_dir = Path(output_dir)
         image = output_dir / "first-frame.png"

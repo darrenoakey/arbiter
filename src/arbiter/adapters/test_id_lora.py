@@ -88,3 +88,29 @@ def test_id_lora_exact_policy():
 
 
 # Policy: allow the exact video adapter without opening arbitrary LoRA workers.
+
+
+@pytest.mark.parametrize("job_type", ["video-id-lora", "video-id-lora-encode"])
+def test_dispatcher_metadata(job_type):
+    from arbiter.adapters.id_lora import parse_request
+    from arbiter.schemas import IDLoraEncodeParams
+
+    schema = IDLoraParams if job_type == "video-id-lora" else IDLoraEncodeParams
+    params = (
+        valid_params()
+        if job_type == "video-id-lora"
+        else {"prompt": valid_params()["prompt"]}
+    )
+    assert (
+        parse_request(params | {"_job_type": job_type}, schema, job_type).prompt
+        == params["prompt"]
+    )
+    with pytest.raises(ValueError, match="worker requires"):
+        parse_request(params | {"_job_type": "caption"}, schema, job_type)
+    with pytest.raises(ValidationError):
+        parse_request(
+            params | {"_job_type": job_type, "_unexpected": True}, schema, job_type
+        )
+
+
+# Dispatcher metadata: real worker-injected identity must not leak into public schemas.
