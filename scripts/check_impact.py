@@ -26,7 +26,6 @@ LEGS = ("go", "python", "gpu-idle")
 GLOBAL = {
     "run",
     "greenline.toml",
-    "deploy-to-spark.sh",
     "pyproject.toml",
     "scripts/check_impact.py",
 }
@@ -56,6 +55,13 @@ def classify(path: str) -> set[str] | None:
         return set()
     if path == "scripts/gpu_idle_hook.py" or path == "scripts/test_gpu_idle_hook.py":
         return {"gpu-idle"}
+    # tests/unit/test_drain_wait.py parses and execs this script with
+    # --test-* flags; nothing else in check touches it. The gate's live
+    # deploy step is its own validation on every release.
+    if path == "deploy-to-spark.sh":
+        return {"python"}
+    if name == ".gitignore":
+        return set()
     if path.startswith("cmd/") and path.endswith(".sql"):
         return {"go"}
     if path.endswith(".go") or path in {"go.mod", "go.sum"}:

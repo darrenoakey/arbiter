@@ -52,6 +52,18 @@ def test_docs_select_nothing():
     assert check_impact.select(["docs/greenline.md"]) == set()
 
 
+def test_gitignore_selects_nothing():
+    assert check_impact.select([".gitignore"]) == set()
+
+
+def test_deploy_script_selects_only_python():
+    # tests/unit/test_drain_wait.py execs deploy-to-spark.sh; the go and
+    # gpu-idle legs never touch it (impact cut measured 2026-10-24: a
+    # deploy-only release paid 112s for legs that cannot see the diff).
+    assert check_impact.select(["deploy-to-spark.sh"]) == {"python"}
+    assert check_impact.select(["deploy-to-spark.sh", ".gitignore"]) == {"python"}
+
+
 def test_unknown_or_empty_or_harness_selects_every_leg():
     every = set(check_impact.LEGS)
     assert check_impact.select(["mystery.bin"]) == every
