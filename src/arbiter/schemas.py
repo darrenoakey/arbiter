@@ -6,7 +6,7 @@ import math
 from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _strict_attention_strengths(value: object) -> list[float] | None:
@@ -541,6 +541,13 @@ class LTX25Denoise1Params(BaseModel):
 class AestheticScoreParams(BaseModel):
     image: Optional[str] = None
     image_file: Optional[str] = None
+    images_file: Optional[str] = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def exclusive_batch(self) -> AestheticScoreParams:
+        if self.images_file is not None and (self.image or self.image_file):
+            raise ValueError("images_file cannot be combined with image or image_file")
+        return self
 
 
 class ReferenceImageEditParams(BaseModel):

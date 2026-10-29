@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import logging
 import math
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
 if TYPE_CHECKING:
     import torch
 
-from arbiter.adapters.base import ModelAdapter, InferenceError
+from arbiter.adapters.base import ModelAdapter, InferenceError, CancelledException
 from arbiter.adapters.registry import register
+
+_BATCH_SIZE = 32
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +41,7 @@ class _Processor(Protocol):
 
 
 class _Scorer(Protocol):
-    def __call__(self, pixels: "torch.Tensor") -> "torch.Tensor": ...
+    def __call__(self, pixels: "torch.Tensor") -> tuple["torch.Tensor", ...]: ...
 
 
 @register
@@ -100,38 +104,29 @@ class AestheticScorerAdapter(ModelAdapter):
     def infer(
         self, params: dict, output_dir: Path, cancel_flag: threading.Event
     ) -> dict:
-        import torch
-
         self._check_cancel(cancel_flag)
 
-        image = self._resolve_image(params)
+        from arbiter.schemas import AestheticScoreParams
 
-        self._check_cancel(cancel_flag)
-
-        # Run inference
+        AestheticScoreParams.model_validate(params)
         start = time.perf_counter()
-        processor = self._processor
-        model = self._model
-        if processor is None or model is None:
-            raise InferenceError("aesthetic-scorer not loaded")
-        pixel_values = processor(images=image, return_tensors="pt")["pixel_values"]
-        pixel_values = pixel_values.to(self._device)
-        with torch.no_grad():
-            outputs = model(pixel_values)
-
-        scores = {}
-        for name, value in zip(_SCORE_NAMES, outputs, strict=True):
-            numeric_value = float(value.squeeze().item())
-            if not math.isfinite(numeric_value):
-                raise InferenceError(f"Non-finite score for {name}: {numeric_value}")
-            scores[name] = numeric_value
+        if params.get("images_file"):
+            payload = {"items": self._score_archive(params, cancel_flag)}
+        else:
+            image = self._resolve_image(params)
+            try:
+                pixels = self._pixels(image)
+                payload = {"scores": self._score_pixels(pixels)[0]}
+            finally:
+                image.close()
+        self._check_cancel(cancel_flag)
 
         elapsed_ms = (time.perf_counter() - start) * 1000.0
 
         # Write result to output dir
         output_dir.mkdir(parents=True, exist_ok=True)
         result = {
-            "scores": scores,
+            **payload,
             "elapsed_ms": round(elapsed_ms, 1),
             "model_repository": _MODEL_REPOSITORY,
             "score_names": list(_SCORE_NAMES),
@@ -139,6 +134,90 @@ class AestheticScorerAdapter(ModelAdapter):
         (output_dir / "result.json").write_text(json.dumps(result, indent=2))
 
         return result
+
+    def _pixels(self, image):
+        if self._processor is None:
+            raise InferenceError("aesthetic-scorer not loaded")
+        return self._processor(images=image, return_tensors="pt")["pixel_values"]
+
+    def _score_pixels(self, pixels) -> list[dict]:
+        import torch
+
+        if self._model is None:
+            raise InferenceError("aesthetic-scorer not loaded")
+        with torch.inference_mode():
+            outputs = self._model(pixels.to(self._device))
+        # Each of the seven heads is [batch, 1], not [7] per image.
+        heads = dict(zip(_SCORE_NAMES, outputs, strict=True))
+        if any(tuple(head.shape) != (pixels.shape[0], 1) for head in heads.values()):
+            raise InferenceError("Unexpected aesthetic scorer head shape")
+        rows = []
+        for index in range(pixels.shape[0]):
+            scores = {name: float(head[index].item()) for name, head in heads.items()}
+            if not all(math.isfinite(value) for value in scores.values()):
+                raise InferenceError("Non-finite aesthetic score")
+            rows.append(scores)
+        return rows
+
+    @staticmethod
+    def _archive_image(archive, member):
+        from PIL import Image
+
+        # Never extract: member names are labels, not filesystem paths.
+        with archive.open(member) as stream, Image.open(stream) as image:
+            return image.convert("RGB")
+
+    def _score_archive(self, params, cancel_flag) -> list[dict]:
+        raw = self._resolve_media(params, "images")
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(raw))
+        except zipfile.BadZipFile as error:
+            raise InferenceError(f"bad input images ZIP: {error}") from error
+        items: list[dict] = []
+        pending: list[tuple[int, torch.Tensor]] = []
+        with archive:
+            for member in archive.infolist():
+                self._check_cancel(cancel_flag)
+                if member.is_dir():
+                    continue
+                index = len(items)
+                items.append({"name": member.filename})
+                try:
+                    image = self._archive_image(archive, member)
+                    try:
+                        pixels = self._pixels(image)
+                    finally:
+                        image.close()
+                    pending.append((index, pixels))
+                except CancelledException:
+                    raise
+                except Exception as error:
+                    items[index]["error"] = f"bad input image: {error}"
+                if len(pending) == _BATCH_SIZE:
+                    self._flush_batch(items, pending, cancel_flag)
+            self._flush_batch(items, pending, cancel_flag)
+        if not items:
+            raise InferenceError("bad input images ZIP: no file members")
+        return items
+
+    def _flush_batch(self, items, pending, cancel_flag):
+        import torch
+
+        self._check_cancel(cancel_flag)
+        if not pending:
+            return
+        try:
+            rows = self._score_pixels(torch.cat([pixels for _, pixels in pending]))
+            self._check_cancel(cancel_flag)
+            for (index, _), scores in zip(pending, rows, strict=True):
+                items[index]["scores"] = scores
+        except CancelledException:
+            raise
+        except Exception as error:
+            for index, _ in pending:
+                items[index]["error"] = str(error)
+        finally:
+            pending.clear()
 
     def estimate_time(self, params: dict) -> float:
         return 2000.0  # ~2s on GPU
