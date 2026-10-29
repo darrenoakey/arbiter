@@ -27,6 +27,9 @@ abort_recovery_termination() {
         already-running)
             echo "ERROR: Arbiter is already running after the drained instance was stopped; deploy aborted without stopping or signaling the replacement" >&2
             ;;
+        active-drain-timeout)
+            echo "ERROR: drain deadline reached with $2 active job(s); deploy aborted before stopping Arbiter so in-flight work is not interrupted" >&2
+            ;;
         *)
             echo "ERROR: unknown deployment recovery condition: $1" >&2
             ;;
@@ -144,46 +147,23 @@ resume_if_aborted() {
 }
 
 # Graceful drain: ask the running arbiter to stop starting NEW jobs and let
-# in-flight work finish before we bounce it, so a redeploy never kills a
-# running job (e.g. a 10-min ltx2 denoise). A missing or malformed drain/status
-# API aborts the deploy before any stop. DEPLOY_DRAIN_TIMEOUT changes the
-# ceiling and only permits a stop while active_jobs is nonzero BEFORE the
-# deadline; at the deadline the bounce proceeds and in-flight work requeues.
+# in-flight work finish before we bounce it. A missing or malformed drain/status
+# API aborts the deploy before any stop. Only active_jobs==0 permits a stop.
+# DEPLOY_DRAIN_TIMEOUT bounds the wait; reaching it with active jobs aborts the
+# deploy, and the EXIT trap resumes dispatch without restarting Arbiter.
 #
-# The default ceiling is deliberately SHORT (30s). This deploy runs inside a
-# greenline release with a hard, non-negotiable 600-second end-to-end deadline
-# and a 180-second target; an ltx25 denoise chunk runs 20-45 minutes and a
-# lora-train can run for hours, so those jobs can never be waited out inside
-# the release window. Measured 2026-10-12: two consecutive releases each
-# burned the FULL old 120s deadline with one long job active (deploy 151s and
-# 136s of 428s/220s totals), and 2026-10-19 (gl/vllm-worker-exit-detect,
-# release 181.3s): the 60s deadline burned 56s idle waiting out one job before
-# the same lossless requeue bounce — the deadline is the deploy floor whenever
-# the fleet has an uninterruptible chunk in flight, which is most releases.
-# With check now ~95s under load, the 180s target leaves deploy ~75s; a 30s
-# deadline + ~16s bounce fits with headroom. Jobs that would finish in the
-# 30-120s band are requeued and rerun instead of being waited out — the same
-# lossless path multi-minute jobs already take at any deadline. Per
-# greenline.toml's contract, at the deadline the deploy PROCEEDS with the
-# bounce: the shutdown path requeues in-flight work (Store.RecoverFromCrash
-# requeues scheduled/running jobs on restart — see cmd/arbiter/store.go) and it
-# reruns after the bounce. The pre-timeout polls still never permit a stop
-# while active_jobs is nonzero, and the stop itself remains ownership-gated.
+# The default ceiling is deliberately SHORT (30s) because Greenline has a hard
+# 600-second end-to-end deadline. Long GPU jobs cannot be waited out inside a
+# release. The release must be retried when the fleet is idle, never completed
+# by interrupting those jobs. The drain is requested UP FRONT so its window
+# overlaps the local build/test phase. If any step fails or the wait expires,
+# the EXIT trap resumes dispatch immediately; the server-side lease is the
+# fallback if the deploy process is killed before the trap can run.
 #
-# The drain is requested UP FRONT — before the local build/test phase — so the
-# in-flight window overlaps it instead of serializing after it (measured
-# 2026-09-15: a full drain-window wait cost 120s of a 203.8s release). The
-# deadline is counted from this request, so the time spent building/testing
-# consumes the same 120s window: short jobs get no less protection, and a bit
-# more wall-clock to finish. If a build/test step fails, the EXIT trap below
-# resumes dispatch immediately; worst case the lease lapses after
-# DEPLOY_DRAIN_LEASE seconds and arbiter resumes dispatch on its own.
-#
-# The drain is LEASED and renewed on every poll. A deploy killed here (gate
-# deadline, ^C, crash) therefore cannot leave the fleet wedged: the lease
-# lapses within DEPLOY_DRAIN_LEASE seconds and arbiter resumes dispatch on its
-# own. The trap below is the fast path for signals we can actually catch; the
-# server-side lease covers SIGKILL, which we cannot.
+# The drain is LEASED and renewed on every poll. A deploy killed here therefore
+# cannot leave the fleet wedged: the lease lapses within DEPLOY_DRAIN_LEASE
+# seconds and arbiter resumes dispatch on its own. The trap below is the fast
+# path for signals we can actually catch; the lease covers SIGKILL.
 DEPLOY_KEY="$(deploy_key)"
 DEPLOY_KEY_PATH="$REMOTE/local/.deploy-key"
 
@@ -399,15 +379,10 @@ while :; do
         break
     fi
     if [ "$decision" = "abort" ]; then
-        # Deadline reached with ${active} job(s) still in flight. Waited-out
-        # work is requeued by the arbiter shutdown path and reruns after the
-        # bounce (greenline.toml contract) — a release is never failed just
-        # because a long train/denoise chunk was in flight. Ownership is still
-        # proven: undrained snapshot -> leased drain -> every poll confirmed
-        # draining=true, so no third party can be mid-deploy.
-        echo "    drain deadline reached with ${active} active job(s) — proceeding with bounce (shutdown path requeues them)"
-        DRAIN_PROVEN=1
-        break
+        # An active-job deadline is never a stop proof. Exit through the
+        # deploy-owned abort trap, which resumes dispatch without a bounce.
+        abort_recovery_termination "active-drain-timeout" "$active"
+        exit 1
     fi
     if [ "$active" != "${last_reported_active:-}" ]; then
         echo "    ${active} job(s) still active; waiting..."
@@ -422,9 +397,9 @@ while :; do
     fi
 done
 
-# DRAIN_PROVEN means every /v1/ps poll validated our owned drain (and, before
-# the deadline, zero active jobs). It is the ownership proof that guards the
-# stop — never stop an arbiter whose drain belongs to another caller.
+# DRAIN_PROVEN means every /v1/ps poll validated our owned drain and the
+# final snapshot had active_jobs==0. It guards the stop; an active-job deadline
+# exits above and can never reach this point.
 if [ "$DRAIN_PROVEN" != "1" ]; then
     echo "ERROR: refusing to stop Arbiter without a validated owned-drain proof" >&2
     exit 1

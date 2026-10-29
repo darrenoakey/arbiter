@@ -175,8 +175,8 @@ case "$CMD" in
         # made every deploy during a long denoise wait ~2.5h for a drain that
         # could never finish in time, so the release was SIGTERM-killed mid-deploy
         # (2026-09-14: left arbiter draining and wedged the whole fleet). The
-        # script's own bounded default applies; in-flight jobs are requeued by
-        # the shutdown path, not lost.
+        # script's own bounded default applies. If work remains at the deadline,
+        # deploy resumes dispatch and fails before any restart; retry when idle.
         export PATH="$PATH:/usr/local/go/bin"
         exec ./deploy-to-spark.sh
         ;;

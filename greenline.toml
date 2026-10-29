@@ -12,9 +12,9 @@ check = "./run check"
 
 # Deploy command. cwd = the canonical checkout. Drain-gated redeploy to spark;
 # idempotent. NEVER use DEPLOY_FORCE=1 (it skips the drain and can kill in-flight
-# work). The drain wait is bounded at 60s so the release fits the 180s target
-# (hard ceiling 600s): a multi-tens-of-minutes denoise chunk is never waited
-# out, it is requeued by the shutdown path and reruns after the bounce.
+# work). The drain wait is bounded so the release fits its time budget. If
+# active work remains at the deadline, deploy resumes dispatch and fails before
+# any restart; retry the release after the fleet becomes idle.
 deploy = "./run deploy"
 
 # Optional health-only probe. Empty = re-run `deploy` as the health probe.
