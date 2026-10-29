@@ -87,3 +87,13 @@ def test_cancelled_batch_does_not_return_item_errors(tmp_path):
         AestheticScorerAdapter().infer(
             {"images_file": str(tmp_path / "never-read.zip")}, tmp_path, flag
         )
+
+
+def test_worker_checks_batch_exclusivity_without_schema_import(tmp_path):
+    # This fails before any model/GPU work, including in the lean worker venv.
+    with pytest.raises(InferenceError, match="cannot be combined"):
+        AestheticScorerAdapter().infer(
+            {"images_file": "batch.zip", "image_file": "single.jpg"},
+            tmp_path,
+            threading.Event(),
+        )

@@ -124,6 +124,7 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", help="diff base (with --head; ignores the worktree)")
     parser.add_argument("--head", help="diff head (with --base; ignores the worktree)")
+    parser.add_argument("--python-tests", action="store_true", help="print dependency-selected pytest files instead of check legs")
     args = parser.parse_args(argv)
     if (args.base is None) != (args.head is None):
         print("pass both --base and --head, or neither", file=sys.stderr)
@@ -135,10 +136,16 @@ def main(argv: list[str]) -> int:
             return 1
     else:
         paths = discover_paths()
-        if paths is None:
+        if paths is None and not args.python_tests:
             for leg in LEGS:
                 print(leg)
             return 0
+    if args.python_tests:
+        from python_test_impact import select_tests
+
+        for test in select_tests(paths):
+            print(test)
+        return 0
     for leg in sorted(select(paths)):
         print(leg)
     return 0

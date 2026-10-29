@@ -210,3 +210,52 @@ def test_deploy_has_only_the_drained_stop_and_normal_start():
     assert "auto/run restart arbiter" not in script
     assert "kill -TERM" not in script
     assert "pkill" not in script
+
+
+def test_inconsistent_wait_snapshot_is_retryable_but_never_a_stop_proof():
+    snapshot = recorded_ps(active=0)
+    snapshot["models"][0]["active_jobs"] = 1
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "wait", "1"],
+        input=json.dumps(snapshot), capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 3
+    assert result.stdout == ""
+    assert "does not equal" in result.stderr
+    # The same inconsistency remains a hard protocol error outside wait mode.
+    assert run_parser("ps", json.dumps(snapshot)).returncode == 2
+
+
+@pytest.mark.parametrize("active", [0, 2])
+def test_pre_drain_cached_snapshot_is_unproved_until_fresh(active):
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "wait", "0"],
+        input=json.dumps(recorded_ps(draining=False, active=active)),
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 4
+    assert result.stdout == ""
+    assert "no longer confirms draining=true" in result.stderr
+    # Outside an acknowledged drain wait this is ordinary undrained state.
+    assert run_parser("ps", json.dumps(recorded_ps(draining=False, active=active))).returncode == 0
+
+
+def test_freshness_wait_keeps_original_deadline_without_lease_renewal():
+    script = DEPLOY_SCRIPT.read_text()
+    wait_body = script.split("wait_state() {", 1)[1].split("resume_if_aborted()", 1)[0]
+    assert '"$(date +%s)" -ge "$drain_deadline"' in wait_body
+    assert "deadline_reached=1" in wait_body
+    assert "drain_request" not in wait_body
+    assert "drain_deadline=" not in wait_body
+    assert '[ "$status" -ne 4 ]' in wait_body
+    assert '[ "$attempt" -lt 3 ]' in wait_body
+
+
+def test_lost_drain_lease_is_not_retryable_at_deadline():
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "wait", "1"],
+        input=json.dumps(recorded_ps(draining=False)),
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 2
+    assert result.stdout == ""

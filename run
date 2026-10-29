@@ -92,6 +92,9 @@ case "$CMD" in
             go_skip="^TestRemote|${ARBITER_GO_TEST_SKIP}"
         fi
         if has_leg go; then
+            # These real fixtures are needed by both Go test processes. Fail
+            # before pytest/build/vet if either endpoint cannot pass its tests.
+            "$PY" "$SCRIPT_DIR/scripts/check_remote_ready.py"
             unformatted="$(gofmt -l .)"
             if [ -n "$unformatted" ]; then
                 echo "Unformatted Go files:" >&2
@@ -122,7 +125,15 @@ case "$CMD" in
         # excluded on purpose — it drives the live spark fleet.
         if has_leg python; then
             leg_started pytest
-            PYTHONPATH="$SCRIPT_DIR/src" "$PY" -m pytest tests/unit src/arbiter/schemas_test.py src/arbiter/adapters/nimble_score_test.py src/arbiter/adapters/clef_score_test.py src/arbiter/adapters/mini_agi_test.py src/arbiter/adapters/qlabs_noise_train_test.py src/arbiter/adapters/test_id_lora.py -q -n 4 || py_status=$?
+            python_tests=()
+            if test_plan="$("$PY" "$SCRIPT_DIR/scripts/check_impact.py" --python-tests)" && [ -n "$test_plan" ]; then
+                while IFS= read -r test_file; do python_tests+=("$test_file"); done <<< "$test_plan"
+            else
+                echo "Python dependency selection failed; retaining the full suite" >&2
+                python_tests=(tests/unit src/arbiter/schemas_test.py src/arbiter/adapters/nimble_score_test.py src/arbiter/adapters/clef_score_test.py src/arbiter/adapters/mini_agi_test.py src/arbiter/adapters/qlabs_noise_train_test.py src/arbiter/adapters/test_id_lora.py)
+            fi
+            echo "check Python files: ${python_tests[*]}"
+            PYTHONPATH="$SCRIPT_DIR/src" "$PY" -m pytest "${python_tests[@]}" -q -n 4 || py_status=$?
             leg_done pytest
         fi
         if has_leg go; then

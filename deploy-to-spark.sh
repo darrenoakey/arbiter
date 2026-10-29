@@ -101,8 +101,28 @@ ps_state() {
 
 wait_state() {
     deadline_reached=$1
-    response="$(curl -fsS --max-time 5 "$ARBITER_URL/v1/ps")" || return 1
-    printf '%s' "$response" | python3 scripts/drain_wait.py wait "$deadline_reached"
+    local attempt=0 status
+    # /v1/ps is cached and may still predate the acknowledged drain. Fresh
+    # reads may catch up only within the ORIGINAL deadline, without renewing
+    # the lease. A false drain at the deadline never proves ownership.
+    # Separately sampled, inconsistent counters retain their three-read bound.
+    while :; do
+        if [ "$(date +%s)" -ge "$drain_deadline" ]; then
+            deadline_reached=1
+        fi
+        response="$(curl -fsS --max-time 5 "$ARBITER_URL/v1/ps")" || return 1
+        if printf '%s' "$response" | python3 scripts/drain_wait.py wait "$deadline_reached"; then
+            return 0
+        else
+            status=$?
+        fi
+        if [ "$status" -ne 4 ]; then
+            [ "$status" -eq 3 ] || return "$status"
+            attempt=$((attempt + 1))
+            [ "$attempt" -lt 3 ] || return "$status"
+        fi
+        sleep 1
+    done
 }
 
 resume_if_aborted() {

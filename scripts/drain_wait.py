@@ -134,6 +134,19 @@ def main() -> int:
             )
     except DrainProtocolError as error:
         print(f"invalid Arbiter {arguments.kind} response: {error}", file=sys.stderr)
+        # /v1/ps is a cached dashboard snapshot: it can still report the
+        # pre-drain state after the live POST acknowledgement. Neither that
+        # sample nor separately sampled, inconsistent active counts is proof.
+        # Retry bounded fresh reads only; never emit a stop decision or renew
+        # the lease here. At the deadline a missing drain remains a hard error.
+        if arguments.kind == "wait":
+            if str(error) == "/v1/ps active_jobs does not equal the sum of models[].active_jobs":
+                return 3
+            if (
+                str(error) == "/v1/ps no longer confirms draining=true"
+                and arguments.lease_seconds == 0
+            ):
+                return 4
         return 2
     return 0
 

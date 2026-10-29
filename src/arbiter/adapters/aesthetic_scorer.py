@@ -106,9 +106,9 @@ class AestheticScorerAdapter(ModelAdapter):
     ) -> dict:
         self._check_cancel(cancel_flag)
 
-        from arbiter.schemas import AestheticScoreParams
-
-        AestheticScoreParams.model_validate(params)
+        # Adapter workers intentionally do not depend on Pydantic.
+        if params.get("images_file") and (params.get("image") or params.get("image_file")):
+            raise InferenceError("bad input: images_file cannot be combined with image or image_file")
         start = time.perf_counter()
         if params.get("images_file"):
             payload = {"items": self._score_archive(params, cancel_flag)}
