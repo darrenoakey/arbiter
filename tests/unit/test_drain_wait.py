@@ -189,6 +189,21 @@ def test_closed_port_curl_failure_cannot_feed_a_successful_parse():
     assert parsed.returncode == 2
 
 
+def test_active_job_drain_deadline_aborts_before_bounce():
+    result = run_recovery_abort("active-drain-timeout", "3")
+    assert result.returncode != 0
+    assert "3 active job(s)" in result.stderr
+    assert "before stopping Arbiter" in result.stderr
+
+    script = DEPLOY_SCRIPT.read_text()
+    abort_branch = script.split('if [ "$decision" = "abort" ]; then', 1)[1].split("fi", 1)[0]
+    assert 'abort_recovery_termination "active-drain-timeout" "$active"' in abort_branch
+    assert "exit 1" in abort_branch
+    assert "DRAIN_PROVEN=1" not in abort_branch
+    assert "break" not in abort_branch
+    assert "trap resume_if_aborted EXIT" in script
+
+
 def test_replacement_listener_aborts_without_recovery_termination():
     result = run_recovery_abort("replacement-listener", "48123")
     assert result.returncode != 0
