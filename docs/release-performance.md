@@ -8,14 +8,20 @@ a change to one adapter and its schema.
 
 `./run check-impact --python-tests --base <base> --head <candidate>` shows the
 Python plan without executing it. The normal gate uses the same planner.
-It follows transitive Python imports, retains registry import smoke and
-source-inspection/subprocess tests, and treats isolated runtime construction
-and deploy-parser contracts separately. Schema changes retain all statically
-reachable schema consumers. Harness/config/runtime changes, missing files,
-parse errors, unknown ownership and unsupported paths retain the full Python
-contract; failed planning falls back to the previous pytest invocation.
-Test-only edits run the changed test files. Integration tests remain excluded
-from this local gate because they drive the real Spark fleet.
+It follows transitive Python imports, package initializers and
+`tests/conftest.py` fixtures. Only literal static imports and audited exact
+owners prove that a changed source has a test; computed registry imports and
+the repository-wide cloud-video scan select tests but never prove ownership,
+so an unowned module still runs the full contract. Tests that read sources,
+run subprocesses, load files or import nothing statically must be declared in
+`AUDITED` in `scripts/python_test_impact.py` (exact owners, `dir/` prefixes,
+or an empty certification); an undeclared or stale declaration, nested
+conftest, or changed package initializer retains the full Python contract, as
+do harness/config/runtime changes, missing files, parse errors and unsupported
+paths. Failed planning falls back to the previous pytest invocation. A
+declared test is selected only when its owners change, so unrelated readers
+no longer grow every release. Integration tests remain excluded from this
+local gate because they drive the real Spark fleet.
 
 The real baseline profiling run passed. Its individual slow calls included
 immutable runtime construction (69.08s) and photo tile blending (58.27s),

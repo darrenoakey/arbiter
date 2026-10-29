@@ -90,7 +90,8 @@ def _git(*args: str) -> str | None:
 
 def diff_paths(base: str, head: str) -> list[str] | None:
     """Files that differ between two commits, or None if git cannot tell us."""
-    out = _git("diff", "--name-only", base, head)
+    # Renames must expose the removed path too: its former consumers can break.
+    out = _git("diff", "--no-renames", "--name-only", base, head)
     if out is None:
         return None
     return [line.strip() for line in out.splitlines() if line.strip()]
@@ -107,7 +108,7 @@ def discover_paths() -> list[str] | None:
     merge_base = _git("merge-base", "HEAD", base)
     if merge_base is None:
         return None
-    committed = _git("diff", "--name-only", merge_base.strip(), "HEAD")
+    committed = _git("diff", "--no-renames", "--name-only", merge_base.strip(), "HEAD")
     dirty = _git("status", "--porcelain=v1", "--untracked-files=all")
     if committed is None or dirty is None:
         return None

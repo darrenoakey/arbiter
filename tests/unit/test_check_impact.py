@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -70,6 +71,36 @@ def test_unknown_or_empty_or_harness_selects_every_leg():
     assert check_impact.select([]) == every
     assert check_impact.select(["run"]) == every
     assert check_impact.select(LAZY_CONFIG + ["run"]) == every
+
+
+def test_committed_rename_keeps_removed_source_impact(tmp_path):
+    """Real Git rename detection must not hide a removed Python source."""
+    def git(*args):
+        return subprocess.run(
+            ["git", "-c", "user.name=Impact Test", "-c", "user.email=impact@example.invalid", *args],
+            cwd=tmp_path, check=True, capture_output=True, text=True,
+        )
+
+    git("init", "--initial-branch=master")
+    script = tmp_path / "scripts/check_impact.py"
+    script.parent.mkdir()
+    script.write_text(SCRIPT.read_text())
+    source = tmp_path / "src/arbiter/removed.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("value = 1\n")
+    git("add", ".")
+    git("commit", "-m", "initial source")
+    git("switch", "-c", "candidate")
+    destination = tmp_path / "docs/removed.md"
+    destination.parent.mkdir()
+    git("mv", str(source), str(destination))
+    git("commit", "-m", "move source to documentation")
+    for args in ([], ["--base", "HEAD^", "--head", "HEAD"]):
+        result = subprocess.run(
+            [sys.executable, str(script), *args], cwd=tmp_path,
+            check=True, capture_output=True, text=True,
+        )
+        assert result.stdout.split() == ["python"]
 
 
 def test_recorded_lazy_config_commit_skips_go():
