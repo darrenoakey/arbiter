@@ -287,6 +287,7 @@ def _file_identity(path: Path) -> tuple[int, int, int, int]:
 
 HASH_PROGRESS_BYTES = 1024**3
 HASH_PROGRESS_SECONDS = 30.0
+STAGE_BUILD_PROGRESS_SECONDS = 30.0
 
 
 def sha256_file(
@@ -446,17 +447,46 @@ class StageClock:
             self.record(name, end - start)
             self._read_peak(name)
 
-    def run_stage(self, prefix: str, stage, loop, cleanup: Callable[[], None], **kwargs):
+    def run_stage(
+        self,
+        prefix: str,
+        stage,
+        loop,
+        cleanup: Callable[[], None],
+        liveness_seconds: float = STAGE_BUILD_PROGRESS_SECONDS,
+        **kwargs,
+    ):
         """Run one DiffusionStage call split into build / denoise / release.
 
         DiffusionStage builds the transformer, then calls ``loop`` with
         keyword arguments, then frees it. Wrapping the public ``loop``
         argument marks the build/denoise and denoise/release boundaries
-        without patching any library code.
+        without patching any library code. A 42 GB transformer build over
+        SMB can take several minutes with an idle GPU, so the build emits
+        periodic worker output until the denoising loop actually starts.
         """
         marks: dict[str, float] = {}
+        build_output_done = threading.Event()
+
+        def report_build_output():
+            started = time.monotonic()
+            while not build_output_done.wait(liveness_seconds):
+                log.info(
+                    "ltx25 benchmark %s transformer build still running after %.1fs",
+                    prefix,
+                    time.monotonic() - started,
+                )
+
+        build_output = threading.Thread(
+            target=report_build_output,
+            name=f"ltx25-{prefix}-build-output",
+            daemon=True,
+        )
+        build_output.start()
 
         def timed_loop(**loop_kwargs):
+            build_output_done.set()
+            build_output.join()
             marks["loop_start"] = self.now()
             result = loop(**loop_kwargs)
             marks["loop_end"] = self.now()
@@ -464,7 +494,11 @@ class StageClock:
 
         self._reset_peak()
         start = self.now()
-        result = stage(loop=timed_loop, **kwargs)
+        try:
+            result = stage(loop=timed_loop, **kwargs)
+        finally:
+            build_output_done.set()
+            build_output.join()
         cleanup()
         end = self.now()
         if "loop_start" not in marks or "loop_end" not in marks:

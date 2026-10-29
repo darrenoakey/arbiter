@@ -10,9 +10,11 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import tarfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -345,6 +347,59 @@ class TestStageClock:
         clock = accel.StageClock(None)
         with pytest.raises(InferenceError):
             clock.record("negative", -1.0)
+
+    def test_long_transformer_build_emits_output_until_denoise_starts(self):
+        clock = accel.StageClock(None)
+        build_output_seen = threading.Event()
+        messages = []
+
+        class OutputHandler(logging.Handler):
+            def emit(self, record):
+                message = record.getMessage()
+                if "transformer build still running" in message:
+                    messages.append(message)
+                    build_output_seen.set()
+
+        handler = OutputHandler()
+        previous_level = accel.log.level
+        accel.log.setLevel(logging.INFO)
+        accel.log.addHandler(handler)
+        try:
+            def stage(loop, **kwargs):
+                assert build_output_seen.wait(5.0)
+                return loop(answer=42)
+
+            result = clock.run_stage(
+                "stage1",
+                stage,
+                lambda answer: answer,
+                lambda: None,
+                liveness_seconds=0.02,
+            )
+        finally:
+            accel.log.removeHandler(handler)
+            accel.log.setLevel(previous_level)
+
+        assert result == 42
+        assert messages
+        assert all("stage1" in message for message in messages)
+        assert clock.timings["stage1_build"] >= 0
+        message_count = len(messages)
+        threading.Event().wait(0.06)
+        assert len(messages) == message_count
+
+    def test_fast_transformer_build_does_not_emit_liveness_output(self, caplog):
+        caplog.set_level("INFO", logger=accel.log.name)
+        clock = accel.StageClock(None)
+        result = clock.run_stage(
+            "stage2",
+            lambda loop: loop(answer="done"),
+            lambda answer: answer,
+            lambda: None,
+            liveness_seconds=30.0,
+        )
+        assert result == "done"
+        assert not [r for r in caplog.records if "transformer build still running" in r.getMessage()]
 
 
 class TestContractMetadata:

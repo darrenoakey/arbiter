@@ -71,6 +71,10 @@ All profiles share the music-video adaptation:
   about 6 minutes on first use. The hash emits a real bytes-hashed stderr line
   every 1 GiB or 30 s, and the GPU idle watchdog reads that output as
   liveness.
+- **Transformer-build liveness.** Building either stage's 42 GB transformer
+  can also take several minutes over SMB with little or no GPU utilization.
+  The worker logs build elapsed time every 30 s until the denoising loop
+  starts, so this expected I/O phase is not mistaken for a hung worker.
 - **One transformer at a time.** Each `DiffusionStage` builds its
   transformer, runs, and frees it. Stage objects, the temporary conv decoder
   and the decode iterator are released in a `finally` block, whether the run
