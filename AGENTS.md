@@ -127,6 +127,28 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   `runtime/ltx25/SOURCE_ARCHIVE.md`. Do not change runner, patch, or
   patched-file hashes to make a missing archive pass.
 
+## LTX 2.5 acceleration benchmark
+
+- New tests that read the pinned runtime archive need an explicit audited
+  dependency in `scripts/python_test_impact.py` as well as their static imports.
+  Otherwise conservative full-suite fallback also breaks the existing bounded
+  ownership regression assertions; never weaken those assertions to compensate.
+
+- `acceleration_benchmark` on `ltx25-denoise1` is opt-in and capped; see
+  `docs/ltx25-acceleration.md`. Its stock profile replays runner `1c8ea922…`
+  phase by phase and refuses any other pinned runner. Re-audit
+  `ltx25_acceleration._run_gpu` before re-pinning.
+- The HF HTTP `etag` of an LTX weight is a Xet/CDN id, not its SHA-256. Pin
+  the Git LFS pointer oid instead. The distilled transformer is `31eb3cad…`;
+  the etag was `9f6bd0b1…`.
+- Hashing a 42 GB weight over the SMB store takes about 6 minutes. Any
+  in-worker hash must log real progress to stderr, because the GPU idle
+  watchdog treats worker silence as a hang.
+- The checksum-pinned runtime source archive is how CPU tests compare
+  constants with installed upstream code without importing `ltx_pipelines`.
+  Read it from the canonical `local/ltx25-runtime-sources/` through
+  `git rev-parse --git-common-dir`.
+
 ## Greenline submit from agents
 
 - The deploy's 120s drain counts dispatched jobs that are still waiting on a

@@ -95,6 +95,7 @@ from __future__ import annotations
 import gc
 import logging
 import threading
+import time
 from pathlib import Path
 
 from arbiter.adapters.base import (
@@ -103,6 +104,11 @@ from arbiter.adapters.base import (
     HeapTrimGuard,
     InferenceError,
     LoadError,
+)
+from arbiter.adapters.ltx25_acceleration import (
+    parse_acceleration_benchmark,
+    require_benchmark_request,
+    run_acceleration_benchmark,
 )
 from arbiter.adapters.ltx25_temporal_attention import (
     load_ltx25_runtime,
@@ -632,12 +638,17 @@ class LTX25Denoise1Adapter(GroupAdapter):
         # ffmpeg work that runs OUTSIDE the lock so it overlaps the next
         # job's GPU phase — same pipelining pattern as ltx2-denoise2.
         self._gpu_lock = threading.Lock()
+        # Measured load() timing, reported only by acceleration benchmarks.
+        self._load_timing: dict | None = None
+        self._infers_since_load = 0
 
     def load(self, device: str = "cuda") -> None:
         self._device = device
 
         try:
+            load_started = time.perf_counter()
             self._runtime_module, self._runtime_provenance = load_ltx25_runtime()
+            runtime_loaded = time.perf_counter()
             self._pipeline = self._runtime_module.FastPipeline()
             log.info(
                 "LTX25-denoise1: pre-loading 22B transformer + LoRA + "
@@ -647,6 +658,14 @@ class LTX25Denoise1Adapter(GroupAdapter):
                 # Public preload hook — keeps the resident set loaded across
                 # every subsequent chunk instead of re-loading it per job.
                 self._pipeline.load_denoise_models()
+            loaded = time.perf_counter()
+            self._load_timing = {
+                "runtime_import_s": runtime_loaded - load_started,
+                "pipeline_init_and_load_denoise_models_s": loaded - runtime_loaded,
+                "load_total_s": loaded - load_started,
+                "loaded_at_unix": time.time(),
+            }
+            self._infers_since_load = 0
             log.info("LTX25-denoise1: models resident")
         except Exception as e:
             self._pipeline = None
@@ -665,6 +684,11 @@ class LTX25Denoise1Adapter(GroupAdapter):
     ) -> dict:
         # Validate params BEFORE the loaded-pipeline check so a malformed job
         # always reports the real defect, never "not loaded".
+        # Opt-in capped A/B benchmark (docs/ltx25-acceleration.md). Absent
+        # leaves the production path below untouched.
+        benchmark_profile = parse_acceleration_benchmark(params)
+        if benchmark_profile is not None:
+            require_benchmark_request(benchmark_profile, params)
         raw_scale = params.get("a2v_guidance_scale", 3.0)
         try:
             a2v_guidance_scale = float(raw_scale)
@@ -715,6 +739,28 @@ class LTX25Denoise1Adapter(GroupAdapter):
             log.info("ltx25 denoise progress: %s/%s %s", stage, status, kw)
             if cancel_flag.is_set():
                 raise CancelledException(f"Cancelled during {stage}/{status}")
+
+        if benchmark_profile is not None:
+            self._infers_since_load += 1
+            return run_acceleration_benchmark(
+                pipeline=self._pipeline,
+                runner=self._runtime_module,
+                runtime_provenance=self._runtime_provenance,
+                gpu_lock=self._gpu_lock,
+                profile=benchmark_profile,
+                params=params,
+                encoded_file=encoded_file,
+                audio_file=audio_file,
+                start_time=start_time,
+                fps=fps,
+                output_dir=output_dir,
+                progress_fn=_progress,
+                check_cancel=lambda: self._check_cancel(cancel_flag),
+                worker_load={
+                    "timing": self._load_timing,
+                    "benchmark_infers_since_load": self._infers_since_load,
+                },
+            )
 
         try:
             # PHASE 1 (CPU/IO): torch.load encoded.pt, map_location="cpu" —

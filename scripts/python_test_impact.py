@@ -64,6 +64,9 @@ AUDITED: dict[str, frozenset[str]] = {
         },
         "tests/unit/test_latentsync_mouth_guard.py": set(),
         "tests/unit/test_ltx2_dimensions.py": set(),
+        # Reads the checksum-pinned runtime manifest/source archive. Adapter
+        # dependencies are already proven by its literal static imports.
+        "tests/unit/test_ltx25_acceleration.py": {"runtime/ltx25/"},
         "tests/unit/test_ltx25_generated_keyframes.py": set(),
         "tests/unit/test_ltx25_runtime_builder.py": {
             "scripts/build_ltx25_runtime.py",
