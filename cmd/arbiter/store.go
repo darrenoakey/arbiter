@@ -956,6 +956,20 @@ func (s *Store) CountActive(modelID string) (int, error) {
 	return count, err
 }
 
+func (s *Store) CancelAbandonedQueuedJob(jobID, reason string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		"UPDATE jobs SET state = 'cancelled', finished_at = ?, error = ? WHERE id = ? AND state = 'queued' AND NOT EXISTS (SELECT 1 FROM job_idempotency WHERE job_id = jobs.id)",
+		nowTS(), reason, jobID,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
 func (s *Store) CancelJob(jobID string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

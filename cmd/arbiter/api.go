@@ -2326,39 +2326,50 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.scheduler.Wake()
+	a.waitForChatCompletion(w, r, job.ID, cacheKey, req.Model, modelID, aliasUsed, 15*time.Minute)
+}
 
-	// Wait for completion (synchronous)
-	timeout := time.After(15 * time.Minute)
+func (a *API) abandonChatJob(jobID, reason string) {
+	cancelled, err := a.store.CancelAbandonedQueuedJob(jobID, reason)
+	if err != nil {
+		slog.Warn("cancel abandoned chat job", "job_id", jobID, "error", err)
+	}
+	if cancelled {
+		a.logger.Log("job.cancelled", map[string]any{"job_id": jobID, "reason": reason})
+	}
+}
+
+func (a *API) waitForChatCompletion(w http.ResponseWriter, r *http.Request, jobID, cacheKey, requestedModel, modelID, aliasUsed string, wait time.Duration) {
+	timeout := time.After(wait)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-
 	for {
 		select {
+		case <-r.Context().Done():
+			a.abandonChatJob(jobID, "synchronous client disconnected")
+			return
 		case <-timeout:
+			a.abandonChatJob(jobID, "synchronous response wait timed out")
 			writeError(w, 504, "chat completion timed out")
 			return
 		case <-ticker.C:
-			j, _ := a.store.GetJob(job.ID)
+			j, _ := a.store.GetJob(jobID)
 			if j == nil {
 				continue
 			}
 			switch j.State {
 			case "completed":
 				if j.Result != nil {
-					// Write to cache on a successful, non-empty completion.
-					// storeChatResultIfCacheable refuses empty content, so we
-					// never cache blank replies.
 					a.storeChatResultIfCacheable(cacheKey, *j.Result)
 					var result map[string]any
 					if err := json.Unmarshal(*j.Result, &result); err != nil {
 						writeError(w, 500, "stored chat result is invalid")
 						return
 					}
-					// Return the OpenAI response directly, echoing the requested model.
 					if resp, ok := result["response"]; ok {
 						w.Header().Set("Content-Type", "application/json")
 						w.Header().Set("X-Arbiter-Cache", "miss")
-						setModelIdentityHeaders(w, req.Model, modelID, aliasUsed)
+						setModelIdentityHeaders(w, requestedModel, modelID, aliasUsed)
 						var raw []byte
 						if rm, ok := resp.(json.RawMessage); ok {
 							raw = rm
@@ -2370,7 +2381,7 @@ func (a *API) chatCompletion(w http.ResponseWriter, r *http.Request) {
 								return
 							}
 						}
-						raw = rewriteOpenAIResponseModel(raw, req.Model)
+						raw = rewriteOpenAIResponseModel(raw, requestedModel)
 						if _, err := w.Write(raw); err != nil {
 							slog.Warn("write chat completion", "error", err)
 						}
