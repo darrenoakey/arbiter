@@ -1,0 +1,24 @@
+# OFFLINE PREPARATION — DO NOT INSTALL BEFORE IMMUTABLE SOURCE REVIEW/APPROVAL.
+# Job/model: p-h3-image / p-h3-image-bf16, comparison only (not IGS fallback).
+# The official checkpoint declares diffusers 0.42.0.dev0 (2026-11-03), newer
+# than Spark's existing 0.40/0.41.dev venvs. No immutable compatible diffusers
+# commit has been selected or audited yet; therefore this file deliberately
+# contains no floating git dependency to execute. Select and pin the exact
+# official GitHub commit first, then update this manifest and docs/p-h3-image.md.
+# Official card's dependency families (versions are NOT runtime evidence):
+# torch==2.14.0+cu130 (GB10 family; verify compatibility at audited commit)
+# transformers>=5.20.1,<6
+# accelerate==1.15.0
+# safetensors==0.9.0rc1
+# pillow>=10
+# numpy>=2,<3
+# pydantic>=2,<3
+#
+# Proposed real-directory venv (venvs are not deployed): venvs/ph3image.
+# Snapshot: PrunaAI/P-H3-Image@7f98acef503cf2bcfba821a78cb1cf1a9928b2df.
+# Full bf16 safetensors payload from official per-directory expanded trees:
+# 99,797,308,280 bytes (88,438,696,120 without prompt upsampler). All runtime
+# metadata/license files included in the adapter pin total 99,845,388,933 bytes.
+# Adapter verifies official immutable Git-blob/LFS ids before any import.
+# MiniMax H3 Community License: Australia is not an excluded territory; the
+# EU/UK/Republic of Korea/USA are excluded absent separate MiniMax licensing.

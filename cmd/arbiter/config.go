@@ -417,6 +417,7 @@ var JobTypeToModel = map[string]string{
 	"flux3-klein-fp8":         flux3KleinFP8Model,
 	"flux3-klein-nvfp4":       flux3KleinNVFP4Model,
 	"moss-image":              mossImageSftModel,
+	"p-h3-image":              ph3ImageBF16Model,
 	"photo-enhance":           "photo-enhance",
 	"image-to-3d":             "trellis2",
 	"routing-decide-train":    "routing-decide",

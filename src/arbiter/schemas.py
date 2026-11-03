@@ -68,6 +68,7 @@ class JobType(str, Enum):
     FLUX3_KLEIN_FP8 = "flux3-klein-fp8"
     FLUX3_KLEIN_NVFP4 = "flux3-klein-nvfp4"
     MOSS_IMAGE = "moss-image"
+    PH3_IMAGE = "p-h3-image"
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
     FINE_TUNE = "fine-tune"
@@ -127,6 +128,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "flux3-klein-fp8": "flux3-klein-fp8",
     "flux3-klein-nvfp4": "flux3-klein-nvfp4",
     "moss-image": "moss-image-sft",
+    "p-h3-image": "p-h3-image-bf16",
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
     "fine-tune": "fine-tune",
@@ -657,6 +659,19 @@ class MossImageParams(BaseModel):
         return value
 
 
+class PH3ImageParams(BaseModel):
+    """P-H3-Image bf16 owner comparison: 8 steps, no CFG, prompt-as-written
+    at 1024² by default. Native 8 MP and upsampling must be explicit."""
+
+    model_config = ConfigDict(extra="forbid")
+    prompt: str = Field(..., min_length=1, max_length=16000)
+    seed: int = Field(default=42, ge=0, le=2**63 - 1)
+    width: int = Field(default=1024, ge=256, le=4096, multiple_of=32)
+    height: int = Field(default=1024, ge=256, le=4096, multiple_of=32)
+    steps: Literal[8] = 8
+    prompt_upsampling: bool = False
+
+
 class ImageTo3DParams(BaseModel):
     image: Optional[str] = None  # base64; RGBA with real alpha skips BiRefNet
     image_file: Optional[str] = None  # staged path on spark
@@ -912,6 +927,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "flux3-klein-fp8": Flux3KleinParams,
     "flux3-klein-nvfp4": Flux3KleinParams,
     "moss-image": MossImageParams,
+    "p-h3-image": PH3ImageParams,
     "tts-voxtral": TTSVoxtralParams,
     "video-generate-h3": VideoGenerateH3Params,
     "video-generate-fast-h3": VideoGenerateH3Params,

@@ -87,6 +87,11 @@ var flux3KleinModels = map[string]bool{
 const mossImageSftModel = "moss-image-sft"
 const mossImageJobType = "moss-image"
 
+// Official PrunaAI/P-H3-Image bf16 only, owner comparison 2026-11-03.
+// No Comfy/w4a8/LoRA alias or IGS routing is opened.
+const ph3ImageBF16Model = "p-h3-image-bf16"
+const ph3ImageJobType = "p-h3-image"
+
 // flux3WeightsRootParam is the only extra adapter param the flux3 workers
 // accept: the absolute snapshot root holding flux-3-image-klein/.
 const flux3WeightsRootParam = "FLUX3_WEIGHTS_ROOT"
@@ -134,7 +139,7 @@ var disabledStillImageMarkers = []string{
 	"sdxl", "sd3", "sd-3", "pixart", "kandinsky", "aura-flow", "auraflow",
 	"playground-v", "ideogram", "recraft", "hidream", "hunyuan-image", "qwen-image",
 	"kolors", "omnigen", "dreamshaper", "realvis", "juggernaut", "image-generator",
-	"moss-image", "mossimage",
+	"moss-image", "mossimage", "p-h3-image", "ph3-image", "minimax-h3-image",
 }
 
 var trustedPythonAdapters = map[string]string{
@@ -199,6 +204,7 @@ var trustedPythonAdapters = map[string]string{
 	flux3KleinFP8Model:        "flux3",
 	flux3KleinNVFP4Model:      "flux3",
 	mossImageSftModel:         "mossimage",
+	ph3ImageBF16Model:         "ph3image",
 	"trellis2":                "trellis2",
 }
 
@@ -255,6 +261,9 @@ func isDisabledStillImageModel(modelID string) bool {
 	if isMossImageSftModel(normalized) {
 		return false
 	}
+	if normalized == normalizedPolicyText(ph3ImageBF16Model) {
+		return false
+	}
 	if normalized == "id-lora" || normalized == "id-lora-encode" || normalized == "lora-train" || normalized == "fine-tune" || normalized == "ltx2" || strings.HasPrefix(normalized, "ltx2-") ||
 		normalized == "ltx25" || strings.HasPrefix(normalized, "ltx25-") {
 		return false
@@ -308,7 +317,7 @@ func disabledStillImageConfig(modelID string, cfg ModelConfig) bool {
 		// pinned by validateWorkerCommand to the trusted adapter identity.
 		return false
 	}
-	if isQwenImage21Model(modelID) || isQwenImage21HereticModel(modelID) || isQwenImage21SglangModel(modelID) || isQwenImage21TurboModel(modelID) || isIris3BModel(modelID) || isMingImageDesignModel(modelID) || isFlux3KleinModel(modelID) || isMossImageSftModel(modelID) {
+	if isQwenImage21Model(modelID) || isQwenImage21HereticModel(modelID) || isQwenImage21SglangModel(modelID) || isQwenImage21TurboModel(modelID) || isIris3BModel(modelID) || isMingImageDesignModel(modelID) || isFlux3KleinModel(modelID) || isMossImageSftModel(modelID) || normalizedPolicyText(modelID) == normalizedPolicyText(ph3ImageBF16Model) {
 		// The sanctioned Qwen adapters legitimately name the Qwen checkpoint
 		// (or its local merged heretic / turbo dir) and their pinned interpreter.
 		return false
@@ -468,6 +477,9 @@ func rejectDisabledStillImage(jobType, modelID string) error {
 	if isMossImageSftModel(modelID) && jobType != mossImageJobType {
 		// The MOSS comparison adapter is reachable only through its own job
 		// type; MOSS-Image-Base and other moss ids stay denied entirely.
+		return fmt.Errorf("%s", stillImageDisabledMessage)
+	}
+	if normalizedPolicyText(modelID) == normalizedPolicyText(ph3ImageBF16Model) && jobType != ph3ImageJobType {
 		return fmt.Errorf("%s", stillImageDisabledMessage)
 	}
 	return nil
