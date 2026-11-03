@@ -60,8 +60,10 @@ Only bf16 diffusers weights are supported, not Comfy quantized files.
 ## Comparison arms
 
 1. Like-for-like: house botanist/Sydney/LUMEN, 1024×1024, seeds
-   42001/42002/42003, exact recovered prompts (pending), prompt upsampling
-   off, checkpoint sigmas, 8 steps/no CFG. Warm renders with queue/load split.
+   42001/42002/42003, exact recovered prompts in the task's
+   `baselines/fixtures.json` `primary_flux_qwen_prompts` (verified against
+   conv-aa7b15c4b63cb5fd seq 567), prompt upsampling off, checkpoint sigmas,
+   8 steps/no CFG. Warm renders with queue/load split.
 2. Native: 2912×2912, same seeds, prompt-as-written, separately labelled
    native-8MP. Optional prompt-upsampling arm requires a reviewed
    implementation and must record expanded prompt plus separate timing.
