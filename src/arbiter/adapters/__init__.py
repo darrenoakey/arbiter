@@ -37,7 +37,7 @@ _ADAPTER_MODULES = (
     "ming_image_design",
     "flux3_klein",
     "moss_image",
-    "p_h3_image",
+    "p_h3_image_comfy",
     "fine_tune",
     "lora_train",
     "composite",

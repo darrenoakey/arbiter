@@ -1,0 +1,37 @@
+# P-H3-Image Comfy — offline preparation only; do not install in turn.
+# Supported upstream: official ComfyUI at exact commit
+# https://github.com/comfyanonymous/ComfyUI.git@576b642e77b4c42f84afe583c8e8f0eef7637618
+# PH3 support #17506. No upstream execution occurred during adapter tests.
+#
+# Existing Mac mini Arbiter storage (preferred, no Spark relocation):
+#   /Volumes/ssd_4/arbiter/models/p-h3-image
+# Existing intended Spark path (requires working existing CIFS mount):
+#   /mnt/arbiter-store/models/p-h3-image/{diffusion_models,text_encoders,vae}
+# Official model revision: PrunaAI/P-H3-Image-Comfy@44a0fb73f299da1bb715bdb5ff59ce3fd3c6f543
+#   diffusion_models/p-h3-image_w4a8.safetensors
+#     13362068864 bytes; sha256 12ea30d6fde736dd69ef16658ce9438823a06e351ac3fa335cc4a3ce6bb17a43
+#   text_encoders/p-h3-image_text_encoder_w4a8.safetensors
+#     3575536021 bytes; sha256 d4ae62d48e1de846dd55fc975623434e9326df3449601c4e15bea8b3ccd67293
+#   vae/p-h3-image_vae_int8_convrot.safetensors
+#     3146996440 bytes; sha256 583e0d43354b6b833aa9a0815a5fac831b1ef6d0c19a7eaa0616980a3dab5ffe
+# Total new weights: 20084601325 bytes. Prompt upsampler excluded.
+#
+# Official Comfy requirements.txt at that commit also requires:
+#   comfy-aimdo==0.6.0
+#   comfy-kitchen==0.2.40
+#   comfyui-frontend-package==1.57.6
+#   comfyui-workflow-templates==0.11.100
+#   comfyui-embedded-docs==0.5.15
+# plus torch, torchsde, torchvision, numpy>=1.25.0, einops,
+# transformers>=4.50.3, tokenizers>=0.13.3, sentencepiece,
+# safetensors>=0.4.2, aiohttp>=3.11.8, yarl>=1.18.0, pyyaml,
+# Pillow>=10.1.0, scipy, tqdm, psutil, alembic, SQLAlchemy>=2.0.0,
+# filelock, av>=17.0.0, requests, simpleeval>=1.0.0, blake3.
+# GB10/aarch64 wheel support and venv footprint are unverified; do not install
+# a package set blindly. Use a real-directory venvs/ph3comfy, torch 2.14+cu130
+# if compatible, with PYTHONPATH only to the immutable Comfy checkout. No
+# ComfyUI HTTP server or arbitrary upstream startup scripts.
+#
+# All downloads/installs/authorized releases must run detached and be slept on.
+# This preparation did not execute a model, start a listener, change storage,
+# submit jobs, or deploy Arbiter.

@@ -244,7 +244,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "moss-image-sft",
         "music-generate",
         "nimble-scorer",
-        "p-h3-image-bf16",
+        "p-h3-image-comfy-w4a8",
         "photo-enhance",
         "qlabs-noise-train",
         "qwen-image-2.1",
