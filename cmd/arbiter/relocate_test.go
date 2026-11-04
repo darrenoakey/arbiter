@@ -27,6 +27,19 @@ func TestRelocateJobOutput_NoShareIsNoop(t *testing.T) {
 	}
 }
 
+func TestLocalOutputDoesNotRelocateToShare(t *testing.T) {
+	share := t.TempDir()
+	local := t.TempDir()
+	cfg := &Config{ShareMount: share, OutputDir: local}
+	got := relocateJobOutput(cfg, "abc", local)
+	if got != local {
+		t.Fatalf("local output relocated to share %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(share, "output", "jobs", "abc")); !os.IsNotExist(err) {
+		t.Fatal("local output unexpectedly created on share")
+	}
+}
+
 func TestRelocateJobOutput_MovesToShare(t *testing.T) {
 	tmp := t.TempDir()
 	share := filepath.Join(tmp, "share")
