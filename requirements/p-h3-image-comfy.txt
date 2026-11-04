@@ -3,10 +3,11 @@
 # https://github.com/comfyanonymous/ComfyUI.git@576b642e77b4c42f84afe583c8e8f0eef7637618
 # PH3 support #17506. No upstream execution occurred during adapter tests.
 #
-# Existing Mac mini Arbiter storage (preferred, no Spark relocation):
-#   /Volumes/ssd_4/arbiter/models/p-h3-image
-# Existing intended Spark path (requires working existing CIFS mount):
-#   /mnt/arbiter-store/models/p-h3-image/{diffusion_models,text_encoders,vae}
+# Prepared local Spark model directory (not created or populated):
+#   /mnt/t9/models/p-h3-image/{diffusion_models,text_encoders,vae}
+# Required mounted filesystem UUID: ec088732-0cb2-4fc4-935e-f5d6f9a3b73b.
+# Honor the storage owner's 50GB free reserve, plus unmeasured install/temp
+# margin. Never fall back to root or restore a mount. Approval pending.
 # Official model revision: PrunaAI/P-H3-Image-Comfy@44a0fb73f299da1bb715bdb5ff59ce3fd3c6f543
 #   diffusion_models/p-h3-image_w4a8.safetensors
 #     13362068864 bytes; sha256 12ea30d6fde736dd69ef16658ce9438823a06e351ac3fa335cc4a3ce6bb17a43

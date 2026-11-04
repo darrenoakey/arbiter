@@ -27,6 +27,7 @@ def test_exact_registration_policy_and_schema():
     assert issubclass(registry.get_adapter_class("p-h3-image-comfy-w4a8"), ph3.PH3ImageComfyAdapter)
     assert JOB_TYPE_TO_MODEL["p-h3-image-comfy"] == "p-h3-image-comfy-w4a8"
     assert JOB_TYPE_PARAMS["p-h3-image-comfy"] is PH3ImageComfyParams
+    assert ph3.DEFAULT_MODELS_DIR == Path("/mnt/t9/models/p-h3-image")
     assert not is_disabled_still_image_model("p-h3-image-comfy-w4a8")
     for alias in ("p-h3-image-comfy", "p-h3-image-comfy-bf16", "p-h3-image-comfy-w4a8-upsampler", "minimax-h3-image"):
         assert is_disabled_still_image_model(alias)

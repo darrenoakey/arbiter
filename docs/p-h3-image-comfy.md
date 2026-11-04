@@ -20,20 +20,29 @@ PH3Image pipeline was found.
 - License: MiniMax H3 Community License. Australian local use is not in the
   excluded EU/UK/Republic of Korea/USA territories. No new agreement accepted.
 
-## Storage finding
+## Local storage and approval state (2026-11-04 19:12 UTC)
 
-Preferred existing authorized storage is Mac mini
-`/Volumes/ssd_4/arbiter/models/p-h3-image` with **1.63 TiB free**, exposed
-through the existing intended mapping `/mnt/arbiter-store/models/p-h3-image`.
-No relocation or Spark cleanup is needed for this payload.
+Prepared model location is `/mnt/t9/models/p-h3-image`, not the unmounted
+`/mnt/arbiter-store` path. The approved physical T9 filesystem UUID is
+`ec088732-0cb2-4fc4-935e-f5d6f9a3b73b`. Before a future download, prove the
+exact mount/UUID, fail if absent, and use a local directory there; never fall
+back to Spark root or automatically mount anything.
 
-At inspection, Spark's existing CIFS mount was absent. TCP/445 connected, but
-SMB3 protocol negotiation timed out and the kernel logged `cifs_mount failed
-w/return code = -112`. The Mac mini has the writable `arbiter-data` share
-configured but no running `smbd` process. **No mount, security, SMB service,
-restart or reconfiguration was attempted.** This is the remaining storage
-blocker, not capacity. Dedicated cleanup owner conv-af0761673c160cb4 has the
-payload and protected-path facts; this task performs no cleanup or downloads.
+Fresh available bytes: root 803,936,972,800; T9 64,384,659,456. Storage owner
+conv-6f92a2a821b950fa requires root use <200 GB, models/logs on T9, and a
+**50,000,000,000-byte T9 free reserve**. Thus usable T9 space is only
+14,384,659,456 bytes: **5,699,941,869 more bytes are required for weights
+alone**, before the unmeasured temporary-download/venv/runtime overhead.
+Recovery is the storage owner's task, not this adapter's. Do not clean or
+compress anything as part of P-H3.
+
+Installation/download approval is pending with the parent. No explicit
+installation or adapter-release denial has occurred, but the original scope
+held both. Direct Spark-to-Mini SSH was explicitly denied and will not be
+retried. The shared drain/restart hold is binding until the music MP4 is
+verified. A production release is a separate decision from installing files.
+The local path removes CIFS as a model-loading dependency, not the storage
+reserve, install approval, or render hold.
 
 ## Adapter scope
 

@@ -10,7 +10,7 @@
   "max_instances": 1,
   "max_runtime_seconds": 3600,
   "memory_gb": 28,
-  "model_path": "/mnt/arbiter-store/models/p-h3-image",
+  "model_path": "/mnt/t9/models/p-h3-image",
   "placements": ["spark"],
   "pressure_index": 1,
   "worker_cmd": [

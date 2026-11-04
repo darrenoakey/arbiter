@@ -9,7 +9,7 @@ import (
 func ph3ImageComfyConfig(root string) ModelConfig {
 	return ModelConfig{
 		MemoryGB: 28, MaxConcurrent: 1, MaxInstances: intPtr(1),
-		ModelPath: "/mnt/arbiter-store/models/p-h3-image", Placements: []string{"spark"},
+		ModelPath: "/mnt/t9/models/p-h3-image", Placements: []string{"spark"},
 		AdapterParams: map[string]string{"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
 		WorkerCmd:     []string{filepath.Join(root, "venvs", "ph3comfy", "bin", "python"), "-m", "arbiter.worker_main", ph3ImageComfyW4A8Model},
 	}

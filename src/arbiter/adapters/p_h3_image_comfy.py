@@ -8,8 +8,8 @@ construction. The former diffusers scaffold was removed because upstream has
 no PH3Image pipeline at the inspected revision.
 
 Weights are the official three-file no-upsampler set, exactly 20,084,601,325
-bytes. The existing Mac mini Arbiter share is the intended model location;
-no existing MiniMax-H3 video component is accepted as a substitute.
+bytes. Model placement is local Spark T9, so loading never relies on the
+unavailable CIFS mount. No existing H3 video part is accepted as a substitute.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ PH3_REPO = "PrunaAI/P-H3-Image-Comfy"
 PH3_REVISION = "44a0fb73f299da1bb715bdb5ff59ce3fd3c6f543"
 COMFY_REPO = "https://github.com/comfyanonymous/ComfyUI.git"
 COMFY_REVISION = "576b642e77b4c42f84afe583c8e8f0eef7637618"
-DEFAULT_MODELS_DIR = Path("/mnt/arbiter-store/models/p-h3-image")
+DEFAULT_MODELS_DIR = Path("/mnt/t9/models/p-h3-image")
 DEFAULT_RUNTIME_DIR = Path("/home/darren/src/arbiter/runtime/ComfyUI")
 EXPECTED_COMFY_GIT_BLOBS = {
     "comfy_extras/nodes_minimax_h3.py": "b0abbc717ba6af7da5169f44467f44364468cda9",
