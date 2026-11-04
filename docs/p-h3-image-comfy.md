@@ -40,7 +40,13 @@ payload and protected-path facts; this task performs no cleanup or downloads.
 - Exact job/model: `p-h3-image-comfy` / `p-h3-image-comfy-w4a8`; all other
   precision/upsampler/LoRA/video-component substitutions fail closed.
 - In-process `execution.PromptExecutor` following official `main.py`; no
-  HTTP listener and no GPU execution outside Arbiter.
+  HTTP listener and no GPU execution outside Arbiter. Before importing Comfy
+  modules, the pinned checkout is inserted into `sys.path`; built-in nodes
+  initialize with both custom nodes and API nodes disabled.
+- Explicit `folder_paths.add_model_folder_path` entries restrict
+  `diffusion_models`, `text_encoders` and `vae` to the pinned snapshot.
+  `folder_paths.set_output_directory` is called per Arbiter job, so PNGs are
+  collected from that job's directory, not a shared runtime/output tree.
 - Seven logical stages distilled into a 12-node prompt graph from Pruna
   workflow `9d43b9c5-ca8f-4a60-837d-d342773e8b8a`: loaders, 1.0/1.0 model
   shift, PH3 conditioning, fixed noise/sigma schedule, Euler sampler, VAE
@@ -54,16 +60,16 @@ payload and protected-path facts; this task performs no cleanup or downloads.
 
 ## Unverified installed-runtime details
 
-The execution host must set Comfy's working/output directory to a dedicated
-writable directory and point its three model search roots at the pinned
-snapshot. The current adapter's executor factory boundary and tiny local
-execution-double tests do not prove that the actual `PromptExecutor`
-initialization/imports or `SaveImage` destination are correct on Spark. Do
-not deploy without completing that smoke check and fixing any mismatch.
+The pinned runtime path is `/home/darren/src/arbiter/runtime/ComfyUI`, a real
+checkout whose HEAD and PH3 source blobs are verified before loading. The
+adapter configures model search roots, output paths and built-in nodes as
+above. Actual `PromptExecutor` initialization/imports, GB10 W4A8 kernel
+support and real model output still require an installed-runtime smoke test;
+offline local doubles cannot prove those. Do not deploy without that check.
 
 ## Tests
 
-Offline only: **66 Python tests passed** (adapter plus existing image-policy
+Offline only: **67 Python tests passed** (adapter plus existing image-policy
 and job-type suites), and focused Go policy tests passed. Tests use local
 files and a lightweight local execution double for our runner boundary; they
 do not import ComfyUI/torch or claim a render. Alias gaps found by the Go

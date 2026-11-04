@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -36,12 +37,15 @@ PH3_REVISION = "44a0fb73f299da1bb715bdb5ff59ce3fd3c6f543"
 COMFY_REPO = "https://github.com/comfyanonymous/ComfyUI.git"
 COMFY_REVISION = "576b642e77b4c42f84afe583c8e8f0eef7637618"
 DEFAULT_MODELS_DIR = Path("/mnt/arbiter-store/models/p-h3-image")
+DEFAULT_RUNTIME_DIR = Path("/home/darren/src/arbiter/runtime/ComfyUI")
 EXPECTED_COMFY_GIT_BLOBS = {
     "comfy_extras/nodes_minimax_h3.py": "b0abbc717ba6af7da5169f44467f44364468cda9",
     "comfy/text_encoders/minimax.py": "3c9e8f7e45fc0f7700cc7aa9996399914007d87e",
     "comfy/ldm/minimax/vae.py": "9faf459198d1da9afd0a90240556dd0d1d0ecd3e",
     "comfy/sd.py": "ca61c01f77664dd94918297fc9f0898217798686",
     "execution.py": "a8918ada17af25941827763e0184f4dab87c46f9",
+    "folder_paths.py": "0673f6c958688ee5771cca35aa653b2062b02d60",
+    "nodes.py": "e279ae2fec49c23a97f2079b63b696aa0510de50",
 }
 
 # oid is the official git blob SHA; lfs is the immutable SHA-256 content id.
@@ -199,11 +203,13 @@ class _NullServer:
 class PH3ImageComfyAdapter(ModelAdapter):
     model_id = "p-h3-image-comfy-w4a8"
 
-    def __init__(self, models_dir: Path = DEFAULT_MODELS_DIR, runtime_dir: Path | None = None,
+    def __init__(self, models_dir: Path = DEFAULT_MODELS_DIR, runtime_dir: Path = DEFAULT_RUNTIME_DIR,
                  executor_factory: Callable | None = None) -> None:
         self.models_dir = models_dir
         self.runtime_dir = runtime_dir
         self._executor_factory = executor_factory
+        self._uses_comfy_paths = executor_factory is None
+        self._folder_paths = None
         self._executor = None
         self._comfy = None
         self._provenance: dict | None = None
@@ -218,16 +224,28 @@ class PH3ImageComfyAdapter(ModelAdapter):
             raise LoadError(f"{self.model_id} refuses to run outside Arbiter's CUDA-capped worker")
         started = time.perf_counter()
         weights = verify_weights(self.models_dir)
-        runtime = verify_comfy_source(self.runtime_dir) if self.runtime_dir else {"repo": COMFY_REPO, "revision": COMFY_REVISION, "verification": "installed worker identity must be pinned"}
+        runtime = verify_comfy_source(self.runtime_dir)
         self._provenance = {"weights": weights, "runtime": runtime}
+        if str(self.runtime_dir) not in sys.path:
+            sys.path.insert(0, str(self.runtime_dir))
         if self._executor_factory is None:
             # No HTTP listener, no Comfy main.py server and no direct GPU
             # execution outside Arbiter. This is main.py's in-process boundary.
+            # The source checkout is a directory, never a PYTHONPATH arbitrary
+            # code string; PH3 built-ins are loaded without custom/API nodes.
+            import asyncio
             import execution
+            import folder_paths
+            import nodes
+            folder_paths.add_model_folder_path("diffusion_models", str(self.models_dir / "diffusion_models"), True)
+            folder_paths.add_model_folder_path("text_encoders", str(self.models_dir / "text_encoders"), True)
+            folder_paths.add_model_folder_path("vae", str(self.models_dir / "vae"), True)
+            failed = asyncio.run(nodes.init_extra_nodes(init_custom_nodes=False, init_api_nodes=False))
+            if failed:
+                raise LoadError(f"p-h3-image-comfy built-in node initialization failed: {failed}")
             self._executor_factory = execution.PromptExecutor
         self._executor = self._executor_factory(_NullServer())
-        self._executor.output_dir = self.models_dir / "comfy-output"
-        self._load_seconds = time.perf_counter() - started
+        self._folder_paths = folder_paths if self._uses_comfy_paths else None
         self._renders = 0
 
     def unload(self) -> None:
@@ -247,8 +265,10 @@ class PH3ImageComfyAdapter(ModelAdapter):
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
             started = time.perf_counter()
+            if self._folder_paths is not None:
+                self._folder_paths.set_output_directory(str(output_dir))
             self._check_cancel(cancel_flag)
-            self._executor.execute(graph, f"arbiter-{time.time_ns()}", {}, ["12"])
+            self._executor.execute(graph, f"arbiter-{time.time_ns()}", {"output_dir": str(output_dir)}, ["12"])
             if cancel_flag.is_set():
                 import nodes
                 nodes.interrupt_processing()
@@ -258,7 +278,7 @@ class PH3ImageComfyAdapter(ModelAdapter):
             torch.cuda.synchronize()
             generated = time.perf_counter()
             prefix = graph["12"]["inputs"]["filename_prefix"]
-            candidates = sorted(self._executor.output_dir.glob(f"{prefix}*.png"))
+            candidates = sorted(output_dir.glob(f"{prefix}*.png"))
             if len(candidates) != 1:
                 raise InferenceError(f"expected one Comfy PNG for {prefix} in {output_dir}, got {candidates}")
             shutil.copyfile(candidates[0], output_dir / "result.png")

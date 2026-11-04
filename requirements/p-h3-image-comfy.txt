@@ -34,4 +34,8 @@
 #
 # All downloads/installs/authorized releases must run detached and be slept on.
 # This preparation did not execute a model, start a listener, change storage,
-# submit jobs, or deploy Arbiter.
+# submit jobs, or deploy Arbiter. The intended real checkout is
+# /home/darren/src/arbiter/runtime/ComfyUI at the exact commit above; adapter
+# load verifies HEAD and PH3 source blobs before any Comfy import.
+# Model roots are pinned via folder_paths.add_model_folder_path, and output
+# is set per Arbiter job. Custom nodes/API nodes are disabled; no HTTP server.

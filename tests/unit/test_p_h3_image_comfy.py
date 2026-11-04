@@ -126,16 +126,50 @@ class _Executor:
     def execute(self, graph, prompt_id, extra, outputs):
         self.graph = graph
         prefix = graph["12"]["inputs"]["filename_prefix"]
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        (self.output_dir / f"{prefix}_00001_.png").write_bytes(b"test png")
+        output_dir = Path(extra["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / f"{prefix}_00001_.png").write_bytes(b"test png")
 
 
-def test_runner_real_file_lifecycle_and_metrics(tmp_path, monkeypatch):
+def test_runtime_paths_and_builtin_initialization(tmp_path, monkeypatch):
+    root = tmp_path / "ComfyUI"
+    (root / ".git").mkdir(parents=True)
+    (root / ".git/HEAD").write_text(ph3.COMFY_REVISION + "\n")
+    for name in ph3.EXPECTED_COMFY_GIT_BLOBS:
+        p = root / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        body = name.encode()
+        p.write_bytes(body)
+        monkeypatch.setitem(ph3.EXPECTED_COMFY_GIT_BLOBS, name, hashlib.sha1(f"blob {len(body)}\0".encode() + body).hexdigest())
+    paths = SimpleNamespace(add_model_folder_path=lambda *args: None)
+    nodes = SimpleNamespace(init_extra_nodes=lambda **kwargs: None)
+    class Asyncio:
+        @staticmethod
+        def run(value):
+            assert value is None
+    monkeypatch.setitem(sys.modules, "folder_paths", paths)
+    monkeypatch.setitem(sys.modules, "nodes", nodes)
+    monkeypatch.setitem(sys.modules, "asyncio", Asyncio)
+    monkeypatch.setitem(sys.modules, "execution", SimpleNamespace(PromptExecutor=_Executor))
+    monkeypatch.setattr(ph3, "verify_weights", lambda p: {})
+    monkeypatch.setenv("ARBITER_MEMORY_GB", "28")
+    adapter = ph3.PH3ImageComfyAdapter(models_dir=tmp_path / "models", runtime_dir=root)
+    adapter.load()
+    adapter._executor.output_dir = tmp_path / "comfy-output"
+    assert adapter._provenance["runtime"]["revision"] == ph3.COMFY_REVISION
+
+
+def test_output_path_is_set_per_job(tmp_path, monkeypatch):
+    output_calls = []
+    paths = SimpleNamespace(set_output_directory=output_calls.append)
+    monkeypatch.setitem(sys.modules, "folder_paths", paths)
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=_Cuda))
     adapter = ph3.PH3ImageComfyAdapter(models_dir=tmp_path, executor_factory=_Executor)
     monkeypatch.setattr(ph3, "verify_weights", lambda p: {"repo": ph3.PH3_REPO, "revision": ph3.PH3_REVISION})
+    monkeypatch.setattr(ph3, "verify_comfy_source", lambda p: {"revision": ph3.COMFY_REVISION})
     monkeypatch.setenv("ARBITER_MEMORY_GB", "28")
     adapter.load()
+    adapter._executor.output_dir = tmp_path
     result = adapter.infer({"_job_type": "p-h3-image-comfy", "prompt": "botanist", "seed": 42001}, tmp_path, threading.Event())
     assert (tmp_path / "result.png").read_bytes() == b"test png"
     assert result["comparison"]["like_for_like_house_1mp"] is True
@@ -143,6 +177,7 @@ def test_runner_real_file_lifecycle_and_metrics(tmp_path, monkeypatch):
     assert result["timings"]["render_index"] == 1
     assert result["memory"]["peak_reserved_bytes"] == 23_456
     assert result["provenance"]["weights"]["revision"] == ph3.PH3_REVISION
+    assert output_calls == []  # custom boundary does not mutate global Comfy paths
     adapter.unload()
 
 
@@ -150,6 +185,7 @@ def test_runner_failure_does_not_claim_image(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=_Cuda))
     adapter = ph3.PH3ImageComfyAdapter(models_dir=tmp_path, executor_factory=_Executor)
     monkeypatch.setattr(ph3, "verify_weights", lambda p: {})
+    monkeypatch.setattr(ph3, "verify_comfy_source", lambda p: {"revision": ph3.COMFY_REVISION})
     monkeypatch.setenv("ARBITER_MEMORY_GB", "28")
     adapter.load()
     adapter._executor.success = False
