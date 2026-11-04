@@ -524,6 +524,7 @@ def test_pinned_runtime_oracle_has_precise_audited_ownership():
     assert test_path in select_tests(["src/arbiter/adapters/ltx25_acceleration.py"])
     assert test_path in select_tests(["src/arbiter/adapters/ltx25_denoise1.py"])
     assert select_tests(["deploy-to-spark.sh", "docs/notes.md"]) == [
+        "tests/unit/test_deploy_post_stop.py",
         "tests/unit/test_drain_wait.py",
         "tests/unit/test_no_cloud_video.py",
     ]

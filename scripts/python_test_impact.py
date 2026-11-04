@@ -52,6 +52,10 @@ AUDITED: dict[str, frozenset[str]] = {
             "scripts/drain_wait.py",
             "deploy-to-spark.sh",
         },
+        "tests/unit/test_deploy_post_stop.py": {
+            "scripts/deploy_post_stop.py",
+            "deploy-to-spark.sh",
+        },
         "tests/unit/test_flux3_klein.py": set(),
         # __import__ of retained adapters; subprocesses import the registry
         # and run worker_main.

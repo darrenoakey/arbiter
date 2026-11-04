@@ -50,6 +50,9 @@ REMOTE=/home/darren/src/arbiter
 
 cd "$(dirname "$0")"
 
+# Validate the optional local maintenance command before any drain can begin.
+python3 scripts/deploy_post_stop.py --validate
+
 LTX25_RUNTIME="$(python3 scripts/build_ltx25_runtime.py build | tail -1)"
 LTX25_RELEASE="$(basename "$LTX25_RUNTIME")"
 
@@ -453,6 +456,9 @@ if [ "$port_wait_rc" -ne 0 ]; then
     exit 1
 fi
 echo "    port 8400 released"
+
+stage "Running optional post-stop maintenance hook..."
+python3 scripts/deploy_post_stop.py --execute
 
 stage "Ensuring .venv python is a real binary (not a symlink)..."
 # resolveTrustedPythonExecutable collapses the interpreter via EvalSymlinks to
