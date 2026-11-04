@@ -62,6 +62,8 @@ AUDITED: dict[str, frozenset[str]] = {
             "src/arbiter/adapters/z_image.py",
             "src/arbiter/adapters/",
         },
+        # Real CPU children exercise the adapter subprocess boundary.
+        "tests/unit/test_latentsync.py": {"src/arbiter/adapters/latentsync.py"},
         "tests/unit/test_latentsync_mouth_guard.py": set(),
         "tests/unit/test_ltx2_dimensions.py": set(),
         # Reads the checksum-pinned runtime manifest/source archive. Adapter

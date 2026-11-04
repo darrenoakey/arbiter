@@ -108,6 +108,20 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   critical path — an 18-minute blocked bundle once let the idle window elapse
   in a single tick.
 
+## LatentSync progress visibility
+
+- LatentSync's mouth guard performs CPU-heavy full-frame scoring/repair after
+  diffusion finishes. A 131-frame 1080p clip exceeded the 180-second GPU-idle
+  window and was falsely killed while the guard was still making progress.
+- Long child stages must stream both diagnostic streams to worker **stderr**
+  (stdout is the JSON reply protocol), launch Python unbuffered, and report
+  actual completed-frame milestones. Do not hide them with `capture_output`
+  or replace progress with a timer heartbeat that could conceal a real stall.
+- After an idle kill, inspect retained `/tmp/latentsync_*` files before retrying.
+  Match the input content hash to the job's staged input and verify MP4/report;
+  an orphaned guard may have completed after its parent died. Do not mark the
+  failed job completed or republish its result without caller verification.
+
 ## LTX 2.5 conditioning changes
 
 - Do not `import ltx_pipelines.utils.helpers` from an adapter unit test or from
