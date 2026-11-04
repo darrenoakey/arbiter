@@ -32,6 +32,20 @@ greenline never discards commits on `master`.
 Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
 <!-- <<< greenline <<< -->
 
+## Coordinated offline deployment maintenance
+
+- An optional `[deploy] post_stop_command` argv list in gitignored
+  `local/config.toml` runs maintenance inside the normal deploy's stopped
+  window. Its executable must be an absolute path. Validation occurs before
+  drain; execution occurs only after the old listener has released port 8400,
+  before startup. No shell or environment-variable configuration is used.
+- The hook has a 120-second timeout and kills only its own local process group
+  on timeout. A remote helper must separately be interruption-safe and
+  idempotent: a failed deployment rolls back through the previous deploy
+  script, which may not know about this hook. Never leave an orphan migration
+  racing rollback startup, and never use a hook to bypass active-job drain or
+  an explicitly coordinated service hold.
+
 ## Production job-store maintenance
 
 - The production `jobs` table is tens of gigabytes. Background retention work
