@@ -52,6 +52,11 @@ AUDITED: dict[str, frozenset[str]] = {
             "scripts/drain_wait.py",
             "deploy-to-spark.sh",
         },
+        "tests/unit/test_deploy_readiness.py": {
+            "scripts/deploy_readiness.py",
+            "scripts/drain_wait.py",
+            "deploy-to-spark.sh",
+        },
         "tests/unit/test_deploy_post_stop.py": {
             "scripts/deploy_post_stop.py",
             "deploy-to-spark.sh",

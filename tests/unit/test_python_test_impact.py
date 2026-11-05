@@ -90,6 +90,7 @@ def test_deploy_and_test_only_changes_have_bounded_ownership():
     # The repository-wide cloud-video scan reads every changed text file.
     assert select_tests(["deploy-to-spark.sh", "docs/notes.md"]) == [
         "tests/unit/test_deploy_post_stop.py",
+        "tests/unit/test_deploy_readiness.py",
         "tests/unit/test_drain_wait.py",
         "tests/unit/test_no_cloud_video.py",
     ]

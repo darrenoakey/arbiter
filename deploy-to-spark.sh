@@ -200,6 +200,13 @@ if [ "${DEPLOY_FORCE:-0}" != "1" ]; then
     fi
 fi
 
+# Optional advisory only: read-only strict-zero readiness cannot grant stop
+# authority. The ordinary owned leased drain below still proves zero itself.
+if ! python3 scripts/deploy_readiness.py "$ARBITER_URL/v1/ps" local/config.toml; then
+    echo "ERROR: pre-drain readiness failed; deploy aborted before requesting drain" >&2
+    exit 1
+fi
+
 if ! initial_state="$(ps_state)"; then
     echo "ERROR: cannot validate Arbiter /v1/ps before requesting drain; deploy aborted" >&2
     exit 1

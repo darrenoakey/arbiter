@@ -34,6 +34,11 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
 
 ## Coordinated offline deployment maintenance
 
+- Optional `[deploy] pre_drain_wait_seconds` (0 by default, at most 180) is a
+  bounded read-only advisory wait for undrained zero active work. Queued jobs
+  remain permitted and persisted. It never grants stop authority: the normal
+  30-second owned drain still independently proves zero before stopping, and
+  its lease/TTL and the gate's overall deadline are unchanged.
 - An optional `[deploy] post_stop_command` argv list in gitignored
   `local/config.toml` runs maintenance inside the normal deploy's stopped
   window. Its executable must be an absolute path. Validation occurs before
