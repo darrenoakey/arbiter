@@ -32,6 +32,27 @@ greenline never discards commits on `master`.
 Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
 <!-- <<< greenline <<< -->
 
+## Coordinated offline deployment maintenance
+
+- Optional `[deploy] pre_drain_wait_seconds` (0 by default, at most 180) is a
+  bounded read-only advisory wait for undrained zero active work. Queued jobs
+  remain permitted and persisted. It never grants stop authority: the normal
+  30-second owned drain still independently proves zero before stopping, and
+  its lease/TTL and the gate's overall deadline are unchanged.
+- An optional `[deploy] post_stop_command` argv list in gitignored
+  `local/config.toml` runs maintenance inside the normal deploy's stopped
+  window. Its executable must be an absolute path. Validation occurs before
+  drain; execution occurs only after the old listener has released port 8400
+  and the candidate binary is installed, before startup. Storage approval must
+  bind the fresh local artifact to that exact installed binary, never a staged
+  or previous executable. No shell or environment-variable configuration is used.
+- The hook has a 120-second timeout and kills only its own local process group
+  on timeout. A remote helper must separately be interruption-safe and
+  idempotent: a failed deployment rolls back through the previous deploy
+  script, which may not know about this hook. Never leave an orphan migration
+  racing rollback startup, and never use a hook to bypass active-job drain or
+  an explicitly coordinated service hold.
+
 ## Production job-store maintenance
 
 - The production `jobs` table is tens of gigabytes. Background retention work
@@ -108,6 +129,20 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   critical path — an 18-minute blocked bundle once let the idle window elapse
   in a single tick.
 
+## LatentSync progress visibility
+
+- LatentSync's mouth guard performs CPU-heavy full-frame scoring/repair after
+  diffusion finishes. A 131-frame 1080p clip exceeded the 180-second GPU-idle
+  window and was falsely killed while the guard was still making progress.
+- Long child stages must stream both diagnostic streams to worker **stderr**
+  (stdout is the JSON reply protocol), launch Python unbuffered, and report
+  actual completed-frame milestones. Do not hide them with `capture_output`
+  or replace progress with a timer heartbeat that could conceal a real stall.
+- After an idle kill, inspect retained `/tmp/latentsync_*` files before retrying.
+  Match the input content hash to the job's staged input and verify MP4/report;
+  an orphaned guard may have completed after its parent died. Do not mark the
+  failed job completed or republish its result without caller verification.
+
 ## LTX 2.5 conditioning changes
 
 - Do not `import ltx_pipelines.utils.helpers` from an adapter unit test or from
@@ -150,6 +185,11 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   `git rev-parse --git-common-dir`.
 
 ## Greenline submit from agents
+
+- Run full checks and external inspection CLIs detached with durable exit/log
+  files, then sleep and inspect the exact verdict on wake. The turn wall also
+  includes planning: obtain the exact helper contract, delegate bounded work,
+  or stand down instead of spending a turn speculating while a handoff is pending.
 
 - The deploy's 120s drain counts dispatched jobs that are still waiting on a
   model load as active. Back-to-back `mini-agi-read` chunks (~1448s) plus

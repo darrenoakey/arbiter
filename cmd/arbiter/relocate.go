@@ -13,7 +13,7 @@ import (
 // shareJobDir returns the path under the share mount where a job's output should
 // live after completion, or "" if no share mount is configured.
 func shareJobDir(cfg *Config, jobID string) string {
-	if cfg.ShareMount == "" {
+	if cfg.ShareMount == "" || (cfg.OutputDir != "" && !pathWithin(cfg.ShareMount, cfg.OutputDir)) {
 		return ""
 	}
 	return filepath.Join(cfg.ShareMount, "output", "jobs", jobID)

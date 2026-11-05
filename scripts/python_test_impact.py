@@ -52,6 +52,16 @@ AUDITED: dict[str, frozenset[str]] = {
             "scripts/drain_wait.py",
             "deploy-to-spark.sh",
         },
+        "tests/unit/test_deploy_readiness.py": {
+            "scripts/deploy_readiness.py",
+            "scripts/drain_wait.py",
+            "deploy-to-spark.sh",
+        },
+        "tests/unit/test_deploy_post_stop.py": {
+            "scripts/deploy_post_stop.py",
+            "deploy-to-spark.sh",
+        },
+        "tests/unit/test_verified_post_stop.py": {"scripts/verified_post_stop.py"},
         "tests/unit/test_flux3_klein.py": set(),
         # __import__ of retained adapters; subprocesses import the registry
         # and run worker_main.
@@ -62,6 +72,8 @@ AUDITED: dict[str, frozenset[str]] = {
             "src/arbiter/adapters/z_image.py",
             "src/arbiter/adapters/",
         },
+        # Real CPU children exercise the adapter subprocess boundary.
+        "tests/unit/test_latentsync.py": {"src/arbiter/adapters/latentsync.py"},
         "tests/unit/test_latentsync_mouth_guard.py": set(),
         "tests/unit/test_ltx2_dimensions.py": set(),
         # Reads the checksum-pinned runtime manifest/source archive. Adapter

@@ -173,8 +173,17 @@ def blend_source(source: np.ndarray, synced: np.ndarray, landmarks: np.ndarray, 
     return mixed.round().clip(0, 255).astype(np.uint8)
 
 
+def _progress(stage: str, completed: int, total: int) -> None:
+    # Report actual completed work, never a timer heartbeat: a truly stalled
+    # detector/decoder must still become silent and remain killable.
+    if completed == 0 or completed % 10 == 0 or completed == total:
+        print(f"mouth guard: {stage} {completed}/{total} frames", file=sys.stderr, flush=True)
+
+
 def _read_frames(path: Path) -> tuple[list[np.ndarray], float]:
     capture = cv2.VideoCapture(str(path))
+    total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    _progress(f"decode {path.name}", 0, total)
     fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
     frames = []
     while True:
@@ -182,6 +191,7 @@ def _read_frames(path: Path) -> tuple[list[np.ndarray], float]:
         if not ok:
             break
         frames.append(frame)
+        _progress(f"decode {path.name}", len(frames), total)
     capture.release()
     if not frames:
         raise RuntimeError(f"mouth guard: no frames decoded from {path}")
@@ -196,14 +206,16 @@ def detect_landmarks(frames: list[np.ndarray]) -> list[np.ndarray | None]:
     here = Path(__file__).resolve().parent
     sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != here]
     sys.modules.pop("insightface", None)
+    _progress("landmark model load", 0, len(frames))
     from insightface.app import FaceAnalysis
 
     app = FaceAnalysis(allowed_modules=["detection", "landmark_2d_106"],
                        providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
     app.prepare(ctx_id=0, det_size=(640, 640))
     found: list[np.ndarray | None] = []
-    for frame in frames:
+    for index, frame in enumerate(frames, 1):
         faces = app.get(frame)
+        _progress("landmarks", index, len(frames))
         if not faces:
             found.append(None)
             continue
@@ -240,13 +252,17 @@ def guard_frames(sources: list[np.ndarray], synced: list[np.ndarray],
                  landmarks: list[np.ndarray | None]) -> tuple[list[np.ndarray], list[FrameScore], np.ndarray]:
     """Score paired frames and return repaired frames; unpaired tail frames pass through."""
     count = min(len(sources), len(synced), len(landmarks))
-    scores = [score_frame(i, sources[i], synced[i], landmarks[i]) for i in range(count)]
+    scores = []
+    for i in range(count):
+        scores.append(score_frame(i, sources[i], synced[i], landmarks[i]))
+        _progress("score", i + 1, count)
     require_persistent_jaw_flags(scores)
     weights = repair_weights([s.bad for s in scores])
     out = list(synced)
     for i in range(count):
         if weights[i] > 0 and landmarks[i] is not None and scores[i].face:
             out[i] = blend_source(sources[i], synced[i], landmarks[i], float(weights[i]))
+        _progress("repair", i + 1, count)
     return out, scores, weights
 
 
@@ -260,8 +276,10 @@ def _encode(frames: list[np.ndarray], fps: float, audio_from: Path, output: Path
         stdin=subprocess.PIPE,
     )
     assert encoder.stdin is not None
-    for frame in frames:
+    _progress("encode", 0, len(frames))
+    for index, frame in enumerate(frames, 1):
         encoder.stdin.write(frame.tobytes())
+        _progress("encode", index, len(frames))
     encoder.stdin.close()
     if encoder.wait() != 0:
         raise RuntimeError("mouth guard: video encode failed")
@@ -298,6 +316,7 @@ def main(argv: list[str]) -> int:
         return 2
     report = run(Path(argv[1]), Path(argv[2]), Path(argv[3]))
     Path(argv[4]).write_text(json.dumps(report))
+    _progress("complete", report["frames"], report["frames"])
     return 0
 
 

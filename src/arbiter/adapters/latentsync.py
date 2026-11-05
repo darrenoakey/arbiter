@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -28,6 +29,24 @@ LATENTSYNC_CHECKPOINT = LATENTSYNC_DIR / "checkpoints" / "latentsync_unet.pt"
 LATENTSYNC_WHISPER = LATENTSYNC_DIR / "checkpoints" / "whisper" / "tiny.pt"
 # Runs under LatentSync's venv (insightface + buffalo_l already installed there).
 MOUTH_GUARD_SCRIPT = Path(__file__).resolve().parent / "latentsync_mouth_guard.py"
+
+
+def _run_stage(cmd: list[str], *, cwd: Path, timeout: float, stage: str) -> None:
+    # Child stdout is diagnostic, not a worker JSON reply. Inherit worker
+    # stderr for both streams so real progress reaches the idle watchdog
+    # immediately, rather than being held by capture_output until exit.
+    try:
+        subprocess.run(
+            cmd, cwd=str(cwd), stdin=subprocess.DEVNULL,
+            stdout=sys.stderr, stderr=subprocess.STDOUT,
+            timeout=timeout, check=True,
+        )
+    except subprocess.CalledProcessError as error:
+        raise InferenceError(
+            f"LatentSync {stage} exited with code {error.returncode}; see worker logs for diagnostics"
+        ) from error
+    except subprocess.TimeoutExpired as error:
+        raise InferenceError(f"LatentSync {stage} timed out after {timeout}s") from error
 
 
 @register
@@ -121,6 +140,7 @@ class LatentSyncAdapter(ModelAdapter):
 
             cmd = [
                 str(LATENTSYNC_PYTHON),
+                "-u",
                 "-m",
                 "scripts.inference",
                 "--unet_config_path",
@@ -148,19 +168,7 @@ class LatentSyncAdapter(ModelAdapter):
                 timeout_s,
             )
 
-            proc = subprocess.run(
-                cmd,
-                cwd=str(LATENTSYNC_DIR),
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-            )
-
-            if proc.returncode != 0:
-                stderr = proc.stderr.strip()[-500:] if proc.stderr else ""
-                raise InferenceError(
-                    f"LatentSync exited with code {proc.returncode}: {stderr}"
-                )
+            _run_stage(cmd, cwd=LATENTSYNC_DIR, timeout=timeout_s, stage="inference")
 
             if not os.path.isfile(tmp_output):
                 raise InferenceError("LatentSync did not produce an output video")
@@ -172,13 +180,12 @@ class LatentSyncAdapter(ModelAdapter):
             # closed mouth over an open jaw. Clean clips pass through as is.
             guarded = os.path.join(tmp_dir, "guarded.mp4")
             report_path = os.path.join(tmp_dir, "mouth_guard.json")
-            guard = subprocess.run(
-                [str(LATENTSYNC_PYTHON), str(MOUTH_GUARD_SCRIPT), tmp_video, tmp_output, guarded, report_path],
-                cwd=str(LATENTSYNC_DIR), capture_output=True, text=True, timeout=max(600, int(duration_s * 30 + 300)),
+            _run_stage(
+                [str(LATENTSYNC_PYTHON), "-u", str(MOUTH_GUARD_SCRIPT), tmp_video, tmp_output, guarded, report_path],
+                cwd=LATENTSYNC_DIR, timeout=max(600, int(duration_s * 30 + 300)), stage="mouth guard",
             )
-            if guard.returncode != 0 or not os.path.isfile(guarded):
-                stderr = guard.stderr.strip()[-500:] if guard.stderr else ""
-                raise InferenceError(f"LatentSync mouth guard failed ({guard.returncode}): {stderr}")
+            if not os.path.isfile(guarded):
+                raise InferenceError("LatentSync mouth guard did not produce an output video")
             with open(report_path) as f:
                 mouth_guard = json.load(f)
             log.info(
@@ -207,11 +214,6 @@ class LatentSyncAdapter(ModelAdapter):
                 },
             }
 
-        except subprocess.TimeoutExpired:
-            raise InferenceError(
-                f"LatentSync subprocess timed out after {timeout_s}s "
-                f"(scaled from video duration {duration_s:.1f}s)"
-            )
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 

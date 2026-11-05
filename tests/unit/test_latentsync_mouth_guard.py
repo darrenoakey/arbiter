@@ -119,7 +119,7 @@ def write_clip(path: Path, frames: list[np.ndarray]) -> None:
     assert process.wait() == 0
 
 
-def test_run_repairs_a_bad_clip_and_reports_it(tmp_path: Path) -> None:
+def test_run_repairs_a_bad_clip_and_reports_it(tmp_path: Path, capfd) -> None:
     source, synced, landmarks = load("jaw_bad")
     even = (source.shape[1] // 2 * 2, source.shape[0] // 2 * 2)
     scale = np.array([even[0] / source.shape[1], even[1] / source.shape[0]], dtype=np.float32)
@@ -135,6 +135,23 @@ def test_run_repairs_a_bad_clip_and_reports_it(tmp_path: Path) -> None:
     repaired, _ = guard._read_frames(out_path)
     assert len(repaired) == 10
     assert not guard.score_frame(4, src_frames[4], repaired[4], landmarks * scale).bad
+    progress = capfd.readouterr()
+    assert progress.out == ""
+    for stage in ("decode src.mp4", "decode syn.mp4", "score", "repair", "encode"):
+        assert f"mouth guard: {stage} 10/10 frames" in progress.err
+
+
+def test_progress_only_reports_completed_frame_milestones(capsys) -> None:
+    for index in range(22):
+        guard._progress("landmarks", index, 21)
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err.splitlines() == [
+        "mouth guard: landmarks 0/21 frames",
+        "mouth guard: landmarks 10/21 frames",
+        "mouth guard: landmarks 20/21 frames",
+        "mouth guard: landmarks 21/21 frames",
+    ]
 
 
 def test_cli_rejects_wrong_arguments() -> None:

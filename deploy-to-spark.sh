@@ -50,6 +50,9 @@ REMOTE=/home/darren/src/arbiter
 
 cd "$(dirname "$0")"
 
+# Validate the optional local maintenance command before any drain can begin.
+python3 scripts/deploy_post_stop.py --validate
+
 LTX25_RUNTIME="$(python3 scripts/build_ltx25_runtime.py build | tail -1)"
 LTX25_RELEASE="$(basename "$LTX25_RUNTIME")"
 
@@ -197,6 +200,13 @@ if [ "${DEPLOY_FORCE:-0}" != "1" ]; then
     fi
 fi
 
+# Optional advisory only: read-only strict-zero readiness cannot grant stop
+# authority. The ordinary owned leased drain below still proves zero itself.
+if ! python3 scripts/deploy_readiness.py "$ARBITER_URL/v1/ps" local/config.toml; then
+    echo "ERROR: pre-drain readiness failed; deploy aborted before requesting drain" >&2
+    exit 1
+fi
+
 if ! initial_state="$(ps_state)"; then
     echo "ERROR: cannot validate Arbiter /v1/ps before requesting drain; deploy aborted" >&2
     exit 1
@@ -237,13 +247,16 @@ stage "Drain requested (no new jobs) — in-flight work winds down while we buil
 # cache turns into ~3s of hashing instead of ~110s of compiling. Any doubt
 # (missing sidecar, changed hash) rebuilds, so this can never ship a stale
 # binary. The hash covers the toolchain, go.mod/go.sum, and every local-module
-# source/embed file reported by `go list -deps` (module deps are content-pinned
-# by go.sum; stdlib by the toolchain version).
+# source/embed file reported by `go list -deps`, plus Git identity embedded by
+# Go's VCS stamping (module deps are pinned by go.sum; stdlib by the toolchain).
+# Even Python/docs-only commits must not reuse a binary stamped with old HEAD.
 MODPATH="$(go list -m -f '{{.Path}}')"
 binary_inputs_hash() {
     local pkg="$1" line dir files gos rest cgo embed f
     {
         go version
+        git rev-parse HEAD
+        git status --porcelain
         shasum -a 256 go.mod go.sum
         go list -deps -f "{{if .Module}}{{if eq .Module.Path \"$MODPATH\"}}{{.Dir}}|{{.GoFiles}}|{{.CgoFiles}}|{{.EmbedFiles}}{{end}}{{end}}" "$pkg" |
         while IFS= read -r line; do
@@ -492,6 +505,11 @@ mv -f $REMOTE/arbiter-go.new $REMOTE/arbiter-go
 mv -f $REMOTE/llm-worker.new $REMOTE/llm-worker
 mv -f $REMOTE/vllm-chat-worker.new $REMOTE/vllm-chat-worker
 mv -f $REMOTE/vllm-worker.new $REMOTE/vllm-worker"
+
+# The stopped-window hook may approve the exact installed candidate artifact.
+# Never approve a staged or previous binary, and never start before it succeeds.
+stage "Running optional post-stop maintenance hook..."
+python3 scripts/deploy_post_stop.py --execute
 
 stage "Installing arbiter firewall guard..."
 # This guard is a host-level backstop, not an arbiter process, but it protects
