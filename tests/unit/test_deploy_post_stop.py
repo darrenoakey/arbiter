@@ -87,6 +87,33 @@ def test_cli_validate_is_noop_execute_invokes_and_failures_exit_one(tmp_path):
     assert cli(write_config(tmp_path / "failure.toml", [str(failing)]), "--execute").returncode == 1
 
 
+def test_binary_cache_identity_changes_with_git_revision(tmp_path):
+    import re
+
+    source = (ROOT / "deploy-to-spark.sh").read_text()
+    function = re.search(r"^binary_inputs_hash\(\) \{\n.*?^\}", source, re.M | re.S).group()
+    (tmp_path / "go.mod").write_text("module example.test/revisionproof\n\ngo 1.23\n")
+    (tmp_path / "go.sum").write_text("")
+    (tmp_path / "main.go").write_text("package main\nfunc main() {}\n")
+
+    def run(*args):
+        return subprocess.run(args, cwd=tmp_path, check=True, capture_output=True, text=True).stdout
+
+    run("git", "init", "-b", "proof")
+    run("git", "config", "user.name", "Arbiter test")
+    run("git", "config", "user.email", "arbiter-test@example.invalid")
+    run("git", "add", ".")
+    run("git", "commit", "-m", "initial source")
+    script = 'MODPATH="$(go list -m -f \'{{.Path}}\')"\n' + function + "\nbinary_inputs_hash .\n"
+    first = run("bash", "-ec", script).strip()
+    (tmp_path / "notes.md").write_text("Only commit identity changed; Go inputs are identical.\n")
+    run("git", "add", "notes.md")
+    run("git", "commit", "-m", "new revision with unchanged Go source")
+    second = run("bash", "-ec", script).strip()
+    assert len(first) == len(second) == 64
+    assert first != second
+
+
 def test_deploy_hook_order_is_after_release_proof_before_start():
     source = (ROOT / "deploy-to-spark.sh").read_text()
     validation = source.index("scripts/deploy_post_stop.py --validate")

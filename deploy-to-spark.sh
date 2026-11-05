@@ -240,13 +240,16 @@ stage "Drain requested (no new jobs) — in-flight work winds down while we buil
 # cache turns into ~3s of hashing instead of ~110s of compiling. Any doubt
 # (missing sidecar, changed hash) rebuilds, so this can never ship a stale
 # binary. The hash covers the toolchain, go.mod/go.sum, and every local-module
-# source/embed file reported by `go list -deps` (module deps are content-pinned
-# by go.sum; stdlib by the toolchain version).
+# source/embed file reported by `go list -deps`, plus Git identity embedded by
+# Go's VCS stamping (module deps are pinned by go.sum; stdlib by the toolchain).
+# Even Python/docs-only commits must not reuse a binary stamped with old HEAD.
 MODPATH="$(go list -m -f '{{.Path}}')"
 binary_inputs_hash() {
     local pkg="$1" line dir files gos rest cgo embed f
     {
         go version
+        git rev-parse HEAD
+        git status --porcelain
         shasum -a 256 go.mod go.sum
         go list -deps -f "{{if .Module}}{{if eq .Module.Path \"$MODPATH\"}}{{.Dir}}|{{.GoFiles}}|{{.CgoFiles}}|{{.EmbedFiles}}{{end}}{{end}}" "$pkg" |
         while IFS= read -r line; do
