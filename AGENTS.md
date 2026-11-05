@@ -37,8 +37,10 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
 - An optional `[deploy] post_stop_command` argv list in gitignored
   `local/config.toml` runs maintenance inside the normal deploy's stopped
   window. Its executable must be an absolute path. Validation occurs before
-  drain; execution occurs only after the old listener has released port 8400,
-  before startup. No shell or environment-variable configuration is used.
+  drain; execution occurs only after the old listener has released port 8400
+  and the candidate binary is installed, before startup. Storage approval must
+  bind the fresh local artifact to that exact installed binary, never a staged
+  or previous executable. No shell or environment-variable configuration is used.
 - The hook has a 120-second timeout and kills only its own local process group
   on timeout. A remote helper must separately be interruption-safe and
   idempotent: a failed deployment rolls back through the previous deploy
@@ -178,6 +180,11 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
   `git rev-parse --git-common-dir`.
 
 ## Greenline submit from agents
+
+- Run full checks and external inspection CLIs detached with durable exit/log
+  files, then sleep and inspect the exact verdict on wake. The turn wall also
+  includes planning: obtain the exact helper contract, delegate bounded work,
+  or stand down instead of spending a turn speculating while a handoff is pending.
 
 - The deploy's 120s drain counts dispatched jobs that are still waiting on a
   model load as active. Back-to-back `mini-agi-read` chunks (~1448s) plus

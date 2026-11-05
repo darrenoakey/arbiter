@@ -92,7 +92,8 @@ def test_deploy_hook_order_is_after_release_proof_before_start():
     validation = source.index("scripts/deploy_post_stop.py --validate")
     drain = source.index("drain_request")
     release = source.index('echo "    port 8400 released"')
+    installed = source.index("mv -f $REMOTE/arbiter-go.new $REMOTE/arbiter-go")
     execute = source.index("scripts/deploy_post_stop.py --execute")
     start = source.index('"/home/darren/local/auto/run start arbiter"')
     assert validation < drain
-    assert release < execute < start
+    assert release < installed < execute < start

@@ -457,9 +457,6 @@ if [ "$port_wait_rc" -ne 0 ]; then
 fi
 echo "    port 8400 released"
 
-stage "Running optional post-stop maintenance hook..."
-python3 scripts/deploy_post_stop.py --execute
-
 stage "Ensuring .venv python is a real binary (not a symlink)..."
 # resolveTrustedPythonExecutable collapses the interpreter via EvalSymlinks to
 # block symlink-swap TOCTOU. If .venv/bin/python is a symlink to
@@ -498,6 +495,11 @@ mv -f $REMOTE/arbiter-go.new $REMOTE/arbiter-go
 mv -f $REMOTE/llm-worker.new $REMOTE/llm-worker
 mv -f $REMOTE/vllm-chat-worker.new $REMOTE/vllm-chat-worker
 mv -f $REMOTE/vllm-worker.new $REMOTE/vllm-worker"
+
+# The stopped-window hook may approve the exact installed candidate artifact.
+# Never approve a staged or previous binary, and never start before it succeeds.
+stage "Running optional post-stop maintenance hook..."
+python3 scripts/deploy_post_stop.py --execute
 
 stage "Installing arbiter firewall guard..."
 # This guard is a host-level backstop, not an arbiter process, but it protects
