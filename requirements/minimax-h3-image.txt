@@ -1,0 +1,6 @@
+# MiniMax-H3-Image local BF16 comparison runtime.
+# GB10 staged encode/unload/transformer lifecycle lives in the adapter.
+# New venv is a dependency overlay on qwenimage's immutable base:
+# torch 2.14.0+cu130, transformers 5.17.0, accelerate 1.15.0.
+# Install detached; never mutate the qwenimage worker packages.
+diffusers @ git+https://github.com/huggingface/diffusers@f598e6e6a99528858b962c1399c45b59a6c25484

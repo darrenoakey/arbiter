@@ -37,6 +37,11 @@ _DISABLED_MARKERS = (
     "image-generator",
     "moss-image",
     "mossimage",
+    "p-h3-image-comfy",
+    "ph3-image",
+    "p-h3-image",
+    "prunaai-p-h3-image",
+    "minimax-h3-image",
 )
 
 
@@ -91,6 +96,15 @@ _DISABLED_MARKERS = (
 #    IGS and never a fallback. Every other moss id (MOSS-Image-Base,
 #    quantized community builds, LoRA variants, renamed copies) stays denied.
 #    See adapters/moss_image.py.
+#
+# 9. (owner request, 2026-11-03) ``p-h3-image-comfy-w4a8`` — official PrunaAI
+#    P-H3-Image Comfy W4A8 comparison only, through the ``p-h3-image-comfy``
+#    job type. Quantized Comfy files, LoRAs and renamed copies stay denied.
+#    Not an IGS fallback. See adapters/p_h3_image_comfy.py.
+#
+# 10. (owner request, 2026-11-11) ``minimax-h3-image`` — the separate new
+#    MiniMaxAI/MiniMax-H3-Image local still-image checkpoint, only through its
+#    exact job type. Not the old H3 video adapter or any cloud renderer.
 REFERENCE_IMAGE_EDIT_MODEL = "reference-image-edit"
 QWEN_IMAGE_21_MODEL = "qwen-image-2.1"
 QWEN_IMAGE_21_HERETIC_MODEL = "qwen-image-2.1-heretic"
@@ -100,6 +114,8 @@ IRIS_3B_MODEL = "iris-3b"
 MING_IMAGE_DESIGN_MODEL = "ming-image-0.1-design"
 FLUX3_KLEIN_MODELS = ("flux3-klein-bf16", "flux3-klein-fp8", "flux3-klein-nvfp4")
 MOSS_IMAGE_SFT_MODEL = "moss-image-sft"
+PH3_IMAGE_COMFY_W4A8_MODEL = "p-h3-image-comfy-w4a8"
+MINIMAX_H3_IMAGE_MODEL = "minimax-h3-image"
 
 
 class StillImageGenerationDisabled(RuntimeError):
@@ -132,6 +148,8 @@ def is_disabled_still_image_model(model_id: str) -> bool:
     if normalized in FLUX3_KLEIN_MODELS:
         return False
     if normalized == _normalize(MOSS_IMAGE_SFT_MODEL):
+        return False
+    if normalized in (_normalize(PH3_IMAGE_COMFY_W4A8_MODEL), MINIMAX_H3_IMAGE_MODEL):
         return False
     if normalized in ("lora-train", "fine-tune", "id-lora", "id-lora-encode") or normalized.startswith("ltx2-"):
         return False

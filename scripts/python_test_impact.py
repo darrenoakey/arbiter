@@ -72,6 +72,11 @@ AUDITED: dict[str, frozenset[str]] = {
             "src/arbiter/adapters/z_image.py",
             "src/arbiter/adapters/",
         },
+        # P-H3 inspects the adapter's own source; MiniMax inspects its
+        # staging methods. These exact static contracts are not GPU tests.
+        "tests/unit/test_minimax_h3_image.py": set(),
+        "tests/unit/test_p_h3_image_comfy.py": set(),
+        "tests/unit/test_ph3_benchmark_runtime.py": set(),
         # Real CPU children exercise the adapter subprocess boundary.
         "tests/unit/test_latentsync.py": {"src/arbiter/adapters/latentsync.py"},
         "tests/unit/test_latentsync_mouth_guard.py": set(),

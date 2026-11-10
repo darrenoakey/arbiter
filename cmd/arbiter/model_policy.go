@@ -87,6 +87,16 @@ var flux3KleinModels = map[string]bool{
 const mossImageSftModel = "moss-image-sft"
 const mossImageJobType = "moss-image"
 
+// Official PrunaAI/P-H3-Image Comfy W4A8 only, owner comparison 2026-11-03.
+// No Comfy/w4a8/LoRA alias or IGS routing is opened.
+const ph3ImageComfyW4A8Model = "p-h3-image-comfy-w4a8"
+const ph3ImageComfyJobType = "p-h3-image-comfy"
+
+// MiniMaxAI/MiniMax-H3-Image local still-image checkpoint (2026-11-10),
+// separate from the MiniMax H3 video adapters and never a cloud renderer.
+const minimaxH3ImageModel = "minimax-h3-image"
+const minimaxH3ImageJobType = "minimax-h3-image"
+
 // flux3WeightsRootParam is the only extra adapter param the flux3 workers
 // accept: the absolute snapshot root holding flux-3-image-klein/.
 const flux3WeightsRootParam = "FLUX3_WEIGHTS_ROOT"
@@ -134,7 +144,7 @@ var disabledStillImageMarkers = []string{
 	"sdxl", "sd3", "sd-3", "pixart", "kandinsky", "aura-flow", "auraflow",
 	"playground-v", "ideogram", "recraft", "hidream", "hunyuan-image", "qwen-image",
 	"kolors", "omnigen", "dreamshaper", "realvis", "juggernaut", "image-generator",
-	"moss-image", "mossimage",
+	"moss-image", "mossimage", "p-h3-image-comfy", "ph3-image", "p-h3-image", "prunaai-p-h3-image", "minimax-h3-image",
 }
 
 var trustedPythonAdapters = map[string]string{
@@ -199,6 +209,8 @@ var trustedPythonAdapters = map[string]string{
 	flux3KleinFP8Model:        "flux3",
 	flux3KleinNVFP4Model:      "flux3",
 	mossImageSftModel:         "mossimage",
+	ph3ImageComfyW4A8Model:    "ph3comfy",
+	minimaxH3ImageModel:       "minimaxh3image",
 	"trellis2":                "trellis2",
 }
 
@@ -255,6 +267,9 @@ func isDisabledStillImageModel(modelID string) bool {
 	if isMossImageSftModel(normalized) {
 		return false
 	}
+	if normalized == normalizedPolicyText(ph3ImageComfyW4A8Model) || normalized == minimaxH3ImageModel {
+		return false
+	}
 	if normalized == "id-lora" || normalized == "id-lora-encode" || normalized == "lora-train" || normalized == "fine-tune" || normalized == "ltx2" || strings.HasPrefix(normalized, "ltx2-") ||
 		normalized == "ltx25" || strings.HasPrefix(normalized, "ltx25-") {
 		return false
@@ -308,7 +323,7 @@ func disabledStillImageConfig(modelID string, cfg ModelConfig) bool {
 		// pinned by validateWorkerCommand to the trusted adapter identity.
 		return false
 	}
-	if isQwenImage21Model(modelID) || isQwenImage21HereticModel(modelID) || isQwenImage21SglangModel(modelID) || isQwenImage21TurboModel(modelID) || isIris3BModel(modelID) || isMingImageDesignModel(modelID) || isFlux3KleinModel(modelID) || isMossImageSftModel(modelID) {
+	if isQwenImage21Model(modelID) || isQwenImage21HereticModel(modelID) || isQwenImage21SglangModel(modelID) || isQwenImage21TurboModel(modelID) || isIris3BModel(modelID) || isMingImageDesignModel(modelID) || isFlux3KleinModel(modelID) || isMossImageSftModel(modelID) || normalizedPolicyText(modelID) == normalizedPolicyText(ph3ImageComfyW4A8Model) || normalizedPolicyText(modelID) == minimaxH3ImageModel {
 		// The sanctioned Qwen adapters legitimately name the Qwen checkpoint
 		// (or its local merged heretic / turbo dir) and their pinned interpreter.
 		return false
@@ -468,6 +483,12 @@ func rejectDisabledStillImage(jobType, modelID string) error {
 	if isMossImageSftModel(modelID) && jobType != mossImageJobType {
 		// The MOSS comparison adapter is reachable only through its own job
 		// type; MOSS-Image-Base and other moss ids stay denied entirely.
+		return fmt.Errorf("%s", stillImageDisabledMessage)
+	}
+	if normalizedPolicyText(modelID) == normalizedPolicyText(ph3ImageComfyW4A8Model) && jobType != ph3ImageComfyJobType {
+		return fmt.Errorf("%s", stillImageDisabledMessage)
+	}
+	if normalizedPolicyText(modelID) == minimaxH3ImageModel && jobType != minimaxH3ImageJobType {
 		return fmt.Errorf("%s", stillImageDisabledMessage)
 	}
 	return nil
