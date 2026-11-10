@@ -39,6 +39,12 @@ def test_exact_registration_policy_and_schema():
         PH3ImageComfyParams(prompt="x", negative_prompt="x")
 
 
+def test_cached_sampler_is_not_misreported_as_new_generation():
+    ph3.reject_cached_sampler([("execution_cached", {"nodes": ["1", "2", "3"]})])
+    with pytest.raises(InferenceError, match="cached"):
+        ph3.reject_cached_sampler([("execution_cached", {"nodes": ["1", "10"]})])
+
+
 def test_parse_request_like_for_like_native_and_fail_closed():
     r = ph3.parse_request({"prompt": "botanist", "seed": 42001})
     assert (r.width, r.height, r.seed) == (1024, 1024, 42001)
@@ -119,10 +125,11 @@ class _Cuda:
 
 
 class _Executor:
-    def __init__(self, server):
+    def __init__(self, server, **kwargs):
         self.success = True
         self.status_messages = []
         self.server = server
+        self.constructor_options = kwargs
 
     def execute(self, graph, prompt_id, extra, outputs):
         self.graph = graph
@@ -151,13 +158,18 @@ def test_runtime_paths_and_builtin_initialization(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "folder_paths", paths)
     monkeypatch.setitem(sys.modules, "nodes", nodes)
     monkeypatch.setitem(sys.modules, "asyncio", Asyncio)
-    monkeypatch.setitem(sys.modules, "execution", SimpleNamespace(PromptExecutor=_Executor))
+    monkeypatch.setitem(sys.modules, "execution", SimpleNamespace(
+        PromptExecutor=_Executor, CacheType=SimpleNamespace(CLASSIC=0),
+    ))
     monkeypatch.setattr(ph3, "verify_weights", lambda p: {})
     monkeypatch.setenv("ARBITER_MEMORY_GB", "28")
     adapter = ph3.PH3ImageComfyAdapter(models_dir=tmp_path / "models", runtime_dir=root)
     adapter.load()
     adapter._executor.output_dir = tmp_path / "comfy-output"
     assert adapter._provenance["runtime"]["revision"] == ph3.COMFY_REVISION
+    assert adapter._executor.constructor_options == {
+        "cache_type": 0, "cache_args": {"ram": 0.0, "ram_inactive": 0.0},
+    }
 
 
 def test_output_path_is_set_per_job(tmp_path, monkeypatch):
@@ -176,6 +188,9 @@ def test_output_path_is_set_per_job(tmp_path, monkeypatch):
     assert result["comparison"]["like_for_like_house_1mp"] is True
     assert result["prompt_upsampling"] is False
     assert result["timings"]["render_index"] == 1
+    assert result["timings"]["pure_inference_seconds"] is None
+    assert result["timings"]["cold_model_load_seconds"] is None
+    assert "generate_seconds" not in result["timings"]
     assert result["memory"]["peak_reserved_bytes"] == 23_456
     assert result["provenance"]["weights"]["revision"] == ph3.PH3_REVISION
     assert output_calls == []  # custom boundary does not mutate global Comfy paths

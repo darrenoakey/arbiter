@@ -168,6 +168,15 @@ def verify_comfy_source(root: Path) -> dict:
     return {"repo": COMFY_REPO, "revision": revision, "verified_source_files": sorted(EXPECTED_COMFY_GIT_BLOBS)}
 
 
+def reject_cached_sampler(status_messages: list) -> None:
+    """A same-seed cache hit is not a warm render or a speed measurement."""
+    for event, data in status_messages:
+        if event == "execution_cached" and "10" in data.get("nodes", []):
+            raise InferenceError(
+                "P-H3 sampler output was cached; refusing to count it as a generated image or warm timing"
+            )
+
+
 def build_graph(request: PH3Request, output_dir: Path) -> dict:
     """Seven-node prompt-as-written graph distilled from Pruna's official
     workflow id 9d43b9c5-ca8f-4a60-837d-d342773e8b8a, with its optional
@@ -243,9 +252,15 @@ class PH3ImageComfyAdapter(ModelAdapter):
             failed = asyncio.run(nodes.init_extra_nodes(init_custom_nodes=False, init_api_nodes=False))
             if failed:
                 raise LoadError(f"p-h3-image-comfy built-in node initialization failed: {failed}")
-            self._executor_factory = execution.PromptExecutor
-        self._executor = self._executor_factory(_NullServer())
-        self._folder_paths = folder_paths if self._uses_comfy_paths else None
+            self._executor = execution.PromptExecutor(
+                _NullServer(), cache_type=execution.CacheType.CLASSIC,
+                cache_args={"ram": 0.0, "ram_inactive": 0.0},
+            )
+            self._folder_paths = folder_paths
+        else:
+            self._executor = self._executor_factory(_NullServer())
+            self._folder_paths = None
+        self._load_seconds = time.perf_counter() - started
         self._renders = 0
 
     def unload(self) -> None:
@@ -275,6 +290,7 @@ class PH3ImageComfyAdapter(ModelAdapter):
                 raise CancelledException(f"Job cancelled for model {self.model_id}")
             if not self._executor.success:
                 raise InferenceError(f"Comfy execution failed: {self._executor.status_messages}")
+            reject_cached_sampler(self._executor.status_messages)
             torch.cuda.synchronize()
             generated = time.perf_counter()
             prefix = graph["12"]["inputs"]["filename_prefix"]
@@ -295,8 +311,15 @@ class PH3ImageComfyAdapter(ModelAdapter):
             "comparison": {"like_for_like_house_1mp": request.width == request.height == 1024,
                            "native_8mp": (request.width, request.height) == (2912, 2912)},
             "provenance": self._provenance,
-            "timings": {"render_index": self._renders, "generate_seconds": round(generated-started, 3),
-                        "png_write_seconds": round(written-generated, 3), "load_seconds": round(self._load_seconds, 3)},
+            "timings": {
+                "render_index": self._renders,
+                "pipeline_seconds": round(generated - started, 3),
+                "result_copy_seconds": round(written - generated, 3),
+                "worker_setup_seconds": round(self._load_seconds, 3),
+                "pure_inference_seconds": None,
+                "cold_model_load_seconds": None,
+                "scope": "Pipeline includes lazy model loading and PNG encoding; not pure inference. Phase instrumentation still required.",
+            },
             "memory": {"peak_allocated_bytes": torch.cuda.max_memory_allocated(),
                        "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
                        "peak_allocated_gb": round(torch.cuda.max_memory_allocated()/gib, 3),

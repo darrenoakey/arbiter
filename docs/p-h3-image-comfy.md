@@ -91,3 +91,26 @@ Use recovered primary Flux/Qwen prompts verbatim at 1024², seeds
 cold load/verification and generation timings distinct; retain logs/original
 PNGs/contact sheets and assess hands, detail, adherence and exact typography.
 All downloads/installs/releases must run detached and be slept on.
+
+## Nov 10 bounded audit (supersedes stale holds/counts above)
+
+MiniMaxAI/MiniMax-H3-Image@492fd8c4eca666f1085f57e30738c1e0d86b3439
+is a distinct Nov10 still-image release, not P-H3's old video base. No new
+model install, licence acceptance, endpoint or job is authorized by this
+adapter. Source/licence/resolution audit and delivered historical sheets with
+NOT RUN cells are in ~/src/p-h3-image-comparison-20261103/CANDIDATE-AUDIT-20261110.md.
+Music owner record14000 cleared the video hold after final delivery; do not
+repeat the stale music hold. Separate production-release authority is still
+unresolved. T9 currently has333.014GB free, above the50GB reserve.
+
+Offline corrections: PromptExecutor gets explicit CLASSIC/cache_args rather
+than its invalid None default; repeated load no longer depends on stale
+local module bindings; worker setup duration is measured; cached sampler
+replay is rejected rather than reported as warm inference. Whole-pipeline
+and copy duration are named as such. Pure-inference and isolated cold-load
+fields remain None, not invented. Cancellation during inference and genuinely
+uncached same-seed warm-repeat support remain pre-release requirements.
+Fresh verification:68 Python tests and2 focused Go policy tests passed.
+Go cold compilation was detached after a120s foreground timeout; its bounded
+verdict completed successfully. No GPU, runtime import, model output or
+production-release test occurred.
