@@ -28,6 +28,8 @@ weights are still BF16 and no quantization or model substitution occurs.
 
 The pinned modular pipeline lacks `enable_model_cpu_offload` and
 `enable_sequential_cpu_offload`; don't add those APIs as a purported fix.
+Large stages are transferred directly to CUDA rather than cloned through a
+second host-side copy, which would double their unified-memory footprint.
 
 ## Benchmark lanes
 

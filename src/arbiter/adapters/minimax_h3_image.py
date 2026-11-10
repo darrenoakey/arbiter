@@ -390,9 +390,13 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
             # swaps it for the transformer/VAE after prompt encoding.
             pipe.load_components(
                 names=["text_encoder", "tokenizer", "processor"],
-                dtype=torch.bfloat16,
+                dtype={"text_encoder": torch.bfloat16},
             )
-            self._pipe_to_cuda_cloned(pipe, device)
+            # Do NOT use _pipe_to_cuda_cloned for these 60+ GiB stages on
+            # GB10: its temporary full-size CPU clone adds a second copy to
+            # the very same physical pool before the copy is released.
+            # Direct tensor-by-tensor CUDA transfer has a much smaller peak.
+            pipe.to(device)
         loaded = time.perf_counter()
 
         problems = []
@@ -454,7 +458,7 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
         pipe.load_components(names=["text_encoder", "tokenizer", "processor"], dtype=torch.bfloat16)
         if type(getattr(pipe, "text_encoder", None)).__name__ != EXPECTED_TEXT_ENCODER_CLASS:
             raise LoadError("minimax-h3-image text encoder reload returned an unexpected class")
-        self._pipe_to_cuda_cloned(pipe, "cuda")
+        pipe.to("cuda")
 
     def _encode_and_swap(self, pipe, prompt: str, cancel_flag: threading.Event) -> tuple[object, dict]:
         import torch
@@ -485,7 +489,7 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
         with HeapTrimGuard():
             pipe.load_components(names=["transformer", "vae", "scheduler"], dtype=torch.bfloat16)
             self._verify_image_stage(pipe)
-            self._pipe_to_cuda_cloned(pipe, "cuda")
+            pipe.to("cuda")
         torch.cuda.synchronize()
         # The loop feeds this tensor straight into the CUDA transformer;
         # unlike the ordinary full-pipeline hooks, our explicit staged path

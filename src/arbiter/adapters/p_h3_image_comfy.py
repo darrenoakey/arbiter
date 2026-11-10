@@ -373,7 +373,7 @@ class PH3ImageComfyAdapter(ModelAdapter):
                 "result_copy_seconds": round(written - generated, 3),
                 "worker_setup_seconds": round(self._load_seconds, 3),
                 "phases": self._observer.phase_totals() if self._observer.node_seconds else None,
-                "scope": "Synchronized node phases; GPU load_models_gpu calls separated, PNG encode/write separate. Actual model smoke still required.",
+                "scope": "Synchronized node phases; GPU load_models_gpu calls separated, PNG encode/write separate.",
             },
             "memory": {"peak_allocated_bytes": torch.cuda.max_memory_allocated(),
                        "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
