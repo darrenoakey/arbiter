@@ -23,6 +23,7 @@ from arbiter.adapters.minimax_h3_image import (
     EXPECTED_STEPS,
     MINIMAX_H3_IMAGE_REVISION,
     MiniMaxH3ImageAdapter,
+    _cpu_module_tensors_are_released,
     expected_canvas_size,
     parse_request,
     require_license_gate,
@@ -60,11 +61,43 @@ def test_staged_lifecycle_does_not_use_futile_unified_memory_offload():
     assert calls.index("unload_components") < calls.index("load_components")
     assert "MiniMaxH3ImageTextEncoderStep" in source
     assert "state = PipelineState()" in source
-    assert "remaining" in source
+    assert "remaining" not in source
+    assert "residual" in source
+    assert "_cpu_module_tensors_are_released" in source
     assert "state.set(\"prompt_embeds\", state.get(\"prompt_embeds\").cpu())" not in source
     adapter_source = inspect.getsource(MiniMaxH3ImageAdapter)
     assert "enable_model_cpu_offload" not in adapter_source
     assert "enable_sequential_cpu_offload" not in adapter_source
+
+
+def test_encoder_release_checks_weights_not_allocator_bookkeeping():
+    import torch
+
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(2))
+            self.register_buffer("metadata", torch.zeros(1))
+
+    assert _cpu_module_tensors_are_released(Encoder())
+    encoder = Encoder().to("meta")
+    assert not _cpu_module_tensors_are_released(encoder)
+    assert _cpu_module_tensors_are_released(None)
+
+
+def test_stage_progress_is_real_worker_stderr_logging():
+    import inspect
+
+    source = inspect.getsource(MiniMaxH3ImageAdapter._report_progress)
+    assert "file=sys.stderr" in source
+    assert "wait(25)" in source
+    assert "_stop_progress" in inspect.getsource(MiniMaxH3ImageAdapter.load)
+    assert "_start_progress" in inspect.getsource(MiniMaxH3ImageAdapter.load)
+    assert "_start_progress" in inspect.getsource(MiniMaxH3ImageAdapter.infer)
+    assert "_stop_progress" in inspect.getsource(MiniMaxH3ImageAdapter.infer)
+    assert "per-prompt text-encoder reload and CUDA transfer" in inspect.getsource(
+        MiniMaxH3ImageAdapter._ensure_text_encoder
+    )
 
 
 def _write(entry: Path, relpath: str, body: bytes, revision: str, lfs: bool) -> None:

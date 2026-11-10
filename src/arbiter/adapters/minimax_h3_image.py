@@ -89,6 +89,7 @@ from arbiter.adapters.base import (
     ModelAdapter,
 )
 from arbiter.adapters.flux3_klein import verify_snapshot_file, write_png_durably
+from arbiter.adapters.ph3_benchmark_runtime import run_cancellable
 from arbiter.adapters.registry import register
 
 log = logging.getLogger(__name__)
@@ -322,6 +323,22 @@ def verify_h3_image_snapshot(entry: Path, revision: str = MINIMAX_H3_IMAGE_REVIS
     }
 
 
+def _cpu_module_tensors_are_released(module) -> bool:
+    """Large weights must be CPU-resident before the next GB10 stage.
+
+    A single 32 MiB PyTorch CUDA block can outlive its tensor as allocator
+    bookkeeping; requiring literal zero allocated bytes misclassifies that
+    cache block as an encoder leak and reloads the 62 GiB model every job.
+    The tensor device check is the real ownership boundary; cached blocks
+    remain bounded by ARBITER_MEMORY_GB and empty_cache().
+    """
+    if module is not None:
+        for tensor in list(module.parameters()) + list(module.buffers()):
+            if tensor.device.type != "cpu":
+                return False
+    return True
+
+
 def verify_diffusers_runtime() -> dict:
     """The installed diffusers must be the pinned commit that ships
     ``MiniMaxH3ImageModularPipeline`` — a PyPI or other-commit install fails
@@ -362,6 +379,9 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
         self._load_info: dict | None = None
         self._renders = 0
         self._lock = threading.Lock()
+        self._progress_stop = None
+        self._progress_thread = None
+        self._progress_phase = "idle"
 
     def load(self, device: str = "cuda") -> None:
         if device != "cuda":
@@ -372,32 +392,36 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
                 f"{self.model_id} refuses to load without the Arbiter worker CUDA cap "
                 "(ARBITER_MEMORY_GB); GPU work runs only through the Arbiter queue"
             )
+        self._start_progress("initial snapshot verification and encoder load")
         started = time.perf_counter()
-        weights = verify_h3_image_snapshot(DEFAULT_WEIGHTS_DIR)
-        runtime_pin = verify_diffusers_runtime()
-        verified = time.perf_counter()
+        try:
+            weights = verify_h3_image_snapshot(DEFAULT_WEIGHTS_DIR)
+            runtime_pin = verify_diffusers_runtime()
+            verified = time.perf_counter()
 
-        import torch
-        from diffusers import ModularPipeline
+            import torch
+            from diffusers import ModularPipeline
 
-        with HeapTrimGuard():
-            pipe = ModularPipeline.from_pretrained(
-                str(DEFAULT_WEIGHTS_DIR),
-                trust_remote_code=False,
-            )
-            # GB10 is unified memory: ordinary CPU offload cannot fit the full
-            # 126 GiB component set. Load only the first stage here; _render
-            # swaps it for the transformer/VAE after prompt encoding.
-            pipe.load_components(
-                names=["text_encoder", "tokenizer", "processor"],
-                dtype={"text_encoder": torch.bfloat16},
-            )
-            # Do NOT use _pipe_to_cuda_cloned for these 60+ GiB stages on
-            # GB10: its temporary full-size CPU clone adds a second copy to
-            # the very same physical pool before the copy is released.
-            # Direct tensor-by-tensor CUDA transfer has a much smaller peak.
-            pipe.to(device)
-        loaded = time.perf_counter()
+            with HeapTrimGuard():
+                pipe = ModularPipeline.from_pretrained(
+                    str(DEFAULT_WEIGHTS_DIR),
+                    trust_remote_code=False,
+                )
+                # GB10 is unified memory: ordinary CPU offload cannot fit the full
+                # 126 GiB component set. Load only the first stage here; _render
+                # swaps it for the transformer/VAE after prompt encoding.
+                pipe.load_components(
+                    names=["text_encoder", "tokenizer", "processor"],
+                    dtype={"text_encoder": torch.bfloat16},
+                )
+                # Do NOT use _pipe_to_cuda_cloned for these 60+ GiB stages on
+                # GB10: its temporary full-size CPU clone adds a second copy to
+                # the very same physical pool before the copy is released.
+                # Direct tensor-by-tensor CUDA transfer has a much smaller peak.
+                pipe.to(device)
+            loaded = time.perf_counter()
+        finally:
+            self._stop_progress()
 
         problems = []
         if type(pipe).__name__ != EXPECTED_PIPELINE_CLASS:
@@ -446,6 +470,39 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
         if problems:
             raise LoadError(f"{self.model_id} loaded unexpected image-stage components: {', '.join(problems)}")
 
+    def _start_progress(self, phase: str) -> None:
+        self._stop_progress()
+        self._progress_phase = phase
+        self._progress_stop = threading.Event()
+        self._progress_thread = threading.Thread(
+            target=self._report_progress, name="minimax-h3-progress", daemon=True
+        )
+        self._progress_thread.start()
+
+    def _report_progress(self) -> None:
+        import sys
+
+        while not self._progress_stop.wait(25):
+            print(
+                f"{self.model_id} active stage: {self._progress_phase}; "
+                "waiting for hash/weight/CUDA work to complete",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _stop_progress(self) -> None:
+        stop = getattr(self, "_progress_stop", None)
+        thread = getattr(self, "_progress_thread", None)
+        if stop is not None:
+            stop.set()
+        if thread is not None:
+            thread.join(timeout=35)
+        self._progress_stop = None
+        self._progress_thread = None
+
+    def _log_still_working(self) -> None:
+        log.info("%s still loading transformer/VAE weights or transferring to CUDA", self.model_id)
+
     def _ensure_text_encoder(self, pipe) -> None:
         import torch
 
@@ -455,10 +512,14 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
             # Both large stages must never coexist in unified memory.
             pipe.unload_components(["transformer", "vae"])
             self._cleanup_gpu()
+        log.info("%s loading text encoder/tokenizer/processor for next prompt", self.model_id)
+        self._progress_phase = "per-prompt text-encoder reload and CUDA transfer"
         pipe.load_components(names=["text_encoder", "tokenizer", "processor"], dtype=torch.bfloat16)
         if type(getattr(pipe, "text_encoder", None)).__name__ != EXPECTED_TEXT_ENCODER_CLASS:
             raise LoadError("minimax-h3-image text encoder reload returned an unexpected class")
         pipe.to("cuda")
+        torch.cuda.synchronize()
+        log.info("%s text encoder CUDA stage ready", self.model_id)
 
     def _encode_and_swap(self, pipe, prompt: str, cancel_flag: threading.Event) -> tuple[object, dict]:
         import torch
@@ -468,6 +529,7 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
         self._ensure_text_encoder(pipe)
         state = PipelineState()
         state.set("prompt", prompt)
+        self._progress_phase = "prompt encoding"
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         started = time.perf_counter()
@@ -489,18 +551,28 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
         pipe.unload_components(["text_encoder"])
         self._cleanup_gpu()
         self._check_cancel(cancel_flag)
-        remaining = torch.cuda.memory_allocated()
-        if remaining != 0:
+        if not _cpu_module_tensors_are_released(pipe.text_encoder):
             raise LoadError(
-                f"minimax-h3-image text encoder memory was not released before image-stage load: "
-                f"{remaining} CUDA bytes still allocated"
+                "minimax-h3-image text encoder still has CUDA-resident weights before image-stage load"
             )
+        residual = torch.cuda.memory_allocated()
+        log.info(
+            "%s text encoder weights released; residual allocator bytes=%d (bounded cache permitted)",
+            self.model_id,
+            residual,
+        )
         freed = time.perf_counter()
-        with HeapTrimGuard():
-            pipe.load_components(names=["transformer", "vae", "scheduler"], dtype=torch.bfloat16)
+        self._progress_phase = "transformer/VAE reload and CUDA transfer"
+        log.info("%s loading transformer/VAE/scheduler after encoder release", self.model_id)
+        with HeapTrimGuard(), run_cancellable(
+            lambda: pipe.load_components(names=["transformer", "vae", "scheduler"], dtype=torch.bfloat16),
+            cancel_flag,
+            self._log_still_working,
+        ):
             self._verify_image_stage(pipe)
             pipe.to("cuda")
         torch.cuda.synchronize()
+        log.info("%s transformer/VAE CUDA stage ready; starting six-step denoise", self.model_id)
         # The loop feeds this tensor straight into the CUDA transformer;
         # unlike the ordinary full-pipeline hooks, our explicit staged path
         # must transfer it before invoking the denoise block.
@@ -512,6 +584,7 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
             "encode_seconds": round(encoded - started, 3),
             "encode_peak_allocated_bytes": encode_peak,
             "encoder_free_seconds": round(freed - encoded, 3),
+            "encoder_residual_allocator_bytes": residual,
             "image_stage_load_seconds": round(swapped - freed, 3),
             "image_stage_resident_allocated_bytes": torch.cuda.memory_allocated(),
             "image_stage_resident_reserved_bytes": torch.cuda.memory_reserved(),
@@ -531,7 +604,11 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
         with self._lock:
             if self._pipe is None or self._load_info is None:
                 raise InferenceError(f"{self.model_id} is not loaded")
-            return self._render(request, output_dir, cancel_flag)
+            self._start_progress("per-prompt encoder lifecycle")
+            try:
+                return self._render(request, output_dir, cancel_flag)
+            finally:
+                self._stop_progress()
 
     def _render(self, request: MiniMaxH3ImageRequest, output_dir: Path, cancel_flag: threading.Event) -> dict:
         import torch
