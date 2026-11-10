@@ -1,0 +1,7 @@
+# MiniMax-H3-Image runtime pin — NOT installed under the P-H3 approval.
+# Installing this is a separate, unauthorized-here step: the load gate in
+# src/arbiter/adapters/minimax_h3_image.py refuses any diffusers that is not
+# this exact git commit (it ships MiniMaxH3ImageModularPipeline).
+# torch / transformers / safetensors versions must be pinned by the parent
+# task alongside the worker venv's existing pins before any real run.
+diffusers @ git+https://github.com/huggingface/diffusers@f598e6e6a99528858b962c1399c45b59a6c25484
