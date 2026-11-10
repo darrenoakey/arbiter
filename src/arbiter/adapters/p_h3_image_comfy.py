@@ -14,6 +14,7 @@ unavailable CIFS mount. No existing H3 video part is accepted as a substitute.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import json
 import logging
@@ -29,6 +30,7 @@ from typing import Callable
 from arbiter.adapters.base import CancelledException, InferenceError, LoadError, ModelAdapter
 from arbiter.adapters.flux3_klein import write_png_durably
 from arbiter.adapters.registry import register
+from arbiter.adapters.ph3_benchmark_runtime import BenchmarkObserver, run_cancellable
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +48,8 @@ EXPECTED_COMFY_GIT_BLOBS = {
     "execution.py": "a8918ada17af25941827763e0184f4dab87c46f9",
     "folder_paths.py": "0673f6c958688ee5771cca35aa653b2062b02d60",
     "nodes.py": "e279ae2fec49c23a97f2079b63b696aa0510de50",
+    "comfy_extras/nodes_custom_sampler.py": "c73a8f6dcc0183e1b46a9525b1212590c45ecd77",
+    "comfy_execution/caching.py": "25f471feb4287a67ef52e8b6aecd3628694186db",
 }
 
 # oid is the official git blob SHA; lfs is the immutable SHA-256 content id.
@@ -168,10 +172,10 @@ def verify_comfy_source(root: Path) -> dict:
     return {"repo": COMFY_REPO, "revision": revision, "verified_source_files": sorted(EXPECTED_COMFY_GIT_BLOBS)}
 
 
-def reject_cached_sampler(status_messages: list) -> None:
+def reject_cached_sampler(status_messages: list, sampler_id: str = "10") -> None:
     """A same-seed cache hit is not a warm render or a speed measurement."""
     for event, data in status_messages:
-        if event == "execution_cached" and "10" in data.get("nodes", []):
+        if event == "execution_cached" and sampler_id in data.get("nodes", []):
             raise InferenceError(
                 "P-H3 sampler output was cached; refusing to count it as a generated image or warm timing"
             )
@@ -183,7 +187,7 @@ def build_graph(request: PH3Request, output_dir: Path) -> dict:
     upsampler removed. The two audio latents required by PH3 conditioning
     are retained even for still images."""
     prefix = f"arbiter-ph3-{request.seed}-{time.time_ns()}"
-    return {
+    graph = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "p-h3-image_w4a8.safetensors", "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "p-h3-image_text_encoder_w4a8.safetensors", "type": "minimax", "device": "default"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": "p-h3-image_vae_int8_convrot.safetensors"}},
@@ -197,6 +201,38 @@ def build_graph(request: PH3Request, output_dir: Path) -> dict:
         "11": {"class_type": "VAEDecode", "inputs": {"samples": ["10", 0], "vae": ["3", 0]}},
         "12": {"class_type": "SaveImage", "inputs": {"images": ["11", 0], "filename_prefix": prefix}},
     }
+    # Comfy's object cache retains SaveImage.output_dir at construction;
+    # inference and output-node identities must be new for every request.
+    renamed = {old: f"{old}_{prefix}" for old in ("5", "10", "12")}
+    for node in graph.values():
+        for key, value in node["inputs"].items():
+            if isinstance(value, list) and len(value) == 2 and value[0] in renamed:
+                node["inputs"][key] = [renamed[value[0]], value[1]]
+    return {renamed.get(key, key): value for key, value in graph.items()}
+
+
+def graph_node_id(graph: dict, class_type: str) -> str:
+    ids = [key for key, node in graph.items() if node["class_type"] == class_type]
+    if len(ids) != 1:
+        raise InferenceError(f"expected one {class_type} node, got {ids}")
+    return ids[0]
+
+
+async def initialize_ph3_nodes(nodes, runtime_dir: Path) -> None:
+    await nodes.init_public_apis()
+    for filename in ("nodes_custom_sampler.py", "nodes_minimax_h3.py"):
+        if not await nodes.load_custom_node(
+            str(runtime_dir / "comfy_extras" / filename), module_parent="comfy_extras"
+        ):
+            raise LoadError(f"P-H3 required built-in node module failed: {filename}")
+    for name in ("PH3ImageConditioning", "SamplerCustomAdvanced"):
+        base = nodes.NODE_CLASS_MAPPINGS[name]
+        # The upstream cache explicitly keys NOT_IDEMPOTENT nodes by node ID.
+        # Fresh graph IDs force encoding/sampling, while loader nodes stay
+        # resident. No upstream file is modified and the worker is isolated.
+        nodes.NODE_CLASS_MAPPINGS[name] = type(
+            f"PH3Benchmark{base.__name__}", (base,), {"NOT_IDEMPOTENT": True}
+        )
 
 
 class _NullServer:
@@ -220,7 +256,9 @@ class PH3ImageComfyAdapter(ModelAdapter):
         self._uses_comfy_paths = executor_factory is None
         self._folder_paths = None
         self._executor = None
-        self._comfy = None
+        self._observer = BenchmarkObserver()
+        self._management = None
+        self._interrupt = None
         self._provenance: dict | None = None
         self._load_seconds = 0.0
         self._renders = 0
@@ -243,17 +281,23 @@ class PH3ImageComfyAdapter(ModelAdapter):
             # The source checkout is a directory, never a PYTHONPATH arbitrary
             # code string; PH3 built-ins are loaded without custom/API nodes.
             import asyncio
+            from comfy.cli_args import args
+            # Native aimdo allocation is outside PyTorch's worker cap.
+            # Keep the approved benchmark on the capped PyTorch allocator.
+            args.disable_dynamic_vram = True
+            args.enable_dynamic_vram = False
             import execution
             import folder_paths
             import nodes
+            import comfy.model_management as management
             folder_paths.add_model_folder_path("diffusion_models", str(self.models_dir / "diffusion_models"), True)
             folder_paths.add_model_folder_path("text_encoders", str(self.models_dir / "text_encoders"), True)
             folder_paths.add_model_folder_path("vae", str(self.models_dir / "vae"), True)
-            failed = asyncio.run(nodes.init_extra_nodes(init_custom_nodes=False, init_api_nodes=False))
-            if failed:
-                raise LoadError(f"p-h3-image-comfy built-in node initialization failed: {failed}")
+            asyncio.run(initialize_ph3_nodes(nodes, self.runtime_dir))
+            self._management = management
+            self._interrupt = nodes.interrupt_processing
             self._executor = execution.PromptExecutor(
-                _NullServer(), cache_type=execution.CacheType.CLASSIC,
+                self._observer, cache_type=execution.CacheType.CLASSIC,
                 cache_args={"ram": 0.0, "ram_inactive": 0.0},
             )
             self._folder_paths = folder_paths
@@ -283,17 +327,29 @@ class PH3ImageComfyAdapter(ModelAdapter):
             if self._folder_paths is not None:
                 self._folder_paths.set_output_directory(str(output_dir))
             self._check_cancel(cancel_flag)
-            self._executor.execute(graph, f"arbiter-{time.time_ns()}", {"output_dir": str(output_dir)}, ["12"])
-            if cancel_flag.is_set():
-                import nodes
-                nodes.interrupt_processing()
-                raise CancelledException(f"Job cancelled for model {self.model_id}")
+            prompt_id = f"arbiter-{time.time_ns()}"
+            self._observer.synchronize = torch.cuda.synchronize
+            self._observer.begin(graph, prompt_id)
+            output_id = graph_node_id(graph, "SaveImage")
+            operation = lambda: self._executor.execute(
+                graph, prompt_id, {"output_dir": str(output_dir), "client_id": prompt_id}, [output_id]
+            )
+            measured_load = (
+                self._observer.measure_gpu_load_calls(self._management)
+                if self._management is not None else nullcontext()
+            )
+            with measured_load:
+                if self._interrupt is not None:
+                    run_cancellable(operation, cancel_flag, self._interrupt)
+                else:
+                    operation()
+            self._check_cancel(cancel_flag)
             if not self._executor.success:
                 raise InferenceError(f"Comfy execution failed: {self._executor.status_messages}")
-            reject_cached_sampler(self._executor.status_messages)
+            reject_cached_sampler(self._executor.status_messages, graph_node_id(graph, "SamplerCustomAdvanced"))
             torch.cuda.synchronize()
             generated = time.perf_counter()
-            prefix = graph["12"]["inputs"]["filename_prefix"]
+            prefix = graph[output_id]["inputs"]["filename_prefix"]
             candidates = sorted(output_dir.glob(f"{prefix}*.png"))
             if len(candidates) != 1:
                 raise InferenceError(f"expected one Comfy PNG for {prefix} in {output_dir}, got {candidates}")
@@ -316,9 +372,8 @@ class PH3ImageComfyAdapter(ModelAdapter):
                 "pipeline_seconds": round(generated - started, 3),
                 "result_copy_seconds": round(written - generated, 3),
                 "worker_setup_seconds": round(self._load_seconds, 3),
-                "pure_inference_seconds": None,
-                "cold_model_load_seconds": None,
-                "scope": "Pipeline includes lazy model loading and PNG encoding; not pure inference. Phase instrumentation still required.",
+                "phases": self._observer.phase_totals() if self._observer.node_seconds else None,
+                "scope": "Synchronized node phases; GPU load_models_gpu calls separated, PNG encode/write separate. Actual model smoke still required.",
             },
             "memory": {"peak_allocated_bytes": torch.cuda.max_memory_allocated(),
                        "peak_reserved_bytes": torch.cuda.max_memory_reserved(),

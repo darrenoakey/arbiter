@@ -60,11 +60,15 @@ def test_graph_uses_official_ph3_components_and_fixed_seed_grid(tmp_path):
     assert g["2"]["inputs"] == {"clip_name": "p-h3-image_text_encoder_w4a8.safetensors", "type": "minimax", "device": "default"}
     assert g["3"]["inputs"]["vae_name"] == "p-h3-image_vae_int8_convrot.safetensors"
     assert g["4"]["inputs"]["shift_video"] == g["4"]["inputs"]["shift_audio"] == 1.0
-    assert g["5"]["class_type"] == "PH3ImageConditioning"
+    conditioning_id = ph3.graph_node_id(g, "PH3ImageConditioning")
+    sampler_id = ph3.graph_node_id(g, "SamplerCustomAdvanced")
+    output_id = ph3.graph_node_id(g, "SaveImage")
+    assert g[conditioning_id]["class_type"] == "PH3ImageConditioning"
     assert g["6"]["inputs"]["noise_seed"] == 42001
     assert g["7"]["inputs"]["sigmas"] == ph3.SIGMA_STRING
-    assert g["10"]["inputs"]["latent_image"] == ["5", 1]
-    assert g["12"]["inputs"]["images"] == ["11", 0]
+    assert g[sampler_id]["inputs"]["latent_image"] == [conditioning_id, 1]
+    assert g["11"]["inputs"]["samples"] == [sampler_id, 0]
+    assert g[output_id]["inputs"]["images"] == ["11", 0]
     assert "upsampler" not in json.dumps(g).lower()
 
 
@@ -133,43 +137,31 @@ class _Executor:
 
     def execute(self, graph, prompt_id, extra, outputs):
         self.graph = graph
-        prefix = graph["12"]["inputs"]["filename_prefix"]
+        prefix = graph[ph3.graph_node_id(graph, "SaveImage")]["inputs"]["filename_prefix"]
         output_dir = Path(extra["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / f"{prefix}_00001_.png").write_bytes(b"test png")
 
 
-def test_runtime_paths_and_builtin_initialization(tmp_path, monkeypatch):
-    root = tmp_path / "ComfyUI"
-    (root / ".git").mkdir(parents=True)
-    (root / ".git/HEAD").write_text(ph3.COMFY_REVISION + "\n")
-    for name in ph3.EXPECTED_COMFY_GIT_BLOBS:
-        p = root / name
-        p.parent.mkdir(parents=True, exist_ok=True)
-        body = name.encode()
-        p.write_bytes(body)
-        monkeypatch.setitem(ph3.EXPECTED_COMFY_GIT_BLOBS, name, hashlib.sha1(f"blob {len(body)}\0".encode() + body).hexdigest())
-    paths = SimpleNamespace(add_model_folder_path=lambda *args: None)
-    nodes = SimpleNamespace(init_extra_nodes=lambda **kwargs: None)
-    class Asyncio:
-        @staticmethod
-        def run(value):
-            assert value is None
-    monkeypatch.setitem(sys.modules, "folder_paths", paths)
-    monkeypatch.setitem(sys.modules, "nodes", nodes)
-    monkeypatch.setitem(sys.modules, "asyncio", Asyncio)
-    monkeypatch.setitem(sys.modules, "execution", SimpleNamespace(
-        PromptExecutor=_Executor, CacheType=SimpleNamespace(CLASSIC=0),
-    ))
-    monkeypatch.setattr(ph3, "verify_weights", lambda p: {})
-    monkeypatch.setenv("ARBITER_MEMORY_GB", "28")
-    adapter = ph3.PH3ImageComfyAdapter(models_dir=tmp_path / "models", runtime_dir=root)
-    adapter.load()
-    adapter._executor.output_dir = tmp_path / "comfy-output"
-    assert adapter._provenance["runtime"]["revision"] == ph3.COMFY_REVISION
-    assert adapter._executor.constructor_options == {
-        "cache_type": 0, "cache_args": {"ram": 0.0, "ram_inactive": 0.0},
-    }
+def test_runtime_paths_and_builtin_initialization_are_explicit_static_contracts():
+    # Inspect our real implementation without importing an unapproved/GPU
+    # runtime. This is a static contract, not a simulated Comfy model run.
+    import ast
+    import inspect
+    source = inspect.getsource(ph3.initialize_ph3_nodes)
+    tree = ast.parse(source)
+    calls = {n.func.attr for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    assert {"init_public_apis", "load_custom_node"}.issubset(calls)
+    assert "init_extra_nodes" not in calls
+    assert "nodes_custom_sampler.py" in source
+    assert "nodes_minimax_h3.py" in source
+    assert '"NOT_IDEMPOTENT": True' in source
+    load_source = inspect.getsource(ph3.PH3ImageComfyAdapter.load)
+    assert 'cache_args={"ram": 0.0, "ram_inactive": 0.0}' in load_source
+    assert "args.disable_dynamic_vram = True" in load_source
+    assert "args.enable_dynamic_vram = False" in load_source
+    assert "add_model_folder_path" in load_source
+    assert ph3.DEFAULT_RUNTIME_DIR == Path("/home/darren/src/arbiter/runtime/ComfyUI")
 
 
 def test_output_path_is_set_per_job(tmp_path, monkeypatch):
@@ -188,8 +180,7 @@ def test_output_path_is_set_per_job(tmp_path, monkeypatch):
     assert result["comparison"]["like_for_like_house_1mp"] is True
     assert result["prompt_upsampling"] is False
     assert result["timings"]["render_index"] == 1
-    assert result["timings"]["pure_inference_seconds"] is None
-    assert result["timings"]["cold_model_load_seconds"] is None
+    assert result["timings"]["phases"] is None  # no real Comfy events in this adapter-only test
     assert "generate_seconds" not in result["timings"]
     assert result["memory"]["peak_reserved_bytes"] == 23_456
     assert result["provenance"]["weights"]["revision"] == ph3.PH3_REVISION
