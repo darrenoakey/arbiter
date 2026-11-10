@@ -564,11 +564,12 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
         freed = time.perf_counter()
         self._progress_phase = "transformer/VAE reload and CUDA transfer"
         log.info("%s loading transformer/VAE/scheduler after encoder release", self.model_id)
-        with HeapTrimGuard(), run_cancellable(
-            lambda: pipe.load_components(names=["transformer", "vae", "scheduler"], dtype=torch.bfloat16),
-            cancel_flag,
-            self._log_still_working,
-        ):
+        with HeapTrimGuard():
+            run_cancellable(
+                lambda: pipe.load_components(names=["transformer", "vae", "scheduler"], dtype=torch.bfloat16),
+                cancel_flag,
+                self._log_still_working,
+            )
             self._verify_image_stage(pipe)
             pipe.to("cuda")
         torch.cuda.synchronize()

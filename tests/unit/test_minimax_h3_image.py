@@ -100,6 +100,95 @@ def test_stage_progress_is_real_worker_stderr_logging():
     )
 
 
+def test_image_stage_load_is_cancellable_not_a_context_manager(tmp_path, monkeypatch):
+    import sys
+    import threading
+    import time
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    calls = []
+    class Cuda:
+        @staticmethod
+        def synchronize(): calls.append("synchronize")
+        @staticmethod
+        def reset_peak_memory_stats(): calls.append("reset")
+        @staticmethod
+        def memory_allocated(): return 32 * 1024 * 1024
+        @staticmethod
+        def memory_reserved(): return 64 * 1024 * 1024
+        @staticmethod
+        def max_memory_allocated(): return 96 * 1024 * 1024
+        @staticmethod
+        def max_memory_reserved(): return 128 * 1024 * 1024
+        @staticmethod
+        def is_available(): return False
+        @staticmethod
+        def is_current_stream_capturing(): return False
+    class EncoderStep:
+        def __call__(self, pipe, state):
+            state.set("prompt_embeds", torch.tensor([1.0]))
+            state.set("text_token_tags", torch.tensor([1]))
+            return pipe, state
+    class Pipe:
+        def __init__(self):
+            self.text_encoder = object()
+            self.transformer = None
+            self.vae = None
+            self.scheduler = None
+        def load_components(self, **kwargs):
+            calls.append(kwargs)
+            self.text_encoder = None
+            self.transformer = object()
+            self.vae = object()
+            self.scheduler = object()
+        def to(self, device):
+            calls.append(("to", device))
+            self.transformer = self.transformer
+            return self
+        def named_parameters(self, recurse=True):
+            return []
+        def parameters(self, recurse=True):
+            return []
+        def buffers(self, recurse=True):
+            return []
+        def unload_components(self, names):
+            calls.append(("unload", names))
+            for name in names:
+                setattr(self, name, None)
+    import torch
+    from types import ModuleType
+
+    # The pinned Diffusers runtime exists only on Spark. This local boundary
+    # stub tests our wrapper/lifecycle, not the model or its rendering.
+    class PipelineState:
+        def __init__(self): self.values = {}
+        def set(self, key, value): self.values[key] = value
+        def get(self, key, default=None): return self.values.get(key, default)
+    modules = {
+        "diffusers": ModuleType("diffusers"),
+        "diffusers.modular_pipelines": ModuleType("diffusers.modular_pipelines"),
+        "diffusers.modular_pipelines.minimax_h3_image": ModuleType("diffusers.modular_pipelines.minimax_h3_image"),
+        "diffusers.modular_pipelines.minimax_h3_image.encoders": ModuleType("diffusers.modular_pipelines.minimax_h3_image.encoders"),
+        "diffusers.modular_pipelines.modular_pipeline": ModuleType("diffusers.modular_pipelines.modular_pipeline"),
+    }
+    modules["diffusers.modular_pipelines.minimax_h3_image.encoders"].MiniMaxH3ImageTextEncoderStep = EncoderStep
+    modules["diffusers.modular_pipelines.modular_pipeline"].PipelineState = PipelineState
+    monkeypatch.setattr(torch, "cuda", Cuda)
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, *args, **kwargs: self)
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    adapter = MiniMaxH3ImageAdapter()
+    monkeypatch.setattr(adapter, "_verify_image_stage", lambda pipe: calls.append("verified"))
+    monkeypatch.setattr(adapter, "_check_cancel", lambda flag: None)
+    pipe = Pipe()
+    state, stage = adapter._encode_and_swap(pipe, "botanist", threading.Event())
+    assert calls.index("verified") < calls.index(("to", "cuda"))
+    assert stage["encoder_residual_allocator_bytes"] == 32 * 1024 * 1024
+    assert state.get("prompt_embeds").device.type == "cpu"
+    assert adapter._progress_thread is None
+
+
 def _write(entry: Path, relpath: str, body: bytes, revision: str, lfs: bool) -> None:
     target = entry / relpath
     target.parent.mkdir(parents=True, exist_ok=True)
