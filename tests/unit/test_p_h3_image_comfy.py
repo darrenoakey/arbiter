@@ -28,6 +28,8 @@ def test_exact_registration_policy_and_schema():
     assert JOB_TYPE_TO_MODEL["p-h3-image-comfy"] == "p-h3-image-comfy-w4a8"
     assert JOB_TYPE_PARAMS["p-h3-image-comfy"] is PH3ImageComfyParams
     assert ph3.DEFAULT_MODELS_DIR == Path("/mnt/t9/models/p-h3-image")
+    assert (Path(__file__).parents[2] / "config" / "spark" / "p-h3-image-comfy-w4a8.model.json").is_file()
+    assert not (Path(__file__).parents[2] / "config" / "spark" / "p-h3-image-comfy.model.json").exists()
     assert not is_disabled_still_image_model("p-h3-image-comfy-w4a8")
     for alias in ("p-h3-image-comfy", "p-h3-image-comfy-bf16", "p-h3-image-comfy-w4a8-upsampler", "MiniMaxAI/MiniMax-H3-Image"):
         assert is_disabled_still_image_model(alias)

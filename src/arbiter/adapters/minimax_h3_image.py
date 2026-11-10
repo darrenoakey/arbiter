@@ -471,20 +471,30 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         started = time.perf_counter()
+        # Keep this scope small: the modular block's returned `components`
+        # reference and all encoder activations must die before unloading.
         with torch.inference_mode():
             _, state = MiniMaxH3ImageTextEncoderStep()(pipe, state)
             torch.cuda.synchronize()
-            # Keep only small CPU embeddings; large encoder activations and
-            # weights must not leak across the staged lifecycle boundary.
-            state.set("prompt_embeds", state.get("prompt_embeds").cpu())
-            state.set("text_token_tags", state.get("text_token_tags").cpu())
+            embeddings = state.get("prompt_embeds").cpu()
+            tags = state.get("text_token_tags").cpu()
         encoded = time.perf_counter()
         encode_peak = torch.cuda.max_memory_allocated()
+        # Rebuild rather than retain the block's BlockState: the original
+        # references can hold the GPU-side embedding and encoder activation
+        # graph, keeping the entire 62 GiB text encoder alive after unload.
+        state = PipelineState()
+        state.set("prompt_embeds", embeddings)
+        state.set("text_token_tags", tags)
         pipe.unload_components(["text_encoder"])
         self._cleanup_gpu()
         self._check_cancel(cancel_flag)
-        if torch.cuda.memory_allocated() != 0:
-            raise LoadError("minimax-h3-image text encoder memory was not released before image-stage load")
+        remaining = torch.cuda.memory_allocated()
+        if remaining != 0:
+            raise LoadError(
+                f"minimax-h3-image text encoder memory was not released before image-stage load: "
+                f"{remaining} CUDA bytes still allocated"
+            )
         freed = time.perf_counter()
         with HeapTrimGuard():
             pipe.load_components(names=["transformer", "vae", "scheduler"], dtype=torch.bfloat16)

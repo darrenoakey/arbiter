@@ -59,6 +59,9 @@ def test_staged_lifecycle_does_not_use_futile_unified_memory_offload():
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
     assert calls.index("unload_components") < calls.index("load_components")
     assert "MiniMaxH3ImageTextEncoderStep" in source
+    assert "state = PipelineState()" in source
+    assert "remaining" in source
+    assert "state.set(\"prompt_embeds\", state.get(\"prompt_embeds\").cpu())" not in source
     adapter_source = inspect.getsource(MiniMaxH3ImageAdapter)
     assert "enable_model_cpu_offload" not in adapter_source
     assert "enable_sequential_cpu_offload" not in adapter_source
