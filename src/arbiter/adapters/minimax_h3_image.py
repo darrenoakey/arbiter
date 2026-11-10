@@ -38,6 +38,15 @@ Lanes (the only sizes this adapter serves, so rows can never be mislabelled):
   (the runtime default; at 16 MP it scales nothing), rendered and delivered
   4096x4096.
 
+The full bf16 components total ~126 GiB, larger than both the CUDA-visible
+pool and physical unified memory once the OS is included. CPU offload is
+therefore not a solution on GB10. The adapter uses the modular runtime's
+selective ``load_components`` / ``unload_components`` lifecycle: load and run
+the text encoder, keep only its small embeddings, truly free the encoder,
+then load the image transformer, VAE and scheduler. Those stages never hold
+their large weights concurrently. The transformer/VAE remain resident between
+jobs; the encoder is reloaded per prompt.
+
 Licence gate: the MiniMax-H3-Image licence requires separate prior *written*
 authorization from MiniMax if the annualized revenue of the user and/or its
 affiliates exceeds USD 1M, or if the model is provided as a Hosted Service to
@@ -108,6 +117,7 @@ EXPECTED_PIPELINE_CLASS = "MiniMaxH3ImageModularPipeline"
 EXPECTED_TRANSFORMER_CLASS = "MiniMaxH3ImageTransformer2DModel"
 EXPECTED_VAE_CLASS = "AutoencoderKLMiniMaxH3Image"
 EXPECTED_SCHEDULER_CLASS = "MiniMaxH3Scheduler"
+EXPECTED_TEXT_ENCODER_CLASS = "Qwen3VLForConditionalGeneration"
 
 CANVAS_MULTIPLE = 32
 DISABLE_MIN_GENERATION_AREA = 1024  # runtime-documented off switch
@@ -341,9 +351,9 @@ def verify_diffusers_runtime() -> dict:
 
 @register
 class MiniMaxH3ImageAdapter(ModelAdapter):
-    """Serves only the ``minimax-h3-image`` model id. Registration with the
-    shared registry/schemas is the parent task's wiring step; this module is
-    import-safe without torch, diffusers, weights, or a GPU."""
+    """Registration with the shared registry/schemas is limited to the exact
+    local still-image id; this module is import-safe without torch, diffusers,
+    weights, or a GPU."""
 
     model_id = "minimax-h3-image"
 
@@ -375,21 +385,21 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
                 str(DEFAULT_WEIGHTS_DIR),
                 trust_remote_code=False,
             )
-            pipe.load_components(dtype=torch.bfloat16)
-            pipe.to(device)
+            # GB10 is unified memory: ordinary CPU offload cannot fit the full
+            # 126 GiB component set. Load only the first stage here; _render
+            # swaps it for the transformer/VAE after prompt encoding.
+            pipe.load_components(
+                names=["text_encoder", "tokenizer", "processor"],
+                dtype=torch.bfloat16,
+            )
+            self._pipe_to_cuda_cloned(pipe, device)
         loaded = time.perf_counter()
 
         problems = []
         if type(pipe).__name__ != EXPECTED_PIPELINE_CLASS:
             problems.append(f"pipeline {type(pipe).__name__}")
-        for attr, expected in (
-            ("transformer", EXPECTED_TRANSFORMER_CLASS),
-            ("vae", EXPECTED_VAE_CLASS),
-            ("scheduler", EXPECTED_SCHEDULER_CLASS),
-        ):
-            actual = type(getattr(pipe, attr, None)).__name__
-            if actual != expected:
-                problems.append(f"{attr} {actual}")
+        if type(getattr(pipe, "text_encoder", None)).__name__ != EXPECTED_TEXT_ENCODER_CLASS:
+            problems.append(f"text_encoder {type(getattr(pipe, 'text_encoder', None)).__name__}")
         sigmas = getattr(pipe.config, "sample_sigmas", None)
         if not isinstance(sigmas, (list, tuple)) or tuple(float(s) for s in sigmas) != EXPECTED_SAMPLE_SIGMAS:
             problems.append(f"config.sample_sigmas {sigmas!r}")
@@ -415,8 +425,83 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
             "load_seconds": round(loaded - started, 3),
             "resident_allocated_bytes": torch.cuda.memory_allocated(),
             "resident_reserved_bytes": torch.cuda.memory_reserved(),
+            "lifecycle": "staged-encode-unload-transformer",
         }
         log.info("%s loaded: %s", self.model_id, self._load_info)
+
+    def _verify_image_stage(self, pipe) -> None:
+        problems = []
+        for attr, expected in (
+            ("transformer", EXPECTED_TRANSFORMER_CLASS),
+            ("vae", EXPECTED_VAE_CLASS),
+            ("scheduler", EXPECTED_SCHEDULER_CLASS),
+        ):
+            actual = type(getattr(pipe, attr, None)).__name__
+            if actual != expected:
+                problems.append(f"{attr} {actual}")
+        if problems:
+            raise LoadError(f"{self.model_id} loaded unexpected image-stage components: {', '.join(problems)}")
+
+    def _ensure_text_encoder(self, pipe) -> None:
+        import torch
+
+        if getattr(pipe, "text_encoder", None) is not None:
+            return
+        if getattr(pipe, "transformer", None) is not None:
+            # Both large stages must never coexist in unified memory.
+            pipe.unload_components(["transformer", "vae"])
+            self._cleanup_gpu()
+        pipe.load_components(names=["text_encoder", "tokenizer", "processor"], dtype=torch.bfloat16)
+        if type(getattr(pipe, "text_encoder", None)).__name__ != EXPECTED_TEXT_ENCODER_CLASS:
+            raise LoadError("minimax-h3-image text encoder reload returned an unexpected class")
+        self._pipe_to_cuda_cloned(pipe, "cuda")
+
+    def _encode_and_swap(self, pipe, prompt: str, cancel_flag: threading.Event) -> tuple[object, dict]:
+        import torch
+        from diffusers.modular_pipelines.minimax_h3_image.encoders import MiniMaxH3ImageTextEncoderStep
+        from diffusers.modular_pipelines.modular_pipeline import PipelineState
+
+        self._ensure_text_encoder(pipe)
+        state = PipelineState()
+        state.set("prompt", prompt)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        started = time.perf_counter()
+        with torch.inference_mode():
+            _, state = MiniMaxH3ImageTextEncoderStep()(pipe, state)
+            torch.cuda.synchronize()
+            # Keep only small CPU embeddings; large encoder activations and
+            # weights must not leak across the staged lifecycle boundary.
+            state.set("prompt_embeds", state.get("prompt_embeds").cpu())
+            state.set("text_token_tags", state.get("text_token_tags").cpu())
+        encoded = time.perf_counter()
+        encode_peak = torch.cuda.max_memory_allocated()
+        pipe.unload_components(["text_encoder"])
+        self._cleanup_gpu()
+        self._check_cancel(cancel_flag)
+        if torch.cuda.memory_allocated() != 0:
+            raise LoadError("minimax-h3-image text encoder memory was not released before image-stage load")
+        freed = time.perf_counter()
+        with HeapTrimGuard():
+            pipe.load_components(names=["transformer", "vae", "scheduler"], dtype=torch.bfloat16)
+            self._verify_image_stage(pipe)
+            self._pipe_to_cuda_cloned(pipe, "cuda")
+        torch.cuda.synchronize()
+        # The loop feeds this tensor straight into the CUDA transformer;
+        # unlike the ordinary full-pipeline hooks, our explicit staged path
+        # must transfer it before invoking the denoise block.
+        state.set("prompt_embeds", state.get("prompt_embeds").to("cuda"))
+        swapped = time.perf_counter()
+        torch.cuda.reset_peak_memory_stats()
+        self._check_cancel(cancel_flag)
+        return state, {
+            "encode_seconds": round(encoded - started, 3),
+            "encode_peak_allocated_bytes": encode_peak,
+            "encoder_free_seconds": round(freed - encoded, 3),
+            "image_stage_load_seconds": round(swapped - freed, 3),
+            "image_stage_resident_allocated_bytes": torch.cuda.memory_allocated(),
+            "image_stage_resident_reserved_bytes": torch.cuda.memory_reserved(),
+        }
 
     def unload(self) -> None:
         self._pipe = None
@@ -449,32 +534,38 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
         rendered_height, rendered_width = expected_canvas_size(
             request.height, request.width, request.min_generation_area
         )
-        torch.cuda.synchronize()
+        started = time.perf_counter()
+        state, stage = self._encode_and_swap(pipe, request.prompt, cancel_flag)
         torch.cuda.reset_peak_memory_stats()
         handle = pipe.transformer.register_forward_pre_hook(cancel_between_forwards, with_kwargs=True)
-        started = time.perf_counter()
+        generated_started = time.perf_counter()
         try:
+            from diffusers.modular_pipelines.minimax_h3_image.decoders import MiniMaxH3ImageDecodeStep
+            from diffusers.modular_pipelines.minimax_h3_image.modular_blocks_minimax_h3_image import (
+                MiniMaxH3ImageCoreDenoiseStep,
+            )
+
+            state.set("height", request.height)
+            state.set("width", request.width)
+            state.set("min_generation_area", request.min_generation_area)
+            state.set("generator", torch.Generator("cpu").manual_seed(request.seed))
+            state.set("output_type", "pil")
             with torch.inference_mode():
-                result = pipe(
-                    prompt=request.prompt,
-                    height=request.height,
-                    width=request.width,
-                    min_generation_area=request.min_generation_area,
-                    generator=torch.Generator("cpu").manual_seed(request.seed),
-                    output_type="pil",
-                )
-            torch.cuda.synchronize()
+                _, state = MiniMaxH3ImageCoreDenoiseStep()(pipe, state)
+                torch.cuda.synchronize()
+                generated = time.perf_counter()
+                state.set("output_height", request.height)
+                state.set("output_width", request.width)
+                _, state = MiniMaxH3ImageDecodeStep()(pipe, state)
+                torch.cuda.synchronize()
         finally:
             handle.remove()
-        generated = time.perf_counter()
+        decoded = time.perf_counter()
         peak_allocated = torch.cuda.max_memory_allocated()
         peak_reserved = torch.cuda.max_memory_reserved()
         self._check_cancel(cancel_flag)
 
-        images = getattr(result, "images", None)
-        if images is None and hasattr(result, "values"):
-            values = result.values
-            images = values.get("images") if isinstance(values, dict) else getattr(values, "images", None)
+        images = state.get("images")
         if not images:
             raise InferenceError(f"{self.model_id} pipeline returned no images")
         image = images[0]
@@ -516,13 +607,15 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
             "license": {"confirmed": True, "confirmation_ref": request.license_confirmation_ref},
             "provenance": {**info["weights"], **info["runtime"]},
             "limitations": [
-                "No authoritative memory-capable GB10 route is proven for this snapshot; "
-                "load is in-process bf16 under the Arbiter worker CUDA cap and fails if it does not fit.",
+                "GB10 unified memory requires staged loading: text encoder freed before transformer/VAE load; "
+                "encoder reload and model swap are measured separately from denoising.",
             ],
             "timings": {
                 "render_index": self._renders,
-                "generate_seconds": round(generated - started, 3),
-                "png_write_seconds": round(written - generated, 3),
+                **stage,
+                "generate_seconds": round(generated - generated_started, 3),
+                "decode_seconds": round(decoded - generated, 3),
+                "png_write_seconds": round(written - decoded, 3),
                 "total_seconds": round(written - started, 3),
                 "transformer_forwards": forwards,
                 "load_seconds": info["load_seconds"],

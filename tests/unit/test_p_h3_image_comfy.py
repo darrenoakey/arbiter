@@ -29,7 +29,7 @@ def test_exact_registration_policy_and_schema():
     assert JOB_TYPE_PARAMS["p-h3-image-comfy"] is PH3ImageComfyParams
     assert ph3.DEFAULT_MODELS_DIR == Path("/mnt/t9/models/p-h3-image")
     assert not is_disabled_still_image_model("p-h3-image-comfy-w4a8")
-    for alias in ("p-h3-image-comfy", "p-h3-image-comfy-bf16", "p-h3-image-comfy-w4a8-upsampler", "minimax-h3-image"):
+    for alias in ("p-h3-image-comfy", "p-h3-image-comfy-bf16", "p-h3-image-comfy-w4a8-upsampler", "MiniMaxAI/MiniMax-H3-Image"):
         assert is_disabled_still_image_model(alias)
     p = PH3ImageComfyParams(prompt="botanist")
     assert (p.width, p.height, p.steps, p.prompt_upsampling) == (1024, 1024, 8, False)

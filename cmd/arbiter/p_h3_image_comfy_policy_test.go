@@ -60,7 +60,7 @@ func TestPH3ComfyCannotBeCrossedOrSmuggled(t *testing.T) {
 			t.Fatalf("mutated worker accepted: %v", err)
 		}
 	}
-	for _, alias := range []string{"p-h3-image-comfy", "PrunaAI/P-H3-Image", "p-h3-image-w4a8", "p-h3-image-comfy", "minimax-h3-image"} {
+	for _, alias := range []string{"p-h3-image-comfy", "PrunaAI/P-H3-Image", "p-h3-image-w4a8", "minimax-h3-image-bf16"} {
 		if !isDisabledStillImageModel(alias) {
 			t.Fatalf("alias accepted: %s", alias)
 		}

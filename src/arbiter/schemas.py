@@ -69,6 +69,7 @@ class JobType(str, Enum):
     FLUX3_KLEIN_NVFP4 = "flux3-klein-nvfp4"
     MOSS_IMAGE = "moss-image"
     PH3_IMAGE_COMFY = "p-h3-image-comfy"
+    MINIMAX_H3_IMAGE = "minimax-h3-image"
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
     FINE_TUNE = "fine-tune"
@@ -129,6 +130,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "flux3-klein-nvfp4": "flux3-klein-nvfp4",
     "moss-image": "moss-image-sft",
     "p-h3-image-comfy": "p-h3-image-comfy-w4a8",
+    "minimax-h3-image": "minimax-h3-image",
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
     "fine-tune": "fine-tune",
@@ -661,7 +663,8 @@ class MossImageParams(BaseModel):
 
 class PH3ImageComfyParams(BaseModel):
     """P-H3-Image Comfy W4A8 owner comparison: 8 steps, no CFG, prompt-as-written
-    at 1024² by default. Native 8 MP and upsampling must be explicit."""
+    at 1024² by default; native 8 MP must be explicit. Upsampling is not
+    available in this matched-prompt adapter."""
 
     model_config = ConfigDict(extra="forbid")
     prompt: str = Field(..., min_length=1, max_length=16000)
@@ -669,7 +672,36 @@ class PH3ImageComfyParams(BaseModel):
     width: int = Field(default=1024, ge=256, le=4096, multiple_of=32)
     height: int = Field(default=1024, ge=256, le=4096, multiple_of=32)
     steps: Literal[8] = 8
-    prompt_upsampling: bool = False
+    prompt_upsampling: Literal[False] = False
+
+    @field_validator("prompt")
+    @classmethod
+    def _nonblank_prompt(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("prompt must not be blank")
+        return value
+
+
+class MiniMaxH3ImageParams(BaseModel):
+    """New MiniMax-H3-Image still-image model; fixed distilled six-step
+    sampling, no CFG/negative prompt/prompt enhancement."""
+
+    model_config = ConfigDict(extra="forbid")
+    prompt: str = Field(..., min_length=1, max_length=16000)
+    seed: int = Field(default=42, ge=0, le=2**63 - 1)
+    lane: Literal["controlled-1024", "recommended-4096"] = "controlled-1024"
+    width: Optional[int] = None
+    height: Optional[int] = None
+    guidance_scale: Literal[1] = 1
+    license_confirmed: Literal[True]
+    license_confirmation_ref: str = Field(..., min_length=8, max_length=200)
+
+    @field_validator("prompt", "license_confirmation_ref")
+    @classmethod
+    def _nonblank_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("value must not be blank")
+        return value
 
 
 class ImageTo3DParams(BaseModel):
@@ -928,6 +960,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "flux3-klein-nvfp4": Flux3KleinParams,
     "moss-image": MossImageParams,
     "p-h3-image-comfy": PH3ImageComfyParams,
+    "minimax-h3-image": MiniMaxH3ImageParams,
     "tts-voxtral": TTSVoxtralParams,
     "video-generate-h3": VideoGenerateH3Params,
     "video-generate-fast-h3": VideoGenerateH3Params,

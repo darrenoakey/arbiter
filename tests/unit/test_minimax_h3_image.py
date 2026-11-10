@@ -12,7 +12,9 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
+from arbiter.adapters import registry
 from arbiter.adapters.base import InferenceError, LoadError
 from arbiter.adapters.minimax_h3_image import (
     DEFAULT_MIN_GENERATION_AREA,
@@ -28,6 +30,38 @@ from arbiter.adapters.minimax_h3_image import (
 )
 
 LICENSED = {"license_confirmed": True, "license_confirmation_ref": "legal-determination-2026-11-10"}
+
+
+def test_exact_registration_policy_and_schema():
+    from arbiter.image_policy import is_disabled_still_image_model
+    from arbiter.schemas import JOB_TYPE_PARAMS, JOB_TYPE_TO_MODEL, MiniMaxH3ImageParams
+
+    assert issubclass(registry.get_adapter_class("minimax-h3-image"), MiniMaxH3ImageAdapter)
+    assert JOB_TYPE_TO_MODEL["minimax-h3-image"] == "minimax-h3-image"
+    assert JOB_TYPE_PARAMS["minimax-h3-image"] is MiniMaxH3ImageParams
+    assert not is_disabled_still_image_model("minimax-h3-image")
+    assert is_disabled_still_image_model("minimax-h3-image-bf16")
+    p = MiniMaxH3ImageParams(prompt="botanist", **LICENSED)
+    assert (p.lane, p.width, p.height, p.guidance_scale) == ("controlled-1024", None, None, 1)
+    with pytest.raises(ValidationError):
+        MiniMaxH3ImageParams(prompt="botanist")
+    with pytest.raises(ValidationError):
+        MiniMaxH3ImageParams(prompt="botanist", steps=6, **LICENSED)
+
+
+def test_staged_lifecycle_does_not_use_futile_unified_memory_offload():
+    import ast
+    import inspect
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(MiniMaxH3ImageAdapter._encode_and_swap))
+    calls = [n.func.attr for n in ast.walk(ast.parse(source))
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+    assert calls.index("unload_components") < calls.index("load_components")
+    assert "MiniMaxH3ImageTextEncoderStep" in source
+    adapter_source = inspect.getsource(MiniMaxH3ImageAdapter)
+    assert "enable_model_cpu_offload" not in adapter_source
+    assert "enable_sequential_cpu_offload" not in adapter_source
 
 
 def _write(entry: Path, relpath: str, body: bytes, revision: str, lfs: bool) -> None:

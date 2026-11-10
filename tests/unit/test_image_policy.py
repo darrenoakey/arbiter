@@ -239,6 +239,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "ming-image-0.1-design",
         "mini-agi",
         "minimax-fast-h3",
+        "minimax-h3-image",
         "minimax-h3-local",
         "moondream",
         "moss-image-sft",

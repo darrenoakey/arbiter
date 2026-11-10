@@ -1,4 +1,4 @@
-# P-H3-Image Comfy — offline preparation only; do not install in turn.
+# P-H3-Image Comfy — installed runtime; execute only through Arbiter workers.
 # Supported upstream: official ComfyUI at exact commit
 # https://github.com/comfyanonymous/ComfyUI.git@576b642e77b4c42f84afe583c8e8f0eef7637618
 # PH3 support #17506. No upstream execution occurred during adapter tests.

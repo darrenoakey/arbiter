@@ -1,7 +1,6 @@
-# MiniMax-H3-Image runtime pin — NOT installed under the P-H3 approval.
-# Installing this is a separate, unauthorized-here step: the load gate in
-# src/arbiter/adapters/minimax_h3_image.py refuses any diffusers that is not
-# this exact git commit (it ships MiniMaxH3ImageModularPipeline).
-# torch / transformers / safetensors versions must be pinned by the parent
-# task alongside the worker venv's existing pins before any real run.
+# MiniMax-H3-Image local BF16 comparison runtime.
+# GB10 staged encode/unload/transformer lifecycle lives in the adapter.
+# New venv is a dependency overlay on qwenimage's immutable base:
+# torch 2.14.0+cu130, transformers 5.17.0, accelerate 1.15.0.
+# Install detached; never mutate the qwenimage worker packages.
 diffusers @ git+https://github.com/huggingface/diffusers@f598e6e6a99528858b962c1399c45b59a6c25484

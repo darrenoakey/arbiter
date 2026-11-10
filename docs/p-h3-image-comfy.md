@@ -2,11 +2,12 @@
 
 ## Status
 
-Owner-requested comparison only; not an IGS/generate_image/SDK route. **No
-weights, runtime installation, GPU execution, job, deployment or Greenline
-submission has occurred.** GB10 compatibility, actual peak memory and timing
-remain unmeasured. The old diffusers scaffold was removed because no upstream
-PH3Image pipeline was found.
+Owner-requested comparison only; not an IGS/generate_image/SDK route. The
+pinned ComfyUI checkout and all three W4A8/int8 weight files were installed
+on Spark on 2026-11-05 and their full content hashes were re-verified on
+2026-11-11. Focused offline tests pass. Real model output is validated only
+through the capped Arbiter worker; no claim is made from installation alone.
+GB10 compatibility, actual peak memory and timings are measured by real jobs.
 
 ## Immutable supported source
 
@@ -20,29 +21,21 @@ PH3Image pipeline was found.
 - License: MiniMax H3 Community License. Australian local use is not in the
   excluded EU/UK/Republic of Korea/USA territories. No new agreement accepted.
 
-## Local storage and approval state (2026-11-04 19:12 UTC)
+## Storage and install receipts (2026-11-11)
 
-Prepared model location is `/mnt/t9/models/p-h3-image`, not the unmounted
-`/mnt/arbiter-store` path. The approved physical T9 filesystem UUID is
-`ec088732-0cb2-4fc4-935e-f5d6f9a3b73b`. Before a future download, prove the
-exact mount/UUID, fail if absent, and use a local directory there; never fall
-back to Spark root or automatically mount anything.
+Prepared model location is `/mnt/t9/models/p-h3-image`, on physical T9 UUID
+`ec088732-0cb2-4fc4-935e-f5d6f9a3b73b`. P-H3 consumes 20,084,601,325 bytes.
+Keep at least 50 GB free on T9 and do not clean unrelated files as part of
+this task. Install receipts are preserved in the comparison evidence bundle
+`~/src/p-h3-image-comparison-20261103/install-evidence/` and
+`INSTALLATION-RECEIPT-20261105.md`; do not repeat an existing download.
 
-Fresh available bytes: root 803,936,972,800; T9 64,384,659,456. Storage owner
-conv-6f92a2a821b950fa requires root use <200 GB, models/logs on T9, and a
-**50,000,000,000-byte T9 free reserve**. Thus usable T9 space is only
-14,384,659,456 bytes: **5,699,941,869 more bytes are required for weights
-alone**, before the unmeasured temporary-download/venv/runtime overhead.
-Recovery is the storage owner's task, not this adapter's. Do not clean or
-compress anything as part of P-H3.
-
-Installation/download approval is pending with the parent. No explicit
-installation or adapter-release denial has occurred, but the original scope
-held both. Direct Spark-to-Mini SSH was explicitly denied and will not be
-retried. The shared drain/restart hold is binding until the music MP4 is
-verified. A production release is a separate decision from installing files.
-The local path removes CIFS as a model-loading dependency, not the storage
-reserve, install approval, or render hold.
+The earlier stale music hold was explicitly released by its owner. The
+2026-11-11 owner takeover authorizes completing these exact comparison
+adapters, their installation and real worker testing. Normal Greenline gate,
+drain and health-check behavior remains mandatory. Direct Spark-to-Mini SSH
+was denied and is not used; the established deployment SSH account is the
+only host route. No Comfy HTTP listener or out-of-band GPU script is used.
 
 ## Adapter scope
 
