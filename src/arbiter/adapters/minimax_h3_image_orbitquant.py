@@ -109,6 +109,7 @@ class MiniMaxH3ImageOrbitQuantAdapter(MiniMaxH3ImageAdapter):
         try:
             weights = self._verify_orbitquant_snapshot()
             runtime_pin = verify_diffusers_runtime(ORBITQUANT_DIFFUSERS_COMMIT)
+            verified = time.perf_counter()
             import torch
             load_pipeline = self._bundle_loader().load_pipeline
             with HeapTrimGuard():

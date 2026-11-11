@@ -74,3 +74,19 @@ def test_bundle_loader_imports_from_snapshot_file_not_sys_path(tmp_path):
     module = MiniMaxH3ImageOrbitQuantAdapter(entry)._bundle_loader()
     assert Path(module.__file__) == entry / "minimax_h3_image_orbitquant.py"
     assert module.load_pipeline(entry, device="cuda")[0] == "bundle"
+
+
+def test_adapter_sources_have_no_undefined_names():
+    """Adapter load paths only run on the GPU host. A NameError there
+    (2026-11-11: `verified` was never assigned) shows up only after a
+    multi-minute load. Ruff's F821 finds it statically, before deploy."""
+    import subprocess
+    import sys
+
+    src = Path(__file__).resolve().parents[2] / "src" / "arbiter"
+    proc = subprocess.run(
+        [sys.executable, "-m", "ruff", "check", "--no-cache", "--select", "F821",
+         "--output-format", "concise", str(src)],
+        check=False, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
