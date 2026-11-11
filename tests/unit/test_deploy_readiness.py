@@ -98,3 +98,48 @@ def test_pre_drain_preparation_overlaps_readiness_and_rejoins_before_drain_wait(
     resume = source[source.index("resume_if_aborted() {"):source.index("\n}\n", source.index("resume_if_aborted() {"))]
     assert 'wait "$PREP_PID"' in resume
     assert not any(line.strip().startswith(("kill", "pkill")) for line in resume.splitlines())
+
+
+def busy(jobs: list[tuple[str, str]], *, mean: float = 6.0, samples: int = 9771) -> dict:
+    """A recorded-shape /v1/ps: chat completions churning on a resident LLM."""
+    active = sum(1 for state, _ in jobs if state != "queued")
+    snap = snapshot(active=active, queued=len(jobs) - active)
+    snap["models"] = [{"id": "llm:qwen3-vl-8b-fp8", "active_jobs": active,
+                       "avg_execution_seconds": mean, "completed_jobs": samples, "state": "active"},
+                      {"id": "ltx25-denoise1", "active_jobs": 0,
+                       "avg_execution_seconds": 1070.8, "completed_jobs": 52, "state": "unloaded"}]
+    snap["active_jobs_detail"] = [{"job_id": str(index), "model": model, "state": state,
+                                   "created_at": 1793705505.5, "type": "chat-completion"}
+                                  for index, (state, model) in enumerate(jobs)]
+    return snap
+
+
+def test_short_running_work_is_ready_without_a_zero_instant():
+    chat = "llm:qwen3-vl-8b-fp8"
+    assert readiness.ready(busy([("running", chat), ("running", chat), ("queued", chat)]))
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda s: s["active_jobs_detail"].__setitem__(0, {**s["active_jobs_detail"][0], "state": "scheduled"}),
+    lambda s: s["models"][0].__setitem__("avg_execution_seconds", 10.5),
+    lambda s: s["models"][0].__setitem__("completed_jobs", 19),
+    lambda s: s["models"][0].pop("avg_execution_seconds"),
+    lambda s: s["models"][0].__setitem__("avg_execution_seconds", True),
+    lambda s: s["active_jobs_detail"].pop(),
+    lambda s: s.pop("active_jobs_detail"),
+    lambda s: s["active_jobs_detail"].__setitem__(1, {**s["active_jobs_detail"][1], "model": "ltx25-denoise1"}),
+    lambda s: s["active_jobs_detail"].__setitem__(1, {**s["active_jobs_detail"][1], "model": "unknown"}),
+], ids=["loading", "long-mean", "few-samples", "no-mean", "bool-mean", "partial-panel",
+        "no-panel", "long-model", "unmeasured-model"])
+def test_unproven_short_work_keeps_the_strict_zero_wait(mutate):
+    chat = "llm:qwen3-vl-8b-fp8"
+    snap = busy([("running", chat), ("running", chat)])
+    mutate(snap)
+    assert not readiness.ready(snap)
+
+
+def test_short_work_never_overrides_a_foreign_drain():
+    snap = busy([("running", "llm:qwen3-vl-8b-fp8")])
+    snap["draining"] = True
+    with pytest.raises(readiness.DrainProtocolError, match="ownership is external"):
+        readiness.ready(snap)

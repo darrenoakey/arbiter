@@ -18,6 +18,18 @@ MAX_WAIT_SECONDS = 180
 MAX_BODY_BYTES = 1_000_000
 HTTP_TIMEOUT_SECONDS = 3
 POLL_SECONDS = 2
+# Short-work readiness. A strict-zero wait on a busy fleet waits on queue churn,
+# not on any job: each finishing chat completion is replaced by the next one,
+# so a zero instant may never occur (2026-11-11: 120s of a 224.3s release).
+# Work that the deploy's own 30s owned drain will outlast needs no read-only
+# wait, because the drain stops dispatch and still independently proves zero
+# before any stop. A job qualifies only once Arbiter marks it "running" (set
+# after its model load succeeded) on a model whose recorded mean execution is
+# a third of that drain deadline, over enough samples to mean something.
+# Anything else (scheduled/loading, long or unmeasured models, an incomplete
+# job panel) keeps the strict-zero wait.
+SHORT_JOB_MAX_MEAN_SECONDS = 10.0
+SHORT_JOB_MIN_SAMPLES = 20
 
 
 def configured_wait(path: Path) -> int:
@@ -37,13 +49,44 @@ def configured_wait(path: Path) -> int:
     return value
 
 
+def only_short_running_work(snapshot: dict, active: int) -> bool:
+    """True only when every active job is provably short, running, resident work."""
+    stats = {}
+    for model in snapshot["models"]:
+        mean = model.get("avg_execution_seconds")
+        samples = model.get("completed_jobs")
+        if (isinstance(model.get("id"), str) and isinstance(mean, (int, float))
+                and not isinstance(mean, bool) and isinstance(samples, int)
+                and not isinstance(samples, bool)):
+            stats[model["id"]] = (float(mean), samples)
+    detail = snapshot.get("active_jobs_detail")
+    if not isinstance(detail, list):
+        return False
+    in_flight = [job for job in detail
+                 if not isinstance(job, dict) or job.get("state") != "queued"]
+    # The panel must account for exactly the validated active count; a capped,
+    # stale, or partial panel never qualifies.
+    if len(in_flight) != active:
+        return False
+    for job in in_flight:
+        if not isinstance(job, dict) or job.get("state") != "running":
+            return False
+        mean, samples = stats.get(job.get("model"), (None, 0))
+        if mean is None or samples < SHORT_JOB_MIN_SAMPLES or not 0 <= mean <= SHORT_JOB_MAX_MEAN_SECONDS:
+            return False
+    return True
+
+
 def ready(snapshot: object) -> bool:
-    """Only an undrained, validated snapshot with coherent strict-zero counts is ready."""
+    """An undrained, validated snapshot is ready at strict zero or with only short running work."""
     draining, active = ps_state(snapshot)
     if draining:
         raise DrainProtocolError("/v1/ps reports draining=true; ownership is external")
-    # Queued jobs remain persisted; only active/running/scheduled work must be zero.
-    return active == 0
+    # Queued jobs remain persisted; only active/running/scheduled work matters.
+    if active == 0:
+        return True
+    assert isinstance(snapshot, dict)  # ps_state validated the shape.
+    return only_short_running_work(snapshot, active)
 
 
 def fetch(url: str) -> object:
@@ -79,7 +122,7 @@ def main() -> int:
         if seconds == 0:
             return 0
         if wait(args.url, seconds):
-            print("==> Read-only readiness: validated undrained strict-zero snapshot")
+            print("==> Read-only readiness: validated undrained snapshot with zero or only short running work")
             return 0
         print("ERROR: pre-drain readiness deadline expired; ordinary drain will not be requested", file=sys.stderr)
         return 1

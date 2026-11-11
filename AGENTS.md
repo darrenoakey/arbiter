@@ -35,7 +35,11 @@ Diagnose with `greenline status` and `greenline doctor` (`--fix` to reconcile).
 ## Coordinated offline deployment maintenance
 
 - Optional `[deploy] pre_drain_wait_seconds` (0 by default, at most 180) is a
-  bounded read-only advisory wait for undrained zero active work. Queued jobs
+  bounded read-only advisory wait for undrained zero active work, or for
+  active work that is only `running` (model already loaded) on models whose
+  recorded mean execution is at most 10s over at least 20 samples, which the
+  drain below outlasts. Scheduled/loading, long, or unmeasured work keeps the
+  strict-zero wait. Queued jobs
   remain permitted and persisted. It never grants stop authority: the normal
   30-second owned drain still independently proves zero before stopping, and
   its lease/TTL and the gate's overall deadline are unchanged.
