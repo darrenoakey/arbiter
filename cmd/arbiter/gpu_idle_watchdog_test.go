@@ -182,6 +182,21 @@ func TestInstanceLastOutputAtTracksWorkerLines(t *testing.T) {
 	}
 }
 
+func TestOutputTapReaderNotesPartialLineOutput(t *testing.T) {
+	inst := NewInstance("ltx2", "ltx2#tap", 1, 40, "python3", t.TempDir())
+	stamp := time.Unix(1_700_000_000, 0)
+	inst.NoteOutputAt(stamp)
+	// tqdm-style progress: carriage returns, no newline, never a full line.
+	tap := outputTapReader{r: strings.NewReader("Loading weights:  42%|####      | 442/1058\r"), inst: inst}
+	buf := make([]byte, 8)
+	if _, err := tap.Read(buf); err != nil {
+		t.Fatalf("tap read: %v", err)
+	}
+	if got := inst.LastOutputAt(); !got.After(stamp) {
+		t.Fatalf("partial-line bytes did not count as output: LastOutputAt = %s, want after %s", got, stamp)
+	}
+}
+
 func TestGPUIdleWatchdogHighUtilUsesLongIntervalAndDoesNotKill(t *testing.T) {
 	w, store, mgr, _ := newTestIdleWatchdog(t)
 	addRunningLocal(t, mgr, store, "ltx2", "ltx2#1")
