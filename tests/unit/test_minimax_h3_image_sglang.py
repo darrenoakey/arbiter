@@ -110,3 +110,41 @@ def test_result_metadata_is_quantized_not_bf16():
     assert precision["text_encoder"].startswith("mxfp8")
     assert precision["attention"].startswith("fp8_fa_sm120")
     assert "bfloat16" not in precision.values()
+
+
+def _capped(monkeypatch):
+    import arbiter.adapters.minimax_h3_image_sglang as module
+
+    monkeypatch.setenv("ARBITER_MEMORY_GB", "64")
+    monkeypatch.setattr(module, "_child_cuda_cap_installed", lambda: True)
+
+
+def test_load_runs_progress_and_verification_before_sglang(snapshots, monkeypatch):
+    """2026-11-11: load() called a progress helper the adapter lacked; the cap
+    check had hidden it from tests. Drive load() through verification."""
+    native, bf16 = snapshots
+    _capped(monkeypatch)
+    (native / "vae" / "diffusion_pytorch_model.safetensors").write_bytes(b"tampered")
+    adapter = MiniMaxH3ImageSglangAdapter(native, bf16)
+    with pytest.raises(LoadError, match="content hash"):
+        adapter.load("cuda")
+    assert adapter._progress_thread is None and adapter._gen is None and adapter._load_info is None
+
+
+def test_load_without_sglang_install_fails_closed_after_verification(snapshots, monkeypatch):
+    from importlib import metadata
+
+    native, bf16 = snapshots
+    _capped(monkeypatch)
+    real_version = metadata.version
+
+    def version(name):
+        if name == "sglang":
+            raise metadata.PackageNotFoundError(name)
+        return real_version(name)
+
+    monkeypatch.setattr(metadata, "version", version)
+    adapter = MiniMaxH3ImageSglangAdapter(native, bf16)
+    with pytest.raises(LoadError, match="no sglang install"):
+        adapter.load("cuda")
+    assert adapter._progress_thread is None and adapter._gen is None

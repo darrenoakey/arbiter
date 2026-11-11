@@ -40,6 +40,7 @@ from arbiter.adapters.minimax_h3_image import (
     EXPECTED_STEPS,
     MINIMAX_H3_IMAGE_HF_REPO,
     MINIMAX_H3_IMAGE_REVISION,
+    StageProgressMixin,
     parse_request,
     verify_h3_image_snapshot,
 )
@@ -133,7 +134,7 @@ def _process_tree_gpu_bytes() -> int:
 
 
 @register
-class MiniMaxH3ImageSglangAdapter(ModelAdapter):
+class MiniMaxH3ImageSglangAdapter(StageProgressMixin, ModelAdapter):
     """Resident SGLang MXFP8 + FP8-attention MiniMax-H3-Image; never ComfyUI."""
 
     model_id = MODEL_ID
@@ -180,7 +181,10 @@ class MiniMaxH3ImageSglangAdapter(ModelAdapter):
             verified = time.perf_counter()
             from importlib import metadata
 
-            sglang_version = metadata.version("sglang")
+            try:
+                sglang_version = metadata.version("sglang")
+            except metadata.PackageNotFoundError as error:
+                raise LoadError(f"{MODEL_ID} worker venv has no sglang install (expected {SGLANG_COMMIT[:12]})") from error
             entrypoint = importlib.import_module("sglang.multimodal_gen.runtime.entrypoints.diffusion_generator")
             self._gen = entrypoint.DiffGenerator.from_pretrained(**self.generator_kwargs())
             loaded = time.perf_counter()

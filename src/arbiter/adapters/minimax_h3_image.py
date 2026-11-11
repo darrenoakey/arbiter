@@ -366,8 +366,49 @@ def verify_diffusers_runtime(expected_commit: str = DIFFUSERS_COMMIT) -> dict:
     return {"source_repo": DIFFUSERS_REPO, "source_commit": commit, "package_version": dist.version}
 
 
+class StageProgressMixin:
+    """Heartbeat for long silent stages (hash verify, weight load, CUDA work).
+
+    The worker watchdog treats stderr silence as a hang; this prints the active
+    stage every 25 s until stopped. Shared by every MiniMax-H3-Image runtime."""
+
+    _progress_stop: threading.Event | None = None
+    _progress_thread: threading.Thread | None = None
+    _progress_phase: str = "idle"
+
+    def _start_progress(self, phase: str) -> None:
+        self._stop_progress()
+        self._progress_phase = phase
+        self._progress_stop = threading.Event()
+        self._progress_thread = threading.Thread(
+            target=self._report_progress, name="minimax-h3-progress", daemon=True
+        )
+        self._progress_thread.start()
+
+    def _report_progress(self) -> None:
+        import sys
+
+        while not self._progress_stop.wait(25):
+            print(
+                f"{self.model_id} active stage: {self._progress_phase}; "
+                "waiting for hash/weight/CUDA work to complete",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _stop_progress(self) -> None:
+        stop = getattr(self, "_progress_stop", None)
+        thread = getattr(self, "_progress_thread", None)
+        if stop is not None:
+            stop.set()
+        if thread is not None:
+            thread.join(timeout=35)
+        self._progress_stop = None
+        self._progress_thread = None
+
+
 @register
-class MiniMaxH3ImageAdapter(ModelAdapter):
+class MiniMaxH3ImageAdapter(StageProgressMixin, ModelAdapter):
     """Registration with the shared registry/schemas is limited to the exact
     local still-image id; this module is import-safe without torch, diffusers,
     weights, or a GPU."""
@@ -474,36 +515,6 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
                 problems.append(f"{attr} {actual}")
         if problems:
             raise LoadError(f"{self.model_id} loaded unexpected image-stage components: {', '.join(problems)}")
-
-    def _start_progress(self, phase: str) -> None:
-        self._stop_progress()
-        self._progress_phase = phase
-        self._progress_stop = threading.Event()
-        self._progress_thread = threading.Thread(
-            target=self._report_progress, name="minimax-h3-progress", daemon=True
-        )
-        self._progress_thread.start()
-
-    def _report_progress(self) -> None:
-        import sys
-
-        while not self._progress_stop.wait(25):
-            print(
-                f"{self.model_id} active stage: {self._progress_phase}; "
-                "waiting for hash/weight/CUDA work to complete",
-                file=sys.stderr,
-                flush=True,
-            )
-
-    def _stop_progress(self) -> None:
-        stop = getattr(self, "_progress_stop", None)
-        thread = getattr(self, "_progress_thread", None)
-        if stop is not None:
-            stop.set()
-        if thread is not None:
-            thread.join(timeout=35)
-        self._progress_stop = None
-        self._progress_thread = None
 
     def _log_still_working(self) -> None:
         log.info("%s still loading transformer/VAE weights or transferring to CUDA", self.model_id)
