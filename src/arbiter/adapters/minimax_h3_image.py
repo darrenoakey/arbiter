@@ -373,6 +373,11 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
     weights, or a GPU."""
 
     model_id = "minimax-h3-image"
+    result_precision = {"components": "bfloat16", "initial_noise": "float32"}
+    result_limitations = (
+        "GB10 unified memory requires staged loading: text encoder freed before transformer/VAE load; "
+        "encoder reload and model swap are measured separately from denoising.",
+    )
 
     def __init__(self) -> None:
         self._pipe = None
@@ -695,13 +700,10 @@ class MiniMaxH3ImageAdapter(ModelAdapter):
             },
             "width": delivered_width,
             "height": delivered_height,
-            "precision": {"components": "bfloat16", "initial_noise": "float32"},
+            "precision": dict(self.result_precision),
             "license": {"confirmed": True, "confirmation_ref": request.license_confirmation_ref},
             "provenance": {**info["weights"], **info["runtime"]},
-            "limitations": [
-                "GB10 unified memory requires staged loading: text encoder freed before transformer/VAE load; "
-                "encoder reload and model swap are measured separately from denoising.",
-            ],
+            "limitations": list(self.result_limitations),
             "timings": {
                 "render_index": self._renders,
                 **stage,

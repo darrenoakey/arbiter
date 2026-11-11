@@ -32,6 +32,16 @@ class MiniMaxH3ImageOrbitQuantAdapter(MiniMaxH3ImageAdapter):
 
     model_id = "minimax-h3-image-orbitquant-w4a8"
     hf_model_path = "/home/darren/nvme-models/minimax-h3-image-orbitquant-w4a8"
+    result_precision = {
+        "transformer": "orbitquant-w4a8",
+        "text_encoder": "orbitquant-w4a8",
+        "vae": "original-bf16",
+        "initial_noise": "float32",
+    }
+    result_limitations = (
+        "Third-party WaveCut OrbitQuant W4A8 quantization of MiniMax-H3-Image: 4-bit weights and 8-bit "
+        "activations change pixels relative to BF16 at the same seed.",
+    )
 
     def __init__(self, models_dir: Path | None = None) -> None:
         super().__init__()
@@ -68,12 +78,7 @@ class MiniMaxH3ImageOrbitQuantAdapter(MiniMaxH3ImageAdapter):
             "revision": manifest.get("base_revision"),
             "weights_dir": str(entry),
             "manifest": manifest,
-            "precision": {
-                "transformer": "orbitquant-w4a8",
-                "text_encoder": "orbitquant-w4a8",
-                "vae": "original-bf16",
-                "initial_noise": "float32",
-            },
+            "precision": dict(self.result_precision),
         }
 
     @staticmethod

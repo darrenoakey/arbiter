@@ -90,3 +90,12 @@ def test_adapter_sources_have_no_undefined_names():
         check=False, capture_output=True, text=True,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_result_metadata_reports_quantized_precision_not_bf16(tmp_path):
+    adapter = MiniMaxH3ImageOrbitQuantAdapter(make_bundle(tmp_path))
+    assert adapter.result_precision["transformer"] == "orbitquant-w4a8"
+    assert adapter.result_precision["text_encoder"] == "orbitquant-w4a8"
+    assert "bfloat16" not in adapter.result_precision.values()
+    assert not any("staged loading" in item for item in adapter.result_limitations)
+    assert adapter._verify_orbitquant_snapshot()["precision"] == adapter.result_precision
