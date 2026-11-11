@@ -148,3 +148,19 @@ def test_load_without_sglang_install_fails_closed_after_verification(snapshots, 
     with pytest.raises(LoadError, match="no sglang install"):
         adapter.load("cuda")
     assert adapter._progress_thread is None and adapter._gen is None
+
+
+def test_request_seeds_cpu_generator_like_the_diffusers_adapters(tmp_path):
+    """2026-11-12: without generator_device="cpu" SGLang seeded a CUDA generator,
+    so the same seed rendered a different image than BF16 (SSIM 0.14) and the
+    precision comparison was meaningless."""
+    from arbiter.adapters.minimax_h3_image import parse_request
+    from tests.unit.test_minimax_h3_image import LICENSED
+
+    request = parse_request({"prompt": "botanist", "seed": 42001, "lane": "controlled-1024", **LICENSED})
+    call = MiniMaxH3ImageSglangAdapter.sampling_kwargs(request, tmp_path)
+    assert call["generator_device"] == "cpu"
+    assert call["seed"] == 42001
+    assert (call["width"], call["height"], call["min_generation_area"]) == (1024, 1024, 1024)
+    assert call["output_path"] == str(tmp_path) and call["output_file_name"] == "result.png"
+    assert "CPU generator" in MiniMaxH3ImageSglangAdapter.result_precision["initial_noise"]

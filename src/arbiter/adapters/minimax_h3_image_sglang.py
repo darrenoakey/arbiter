@@ -144,6 +144,7 @@ class MiniMaxH3ImageSglangAdapter(StageProgressMixin, ModelAdapter):
         "attention": "fp8_fa_sm120 (E4M3 Q/K/V)",
         "adaln_tables": "native precompute",
         "vae": "native",
+        "initial_noise": "float32, CPU generator (matches the diffusers BF16 and OrbitQuant adapters)",
     }
     result_limitations = (
         "SGLang PR 49599 (unmerged) Spark recipe: MXFP8 weights and FP8 attention change pixels "
@@ -238,11 +239,16 @@ class MiniMaxH3ImageSglangAdapter(StageProgressMixin, ModelAdapter):
             finally:
                 self._stop_progress()
 
-    def _render(self, request, output_dir: Path, cancel_flag: threading.Event) -> dict:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        call = {
+    @staticmethod
+    def sampling_kwargs(request, output_dir: Path) -> dict:
+        """One SGLang request. ``generator_device="cpu"`` is what makes a seed
+        comparable across runtimes: SGLang otherwise seeds a CUDA generator,
+        while the diffusers adapters draw the identical
+        ``randn(1, 24, 1, H/16, W/16)`` float32 noise from a CPU generator."""
+        return {
             "prompt": request.prompt,
             "seed": request.seed,
+            "generator_device": "cpu",
             "width": request.width,
             "height": request.height,
             "min_generation_area": request.min_generation_area,
@@ -250,8 +256,11 @@ class MiniMaxH3ImageSglangAdapter(StageProgressMixin, ModelAdapter):
             "output_path": str(output_dir),
             "output_file_name": "result.png",
         }
+
+    def _render(self, request, output_dir: Path, cancel_flag: threading.Event) -> dict:
+        output_dir.mkdir(parents=True, exist_ok=True)
         started = time.perf_counter()
-        result = self._gen.generate(sampling_params_kwargs=call)  # type: ignore[attr-defined]
+        result = self._gen.generate(sampling_params_kwargs=self.sampling_kwargs(request, output_dir))  # type: ignore[attr-defined]
         finished = time.perf_counter()
         self._check_cancel(cancel_flag)
         if isinstance(result, list):
