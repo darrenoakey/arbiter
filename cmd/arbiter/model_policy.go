@@ -96,8 +96,23 @@ const ph3ImageComfyJobType = "p-h3-image-comfy"
 // separate from the MiniMax H3 video adapters and never a cloud renderer.
 const minimaxH3ImageModel = "minimax-h3-image"
 const minimaxH3ImageOrbitQuantModel = "minimax-h3-image-orbitquant-w4a8"
+const minimaxH3ImageSglangMXFP8Model = "minimax-h3-image-sglang-mxfp8"
 const minimaxH3ImageJobType = "minimax-h3-image"
 const minimaxH3ImageOrbitQuantJobType = "minimax-h3-image-orbitquant-w4a8"
+const minimaxH3ImageSglangMXFP8JobType = "minimax-h3-image-sglang-mxfp8"
+
+// minimaxH3ImageJobTypes binds each local MiniMax-H3-Image runtime to its one
+// exact job type; any other pairing is refused as a disabled still image.
+var minimaxH3ImageJobTypes = map[string]string{
+	minimaxH3ImageModel:            minimaxH3ImageJobType,
+	minimaxH3ImageOrbitQuantModel:  minimaxH3ImageOrbitQuantJobType,
+	minimaxH3ImageSglangMXFP8Model: minimaxH3ImageSglangMXFP8JobType,
+}
+
+func isMiniMaxH3ImageModel(modelID string) bool {
+	_, ok := minimaxH3ImageJobTypes[normalizedPolicyText(modelID)]
+	return ok
+}
 
 // flux3WeightsRootParam is the only extra adapter param the flux3 workers
 // accept: the absolute snapshot root holding flux-3-image-klein/.
@@ -150,71 +165,72 @@ var disabledStillImageMarkers = []string{
 }
 
 var trustedPythonAdapters = map[string]string{
-	"aesthetic-scorer":            "aesthetic",
-	"birefnet":                    "birefnet",
-	"composite":                   "",
-	"demucs":                      "demucs",
-	"vocal-stem":                  "demucs",
-	"voice-bench-moshi":           "voice-bench",
-	"voice-bench-kyutai":          "voice-bench",
-	"voice-bench-minicpmo":        "voice-bench-minicpmo",
-	"echomimic":                   "",
-	"embed-text":                  "embed",
-	"face-restore":                "",
-	"face-restore-codeformer":     "",
-	"insightface":                 "insightface",
-	"latentsync":                  "",
-	"lora-train":                  "",
-	"fine-tune":                   "",
-	"ltx2":                        "",
-	"ltx2-denoise1":               "",
-	"ltx2-denoise2":               "",
-	"ltx2-dev-denoise1":           "",
-	"ltx2-dev-denoise2":           "",
-	"ltx2-encode":                 "",
-	"ltx25-denoise1":              "ltx25",
-	"ltx25-encode":                "ltx25",
-	"id-lora-encode":              "id-lora",
-	"id-lora":                     "id-lora",
-	"minimax-h3-local":            "minimax-h3",
-	"minimax-fast-h3":             "minimax-h3",
-	"moondream":                   "moondream",
-	"mini-agi":                    "",
-	"rvc-convert":                 "rvc",
-	"routing-decide":              "routing-decide",
-	"nimble-scorer":               "nimble-scorer",
-	"clef-scorer":                 "clef-scorer",
-	"clef-flash-scorer":           "clef-scorer",
-	"rvc-train":                   "rvc",
-	"voice-fit":                   "voxsmith",
-	"qlabs-noise-train":           "qlabsnoise",
-	"music-generate":              "music-generate",
-	"yue2":                        "yue2",
-	"photo-enhance":               "photo-enhance",
-	"sadtalker":                   "",
-	"sonic":                       "",
-	"tts-clone":                   "qwentts",
-	"tts-custom":                  "qwentts",
-	"tts-design":                  "qwentts",
-	"tts-kokoro":                  "kokoro",
-	"tts-breeze":                  "breeze",
-	"wan-s2v":                     "",
-	"whisper-large":               "whisper",
-	referenceImageEditModel:       "flux2",
-	qwenImage21Model:              "qwenimage",
-	qwenImage21HereticModel:       "qwenimage",
-	qwenImage21SglangModel:        "qwenimage-sglang",
-	qwenImage21TurboModel:         "qwenimage-turbo",
-	iris3BModel:                   "iris3b",
-	mingImageDesignModel:          "mingimage",
-	flux3KleinBF16Model:           "flux3",
-	flux3KleinFP8Model:            "flux3",
-	flux3KleinNVFP4Model:          "flux3",
-	mossImageSftModel:             "mossimage",
-	ph3ImageComfyW4A8Model:        "ph3comfy",
-	minimaxH3ImageModel:           "minimaxh3image",
-	minimaxH3ImageOrbitQuantModel: "orbitquant",
-	"trellis2":                    "trellis2",
+	"aesthetic-scorer":             "aesthetic",
+	"birefnet":                     "birefnet",
+	"composite":                    "",
+	"demucs":                       "demucs",
+	"vocal-stem":                   "demucs",
+	"voice-bench-moshi":            "voice-bench",
+	"voice-bench-kyutai":           "voice-bench",
+	"voice-bench-minicpmo":         "voice-bench-minicpmo",
+	"echomimic":                    "",
+	"embed-text":                   "embed",
+	"face-restore":                 "",
+	"face-restore-codeformer":      "",
+	"insightface":                  "insightface",
+	"latentsync":                   "",
+	"lora-train":                   "",
+	"fine-tune":                    "",
+	"ltx2":                         "",
+	"ltx2-denoise1":                "",
+	"ltx2-denoise2":                "",
+	"ltx2-dev-denoise1":            "",
+	"ltx2-dev-denoise2":            "",
+	"ltx2-encode":                  "",
+	"ltx25-denoise1":               "ltx25",
+	"ltx25-encode":                 "ltx25",
+	"id-lora-encode":               "id-lora",
+	"id-lora":                      "id-lora",
+	"minimax-h3-local":             "minimax-h3",
+	"minimax-fast-h3":              "minimax-h3",
+	"moondream":                    "moondream",
+	"mini-agi":                     "",
+	"rvc-convert":                  "rvc",
+	"routing-decide":               "routing-decide",
+	"nimble-scorer":                "nimble-scorer",
+	"clef-scorer":                  "clef-scorer",
+	"clef-flash-scorer":            "clef-scorer",
+	"rvc-train":                    "rvc",
+	"voice-fit":                    "voxsmith",
+	"qlabs-noise-train":            "qlabsnoise",
+	"music-generate":               "music-generate",
+	"yue2":                         "yue2",
+	"photo-enhance":                "photo-enhance",
+	"sadtalker":                    "",
+	"sonic":                        "",
+	"tts-clone":                    "qwentts",
+	"tts-custom":                   "qwentts",
+	"tts-design":                   "qwentts",
+	"tts-kokoro":                   "kokoro",
+	"tts-breeze":                   "breeze",
+	"wan-s2v":                      "",
+	"whisper-large":                "whisper",
+	referenceImageEditModel:        "flux2",
+	qwenImage21Model:               "qwenimage",
+	qwenImage21HereticModel:        "qwenimage",
+	qwenImage21SglangModel:         "qwenimage-sglang",
+	qwenImage21TurboModel:          "qwenimage-turbo",
+	iris3BModel:                    "iris3b",
+	mingImageDesignModel:           "mingimage",
+	flux3KleinBF16Model:            "flux3",
+	flux3KleinFP8Model:             "flux3",
+	flux3KleinNVFP4Model:           "flux3",
+	mossImageSftModel:              "mossimage",
+	ph3ImageComfyW4A8Model:         "ph3comfy",
+	minimaxH3ImageModel:            "minimaxh3image",
+	minimaxH3ImageOrbitQuantModel:  "orbitquant",
+	minimaxH3ImageSglangMXFP8Model: "h3image-sglang",
+	"trellis2":                     "trellis2",
 }
 
 var trustedRepositoryWorkers = map[string]string{
@@ -270,7 +286,7 @@ func isDisabledStillImageModel(modelID string) bool {
 	if isMossImageSftModel(normalized) {
 		return false
 	}
-	if normalized == normalizedPolicyText(ph3ImageComfyW4A8Model) || normalized == minimaxH3ImageModel || normalized == minimaxH3ImageOrbitQuantModel {
+	if normalized == normalizedPolicyText(ph3ImageComfyW4A8Model) || isMiniMaxH3ImageModel(normalized) {
 		return false
 	}
 	if normalized == "id-lora" || normalized == "id-lora-encode" || normalized == "lora-train" || normalized == "fine-tune" || normalized == "ltx2" || strings.HasPrefix(normalized, "ltx2-") ||
@@ -326,7 +342,7 @@ func disabledStillImageConfig(modelID string, cfg ModelConfig) bool {
 		// pinned by validateWorkerCommand to the trusted adapter identity.
 		return false
 	}
-	if isQwenImage21Model(modelID) || isQwenImage21HereticModel(modelID) || isQwenImage21SglangModel(modelID) || isQwenImage21TurboModel(modelID) || isIris3BModel(modelID) || isMingImageDesignModel(modelID) || isFlux3KleinModel(modelID) || isMossImageSftModel(modelID) || normalizedPolicyText(modelID) == normalizedPolicyText(ph3ImageComfyW4A8Model) || normalizedPolicyText(modelID) == minimaxH3ImageModel || normalizedPolicyText(modelID) == minimaxH3ImageOrbitQuantModel {
+	if isQwenImage21Model(modelID) || isQwenImage21HereticModel(modelID) || isQwenImage21SglangModel(modelID) || isQwenImage21TurboModel(modelID) || isIris3BModel(modelID) || isMingImageDesignModel(modelID) || isFlux3KleinModel(modelID) || isMossImageSftModel(modelID) || normalizedPolicyText(modelID) == normalizedPolicyText(ph3ImageComfyW4A8Model) || isMiniMaxH3ImageModel(modelID) {
 		// The sanctioned Qwen adapters legitimately name the Qwen checkpoint
 		// (or its local merged heretic / turbo dir) and their pinned interpreter.
 		return false
@@ -491,7 +507,7 @@ func rejectDisabledStillImage(jobType, modelID string) error {
 	if normalizedPolicyText(modelID) == normalizedPolicyText(ph3ImageComfyW4A8Model) && jobType != ph3ImageComfyJobType {
 		return fmt.Errorf("%s", stillImageDisabledMessage)
 	}
-	if normalizedPolicyText(modelID) == minimaxH3ImageModel && jobType != minimaxH3ImageJobType || normalizedPolicyText(modelID) == minimaxH3ImageOrbitQuantModel && jobType != minimaxH3ImageOrbitQuantJobType {
+	if want, ok := minimaxH3ImageJobTypes[normalizedPolicyText(modelID)]; ok && jobType != want {
 		return fmt.Errorf("%s", stillImageDisabledMessage)
 	}
 	return nil

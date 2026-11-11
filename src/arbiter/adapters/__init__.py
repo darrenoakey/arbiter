@@ -40,6 +40,7 @@ _ADAPTER_MODULES = (
     "p_h3_image_comfy",
     "minimax_h3_image",
     "minimax_h3_image_orbitquant",
+    "minimax_h3_image_sglang",
     "fine_tune",
     "lora_train",
     "composite",

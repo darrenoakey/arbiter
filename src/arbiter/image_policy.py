@@ -117,6 +117,12 @@ MOSS_IMAGE_SFT_MODEL = "moss-image-sft"
 PH3_IMAGE_COMFY_W4A8_MODEL = "p-h3-image-comfy-w4a8"
 MINIMAX_H3_IMAGE_MODEL = "minimax-h3-image"
 MINIMAX_H3_IMAGE_ORBITQUANT_MODEL = "minimax-h3-image-orbitquant-w4a8"
+MINIMAX_H3_IMAGE_SGLANG_MXFP8_MODEL = "minimax-h3-image-sglang-mxfp8"
+MINIMAX_H3_IMAGE_MODELS = (
+    MINIMAX_H3_IMAGE_MODEL,
+    MINIMAX_H3_IMAGE_ORBITQUANT_MODEL,
+    MINIMAX_H3_IMAGE_SGLANG_MXFP8_MODEL,
+)
 
 
 class StillImageGenerationDisabled(RuntimeError):
@@ -150,7 +156,7 @@ def is_disabled_still_image_model(model_id: str) -> bool:
         return False
     if normalized == _normalize(MOSS_IMAGE_SFT_MODEL):
         return False
-    if normalized in (_normalize(PH3_IMAGE_COMFY_W4A8_MODEL), MINIMAX_H3_IMAGE_MODEL, MINIMAX_H3_IMAGE_ORBITQUANT_MODEL):
+    if normalized == _normalize(PH3_IMAGE_COMFY_W4A8_MODEL) or normalized in MINIMAX_H3_IMAGE_MODELS:
         return False
     if normalized in ("lora-train", "fine-tune", "id-lora", "id-lora-encode") or normalized.startswith("ltx2-"):
         return False

@@ -1,0 +1,33 @@
+# venvs/h3image-sglang — MiniMax-H3-Image via SGLang-Diffusion, MXFP8 DiT + encoder,
+# FP8 attention (job type and model id `minimax-h3-image-sglang-mxfp8`).
+#
+# Pinned to SGLang PR 49599 head fd31ed2ecd5e4c6fc85718604e59a5406e38c460
+# (mickqian:codex/h3-image-spark-performance, "enable H3 Image FP8 attention on
+# DGX Spark"), the upstream-measured GB10 recipe. Build ON SPARK, detached:
+#
+#   git clone https://github.com/sgl-project/sglang.git ~/src/sglang-h3/sglang
+#   cd ~/src/sglang-h3/sglang && git fetch origin pull/49599/head && git checkout fd31ed2ecd5e
+#   python3.12 -m venv --copies ~/src/arbiter/venvs/h3image-sglang      # real dir, never a symlink
+#   P=~/src/arbiter/venvs/h3image-sglang/bin/python
+#   $P -m pip install --upgrade pip wheel setuptools setuptools-rust setuptools-scm
+#   $P -m pip install torch==2.14.1 torchvision --index-url https://download.pytorch.org/whl/cu130
+#   # rustup cargo (>=1.85, Cargo resolver 3): PATH="$HOME/.cargo/bin:$PATH"; system cargo 1.75 fails.
+#   $P -m pip install scikit-build-core pybind11 cmake ninja   # xatlas sdist under --no-build-isolation
+#   CARGO_TARGET_DIR=/tmp/h3-image-spark-build $P -m pip install --no-build-isolation \
+#       "~/src/sglang-h3/sglang/python[diffusion]" --extra-index-url https://download.pytorch.org/whl/cu130
+#   $P -m pip uninstall -y flashinfer-jit-cache-sm80 ... flashinfer-jit-cache-sm121a
+#   $P -m pip install --no-deps flash-attn-4==4.0.0b38
+#   $P -m pip install --no-deps flashinfer-cubin==0.7.3 --index-url https://flashinfer.ai/whl/
+#   $P -m pip install --no-deps flashinfer-jit-cache==0.7.3+cu130 --index-url https://flashinfer.ai/whl/cu130
+#   cp venvs/qwenimage-sglang/lib/python3.12/site-packages/sitecustomize.py <venv site-packages>/
+#   echo /home/darren/src/arbiter/src > <venv site-packages>/arbiter.pth
+#
+# sitecustomize.py applies ARBITER_MEMORY_GB to SGLang's scheduler child; load()
+# refuses to start without it.
+#
+# Weights: native-layout transformer/, vae/, pdd_* of MiniMaxAI/MiniMax-H3-Image
+# at revision 492fd8c4eca666f1085f57e30738c1e0d86b3439, downloaded with
+# `hf download --local-dir` into /home/darren/nvme-models/minimax-h3-image-sglang/MiniMax-H3-Image.
+# LICENSE, model_index.json, modular_model_index.json, tokenizer/, processor/
+# and scheduler/ are hard links into the verified BF16 snapshot. text_encoder/
+# is read from the BF16 snapshot through component_paths.

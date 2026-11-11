@@ -420,6 +420,7 @@ var JobTypeToModel = map[string]string{
 	"p-h3-image-comfy":                 ph3ImageComfyW4A8Model,
 	"minimax-h3-image":                 minimaxH3ImageModel,
 	"minimax-h3-image-orbitquant-w4a8": minimaxH3ImageOrbitQuantModel,
+	"minimax-h3-image-sglang-mxfp8":    minimaxH3ImageSglangMXFP8Model,
 	"photo-enhance":                    "photo-enhance",
 	"image-to-3d":                      "trellis2",
 	"routing-decide-train":             "routing-decide",

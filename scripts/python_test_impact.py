@@ -75,6 +75,8 @@ AUDITED: dict[str, frozenset[str]] = {
         # P-H3 inspects the adapter's own source; MiniMax inspects its
         # staging methods. These exact static contracts are not GPU tests.
         "tests/unit/test_minimax_h3_image.py": set(),
+        # tmp-file snapshot fixtures only; static imports prove ownership.
+        "tests/unit/test_minimax_h3_image_sglang.py": set(),
         # Subprocess runs ruff F821 over the whole package: a guard that any
         # package change selects, never an ownership proof.
         "tests/unit/test_minimax_h3_image_orbitquant.py": {"src/arbiter/"},
