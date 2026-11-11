@@ -10,7 +10,6 @@ import time
 from pathlib import Path
 
 from arbiter.adapters.minimax_h3_image import (
-    DIFFUSERS_COMMIT,
     EXPECTED_PIPELINE_CLASS,
     EXPECTED_SAMPLE_SIGMAS,
     EXPECTED_SCHEDULER_CLASS,
@@ -21,6 +20,10 @@ from arbiter.adapters.minimax_h3_image import (
 from arbiter.adapters.base import HeapTrimGuard, LoadError
 from arbiter.adapters.minimax_h3_image import log, verify_diffusers_runtime
 from arbiter.adapters.registry import register
+
+# WaveCut bundle manifest pins its own diffusers build (installed in venvs/orbitquant).
+ORBITQUANT_DIFFUSERS_COMMIT = "875373ac7f5856071e345a3e394c74efccc6b9e6"
+ORBITQUANT_VERSION = "0.18.0"
 
 
 @register
@@ -38,13 +41,14 @@ class MiniMaxH3ImageOrbitQuantAdapter(MiniMaxH3ImageAdapter):
         entry = self.models_dir
         if entry.is_symlink() or not entry.is_dir():
             raise LoadError(f"{self.model_id} requires a real snapshot directory")
-        manifest = self._read_manifest(entry)
+        manifest = self._read_manifest(entry / "manifest.json")
         if manifest.get("format") != "minimax-h3-image-orbitquant":
             raise LoadError("not an H3-Image OrbitQuant snapshot")
-        if manifest.get("orbitquant") != "0.18.0" or manifest.get("diffusers") != DIFFUSERS_COMMIT:
+        if manifest.get("orbitquant") != ORBITQUANT_VERSION or manifest.get("diffusers") != ORBITQUANT_DIFFUSERS_COMMIT:
             raise LoadError("OrbitQuant/runtime revision mismatch")
         required = (
             "manifest.json", "modular_model_index.json", "LICENSE", "NOTICE",
+            "minimax_h3_image_orbitquant.py",
             "transformer/config.json", "transformer/model.safetensors",
             "transformer/modulation.json", "transformer/orbitquant_manifest.json",
             "text_encoder/config.json", "text_encoder/model.safetensors",
@@ -80,6 +84,20 @@ class MiniMaxH3ImageOrbitQuantAdapter(MiniMaxH3ImageAdapter):
         except (OSError, ValueError) as exc:
             raise LoadError(f"cannot read OrbitQuant manifest {path}: {exc}") from exc
 
+    def _bundle_loader(self):
+        """Import the verified snapshot's own loader by file, never via sys.path."""
+        import importlib.util
+
+        source = self.models_dir / "minimax_h3_image_orbitquant.py"
+        spec = importlib.util.spec_from_file_location("_orbitquant_h3_bundle_loader", source)
+        if spec is None or spec.loader is None:
+            raise LoadError(f"cannot import OrbitQuant bundle loader {source}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if not callable(getattr(module, "load_pipeline", None)):
+            raise LoadError("OrbitQuant bundle loader lacks load_pipeline")
+        return module
+
     def load(self, device: str = "cuda") -> None:
         if device != "cuda":
             raise LoadError(f"{self.model_id} requires cuda")
@@ -90,9 +108,9 @@ class MiniMaxH3ImageOrbitQuantAdapter(MiniMaxH3ImageAdapter):
         started = time.perf_counter()
         try:
             weights = self._verify_orbitquant_snapshot()
-            runtime_pin = verify_diffusers_runtime()
+            runtime_pin = verify_diffusers_runtime(ORBITQUANT_DIFFUSERS_COMMIT)
             import torch
-            from minimax_h3_image_orbitquant import load_pipeline
+            load_pipeline = self._bundle_loader().load_pipeline
             with HeapTrimGuard():
                 pipe = load_pipeline(self.models_dir, offload=False, attention="cudnn", device=device)
             loaded = time.perf_counter()

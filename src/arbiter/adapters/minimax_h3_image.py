@@ -339,7 +339,7 @@ def _cpu_module_tensors_are_released(module) -> bool:
     return True
 
 
-def verify_diffusers_runtime() -> dict:
+def verify_diffusers_runtime(expected_commit: str = DIFFUSERS_COMMIT) -> dict:
     """The installed diffusers must be the pinned commit that ships
     ``MiniMaxH3ImageModularPipeline`` — a PyPI or other-commit install fails
     closed instead of silently running an unreviewed runtime."""
@@ -359,9 +359,9 @@ def verify_diffusers_runtime() -> dict:
     except ValueError as error:
         raise LoadError("diffusers direct_url.json is malformed") from error
     commit = (direct.get("vcs_info") or {}).get("commit_id")
-    if commit != DIFFUSERS_COMMIT:
+    if commit != expected_commit:
         raise LoadError(
-            f"diffusers was installed from {direct.get('url')} at {commit!r}; expected commit {DIFFUSERS_COMMIT}"
+            f"diffusers was installed from {direct.get('url')} at {commit!r}; expected commit {expected_commit}"
         )
     return {"source_repo": DIFFUSERS_REPO, "source_commit": commit, "package_version": dist.version}
 
