@@ -116,6 +116,26 @@ func (inst *Instance) noteOutput() {
 	inst.lastOutputNanos.Store(time.Now().UnixNano())
 }
 
+// outputTapReader notes worker output as bytes arrive, before any line
+// framing. A bufio.Scanner only delivers a token at a newline (or errors past
+// its buffer cap), so tqdm-style progress written with '\r' and no '\n' —
+// the normal shape of Hugging Face / diffusers weight loaders — would
+// otherwise register as total silence for minutes and let the GPU-idle
+// watchdog kill a worker that is actively streaming progress. Silence must
+// mean the worker emitted no bytes, which is what LastOutputAt documents.
+type outputTapReader struct {
+	r    io.Reader
+	inst *Instance
+}
+
+func (t outputTapReader) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if n > 0 {
+		t.inst.noteOutput()
+	}
+	return n, err
+}
+
 // NoteOutputAt records worker output at an explicit time (tests use a fake clock).
 func (inst *Instance) NoteOutputAt(at time.Time) {
 	inst.lastOutputNanos.Store(at.UnixNano())
@@ -357,7 +377,7 @@ func (inst *Instance) Spawn() error {
 
 	inst.cmd = cmd
 	inst.stdin = stdin
-	inst.stdout = bufio.NewScanner(stdout)
+	inst.stdout = bufio.NewScanner(outputTapReader{r: stdout, inst: inst})
 	// Grow up to 96MB per response line. Small initial buffer keeps baseline
 	// memory low; the ceiling accommodates adapters that inline base64 audio
 	// (e.g. demucs two-stem or rvc-convert output for a verse) in the result
@@ -372,7 +392,7 @@ func (inst *Instance) Spawn() error {
 
 	// Read stderr in background (adapter logs)
 	go func() {
-		scanner := bufio.NewScanner(stderr)
+		scanner := bufio.NewScanner(outputTapReader{r: stderr, inst: inst})
 		scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 		for scanner.Scan() {
 			inst.noteOutput()

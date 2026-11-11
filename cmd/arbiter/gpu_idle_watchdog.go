@@ -322,7 +322,7 @@ func (w *GPUIdleWatchdog) noteProgressSkip(at time.Time, victims []gpuIdleVictim
 	}
 	ages := make([]string, 0, len(victims))
 	for _, v := range victims {
-		ages = append(ages, fmt.Sprintf("%s=%.0fs", v.Inst.InstanceID, v.OutputAge.Seconds()))
+		ages = append(ages, fmt.Sprintf("%s silent_for=%.0fs", v.Inst.InstanceID, v.OutputAge.Seconds()))
 	}
 	slog.Info("gpu idle watchdog: GPU idle but workers still emitting progress; not killing",
 		"instances", strings.Join(ages, " "))
