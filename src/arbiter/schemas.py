@@ -70,6 +70,7 @@ class JobType(str, Enum):
     MOSS_IMAGE = "moss-image"
     PH3_IMAGE_COMFY = "p-h3-image-comfy"
     MINIMAX_H3_IMAGE = "minimax-h3-image"
+    MINIMAX_H3_IMAGE_ORBITQUANT = "minimax-h3-image-orbitquant-w4a8"
     TTS_VOXTRAL = "tts-voxtral"
     LORA_TRAIN = "lora-train"
     FINE_TUNE = "fine-tune"
@@ -131,6 +132,7 @@ JOB_TYPE_TO_MODEL: dict[str, str] = {
     "moss-image": "moss-image-sft",
     "p-h3-image-comfy": "p-h3-image-comfy-w4a8",
     "minimax-h3-image": "minimax-h3-image",
+    "minimax-h3-image-orbitquant-w4a8": "minimax-h3-image-orbitquant-w4a8",
     "tts-voxtral": "tts-voxtral",
     "lora-train": "lora-train",
     "fine-tune": "fine-tune",
@@ -961,6 +963,7 @@ JOB_TYPE_PARAMS: dict[str, type[BaseModel]] = {
     "moss-image": MossImageParams,
     "p-h3-image-comfy": PH3ImageComfyParams,
     "minimax-h3-image": MiniMaxH3ImageParams,
+    "minimax-h3-image-orbitquant-w4a8": MiniMaxH3ImageParams,
     "tts-voxtral": TTSVoxtralParams,
     "video-generate-h3": VideoGenerateH3Params,
     "video-generate-fast-h3": VideoGenerateH3Params,

@@ -116,6 +116,7 @@ FLUX3_KLEIN_MODELS = ("flux3-klein-bf16", "flux3-klein-fp8", "flux3-klein-nvfp4"
 MOSS_IMAGE_SFT_MODEL = "moss-image-sft"
 PH3_IMAGE_COMFY_W4A8_MODEL = "p-h3-image-comfy-w4a8"
 MINIMAX_H3_IMAGE_MODEL = "minimax-h3-image"
+MINIMAX_H3_IMAGE_ORBITQUANT_MODEL = "minimax-h3-image-orbitquant-w4a8"
 
 
 class StillImageGenerationDisabled(RuntimeError):
@@ -149,7 +150,7 @@ def is_disabled_still_image_model(model_id: str) -> bool:
         return False
     if normalized == _normalize(MOSS_IMAGE_SFT_MODEL):
         return False
-    if normalized in (_normalize(PH3_IMAGE_COMFY_W4A8_MODEL), MINIMAX_H3_IMAGE_MODEL):
+    if normalized in (_normalize(PH3_IMAGE_COMFY_W4A8_MODEL), MINIMAX_H3_IMAGE_MODEL, MINIMAX_H3_IMAGE_ORBITQUANT_MODEL):
         return False
     if normalized in ("lora-train", "fine-tune", "id-lora", "id-lora-encode") or normalized.startswith("ltx2-"):
         return False

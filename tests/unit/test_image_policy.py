@@ -240,6 +240,7 @@ def test_adapter_package_import_is_clean_strict_and_complete():
         "mini-agi",
         "minimax-fast-h3",
         "minimax-h3-image",
+        "minimax-h3-image-orbitquant-w4a8",
         "minimax-h3-local",
         "moondream",
         "moss-image-sft",

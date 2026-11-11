@@ -39,6 +39,7 @@ _ADAPTER_MODULES = (
     "moss_image",
     "p_h3_image_comfy",
     "minimax_h3_image",
+    "minimax_h3_image_orbitquant",
     "fine_tune",
     "lora_train",
     "composite",
