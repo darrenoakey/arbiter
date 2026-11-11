@@ -73,3 +73,28 @@ def test_deadline_is_assigned_once_before_the_poll_loop():
     assert len(deadlines) == 1
     loop_index = next(index for index, node in enumerate(function.body) if isinstance(node, ast.While))
     assert function.body.index(deadlines[0]) < loop_index
+
+
+def test_pre_drain_preparation_overlaps_readiness_and_rejoins_before_drain_wait():
+    source = (ROOT / "deploy-to-spark.sh").read_text()
+    no_op = source.index("skipping drain, build, sync, and bounce")
+    prep_start = source.index('PREP_LOG="$(mktemp -t arbiter-deploy-prep)"')
+    prep_end = source.index(') >"$PREP_LOG" 2>&1 &')
+    readiness_call = source.index("scripts/deploy_readiness.py")
+    drain_requested = source.index('stage "Drain requested')
+    rejoin = source.index('wait "$PREP_PID" || prep_rc=$?')
+    drain_wait = source.index('stage "Draining arbiter')
+    stop = source.index('stage "Stopping arbiter on spark..."')
+    assert no_op < prep_start < prep_end < readiness_call < drain_requested < rejoin < drain_wait < stop
+    prep = source[prep_start:prep_end]
+    for step in ("arbiter.adapters import registry", "pip install", "build_ltx25_runtime.py' verify",
+                 "build_binary arbiter-linux-arm64", "arbiter-go.new"):
+        assert step in prep
+    # The job may only stage: nothing on the live path is stopped or replaced.
+    for live in ("run stop arbiter", "run start arbiter", "mv -f", "/v1/drain"):
+        assert live not in prep
+    trap = source.index("trap resume_if_aborted EXIT")
+    assert prep_end < trap < readiness_call
+    resume = source[source.index("resume_if_aborted() {"):source.index("\n}\n", source.index("resume_if_aborted() {"))]
+    assert 'wait "$PREP_PID"' in resume
+    assert not any(line.strip().startswith(("kill", "pkill")) for line in resume.splitlines())

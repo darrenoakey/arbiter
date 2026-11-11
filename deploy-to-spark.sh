@@ -89,7 +89,7 @@ deploy_key() {
         git diff HEAD 2>/dev/null || true
         find src/arbiter config/spark runtime/ltx25 scripts/build_ltx25_runtime.py \
             scripts/spark-host/arbiter-firewall-guard -type f 2>/dev/null \
-            | LC_ALL=C sort | while IFS= read -r f; do md5 -q "$f"; done
+            | LC_ALL=C sort | tr '\n' '\0' | xargs -0 md5 -q  # one hash line per file, in order
     } | md5 -q
 }
 
@@ -134,6 +134,12 @@ wait_state() {
 resume_if_aborted() {
     rc=$?
     trap - EXIT INT TERM HUP
+    if [ -n "${PREP_PID:-}" ]; then
+        # Reap, never kill: the pre-drain job only stages inert artifacts, and
+        # interrupting its atomic LTX runtime staging would strand a partial dir.
+        wait "$PREP_PID" 2>/dev/null || true
+        rm -f "${PREP_LOG:-}"
+    fi
     if [ "$DRAIN_OWNED" = "1" ]; then
         echo "==> Deploy ended before the bounce (rc=$rc) — resuming arbiter dispatch"
         response="$(curl -fsS --max-time 5 -X POST "$ARBITER_URL/v1/drain" \
@@ -200,39 +206,21 @@ if [ "${DEPLOY_FORCE:-0}" != "1" ]; then
     fi
 fi
 
-# Optional advisory only: read-only strict-zero readiness cannot grant stop
-# authority. The ordinary owned leased drain below still proves zero itself.
-if ! python3 scripts/deploy_readiness.py "$ARBITER_URL/v1/ps" local/config.toml; then
-    echo "ERROR: pre-drain readiness failed; deploy aborted before requesting drain" >&2
-    exit 1
-fi
-
-if ! initial_state="$(ps_state)"; then
-    echo "ERROR: cannot validate Arbiter /v1/ps before requesting drain; deploy aborted" >&2
-    exit 1
-fi
-initial_draining="${initial_state%%$'\t'*}"
-if [ "$initial_draining" != "0" ]; then
-    echo "ERROR: Arbiter is already draining; ownership is external, so deploy aborted without resuming it" >&2
-    exit 1
-fi
-
-# The server exposes one global leased drain, not caller tokens. A validated
-# undrained snapshot is the ownership boundary: only this deploy's subsequent
-# request may be resumed by its abort trap. Never resume a drain observed as
-# already active, because it belongs to another caller.
-DRAIN_OWNED=1
-trap resume_if_aborted EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
-if ! drain_request; then
-    echo "ERROR: Arbiter did not confirm the leased drain; deploy aborted" >&2
-    exit 1
-fi
-drain_deadline=$(( $(date +%s) + DEPLOY_DRAIN_TIMEOUT ))
-stage "Drain requested (no new jobs) — in-flight work winds down while we build/test locally"
-
+# Pre-drain preparation runs as ONE background job started before the
+# read-only readiness wait, then is rejoined after the drain request.
+# 2026-11-12 (gl/orbitquant-h3-image speed-up, release 224.3s): readiness
+# waited ~120s for in-flight GPU jobs to reach zero and only THEN did ~11s of
+# build/smoke/staging begin, serially. Every step in this job is pre-drain
+# safe by its own contract (local cross-compile, a smoke import in /tmp, an
+# idempotent dependency install the full path already ran beside in-flight
+# jobs, an atomically renamed immutable LTX runtime, and inert *.new binary
+# uploads), so it overlaps the wait instead of following it. Its output is
+# captured and replayed when rejoined; any failure still aborts before the
+# running Arbiter is stopped. An early abort WAITS for the job (never kills
+# it) so an atomic staging step is never left half-done.
+PREP_PID=""
+PREP_LOG="$(mktemp -t arbiter-deploy-prep)"
+(
 # The cross-compile is purely local and independent of the remote smoke test,
 # pip install and LTX runtime staging below, so it overlaps them (and the four
 # binaries build concurrently) instead of running after them. Its output is
@@ -365,6 +353,53 @@ scp -q arbiter-linux-arm64 "$SPARK:$REMOTE/arbiter-go.new"
 scp -q llm-worker-linux-arm64 "$SPARK:$REMOTE/llm-worker.new"
 scp -q vllm-chat-worker-linux-arm64 "$SPARK:$REMOTE/vllm-chat-worker.new"
 scp -q vllm-worker-linux-arm64 "$SPARK:$REMOTE/vllm-worker.new"
+
+) >"$PREP_LOG" 2>&1 &
+PREP_PID=$!
+trap resume_if_aborted EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# Optional advisory only: read-only strict-zero readiness cannot grant stop
+# authority. The ordinary owned leased drain below still proves zero itself.
+if ! python3 scripts/deploy_readiness.py "$ARBITER_URL/v1/ps" local/config.toml; then
+    echo "ERROR: pre-drain readiness failed; deploy aborted before requesting drain" >&2
+    exit 1
+fi
+
+if ! initial_state="$(ps_state)"; then
+    echo "ERROR: cannot validate Arbiter /v1/ps before requesting drain; deploy aborted" >&2
+    exit 1
+fi
+initial_draining="${initial_state%%$'\t'*}"
+if [ "$initial_draining" != "0" ]; then
+    echo "ERROR: Arbiter is already draining; ownership is external, so deploy aborted without resuming it" >&2
+    exit 1
+fi
+
+# The server exposes one global leased drain, not caller tokens. A validated
+# undrained snapshot is the ownership boundary: only this deploy's subsequent
+# request may be resumed by its abort trap. Never resume a drain observed as
+# already active, because it belongs to another caller.
+DRAIN_OWNED=1
+if ! drain_request; then
+    echo "ERROR: Arbiter did not confirm the leased drain; deploy aborted" >&2
+    exit 1
+fi
+drain_deadline=$(( $(date +%s) + DEPLOY_DRAIN_TIMEOUT ))
+stage "Drain requested (no new jobs) — in-flight work winds down while pre-drain preparation finishes"
+
+stage "Awaiting pre-drain preparation (smoke test, installs, cross-compile, staging)..."
+prep_rc=0
+wait "$PREP_PID" || prep_rc=$?
+PREP_PID=""
+cat "$PREP_LOG"
+rm -f "$PREP_LOG"
+if [ "$prep_rc" -ne 0 ]; then
+    echo "ERROR: pre-drain preparation failed (rc=$prep_rc); deploy aborted before stopping Arbiter" >&2
+    exit "$prep_rc"
+fi
 
 # Rejoin the drain requested before the build/test phase. Existing queued work
 # is deliberately allowed to remain: drain pauses dispatch, and the queue is
