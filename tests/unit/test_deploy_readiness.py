@@ -143,3 +143,36 @@ def test_short_work_never_overrides_a_foreign_drain():
     snap["draining"] = True
     with pytest.raises(readiness.DrainProtocolError, match="ownership is external"):
         readiness.ready(snap)
+
+
+def incoherent() -> dict:
+    # Cached /v1/ps read: the total and the per-model sum were sampled apart.
+    bad = snapshot(active=1)
+    bad["models"][0]["active_jobs"] = 0
+    return bad
+
+
+def test_wait_rereads_a_transiently_incoherent_snapshot_until_coherent(monkeypatch):
+    snaps = [incoherent(), incoherent(), snapshot()]
+    monkeypatch.setattr(readiness, "fetch", lambda url: snaps.pop(0))
+    monkeypatch.setattr(readiness.time, "sleep", lambda seconds: None)
+    assert readiness.wait("http://ps.invalid/v1/ps", 30) is True
+    assert snaps == []
+
+
+def test_wait_never_accepts_an_incoherent_snapshot(monkeypatch):
+    monkeypatch.setattr(readiness, "fetch", lambda url: incoherent())
+    monkeypatch.setattr(readiness.time, "sleep", lambda seconds: None)
+    assert readiness.wait("http://ps.invalid/v1/ps", 0) is False
+
+
+def test_wait_still_fails_closed_on_draining_and_malformed(monkeypatch):
+    monkeypatch.setattr(readiness.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(readiness, "fetch", lambda url: snapshot(draining=True))
+    with pytest.raises(readiness.DrainProtocolError, match="ownership is external"):
+        readiness.wait("http://ps.invalid/v1/ps", 30)
+    malformed = snapshot()
+    del malformed["models"]
+    monkeypatch.setattr(readiness, "fetch", lambda url: malformed)
+    with pytest.raises(readiness.DrainProtocolError):
+        readiness.wait("http://ps.invalid/v1/ps", 30)

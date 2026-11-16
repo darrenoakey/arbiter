@@ -17,16 +17,20 @@
 #   # path hack — PYTHONPATH is forbidden as an adapter param):
 #   cp venvs/qwentts/lib/python3.12/site-packages/arbiter.pth venvs/yue2/lib/python3.12/site-packages/
 #
-# yue2-infer is NOT on PyPI. The production pin 0.1.5 was installed from a
-# wheel kept on the host at ~/yue2-pkg/yue2_infer-0.1.5-py3-none-any.whl:
+# yue2-infer is NOT on PyPI. The production pin 0.1.6 was installed from a
+# wheel kept on the host at ~/yue2-pkg/yue2_infer-0.1.6-py3-none-any.whl
+# (sha256 129a015327a2eca530760ffd2163ccb8cb65f7e601715de1d9626a40c568e2e2,
+# the SHA256SUMS value published with yue2-v0.1.6):
 #
-#   venvs/yue2/bin/pip install ~/yue2-pkg/yue2_infer-0.1.5-py3-none-any.whl
+#   venvs/yue2/bin/pip install ~/yue2-pkg/yue2_infer-0.1.6-py3-none-any.whl
 #
-# Upstream's current release is 0.1.6
-# (https://github.com/multimodal-art-projection/YuE/releases/download/yue2-v0.1.6/yue2_infer-0.1.6-py3-none-any.whl).
-# Do NOT upgrade the worker pin without a real arbiter job proving the new
-# package — the adapter depends on the pipeline call surface
-# (style/lyrics/cot/seed/cfg_scale/abc, SongResult.audio/sample_rate/timing).
+# Previous pin 0.1.5 (wheel kept at ~/yue2-pkg/yue2_infer-0.1.5-py3-none-any.whl)
+# is the rollback target. Upstream release notes say 0.1.6 is a packaging and
+# licensing patch with generation matching 0.1.5 exactly; the upgrade was
+# proven with a real arbiter music-generate-yue2 job before this pin changed.
+# The adapter depends on the pipeline call surface (style/lyrics/cot/seed/
+# cfg_scale/abc, SongResult.audio/sample_rate/timing); re-verify with a real
+# job before bumping the pin again.
 #
 # Weights m-a-p/YuE2-3B + m-a-p/YuE2-Vae resolve from the shared HF cache at
 # /mnt/t9/hf-cache (symlinked into ~/.cache/huggingface/hub). Do not set
@@ -41,4 +45,4 @@ accelerate==1.13.0
 numpy==2.2.6
 soundfile==0.13.1
 tiktoken==0.12.0
-yue2-infer==0.1.5
+yue2-infer==0.1.6

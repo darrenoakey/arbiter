@@ -98,14 +98,25 @@ def fetch(url: str) -> object:
     return json.loads(body)
 
 
+# drain_wait.py rejects a snapshot whose active_jobs disagrees with the sum of
+# models[].active_jobs. /v1/ps is a cached dashboard, so the two fields can be
+# sampled at different instants while jobs start and finish. That is transient:
+# re-read until the deadline. It is never accepted as ready.
+INCOHERENT_SNAPSHOT = "/v1/ps active_jobs does not equal the sum of models[].active_jobs"
+
+
 def wait(url: str, seconds: int) -> bool:
     deadline = time.monotonic() + seconds
     while True:
         snapshot = fetch(url)
         if time.monotonic() > deadline:
             return False
-        if ready(snapshot):
-            return True
+        try:
+            if ready(snapshot):
+                return True
+        except DrainProtocolError as error:
+            if str(error) != INCOHERENT_SNAPSHOT:
+                raise
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False

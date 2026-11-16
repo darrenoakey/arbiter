@@ -52,8 +52,8 @@ shared output tree (`arbiter_client.local_result()`); YuE2's own artifacts
 The worker venv is `venvs/yue2` on spark, created from scratch with torch
 `2.10.0+cu130` (the +cu130 build is mandatory — plain `torch` is CPU-only)
 plus the `yue2-infer` package. `yue2-infer` is **not on PyPI**: production
-runs 0.1.5 from a wheel kept at `~/yue2-pkg/` on spark; upstream's current
-release is 0.1.6. Full recreation steps live in `requirements/yue2.txt` —
+runs 0.1.6 from a wheel kept at `~/yue2-pkg/` on spark (sha256 pinned in
+`requirements/yue2.txt`; 0.1.5 is the rollback wheel). Full recreation steps live in `requirements/yue2.txt` —
 follow them verbatim; the venv MUST be a real directory (worker policy
 rejects symlinked venv paths) and must carry the copied `arbiter.pth`.
 
