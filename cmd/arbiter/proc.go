@@ -914,13 +914,11 @@ func collectDescendants(rootPid int) []int {
 	return out
 }
 
-// reapWorkersExcept scans for leftover arbiter worker processes and kills any
-// that aren't the named PID (which might still be winding down). Called from
-// Instance.Kill as a belt-and-braces sweep after the descendant-tree walk.
+// reapWorkersExcept sweeps for leftover arbiter worker processes this arbiter
+// owns and kills any that aren't the named PID (which might still be winding
+// down). Called from Instance.Kill as a belt-and-braces sweep after the
+// descendant-tree walk. Ownership rules live in reapOwnedOrphans.
 //
-// Patterns include the Python multiprocessing children of vLLM (which rename
-// themselves to "VLLM::EngineCore" via setproctitle), since those reparent to
-// init the moment vllm serve dies and then aren't reachable via PPID walks.
 // reapSweepMinInterval debounces the orphan sweep: Kill calls arrive in
 // clusters (scale-down storms, test cleanup) and each sweep scans the whole
 // process table, so a second sweep within this window adds latency without
@@ -942,40 +940,8 @@ func reapWorkersExcept(excludePid int) {
 	}
 	lastReapAt = time.Now()
 	reapMu.Unlock()
-	// One pgrep for all patterns instead of one per pattern: a full command-
-	// line scan of every process on the host was measured at ~1s+ per pattern
-	// under load, and Kill runs this sweep on every teardown — 7 scans made
-	// each test-suite Kill cost 5-10s when the machine was busy.
-	pattern := strings.Join([]string{
-		"llama.cpp/build/bin/llama-server",
-		"arbiter/vllm-chat-worker",
-		"arbiter/llm-worker",
-		"arbiter.worker_main",
-		".venv-vllm/bin/vllm",
-		"VLLM::EngineCore",
-		"vllm.entrypoints",
-	}, "|")
-	output, err := exec.Command("pgrep", "-f", pattern).Output()
-	if err != nil {
-		return
-	}
-	selfPid := os.Getpid()
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		if line == "" {
-			continue
-		}
-		pid, err := strconv.Atoi(line)
-		if err != nil || pid == selfPid || pid == excludePid {
-			continue
-		}
-		// Skip processes still rooted under the running arbiter — those
-		// are healthy in-flight loads, not orphans.
-		if hasAncestor(pid, selfPid) {
-			continue
-		}
-		if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
-			slog.Warn("reaped orphan worker", "pid", pid)
-		}
+	for _, pid := range reapOwnedOrphans(workerReapPatterns, os.Getpid(), excludePid) {
+		slog.Warn("reaped orphan worker", "pid", pid)
 	}
 }
 

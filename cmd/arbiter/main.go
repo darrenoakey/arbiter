@@ -6,10 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -23,40 +21,18 @@ import (
 // load fails with "VRAM reserve failed", the circuit breaker trips after 3
 // tries, and every queued job is parked indefinitely.
 //
-// The reaper finds any llama-server, vllm-chat-worker, or arbiter.worker_main
-// process that isn't a child of this arbiter pid and SIGKILLs it. This is safe:
-// those binaries only run as arbiter-spawned workers. User-launched ones would
-// be caught by pgrep too, but this is a machine-dedicated role (spark) so any
-// match is an orphan from a prior arbiter.
+// The reaper finds llama-server, vllm-chat-worker, llm-worker and
+// arbiter.worker_main processes and SIGKILLs only true orphans (see
+// reapOwnedOrphans): a worker whose process tree has been reparented to init,
+// or that sits in this arbiter's own cgroup. A worker still owned by another
+// live process tree in another cgroup, such as a separately managed Arbiter
+// lane in its own systemd unit, is left to its owner.
 func reapOrphanWorkers() {
-	patterns := []string{
-		"llama.cpp/build/bin/llama-server",
-		"arbiter/vllm-chat-worker",
-		"arbiter/llm-worker",
-		"arbiter.worker_main",
+	reaped := reapOwnedOrphans(startupReapPatterns, os.Getpid(), 0)
+	for _, pid := range reaped {
+		slog.Warn("reaped orphan worker from prior arbiter", "pid", pid)
 	}
-	selfPid := os.Getpid()
-	killed := 0
-	for _, pattern := range patterns {
-		output, err := exec.Command("pgrep", "-f", pattern).Output()
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-			if line == "" {
-				continue
-			}
-			pid, err := strconv.Atoi(line)
-			if err != nil || pid == selfPid {
-				continue
-			}
-			if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
-				slog.Warn("reaped orphan worker from prior arbiter", "pid", pid, "pattern", pattern)
-				killed++
-			}
-		}
-	}
-	if killed > 0 {
+	if len(reaped) > 0 {
 		time.Sleep(2 * time.Second) // let VRAM actually release before the scheduler starts
 	}
 }
